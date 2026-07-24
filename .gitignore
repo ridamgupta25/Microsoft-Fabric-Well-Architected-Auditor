@@ -1,0 +1,16 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# AuditFAST output
+output/
+
+# Local project configs (keep the example)
+config/*.yaml
+!config/project.example.yaml
+!config/remediation.yaml
+
+# SQLite / local DB files
+*.db

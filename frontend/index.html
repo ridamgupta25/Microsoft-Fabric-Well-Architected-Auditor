@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Fabric Well-Architected Auditor</title>
+<!-- Styles live in a separate stylesheet; behaviour in ES modules under /static/js. -->
+<link rel="stylesheet" href="/static/css/styles.css" />
+</head>
+<body>
+<header>
+  <button id="navToggle" class="navToggle" title="Collapse / expand the panel" aria-label="Toggle panel">☰</button>
+  <h1>Fabric Well-Architected Auditor</h1>
+  <span class="badge">Phase 0 · rule-based · read-only</span>
+</header>
+
+<div class="layout">
+  <!-- ===== Config panel (collapses to an icon rail) ===== -->
+  <aside class="panel">
+    <div class="rail">
+      <button class="railbtn" data-target="secScope" title="Scope &amp; sign-in">⚙️</button>
+      <button class="railbtn" data-target="secWs" title="Workspaces">🗂️</button>
+      <button class="railbtn" data-target="secPil" title="Pillars">🎯</button>
+      <button class="railbtn run" id="railRun" title="Run Audit">▶</button>
+    </div>
+    <div class="panelbody">
+    <h2 id="secScope">1 · Scope</h2>
+    <div class="field">
+      Mode
+      <select id="mode">
+        <option value="mock">Mock (offline demo)</option>
+        <option value="live">Live (OAuth2 read-only)</option>
+      </select>
+    </div>
+
+    <div class="authbox" id="authPanel">
+      <strong>Sign in (read-only)</strong>
+      <input id="email" type="email" placeholder="you@company.com" />
+      <button id="signIn">Sign in with Microsoft</button>
+      <button id="signInAz" class="secbtn">or: use Azure CLI (az login)</button>
+      <button id="diagBtn" class="secbtn">Diagnose connection</button>
+      <details class="advauth"><summary>Advanced (optional app setup)</summary>
+        <input id="tenantId" placeholder="Directory (tenant) ID (optional)" />
+        <input id="clientId" placeholder="Application (client) ID (optional)" />
+        <div class="hint">No app registration needed: sign-in uses Microsoft's built-in client. Set a client ID here only if your tenant blocks that.</div>
+      </details>
+      <div class="authmsg" id="authMsg"></div>
+    </div>
+
+    <h3 id="secWs">Workspaces <span class="muted" id="wsCount"></span></h3>
+    <button id="loadWs" class="secbtn" style="margin:4px 0;">↻ Load my Fabric workspaces (after sign-in)</button>
+    <div class="addws">
+      <input id="wsAddId" placeholder="Workspace name or ID" />
+      <select id="wsAddRole">
+        <option>Data Prep</option><option>Data Storage</option><option>Data Logs</option>
+        <option>Data Operations</option><option>Reporting / Semantic</option><option>Mixed</option>
+      </select>
+      <button id="wsAdd" title="Add workspace">+</button>
+    </div>
+    <div class="wstools">
+      <button id="wsSelAll" class="linkbtn">Select all</button>
+      <span class="linkbtn sep">|</span>
+      <button id="wsDeselAll" class="linkbtn">Deselect all</button>
+      <span class="muted" id="wsSelCount" style="margin-left:auto;font-size:12px;"></span>
+    </div>
+    <div id="workspaces"></div>
+    <div class="hint">Grouped by layer role. Use “+” to add a workspace (by name/ID) under a role.</div>
+
+    <h3 id="secPil">Pillars to assess</h3>
+    <div id="pillars"></div>
+
+    <button id="run">Run Audit</button>
+    <div id="status"></div>
+    </div>
+  </aside>
+
+  <!-- ===== Results panel ===== -->
+  <main class="panel">
+    <div id="results">
+      <div class="empty">Select pillars and workspaces, then <strong>Run Audit</strong>.</div>
+    </div>
+  </main>
+</div>
+
+<!-- ===== Fun loading overlay (mini-game) ===== -->
+<div id="loadingOverlay" class="overlay">
+  <div class="loadcard">
+    <div class="loadhead">
+      <div class="spinner"></div>
+      <div>
+        <div class="loadtitle">Auditing your Fabric workspaces…</div>
+        <div class="loadsub" id="loadTip">Warming up the rule engine…</div>
+      </div>
+    </div>
+    <div class="progress"><span></span></div>
+    <!-- The mini-game (or any future distraction) is injected here by its plug-in. -->
+    <div id="loadingExtra"></div>
+    <div class="loadfoot">Read-only — keep playing, we’ll pop the results in the moment they’re ready.</div>
+  </div>
+</div>
+
+<script type="module" src="/static/js/main.js"></script>
+</body>
+</html>

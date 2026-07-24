@@ -1,0 +1,33 @@
+# AuditFAST Core - project definition (Phase 1)
+# One project can span several Fabric workspaces; tag each with its layer role.
+project:
+  name: "Sales Analytics - Fabric Migration"
+  client: "Contoso"
+  # Best-practice conventions the checks enforce (edit per engagement):
+  naming_convention: '^[A-Za-z]+-(Dev|Test|Prod)-[A-Za-z]+$'   # e.g. Sales-Prod-DataPrep
+  pipeline_naming_convention: '^PL_[A-Za-z0-9_]+$'             # e.g. PL_Bronze_Load
+  orphan_days: 90
+  max_admins: 2
+
+# Offline demo data (used in --mock mode).
+mock:
+  tenant_file: "sample_data/tenant.json"
+
+remediation: "config/remediation.yaml"
+
+# The workspaces that make up this project, each tagged with a layer role.
+workspaces:
+  - id: "ws-prep-01"
+    role: "Data Prep"
+  - id: "ws-store-01"
+    role: "Data Storage"
+  - id: "ws-ops-01"
+    role: "Data Operations"
+
+# Used only in --live mode (register a read-only Entra app first).
+auth:
+  tenant_id: "<TENANT_ID>"
+  client_id: "<ENTRA_APP_CLIENT_ID>"
+  scopes:
+    - "https://api.fabric.microsoft.com/Workspace.Read.All"
+    - "https://api.fabric.microsoft.com/Item.Read.All"

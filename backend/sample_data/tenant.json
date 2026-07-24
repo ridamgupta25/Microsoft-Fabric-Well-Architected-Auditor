@@ -1,0 +1,161 @@
+{
+  "workspaces": [
+    {
+      "id": "ws-prep-01",
+      "displayName": "Sales-Prod-DataPrep",
+      "role": "Data Prep",
+      "capacityId": "CAP-F64-01",
+      "gitConnected": true,
+      "deploymentPipeline": true,
+      "roleAssignments": [
+        { "principalType": "Group", "displayName": "Fabric-Prod-Contributors", "role": "Contributor" },
+        { "principalType": "Group", "displayName": "Fabric-Prod-Admins", "role": "Admin" },
+        { "principalType": "User", "displayName": "ridam@contoso.com", "role": "Admin" }
+      ],
+      "items": [
+        { "id": "pl-1", "type": "DataPipeline", "displayName": "PL_Bronze_Load", "sensitivityLabel": "Confidential", "lastRunUtc": "2026-07-20T04:00:00Z" },
+        { "id": "pl-2", "type": "DataPipeline", "displayName": "PL_Silver_Merge", "sensitivityLabel": null, "lastRunUtc": "2026-07-19T04:00:00Z" },
+        { "id": "nb-1", "type": "Notebook", "displayName": "NB_Gold_Build", "sensitivityLabel": "Confidential", "lastRunUtc": "2026-07-21T04:00:00Z" }
+      ],
+      "pipelines": {
+        "PL_Bronze_Load": {
+          "name": "PL_Bronze_Load",
+          "properties": {
+            "description": "Ingest source tables into the Bronze layer.",
+            "parameters": { "p_load_date": { "type": "string" } },
+            "activities": [
+              {
+                "name": "Copy_Source_To_Bronze",
+                "type": "Copy",
+                "description": "Copy source to bronze delta",
+                "policy": { "retry": 2, "retryIntervalInSeconds": 60, "timeout": "0.02:00:00" },
+                "dependsOn": [],
+                "typeProperties": { "source": { "type": "SqlServerSource" }, "sink": { "type": "DeltaSink" } }
+              },
+              {
+                "name": "Run_Silver_Notebook",
+                "type": "TridentNotebook",
+                "description": "Kick off silver transform",
+                "policy": { "retry": 1, "timeout": "0.01:30:00" },
+                "dependsOn": [ { "activity": "Copy_Source_To_Bronze", "dependencyConditions": ["Succeeded"] } ]
+              },
+              {
+                "name": "Notify_On_Failure",
+                "type": "Teams",
+                "dependsOn": [ { "activity": "Run_Silver_Notebook", "dependencyConditions": ["Failed"] } ]
+              }
+            ]
+          }
+        },
+        "PL_Silver_Merge": {
+          "name": "PL_Silver_Merge",
+          "properties": {
+            "activities": [
+              {
+                "name": "Merge Silver",
+                "type": "Script",
+                "policy": {},
+                "dependsOn": [],
+                "typeProperties": {
+                  "scripts": [
+                    { "type": "Query", "text": "MERGE INTO silver.customer t USING (SELECT * FROM ext) s ON t.id=s.id; -- conn 'Server=tcp:prod-sql.database.windows.net;User ID=svc;Password=Sup3rSecret!;'" }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "ws-store-01",
+      "displayName": "Sales-Prod-DataStorage",
+      "role": "Data Storage",
+      "capacityId": "CAP-F64-01",
+      "gitConnected": false,
+      "deploymentPipeline": true,
+      "roleAssignments": [
+        { "principalType": "Group", "displayName": "Fabric-Prod-Contributors", "role": "Contributor" },
+        { "principalType": "Group", "displayName": "Fabric-Prod-Admins", "role": "Admin" }
+      ],
+      "items": [
+        { "id": "lh-1", "type": "Lakehouse", "displayName": "LH_Sales_Gold", "sensitivityLabel": "Confidential", "lastRunUtc": "2026-07-22T04:00:00Z" },
+        { "id": "wh-1", "type": "Warehouse", "displayName": "WH_Sales_Mart", "sensitivityLabel": null, "lastRunUtc": "2026-07-10T04:00:00Z" }
+      ],
+      "pipelines": {
+        "PL_Load_Warehouse": {
+          "name": "PL_Load_Warehouse",
+          "properties": {
+            "description": "Load gold into the warehouse mart.",
+            "parameters": { "p_batch": { "type": "string" } },
+            "activities": [
+              {
+                "name": "Copy_Gold_To_Warehouse",
+                "type": "Copy",
+                "description": "Copy gold to WH",
+                "policy": { "retry": 2, "timeout": "0.03:00:00" },
+                "dependsOn": []
+              },
+              {
+                "name": "Refresh_Semantic_Model",
+                "type": "Web",
+                "description": "Trigger dataset refresh",
+                "policy": { "retry": 1, "timeout": "0.01:00:00" },
+                "dependsOn": [ { "activity": "Copy_Gold_To_Warehouse", "dependencyConditions": ["Succeeded"] } ]
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "ws-ops-01",
+      "displayName": "salesops",
+      "role": "Data Operations",
+      "capacityId": null,
+      "gitConnected": true,
+      "deploymentPipeline": false,
+      "roleAssignments": [
+        { "principalType": "Group", "displayName": "Fabric-Ops", "role": "Contributor" },
+        { "principalType": "User", "displayName": "admin1@contoso.com", "role": "Admin" },
+        { "principalType": "User", "displayName": "admin2@contoso.com", "role": "Admin" },
+        { "principalType": "User", "displayName": "admin3@contoso.com", "role": "Admin" },
+        { "principalType": "User", "displayName": "contractor#EXT#@partner.com", "role": "Viewer" }
+      ],
+      "items": [
+        { "id": "pl-3", "type": "DataPipeline", "displayName": "orchestrator_daily", "sensitivityLabel": null, "lastRunUtc": "2025-01-15T04:00:00Z" },
+        { "id": "rf-1", "type": "Reflex", "displayName": "AlertRule", "sensitivityLabel": null, "lastRunUtc": "2026-07-01T04:00:00Z" }
+      ],
+      "pipelines": {
+        "orchestrator_daily": {
+          "name": "orchestrator_daily",
+          "properties": {
+            "description": "Master orchestrator.",
+            "activities": [
+              {
+                "name": "Invoke_Bronze",
+                "type": "InvokePipeline",
+                "description": "run bronze",
+                "policy": { "retry": 2, "timeout": "0.04:00:00" },
+                "dependsOn": []
+              },
+              {
+                "name": "Write_Audit_Log",
+                "type": "Copy",
+                "description": "write audit log to storage",
+                "policy": { "retry": 1, "timeout": "0.01:00:00" },
+                "dependsOn": [ { "activity": "Invoke_Bronze", "dependencyConditions": ["Succeeded", "Failed"] } ],
+                "typeProperties": {
+                  "sink": {
+                    "type": "BlobSink",
+                    "connectionString": "DefaultEndpointsProtocol=https;AccountName=salesops;AccountKey=abcd1234VeryLongKeyMustRotate==;EndpointSuffix=core.windows.net"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}
