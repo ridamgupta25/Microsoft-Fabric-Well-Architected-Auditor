@@ -12,8 +12,6 @@ against the five Well-Architected pillars, and produces a rated report.
   aggregated score plus a per-workspace breakdown.
 - **No AI in this release** (an AI-assisted layer is planned later).
 
-Design doc: [`../09-fabric-well-architected-auditor-draft.md`](../09-fabric-well-architected-auditor-draft.md)
-
 ---
 
 ## Quick start — interactive web UI (recommended)
