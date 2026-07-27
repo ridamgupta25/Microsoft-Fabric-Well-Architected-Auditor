@@ -66,7 +66,6 @@ export function DashboardPage() {
                 <tr>
                   <th scope="col">Audit</th>
                   <th scope="col">Submitted</th>
-                  <th scope="col">Mode</th>
                   <th scope="col">Status</th>
                   <th scope="col">Score</th>
                 </tr>
@@ -83,7 +82,6 @@ export function DashboardPage() {
                       </Link>
                     </td>
                     <td className="whitespace-nowrap">{formatDateTime(item.submitted_at)}</td>
-                    <td>{item.mode}</td>
                     <td>{item.status}</td>
                     <td className={ratingFor(item.overall).textClass}>
                       {formatPercent(item.overall)}

@@ -5,25 +5,23 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query
 
-from ...schemas.audit import AuditMode, WorkspaceOut
+from ...schemas.audit import WorkspaceOut
 from ...schemas.auth import DiagnosticsResponse
 from ...services import audit_service
-from ..deps import ProjectDep, resolve_live_token
+from ..deps import ProjectDep, resolve_token
 
 router = APIRouter(prefix="/workspaces", tags=["workspaces"])
 
 
-@router.get("", response_model=list[WorkspaceOut], summary="List selectable workspaces")
-async def list_workspaces(
-    project: ProjectDep,
-    mode: Annotated[AuditMode, Query(description="mock reads the fixture; live reads the project file.")] = AuditMode.MOCK,
-) -> list[WorkspaceOut]:
-    """Workspaces available for selection, before any sign-in.
+@router.get("", response_model=list[WorkspaceOut], summary="List declared workspaces")
+async def list_workspaces(project: ProjectDep) -> list[WorkspaceOut]:
+    """Workspaces declared by the project file, before any sign-in.
 
-    In live mode this can only echo what the project declares — enumerating a
-    tenant needs a token. Use ``/workspaces/live`` once signed in.
+    Contents cannot be enumerated without a token, so this only echoes what the
+    project declares. Use ``/workspaces/live`` once signed in to see the real
+    tenant.
     """
-    rows = audit_service.list_workspaces(project, mode.value)
+    rows = audit_service.list_workspaces(project)
     return [WorkspaceOut(**row) for row in rows]
 
 
@@ -36,7 +34,7 @@ async def list_live_workspaces(
     session: Annotated[str, Query(description="Completed sign-in session id.")],
 ) -> list[WorkspaceOut]:
     """Enumerate the tenant, regardless of what the project file declares."""
-    token = resolve_live_token("live", session)
+    token = resolve_token(session)
     return [WorkspaceOut(**row) for row in audit_service.list_live_workspaces(token)]
 
 
@@ -53,5 +51,5 @@ async def diagnostics(
     Use when a live audit returns less than expected: it distinguishes a bad
     token from missing permissions on a specific sub-resource.
     """
-    token = resolve_live_token("live", session)
+    token = resolve_token(session)
     return DiagnosticsResponse(**audit_service.diagnose(token))

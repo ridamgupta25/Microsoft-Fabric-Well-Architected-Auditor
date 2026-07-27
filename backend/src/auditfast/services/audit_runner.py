@@ -54,7 +54,6 @@ class AuditRunner:
         self,
         *,
         project_path: str,
-        mode: str,
         pillars: list[str] | None = None,
         workspaces: list[dict] | None = None,
         out_dir: str | None = None,
@@ -64,12 +63,10 @@ class AuditRunner:
         """Accept an audit and start it in the background."""
         job = AuditJob(
             id=uuid.uuid4().hex[:16],
-            mode=mode,
             status=JobStatus.QUEUED,
             organization_id=organization_id,
             request={
                 "project": project_path,
-                "mode": mode,
                 "pillars": pillars or [],
                 "workspaces": workspaces or [],
             },
@@ -80,7 +77,6 @@ class AuditRunner:
             self._execute(
                 job,
                 project_path=project_path,
-                mode=mode,
                 pillars=pillars,
                 workspaces=workspaces,
                 out_dir=out_dir,
@@ -97,7 +93,6 @@ class AuditRunner:
         job: AuditJob,
         *,
         project_path: str,
-        mode: str,
         pillars: list[str] | None,
         workspaces: list[dict] | None,
         out_dir: str | None,
@@ -112,13 +107,12 @@ class AuditRunner:
         async with self._semaphore:
             job.mark_running()
             await self._repository.update(job)
-            logger.info("audit started", extra={"audit_id": job.id, "mode": mode})
+            logger.info("audit started", extra={"audit_id": job.id})
 
             try:
                 run = await asyncio.to_thread(
                     audit_service.run_audit,
                     project_path,
-                    mode,
                     pillars,
                     workspaces,
                     out_dir,

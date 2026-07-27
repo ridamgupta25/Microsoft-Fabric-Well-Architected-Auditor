@@ -14,13 +14,13 @@ from .conftest import (
     EXPECTED_OVERALL,
     EXPECTED_RESULT_ROWS,
     EXPECTED_SCORED_CHECKS,
-    MOCK_SETTINGS,
-    MOCK_TARGETS,
+    FIXTURE_SETTINGS,
+    FIXTURE_TARGETS,
 )
 
 
 def _run(provider, **kwargs):
-    return run_audit(provider, MOCK_TARGETS, MOCK_SETTINGS, **kwargs)
+    return run_audit(provider, FIXTURE_TARGETS, FIXTURE_SETTINGS, **kwargs)
 
 
 # -- scoring maths -------------------------------------------------------------
@@ -237,7 +237,7 @@ def test_passing_checks_carry_no_severity_or_remediation(provider):
 # -- unreadable workspaces -----------------------------------------------------
 
 def test_missing_workspace_is_reported_not_scored(provider):
-    results = run_audit(provider, [("does-not-exist", Layer.PREP)], MOCK_SETTINGS)
+    results = run_audit(provider, [("does-not-exist", Layer.PREP)], FIXTURE_SETTINGS)
     access = [r for r in results if r.check_id == "WS-ACCESS"]
     assert len(access) == 1
     assert access[0].scored is False
@@ -255,8 +255,8 @@ def test_a_crashing_check_does_not_abort_the_run(provider):
     def _boom(ctx):
         raise RuntimeError("kaboom")
 
-    results = run_audit(provider, MOCK_TARGETS, MOCK_SETTINGS, registry=registry)
-    assert len(results) == len(MOCK_TARGETS)
+    results = run_audit(provider, FIXTURE_TARGETS, FIXTURE_SETTINGS, registry=registry)
+    assert len(results) == len(FIXTURE_TARGETS)
     assert all(r.status is Status.NA and not r.scored for r in results)
     assert "kaboom" in results[0].evidence
 

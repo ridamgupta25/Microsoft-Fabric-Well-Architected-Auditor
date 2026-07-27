@@ -24,8 +24,6 @@ export interface Page<T> {
   offset: number;
 }
 
-export type AuditMode = "mock" | "live";
-
 export type JobStatus = "queued" | "running" | "succeeded" | "failed";
 
 export type CheckStatus = "PASS" | "PARTIAL" | "FAIL" | "N/A" | "INFO";
@@ -93,10 +91,10 @@ export interface WorkspaceSelection {
 }
 
 export interface AuditRequest {
-  mode: AuditMode;
   project?: string | null;
   pillars: string[];
   workspaces: WorkspaceSelection[];
+  /** Completed sign-in session id. Every audit reads the live tenant. */
   auth_session?: string | null;
 }
 
@@ -155,7 +153,6 @@ export interface WorkspaceScore {
 export interface AuditReport {
   audit_id?: string | null;
   project_name: string;
-  mode: string;
   overall: number | null;
   by_pillar: Record<string, PillarScore>;
   by_workspace: Record<string, WorkspaceScore>;
@@ -177,7 +174,6 @@ export interface AuditJob {
   started_at?: string | null;
   finished_at?: string | null;
   duration_seconds?: number | null;
-  mode: string;
   error?: string | null;
   report?: AuditReport | null;
 }
@@ -188,7 +184,6 @@ export interface AuditJobSummary {
   submitted_at: string;
   finished_at?: string | null;
   duration_seconds?: number | null;
-  mode: string;
   project_name?: string | null;
   overall?: number | null;
   workspaces: number;

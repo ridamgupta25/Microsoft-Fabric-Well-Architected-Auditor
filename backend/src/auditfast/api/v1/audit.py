@@ -18,7 +18,7 @@ from ...schemas.audit import (
     SingleCheckRequest,
 )
 from ...services import audit_service
-from ..deps import OrganizationDep, RunnerDep, SettingsDep, resolve_live_token
+from ..deps import OrganizationDep, RunnerDep, SettingsDep, resolve_token
 
 router = APIRouter(prefix="/audit", tags=["audit"])
 
@@ -38,16 +38,15 @@ async def submit_audit(
 ) -> AuditAccepted:
     """Start an audit and return its id.
 
-    Live mode requires a completed sign-in; the token is resolved here so an
+    Requires a completed sign-in; the token is resolved here so an
     unauthenticated request fails immediately rather than as a dead background
     job.
     """
-    token = resolve_live_token(request.mode.value, request.auth_session)
+    token = resolve_token(request.auth_session)
     project = str(settings.resolve(request.project) if request.project else settings.project_path)
 
     job = await runner.submit(
         project_path=project,
-        mode=request.mode.value,
         pillars=request.pillars,
         workspaces=[w.model_dump(exclude_none=True) for w in request.workspaces],
         out_dir=str(settings.output_path),
@@ -84,7 +83,6 @@ async def get_audit(
         started_at=job.started_at,
         finished_at=job.finished_at,
         duration_seconds=job.duration_seconds,
-        mode=job.mode,
         error=job.error,
         report=AuditReport(**job.report) if job.report else None,
     )
@@ -106,14 +104,13 @@ async def run_single_check(
     iterate on a rule. Only addressable because checks carry metadata — there
     was previously no way to invoke one by id.
     """
-    token = resolve_live_token(request.mode.value, request.auth_session)
+    token = resolve_token(request.auth_session)
     project = str(settings.resolve(request.project) if request.project else settings.project_path)
 
     results = audit_service.run_check(
         check_id=request.check_id,
         workspace_id=request.workspace_id,
         project_path=project,
-        mode=request.mode.value,
         layer=request.layer,
         token=token,
     )

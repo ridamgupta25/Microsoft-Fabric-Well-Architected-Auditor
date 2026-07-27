@@ -17,10 +17,16 @@ Requires the optional extra::
 Design notes:
 
 * Catalog tools need no tenant and no sign-in, so they are safe to call freely.
+* Every audit reads the live tenant, so ``list_workspaces``, ``run_check``,
+  ``run_audit``, and ``summarize_findings`` all take a Fabric bearer ``token``
+  explicitly — MCP has no browser to run an interactive sign-in through, so the
+  caller (an agent, or whoever configured this server) must supply one, e.g.
+  acquired via ``auditfast run`` once interactively, an ``az account
+  get-access-token`` call, or a service principal.
 * ``run_audit`` is synchronous here (unlike the REST API's fire-and-poll)
   because MCP calls are already request/response with a client-side timeout, and
   an agent has nowhere useful to put a job id.
-* No tool ever returns a Fabric access token.
+* No tool ever returns the token it was given.
 """
 from __future__ import annotations
 
@@ -85,9 +91,15 @@ def catalog_summary() -> dict:
 # -- workspaces ----------------------------------------------------------------
 
 @mcp.tool()
-def list_workspaces(mode: str = "mock", project: str | None = None) -> list[dict]:
-    """List the workspaces available to audit. Mock mode needs no sign-in."""
-    return audit_service.list_workspaces(_project(project), mode)
+def list_declared_workspaces(project: str | None = None) -> list[dict]:
+    """List the workspaces the project file declares, without contacting Fabric."""
+    return audit_service.list_workspaces(_project(project))
+
+
+@mcp.tool()
+def list_workspaces(token: str) -> list[dict]:
+    """List every workspace the given Fabric token can see."""
+    return audit_service.list_live_workspaces(token)
 
 
 # -- running -------------------------------------------------------------------
@@ -96,7 +108,7 @@ def list_workspaces(mode: str = "mock", project: str | None = None) -> list[dict
 def run_check(
     check_id: str,
     workspace_id: str,
-    mode: str = "mock",
+    token: str,
     layer: str | None = None,
     project: str | None = None,
 ) -> list[dict]:
@@ -109,25 +121,25 @@ def run_check(
         check_id=check_id,
         workspace_id=workspace_id,
         project_path=_project(project),
-        mode=mode,
         layer=layer,
+        token=token,
     )
 
 
 @mcp.tool()
 def run_audit(
-    mode: str = "mock",
+    token: str,
     pillars: list[str] | None = None,
     workspaces: list[dict] | None = None,
     project: str | None = None,
 ) -> dict[str, Any]:
-    """Run a full audit and return the scorecard.
+    """Run a full audit against the live tenant and return the scorecard.
 
     ``workspaces`` takes ``[{"id": "...", "role": "Data Prep"}]``. Omit it to
     audit whatever the project file declares.
     """
     run = audit_service.run_audit(
-        _project(project), mode=mode, pillars=pillars, workspaces=workspaces
+        _project(project), pillars=pillars, workspaces=workspaces, token=token
     )
     report = audit_service.to_json(run)
     # Findings can run to hundreds of rows; an agent wants the shape first.
@@ -137,9 +149,9 @@ def run_audit(
 
 
 @mcp.tool()
-def summarize_findings(mode: str = "mock", project: str | None = None) -> dict:
+def summarize_findings(token: str, project: str | None = None) -> dict:
     """Run an audit and return only the failing and partial findings, worst first."""
-    run = audit_service.run_audit(_project(project), mode=mode)
+    run = audit_service.run_audit(_project(project), token=token)
     findings = [r for r in run.results if r.status.value in {"FAIL", "PARTIAL"}]
     findings.sort(key=lambda r: (r.score if r.score is not None else 9))
     return {

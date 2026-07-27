@@ -2,6 +2,12 @@
 
 No ``sys.path`` manipulation: the package is installed (``pip install -e backend``)
 so tests import it the same way production does.
+
+The application ships exactly one data source — the live Fabric provider. Tests
+get their determinism from :mod:`tests.fixtures.provider`, a recorded-tenant
+double that is never imported by ``auditfast.*`` itself; see that module's
+docstring for why a fixture-backed provider is not the same thing as a "mock
+mode" product feature.
 """
 from __future__ import annotations
 
@@ -14,12 +20,13 @@ from auditfast.config.settings import Settings
 from auditfast.core.enums import Layer
 from auditfast.main import create_app
 
+from .fixtures.provider import FIXTURE_FILE, RecordedProvider
+
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_FILE = BACKEND_ROOT / "config" / "project.example.yaml"
-TENANT_FIXTURE = BACKEND_ROOT / "sample_data" / "tenant.json"
 
-#: The mock tenant's workspaces and the layer each plays.
-MOCK_TARGETS = [
+#: The recorded tenant's workspaces and the layer each plays.
+FIXTURE_TARGETS = [
     ("ws-prep-01", Layer.PREP),
     ("ws-store-01", Layer.STORAGE),
     ("ws-ops-01", Layer.OPERATIONS),
@@ -27,19 +34,25 @@ MOCK_TARGETS = [
 
 #: Conventions the example project enforces. Mirrors project.example.yaml, kept
 #: here so engine tests do not need to parse YAML.
-MOCK_SETTINGS = {
+FIXTURE_SETTINGS = {
     "naming_convention": r"^[A-Za-z]+-(Dev|Test|Prod)-[A-Za-z]+$",
     "pipeline_naming_convention": r"^PL_[A-Za-z0-9_]+$",
     "orphan_days": 90,
     "max_admins": 2,
 }
 
-#: The overall score the mock tenant must produce. Pinned to the value the
-#: pre-refactor implementation returned (110/190*3... i.e. 110 of 190 points), so
-#: any change to a check, a band, or the roll-up fails loudly here.
+#: The overall score the recorded tenant must produce. Pinned to the value the
+#: pre-refactor implementation returned (110 of 190 points), so any change to a
+#: check, a band, or the roll-up fails loudly here.
 EXPECTED_OVERALL = 57.89473684210527
 EXPECTED_SCORED_CHECKS = 57
 EXPECTED_RESULT_ROWS = 60
+
+#: A session id the auth-service patch below always resolves to a token.
+#: Anything else — including a missing session — resolves to no token, so
+#: unauthenticated-request tests keep working unchanged.
+AUTHENTICATED_SESSION = "test-session-ok"
+FAKE_TOKEN = "test-token"
 
 
 @pytest.fixture(scope="session")
@@ -59,19 +72,38 @@ def settings(tmp_path: Path) -> Settings:
 
 
 @pytest.fixture
-def client(settings: Settings) -> TestClient:
-    """A TestClient whose lifespan has run, so app.state is populated."""
+def client(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    """A TestClient whose lifespan has run, so app.state is populated.
+
+    Two things are patched so a full audit can run through the real API without
+    a live Fabric tenant:
+
+    * ``auth_service.token_for`` — only :data:`AUTHENTICATED_SESSION` resolves
+      to a token, so tests exercising the unauthenticated (401) path are
+      unaffected.
+    * ``audit_service.build_provider`` — returns the recorded-tenant provider
+      instead of constructing a real ``LiveFabricProvider``, so no network call
+      is ever made.
+    """
+    from auditfast.api import deps
+    from auditfast.services import audit_service, auth_service
+
+    def fake_token_for(session_id: str | None) -> str | None:
+        return FAKE_TOKEN if session_id == AUTHENTICATED_SESSION else None
+
+    def fake_build_provider(config, token=None):
+        return RecordedProvider(FIXTURE_FILE)
+
+    monkeypatch.setattr(auth_service, "token_for", fake_token_for)
+    monkeypatch.setattr(audit_service, "build_provider", fake_build_provider)
+
     app = create_app(settings)
     # Override the cached settings dependency so routes see the temp output dir.
-    from auditfast.api import deps
-
     app.dependency_overrides[deps.settings_dep] = lambda: settings
     with TestClient(app) as test_client:
         yield test_client
 
 
 @pytest.fixture
-def provider():
-    from auditfast.clients import MockProvider
-
-    return MockProvider(TENANT_FIXTURE)
+def provider() -> RecordedProvider:
+    return RecordedProvider(FIXTURE_FILE)

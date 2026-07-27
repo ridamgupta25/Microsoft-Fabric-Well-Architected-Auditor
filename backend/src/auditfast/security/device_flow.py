@@ -1,14 +1,15 @@
 """OAuth2 delegated (read-only) authentication via MSAL device-code flow.
 
-Used only in --live mode. The device-code flow works in a terminal: it prints a
-URL and code, the auditor signs in in a browser, and we receive a read-only
-delegated access token. No secrets are stored; only read scopes are requested.
+Used by the CLI's ``run`` command to sign in before every audit. The device-code
+flow works in a terminal: it prints a URL and code, the auditor signs in in a
+browser, and we receive a read-only delegated access token. No secrets are
+stored; only read scopes are requested.
 """
 from __future__ import annotations
 
 
 def acquire_token(tenant_id: str, client_id: str, scopes: list[str]) -> str:
-    import msal  # local import so mock mode needs no dependency
+    import msal  # local import so callers that never sign in need no dependency
 
     authority = f"https://login.microsoftonline.com/{tenant_id}"
     app = msal.PublicClientApplication(client_id, authority=authority)

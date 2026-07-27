@@ -10,9 +10,9 @@ the working audit logic** — this was a restructure, not a rewrite.
 The strongest claim available, made first.
 
 Before touching anything, a full baseline was captured from the original
-implementation: every check result for the mock tenant, with status, score,
-coverage, pillar, severity, and evidence text. After the restructure the same
-audit produces:
+implementation: every check result for the fixture tenant then bundled with the
+product as `sample_data/tenant.json`, with status, score, coverage, pillar,
+severity, and evidence text. After the restructure the same audit produces:
 
 | Measure | Before | After |
 |---------|--------|-------|
@@ -70,7 +70,6 @@ rules and thresholds are identical.
 | **Device-code flow** | `security/device_flow.py` | Unchanged |
 | **Fabric REST endpoints** | `clients/live.py` | Same URLs, same read-only calls |
 | **Project + remediation YAML** | `config/` | Same schema; one missing key added |
-| **Tenant fixture** | `sample_data/tenant.json` | Untouched |
 
 ---
 
@@ -178,3 +177,67 @@ So nobody "fixes" these thinking they are oversights:
 - **Deterministic.** Still no AI anywhere in the scoring path.
 - **`Data Storage` workspaces still fail layer separation** when they contain
   pipelines. That is a correct finding, not a regression.
+
+---
+
+## 9. Removing mock mode as a product feature
+
+A follow-up change, after the FastAPI/React migration above had landed. The
+product initially shipped **two** ways to run an audit — `mock` (an offline
+fixture tenant, selectable from the UI and the CLI) and `live` (a real Fabric
+tenant). Mock mode was removed entirely: no mode selector, no fixture data
+reachable from the browser, no `--mock` CLI flag, no `mode` field anywhere in
+the API contract. **Every audit now reads the live tenant.**
+
+### Why
+
+The mode toggle was surfacing fixture data as if it were real: the run-audit
+page defaulted to `mode="mock"` and listed the fixture tenant's three
+workspaces regardless of whether the user had signed in, which read as the
+tool showing "your workspaces" when it was actually showing sample data. The
+fix was not a UI tweak — it was removing the concept of a non-live source from
+the product entirely, so that ambiguity cannot recur.
+
+### What changed
+
+| Layer | Change |
+|-------|--------|
+| `clients/` | `MockProvider` deleted. `LiveFabricProvider` is the only shipped provider |
+| `services/audit_service.py` | `build_provider()` always requires a token; `MOCK`/`LIVE` constants and every `mode` parameter removed |
+| `cli.py` | `--mock`/`--live` flags removed; `run` always signs in via the device-code flow first |
+| `schemas/audit.py` | `AuditMode` enum removed; `mode` dropped from every request/response schema |
+| `database/models.py` | `AuditJob.mode` removed |
+| `mcp/server.py` | Tools that need Fabric data now take an explicit `token` argument — MCP has no browser to sign in through |
+| `config/project.example.yaml` | `mock:` section removed |
+| Frontend | Mode dropdown removed from the header; `RunAuditPage` only fetches workspaces once signed in, and shows a connect gate otherwise |
+
+### Test strategy
+
+Removing mock mode from the product does not remove the need for deterministic,
+offline tests — hitting live Fabric from CI would be slow, non-reproducible,
+and require tenant credentials in a build pipeline. The fixture data and the
+provider that serves it moved to `backend/tests/fixtures/` instead of being
+deleted:
+
+* `tests/fixtures/tenant.json` — the same recorded tenant, relocated.
+* `tests/fixtures/provider.py` — `RecordedProvider`, satisfying the same
+  `Provider` protocol `LiveFabricProvider` does. It is never imported by
+  `auditfast.*`; only `tests/conftest.py` constructs it.
+
+For the engine and scoring tests (`test_engine.py`), this is a drop-in
+replacement — they take a `provider` fixture and never cared which
+implementation it was.
+
+For the API lifecycle tests (`test_api.py`), removing the `mode` field meant
+`auth_session` became required for every audit, which needed a second fixture:
+the `client` fixture in `conftest.py` monkeypatches
+`auth_service.token_for` (only a known test session id resolves to a token —
+anything else still 401s, so the negative tests are unaffected) and
+`audit_service.build_provider` (always returns `RecordedProvider`, so no
+network call is ever made). Every test that submits an audit passes
+`AUTHENTICATED_SESSION` from `conftest.py` where it previously passed
+`mode: "mock"`.
+
+Net effect: the parity numbers in Section 1 above are unchanged, the suite
+still runs fully offline, and the word "mock" no longer appears anywhere in
+`src/auditfast`.

@@ -121,7 +121,7 @@ Priorities:
 2. **Cache workspace metadata** with a short TTL; re-auditing the same workspace
    within minutes should not re-read it.
 3. **Honour `Retry-After`** with exponential backoff in `LiveFabricProvider`.
-   Not implemented — the highest-value next change for live mode.
+   Not implemented — the highest-value next change here.
 4. **Cap per-tenant concurrency**, not just global, so one large customer cannot
    exhaust the shared quota.
 

@@ -18,8 +18,9 @@ input always produces the same score.
 
 ## Quick start
 
-Mock mode runs **completely offline** — no Fabric tenant, no sign-in, no Azure
-account.
+Every audit reads a **live** Microsoft Fabric tenant — sign-in is required. The
+easiest path needs only `az login` and no app registration; see
+[docs/getting-started.md § Signing in](docs/getting-started.md#8-signing-in).
 
 ```powershell
 # 1. Backend (from the repository root)
@@ -44,9 +45,10 @@ cd frontend
 npm run dev
 ```
 
-Open **http://localhost:5173**, go to **Run audit**, click **Run audit**.
+Open **http://localhost:5173**, click **Connect to Fabric** and sign in, then go
+to **Run audit** and click **Run audit**.
 
-> Full setup, troubleshooting, live-mode sign-in, and configuration:
+> Full setup, troubleshooting, sign-in options, and configuration:
 > **[docs/getting-started.md](docs/getting-started.md)**
 
 | URL | What |
@@ -59,9 +61,12 @@ Open **http://localhost:5173**, go to **Run audit**, click **Run audit**.
 
 ```powershell
 cd backend
-..\.venv\Scripts\python.exe -m auditfast run --project config/project.example.yaml --mock
+..\.venv\Scripts\python.exe -m auditfast run --project config/project.example.yaml
 ..\.venv\Scripts\python.exe -m auditfast checks --pillar Security
 ```
+
+`run` signs you in first (device-code flow) — every audit reads the live
+tenant, so there is no `--mock`/`--live` flag to choose between.
 
 Reports land in `backend/output/` as Markdown and Excel (Scorecard / Checks /
 Risk Register).
@@ -70,7 +75,7 @@ Risk Register).
 
 ```powershell
 cd backend
-..\.venv\Scripts\python.exe -m pytest      # 52 passed, fully offline
+..\.venv\Scripts\python.exe -m pytest      # 53 passed, fully offline against a recorded test fixture
 ```
 
 ---
@@ -80,7 +85,7 @@ cd backend
 ```
 backend/src/auditfast/
   core/       engine · checks · scoring · models   ← depends on nothing
-  clients/    read-only providers (live Fabric, offline fixture)
+  clients/    the read-only Fabric REST provider
   services/   orchestration; the single audit path, framework-free
   api/v1/     FastAPI routers, versioned
   cli.py      mcp/    two further adapters over the same services

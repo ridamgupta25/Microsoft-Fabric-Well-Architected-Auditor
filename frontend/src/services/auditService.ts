@@ -70,13 +70,13 @@ export async function getHistory(limit = 25, offset = 0): Promise<Page<AuditJobS
 export async function runSingleCheck(
   checkId: string,
   workspaceId: string,
-  mode: string,
+  authSession: string,
   layer?: string,
 ): Promise<CheckResult[]> {
   const { data } = await apiClient.post<CheckResult[]>("/audit/check", {
     check_id: checkId,
     workspace_id: workspaceId,
-    mode,
+    auth_session: authSession,
     layer: layer ?? null,
   });
   return data;

@@ -41,7 +41,6 @@ export function HistoryPage() {
                   <th scope="col">Project</th>
                   <th scope="col">Submitted</th>
                   <th scope="col">Duration</th>
-                  <th scope="col">Mode</th>
                   <th scope="col">Workspaces</th>
                   <th scope="col">Status</th>
                   <th scope="col">Score</th>
@@ -61,7 +60,6 @@ export function HistoryPage() {
                     <td>{item.project_name ?? "—"}</td>
                     <td className="whitespace-nowrap">{formatDateTime(item.submitted_at)}</td>
                     <td>{formatDuration(item.duration_seconds)}</td>
-                    <td>{item.mode}</td>
                     <td>{item.workspaces}</td>
                     <td>{item.status}</td>
                     <td className={ratingFor(item.overall).textClass}>

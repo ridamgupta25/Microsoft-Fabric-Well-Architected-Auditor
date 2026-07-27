@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auditfast"
-version = "0.3.0"
+version = "0.4.0"
 description = "Microsoft Fabric Well-Architected Auditing Platform — API, engine and CLI"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }

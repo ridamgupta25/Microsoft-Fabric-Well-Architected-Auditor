@@ -9,10 +9,6 @@ project:
   orphan_days: 90
   max_admins: 2
 
-# Offline demo data (used in --mock mode).
-mock:
-  tenant_file: "sample_data/tenant.json"
-
 remediation: "config/remediation.yaml"
 
 # The workspaces that make up this project, each tagged with a layer role.
@@ -24,7 +20,8 @@ workspaces:
   - id: "ws-ops-01"
     role: "Data Operations"
 
-# Used only in --live mode (register a read-only Entra app first).
+# Read-only Entra app registration for signing in (optional — the CLI and API
+# both fall back to Microsoft's first-party Azure CLI client if this is unset).
 auth:
   tenant_id: "<TENANT_ID>"
   client_id: "<ENTRA_APP_CLIENT_ID>"

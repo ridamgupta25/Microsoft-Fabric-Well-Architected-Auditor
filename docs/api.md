@@ -42,7 +42,7 @@ lines for that request.
 | `validation_error` | 422 | Request did not match the schema |
 | `authentication_error` | 401 | Not signed in, or the session expired |
 | `workspace_access_denied` | 403 | The user cannot read that workspace |
-| `audit_error` | 400 | Run could not start — bad mode, unknown check |
+| `audit_error` | 400 | Run could not start — missing token, unknown check |
 | `not_found` / `http_error` | 404 | No such resource |
 | `provider_error` | 502 | Upstream Fabric problem; retryable |
 | `internal_error` | 500 | Unexpected. Detail is logged, not returned |
@@ -89,7 +89,8 @@ continues through the backend.
 
 ## The audit lifecycle
 
-The core flow. Three calls.
+Every audit reads the live tenant — there is no offline mode, and
+`auth_session` is required. The core flow is three calls.
 
 ### 1. Submit
 
@@ -99,10 +100,9 @@ POST /api/v1/audit
 
 ```json
 {
-  "mode": "mock",
   "pillars": ["Security", "Reliability"],
   "workspaces": [{ "id": "ws-prep-01", "role": "Data Prep" }],
-  "auth_session": null
+  "auth_session": "3f2a9c14"
 }
 ```
 
@@ -118,10 +118,9 @@ Returns **202 Accepted** immediately:
 
 | Field | Notes |
 |-------|-------|
-| `mode` | `mock` or `live`. Live requires `auth_session` |
 | `pillars` | Empty means all. Deselecting genuinely skips work and Fabric calls |
 | `workspaces` | Empty means whatever the project file declares |
-| `auth_session` | Session id from a sign-in. Validated *before* scheduling, so a bad session fails fast with 401 |
+| `auth_session` | Completed sign-in session id. Resolved to a token *before* scheduling, so a missing or expired session fails fast with 401 rather than as a dead background job |
 
 The `role` matters: it decides whether pipeline checks run at all, and drives the
 layer-content and layer-separation checks.
@@ -145,7 +144,6 @@ GET /api/v1/reports/{audit_id}
 {
   "audit_id": "81fe3389df6b42d7",
   "project_name": "Sales Analytics - Fabric Migration",
-  "mode": "mock",
   "overall": 57.89473684210527,
   "by_pillar": {
     "Security": { "pct": 48.9, "count": 15 },
@@ -197,7 +195,7 @@ POST /api/v1/audit/check
 ```
 
 ```json
-{ "check_id": "WS-GIT", "workspace_id": "ws-prep-01", "mode": "mock", "layer": "Data Prep" }
+{ "check_id": "WS-GIT", "workspace_id": "ws-prep-01", "auth_session": "3f2a9c14", "layer": "Data Prep" }
 ```
 
 Synchronous, because it only fetches the resources that one check declares and
@@ -307,14 +305,20 @@ file. Excel has three sheets: Scorecard, Checks, Risk Register.
 
 ## Calling the API from tests
 
-No server, no browser — the TestClient drives the real app, middleware included:
+No server, no browser — the TestClient drives the real app, middleware
+included. Because every audit needs a token, tests patch provider construction
+to return a recorded-tenant double instead of calling live Fabric — see
+[`backend/tests/conftest.py`](../backend/tests/conftest.py) for the fixture that
+does this (`client`) and its `AUTHENTICATED_SESSION` constant:
 
 ```python
 from fastapi.testclient import TestClient
 from auditfast.main import create_app
 
-with TestClient(create_app()) as client:
-    audit_id = client.post("/api/v1/audit", json={"mode": "mock"}).json()["audit_id"]
+with TestClient(create_app()) as client:  # here, "client" is patched per conftest.py
+    audit_id = client.post(
+        "/api/v1/audit", json={"auth_session": AUTHENTICATED_SESSION}
+    ).json()["audit_id"]
     # poll /api/v1/audit/{audit_id} until terminal
     report = client.get(f"/api/v1/reports/{audit_id}").json()
     assert report["overall"] == 57.89473684210527

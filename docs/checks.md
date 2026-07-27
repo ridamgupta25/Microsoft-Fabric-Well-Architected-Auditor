@@ -217,8 +217,11 @@ and raises nothing.
 ### 4. Add fixture data and tests
 
 Give the check something to fail against in
-[`sample_data/tenant.json`](../backend/sample_data/tenant.json), then assert on it
-in [`tests/test_engine.py`](../backend/tests/test_engine.py).
+[`tests/fixtures/tenant.json`](../backend/tests/fixtures/tenant.json), then
+assert on it in [`tests/test_engine.py`](../backend/tests/test_engine.py). That
+fixture is test-only infrastructure — see
+[migration.md § Test strategy](migration.md#test-strategy) for why it is not
+part of the shipped product.
 
 `test_registry_is_fully_populated` pins the registry counts and the parity tests
 pin the overall score — both will fail, correctly, and both need updating with

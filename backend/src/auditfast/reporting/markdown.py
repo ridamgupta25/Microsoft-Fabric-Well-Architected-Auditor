@@ -11,7 +11,7 @@ def _fmt(pct):
     return "—" if pct is None else f"{pct:.1f}%"
 
 
-def build_markdown(project_name: str, agg: dict, results: list, mode: str) -> str:
+def build_markdown(project_name: str, agg: dict, results: list) -> str:
     overall = agg["overall"]
     o_label, o_emoji = rating(overall)
     counts = agg["counts"]
@@ -21,7 +21,7 @@ def build_markdown(project_name: str, agg: dict, results: list, mode: str) -> st
     lines.append("")
     lines.append(f"**Project:** {project_name}  ")
     lines.append(f"**Date:** {date.today().isoformat()}  ")
-    lines.append(f"**Mode:** {mode} (rule-based, no AI)  ")
+    lines.append("**Basis:** rule-based, no AI  ")
     lines.append("**Depth:** architecture / best-practice level (not a deep-dive)")
     lines.append("")
     lines.append("## Overall")
