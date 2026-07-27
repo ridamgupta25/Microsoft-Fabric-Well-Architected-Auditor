@@ -1,112 +1,140 @@
-# AuditFAST Core — Fabric Well-Architected Auditor (Phase 1)
+# AuditFAST Core — Fabric Well-Architected Auditor
 
-A **rule-based (no-AI)** tool that signs in to Microsoft Fabric (read-only), runs
-deterministic **best-practice** checks across a project's workspaces, scores them
-against the five Well-Architected pillars, and produces a rated report.
+A **rule-based (no-AI)** tool that signs in to Microsoft Fabric **read-only**, runs
+deterministic best-practice checks across the workspaces that make up a project,
+scores them against the Well-Architected pillars, and produces a rated report.
 
 - **Best-practice level, not a deep-dive.** It checks whether the *implemented*
-  pipelines and workspaces follow Fabric best practices — it does **not** trace
-  data flow, profile rows, or review code line by line.
-- **Multi-workspace per project.** Register the workspaces that make up a project
-  (Data Prep / Data Storage / Data Logs / Data Operations / Reporting) and get one
-  aggregated score plus a per-workspace breakdown.
-- **No AI in this release** (an AI-assisted layer is planned later).
+  workspaces and pipelines follow Fabric best practices. It does not trace data
+  flow, profile rows, or review code line by line.
+- **Multi-workspace per project.** Register the workspaces that make up a project,
+  tag each with its layer role (Data Prep / Storage / Logs / Operations /
+  Reporting), and get one aggregated score plus a per-workspace breakdown.
+- **Fully deterministic.** Every check is a fixed rule with a fixed threshold and a
+  pre-written recommendation, so the same input always gives the same score. An
+  AI-assisted layer is planned for a later phase.
 
 ---
 
-## Quick start — interactive web UI (recommended)
+## Quick start
 
-From this `auditfast-core/` folder:
+Works fully offline in **mock** mode — no Fabric tenant or sign-in needed.
 
 ```powershell
+# 1. Install (from the repository root)
 py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m auditfast serve --project config/project.example.yaml
+.\.venv\Scripts\python.exe -m pip install -r backend/requirements.txt
+
+# 2. Launch the web UI
+cd backend
+..\.venv\Scripts\python.exe -m auditfast serve --project config/project.example.yaml
 ```
 
 Your browser opens `http://127.0.0.1:8000`. In the app you can:
 
-- pick **which workspaces** to audit (each shows its layer role: Data Prep /
-  Storage / Logs / Ops / Reporting),
-- pick **which pillars** to assess (Reliability, Security, Cost, Operational
-  Excellence, Performance),
-- click **Run Audit** to see a live pillar scorecard, per-workspace breakdown,
-  colour-coded findings, an "all checks" view (workspace checks are flagged as
-  *common to every project*), and
+- pick **which workspaces** to audit and tag each with its layer role,
+- pick **which pillars** to assess,
+- click **Run Audit** for a live pillar scorecard, per-workspace breakdown, and
+  colour-coded findings,
 - download the **Markdown** and **Excel** reports.
 
-The UI uses the Python standard library only — no web framework dependency.
-
-## Command-line run (headless / CI)
+### Command line (headless / CI)
 
 ```powershell
-.\.venv\Scripts\python.exe -m auditfast run --project config/project.example.yaml --mock
-# optional: only score some pillars
-.\.venv\Scripts\python.exe -m auditfast run --project config/project.example.yaml --mock --pillars Security,Reliability
+cd backend
+..\.venv\Scripts\python.exe -m auditfast run --project config/project.example.yaml --mock
+
+# optional: score only some pillars
+..\.venv\Scripts\python.exe -m auditfast run --project config/project.example.yaml --mock --pillars Security,Reliability
 ```
 
-Outputs:
-- Console pillar scorecard + per-workspace breakdown
-- `output/audit-report.md` — WAF-style Markdown report
-- `output/audit-report.xlsx` — Scorecard / Checks / Risk Register sheets
+Outputs a console scorecard plus `output/audit-report.md` and
+`output/audit-report.xlsx` (Scorecard / Checks / Risk Register sheets).
 
-Run the tests:
+### Tests
 
 ```powershell
-.\.venv\Scripts\python.exe tests/test_smoke.py     # built-in runner (pytest optional)
+cd backend
+..\.venv\Scripts\python.exe -m pytest -q
 ```
+
+The whole suite runs offline against `sample_data/tenant.json`.
+
+---
 
 ## Live mode (read-only OAuth2)
 
-1. Register a Microsoft Entra app (public client) with **delegated, read-only**
-   Fabric scopes (`Workspace.Read.All`, `Item.Read.All`).
-2. Put the `tenant_id`, `client_id`, real workspace IDs, and layer roles into a
-   copy of `config/project.example.yaml`.
-3. Run:
+1. Register a Microsoft Entra **public client** app with delegated, read-only
+   Fabric scopes: `Workspace.Read.All`, `Item.Read.All`.
+2. Copy `backend/config/project.example.yaml` and fill in `tenant_id`,
+   `client_id`, and your real workspace IDs with their layer roles.
+3. Sign in from the web UI, or run the CLI with `--live` for a device-code
+   sign-in.
 
-   ```powershell
-   .\.venv\Scripts\python.exe -m auditfast run --project config/my-project.yaml --live
-   ```
+No app registration? The UI can sign you in with just your email using
+Microsoft's first-party client, or reuse an existing `az login`. Neither needs an
+admin.
 
-   You'll be prompted with a device-code URL to sign in. The tool only ever
-   issues read calls (and the read-only `getDefinition`); it never writes.
+The tool only ever issues read calls (and the read-only `getDefinition`). It
+never writes, and tokens are never stored on disk.
 
-## What Phase 1 checks
+---
+
+## What it checks today
 
 | Level | Checks |
 |-------|--------|
-| **Workspace** | naming convention, roles use security groups, least-privilege admins, no guest access, sensitivity labels, Git enabled, deployment pipeline, capacity assigned, orphaned items, inventory |
-| **Pipeline** (per pipeline) | naming, descriptions/annotations, parameterized (no hardcoded endpoints), retry policy, on-failure path, failure notification, explicit timeouts, no hardcoded secrets |
+| **Workspace** (12) | naming convention, roles use security groups, least-privilege admins, no guest access, sensitivity labels, Git enabled, deployment pipeline, capacity assigned, orphaned items, item inventory, layer content, layer separation |
+| **Pipeline** (8, per pipeline) | naming, descriptions/annotations, parameterization (no hardcoded endpoints), retry policy, on-failure path, failure notification, explicit timeouts, no hardcoded secrets |
 
-Pillars scored: **Reliability, Security, Cost Optimization, Operational Excellence.**
-**Performance Efficiency** and other technologies (notebooks, Delta, semantic
-models, reports) are Phase 2 / handled via the Excel checklist.
+Coverage by pillar:
 
-## Project layout
+| Pillar | Checks |
+|--------|-------:|
+| Operational Excellence | 8 |
+| Security | 5 |
+| Reliability | 4 |
+| Cost Optimization | 2 |
+| Performance Efficiency | **0** — Phase 2 |
+
+Other technologies — notebooks, Delta/Lakehouse internals, semantic models,
+reports — are Phase 2 and currently covered by the manual Excel checklist.
+
+---
+
+## Layout
 
 ```
-auditfast-core/
-├─ auditfast/            # package
-│  ├─ cli.py             # `auditfast run ...` and `auditfast serve`
-│  ├─ webapp.py          # stdlib web server (no framework deps)
-│  ├─ web/index.html     # interactive UI (pillars + workspaces + scorecard)
-│  ├─ service.py         # shared run path (used by CLI + web)
-│  ├─ engine.py          # runs checks across workspaces
-│  ├─ scoring.py         # coverage -> 0-3 -> pillar rollup -> rating
-│  ├─ fabric_client.py   # MockFabricClient + LiveFabricClient (read-only)
-│  ├─ auth.py            # MSAL device-code OAuth2 (read-only)
-│  ├─ checks/            # workspace_checks.py + pipeline_checks.py
-│  ├─ report_markdown.py # WAF-style report
-│  └─ report_excel.py    # Scorecard / Checks / Risk Register
-├─ config/               # project.example.yaml + remediation.yaml
-├─ sample_data/          # tenant.json (offline demo)
-└─ tests/                # smoke tests
+backend/
+  auditfast/
+    core/        models, scoring, engine, checks   (pure domain — no AI)
+    clients/     read-only Fabric adapters (mock + live)
+    services/    orchestration shared by CLI and web
+    reporting/   markdown / excel / console
+    security/    read-only OAuth device flow
+    web/         create_app() + routes/            (Flask JSON API)
+  config/        project.example.yaml, remediation.yaml
+  sample_data/   tenant.json (offline fixture)
+  tests/
+frontend/        index.html, css/, js/ (vanilla ES modules — no build step)
+docs/            architecture, checks, scoring, API, development
 ```
 
-## Extending
+Request flow: **browser → Flask JSON API → services → core (rules + scoring) /
+clients (read Fabric) → results**.
 
-- **Add a check:** write a function in `checks/workspace_checks.py` or
-  `checks/pipeline_checks.py`, decorate it with `@workspace_check` /
-  `@pipeline_check`, and add its remediation text to `config/remediation.yaml`.
-- **Tune conventions:** edit `naming_convention`, `pipeline_naming_convention`,
-  `orphan_days`, `max_admins` in the project YAML.
+---
+
+## Documentation
+
+| Document | |
+|----------|---|
+| [docs/architecture.md](docs/architecture.md) | Layers, runtime flow, and the data contracts everything hangs off |
+| [docs/checks.md](docs/checks.md) | Every check in the catalog, and how to add one |
+| [docs/scoring.md](docs/scoring.md) | How 0–3 scores roll up into pillar percentages and ratings |
+| [docs/api.md](docs/api.md) | JSON API reference |
+| [docs/development.md](docs/development.md) | Setup, testing, and full project-YAML configuration |
+| [OVERVIEW.md](OVERVIEW.md) | Short project overview |
+
+**Adding a check?** Start with
+[docs/checks.md → Adding a check](docs/checks.md#adding-a-check).
