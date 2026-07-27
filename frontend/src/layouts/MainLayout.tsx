@@ -45,7 +45,7 @@ function HealthIndicator() {
 }
 
 export function MainLayout() {
-  const { mode, setMode, isSignedIn } = useAuditContext();
+  const { isSignedIn } = useAuditContext();
 
   return (
     <div className="flex min-h-full flex-col">
@@ -76,30 +76,22 @@ export function MainLayout() {
           </nav>
 
           <div className="ml-auto flex items-center gap-2">
-            <label htmlFor="mode" className="text-sm text-slate-500">
-              Mode
-            </label>
-            <select
-              id="mode"
-              value={mode}
-              onChange={(event) => setMode(event.target.value as "mock" | "live")}
-              className="input w-auto py-1 text-sm"
+            <NavLink
+              to="/sign-in"
+              className={`badge gap-1.5 ${
+                isSignedIn
+                  ? "bg-green-100 text-green-800 dark:bg-green-950 dark:text-green-300"
+                  : "bg-orange-100 text-orange-800 hover:bg-orange-200 dark:bg-orange-950 dark:text-orange-300"
+              }`}
             >
-              <option value="mock">Mock (offline)</option>
-              <option value="live">Live (Fabric)</option>
-            </select>
-            {mode === "live" && (
-              <NavLink
-                to="/sign-in"
-                className={`badge ${
-                  isSignedIn
-                    ? "bg-green-100 text-green-800 dark:bg-green-950 dark:text-green-300"
-                    : "bg-orange-100 text-orange-800 hover:bg-orange-200 dark:bg-orange-950 dark:text-orange-300"
+              <span
+                className={`h-1.5 w-1.5 rounded-full ${
+                  isSignedIn ? "bg-green-600" : "bg-orange-500"
                 }`}
-              >
-                {isSignedIn ? "Signed in" : "Sign in required"}
-              </NavLink>
-            )}
+                aria-hidden="true"
+              />
+              {isSignedIn ? "Connected to Fabric" : "Connect to Fabric"}
+            </NavLink>
           </div>
         </div>
       </header>

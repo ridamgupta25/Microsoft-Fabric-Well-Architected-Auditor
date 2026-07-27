@@ -1,6 +1,10 @@
 /**
  * Submit an audit: pick workspaces and pillars, then watch it run.
  *
+ * Always audits the live tenant. Workspaces are only ever fetched once the user
+ * has a real sign-in session — there is no sample/fixture data shown here, so
+ * what you see on this page is always what your account can actually reach.
+ *
  * Submission is fire-and-poll, so the page shows live status while the backend
  * works rather than freezing on a long request.
  */
@@ -10,27 +14,19 @@ import { Link, useNavigate } from "react-router-dom";
 import { ErrorBanner, Section, Spinner } from "@/components/ui";
 import { useAuditContext } from "@/context/AuditContext";
 import { useAsync } from "@/hooks/useAsync";
-import {
-  listLiveWorkspaces,
-  listWorkspaces,
-  pollAudit,
-  submitAudit,
-} from "@/services/auditService";
+import { listLiveWorkspaces, pollAudit, submitAudit } from "@/services/auditService";
 import { listLayers, listPillars } from "@/services/catalogService";
 import type { AuditJob } from "@/types/api";
 
 export function RunAuditPage() {
   const navigate = useNavigate();
-  const { mode, session, isSignedIn, setLastAuditId, setReport } = useAuditContext();
+  const { session, isSignedIn, setLastAuditId, setReport } = useAuditContext();
 
-  // Signed in to live mode? Enumerate the tenant. Otherwise fall back to what
-  // the project file declares — listing a tenant needs a token.
+  // Only fetch once there is a real session — never fall back to sample data.
   const workspaces = useAsync(
-    () =>
-      mode === "live" && session
-        ? listLiveWorkspaces(session)
-        : listWorkspaces(mode),
-    [mode, session],
+    () => (session ? listLiveWorkspaces(session) : Promise.resolve([])),
+    [session],
+    isSignedIn,
   );
   const pillars = useAsync(() => listPillars(), []);
   const layers = useAsync(() => listLayers(), []);
@@ -43,7 +39,7 @@ export function RunAuditPage() {
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  // Select every workspace by default — auditing the whole project is the
+  // Select every workspace by default — auditing everything you can see is the
   // common case, and deselecting is easier than hunting for the right ones.
   useEffect(() => {
     if (!workspaces.data) return;
@@ -63,6 +59,11 @@ export function RunAuditPage() {
   useEffect(() => () => abortRef.current?.abort(), []);
 
   const run = useCallback(async () => {
+    if (!isSignedIn || !session) {
+      setError("Connect to Fabric before running an audit.");
+      return;
+    }
+
     const chosenWorkspaces = Object.entries(selected)
       .filter(([, isOn]) => isOn)
       .map(([id]) => ({ id, role: roles[id] ?? "Mixed" }));
@@ -78,10 +79,6 @@ export function RunAuditPage() {
       setError("Select at least one pillar.");
       return;
     }
-    if (mode === "live" && !isSignedIn) {
-      setError("Sign in before running a live audit.");
-      return;
-    }
 
     setError(null);
     setSubmitting(true);
@@ -93,7 +90,7 @@ export function RunAuditPage() {
 
     try {
       const accepted = await submitAudit({
-        mode,
+        mode: "live",
         pillars: chosen,
         workspaces: chosenWorkspaces,
         auth_session: session,
@@ -114,7 +111,7 @@ export function RunAuditPage() {
       setSubmitting(false);
     }
   }, [
-    selected, roles, chosenPillars, mode, isSignedIn, session,
+    selected, roles, chosenPillars, isSignedIn, session,
     setLastAuditId, setReport, navigate,
   ]);
 
@@ -123,22 +120,31 @@ export function RunAuditPage() {
     setSelected(Object.fromEntries(workspaces.data.map((w) => [w.id, value])));
   };
 
+  if (!isSignedIn) {
+    return (
+      <div className="card flex flex-col items-center gap-3 py-12 text-center">
+        <div className="rounded-full bg-orange-100 p-3 dark:bg-orange-950">
+          <span className="block h-2.5 w-2.5 rounded-full bg-orange-500" aria-hidden="true" />
+        </div>
+        <h2 className="text-lg font-semibold">Connect to Microsoft Fabric</h2>
+        <p className="max-w-md text-sm text-slate-600 dark:text-slate-400">
+          Sign in to see the workspaces you have access to, then choose which ones to audit.
+          Read-only — the tool never writes to your tenant.
+        </p>
+        <Link to="/sign-in" className="btn-primary mt-2">
+          Connect to Fabric
+        </Link>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
       {error && <ErrorBanner message={error} />}
-      {mode === "live" && !isSignedIn && (
-        <div className="rounded-md border border-orange-200 bg-orange-50 p-3 text-sm text-orange-800 dark:border-orange-900 dark:bg-orange-950 dark:text-orange-300">
-          Live mode needs a read-only Microsoft sign-in.{" "}
-          <Link to="/sign-in" className="font-medium underline">
-            Sign in
-          </Link>{" "}
-          — or switch to Mock in the header to explore offline.
-        </div>
-      )}
 
       <Section
         title="Workspaces"
-        description="Each workspace is audited in the context of the layer it represents."
+        description="Every workspace your account can see. Each is audited in the context of the layer role you assign it."
         actions={
           <div className="flex gap-2">
             <button type="button" className="btn-secondary" onClick={() => selectAll(true)}>
@@ -150,11 +156,21 @@ export function RunAuditPage() {
           </div>
         }
       >
-        {workspaces.loading && <Spinner label="Loading workspaces…" />}
+        {workspaces.loading && <Spinner label="Loading your workspaces…" />}
         {workspaces.error && (
           <ErrorBanner message={workspaces.error} onRetry={workspaces.reload} />
         )}
-        {workspaces.data && (
+        {workspaces.data && workspaces.data.length === 0 && !workspaces.loading && (
+          <div className="card text-sm text-slate-600 dark:text-slate-400">
+            No workspaces are visible to the signed-in account. Confirm you have at least
+            Viewer access, or check{" "}
+            <Link to="/sign-in" className="font-medium underline">
+              access diagnostics
+            </Link>
+            .
+          </div>
+        )}
+        {workspaces.data && workspaces.data.length > 0 && (
           <div className="card scroll-x">
             <table className="table-base">
               <thead>
@@ -249,7 +265,12 @@ export function RunAuditPage() {
       </Section>
 
       <div className="flex items-center gap-3">
-        <button type="button" className="btn-primary" onClick={run} disabled={submitting}>
+        <button
+          type="button"
+          className="btn-primary"
+          onClick={run}
+          disabled={submitting || workspaces.loading}
+        >
           {submitting ? "Running…" : "Run audit"}
         </button>
         {job && (
