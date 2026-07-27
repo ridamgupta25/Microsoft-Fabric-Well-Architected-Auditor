@@ -1,0 +1,204 @@
+"""Schemas for requesting audits and reading their results."""
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+
+from pydantic import BaseModel, Field
+
+
+class AuditMode(str, Enum):
+    """Where the audit reads its data from."""
+
+    MOCK = "mock"
+    LIVE = "live"
+
+
+class JobStatus(str, Enum):
+    """Lifecycle of a submitted audit."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class WorkspaceSelection(BaseModel):
+    """One workspace to audit, and the layer role it plays."""
+
+    id: str = Field(description="Fabric workspace GUID, or a fixture id in mock mode.")
+    role: str | None = Field(
+        default=None,
+        description="Layer role: Data Prep | Data Storage | Data Logs | "
+                    "Data Operations | Reporting / Semantic | Mixed.",
+    )
+    name: str | None = None
+
+
+class AuditRequest(BaseModel):
+    """A request to run an audit."""
+
+    mode: AuditMode = AuditMode.MOCK
+    project: str | None = Field(
+        default=None, description="Project YAML path. Defaults to the server's project."
+    )
+    pillars: list[str] = Field(
+        default_factory=list,
+        description="Restrict scoring to these pillars. Empty means all of them.",
+    )
+    workspaces: list[WorkspaceSelection] = Field(
+        default_factory=list,
+        description="Workspaces to audit. Empty means whatever the project declares.",
+    )
+    auth_session: str | None = Field(
+        default=None, description="Sign-in session id. Required when mode is 'live'."
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "mode": "mock",
+                "pillars": ["Security", "Reliability"],
+                "workspaces": [{"id": "ws-prep-01", "role": "Data Prep"}],
+            }
+        }
+    }
+
+
+class AuditAccepted(BaseModel):
+    """Returned immediately when an audit is submitted."""
+
+    audit_id: str
+    status: JobStatus
+    submitted_at: datetime
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "audit_id": "a3f19c2e8b7d4a10",
+                "status": "running",
+                "submitted_at": "2026-07-27T10:15:00Z",
+            }
+        }
+    }
+
+
+class CheckResultOut(BaseModel):
+    """One verdict about one implemented object."""
+
+    check_id: str
+    ref: str
+    title: str
+    pillar: str
+    status: str
+    score: int | None = Field(description="0-3, or null when informational.")
+    coverage: float | None = Field(description="0..1 for proportional checks.")
+    evidence: str
+    recommendation: str
+    severity: str
+    workspace: str
+    workspace_role: str
+    layer: str
+    obj: str = Field(description="Object name; empty for workspace-level checks.")
+    scope: str
+    weight: float
+    scored: bool
+    common: bool = Field(description="True for checks that apply to every project.")
+
+
+class WorkspaceError(BaseModel):
+    """A workspace that could not be read at all."""
+
+    workspace: str
+    role: str
+    message: str
+    recommendation: str
+
+
+class PillarScore(BaseModel):
+    pct: float | None = Field(description="Null means not assessed, which is not zero.")
+    count: int
+
+
+class WorkspaceScore(BaseModel):
+    role: str
+    layer: str
+    pct: float | None
+    count: int
+    by_pillar: dict[str, float | None]
+
+
+class AuditReport(BaseModel):
+    """The full result of a completed audit."""
+
+    audit_id: str | None = None
+    project_name: str
+    mode: str
+    overall: float | None
+    by_pillar: dict[str, PillarScore]
+    by_workspace: dict[str, WorkspaceScore]
+    by_layer: dict[str, PillarScore] = Field(
+        default_factory=dict, description="Score per architecture layer."
+    )
+    matrix: dict[str, dict[str, float | None]] = Field(
+        default_factory=dict,
+        description="Pillar x layer scores — how each layer fares on each pillar.",
+    )
+    layers: list[str] = Field(default_factory=list)
+    counts: dict[str, int]
+    total_scored: int
+    results: list[CheckResultOut]
+    errors: list[WorkspaceError] = Field(default_factory=list)
+    files: dict[str, str] = Field(
+        default_factory=dict, description="Generated report file names."
+    )
+
+
+class AuditJobOut(BaseModel):
+    """Status of a submitted audit, with the report once it has finished."""
+
+    audit_id: str
+    status: JobStatus
+    submitted_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    duration_seconds: float | None = None
+    mode: str
+    error: str | None = None
+    report: AuditReport | None = None
+
+
+class AuditJobSummary(BaseModel):
+    """One row in the audit history — no report body."""
+
+    audit_id: str
+    status: JobStatus
+    submitted_at: datetime
+    finished_at: datetime | None = None
+    duration_seconds: float | None = None
+    mode: str
+    project_name: str | None = None
+    overall: float | None = None
+    workspaces: int = 0
+
+
+class SingleCheckRequest(BaseModel):
+    """Run exactly one check against one workspace — the fast feedback loop."""
+
+    check_id: str
+    workspace_id: str
+    mode: AuditMode = AuditMode.MOCK
+    project: str | None = None
+    layer: str | None = None
+    auth_session: str | None = None
+
+
+class WorkspaceOut(BaseModel):
+    """A workspace available for selection."""
+
+    id: str
+    name: str
+    role: str = ""
+    layer: str = ""
+    items: int | None = None
+    pipelines: int | None = None

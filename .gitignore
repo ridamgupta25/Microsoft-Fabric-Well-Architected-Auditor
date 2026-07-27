@@ -1,16 +1,38 @@
 # Python
 .venv/
+venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+backend/src/*.egg-info/
 
-# AuditFAST output
+# Node / frontend
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# Environment
+.env
+.env.local
+!.env.example
+
+# Generated audit output
 output/
 
-# Local project configs (keep the example)
-config/*.yaml
-!config/project.example.yaml
-!config/remediation.yaml
+# Local engagement configs (keep the examples).
+# NOTE: a pattern containing a slash is anchored to this file's directory, so
+# the path must be the real one — `config/*.yaml` would only match a top-level
+# config/ directory, silently leaving real client files (tenant ids, client ids,
+# production workspace GUIDs) tracked.
+backend/config/*.yaml
+!backend/config/project.example.yaml
+!backend/config/remediation.yaml
 
 # SQLite / local DB files
 *.db
+
+# Working notes and client material, kept out of history
+Local/
