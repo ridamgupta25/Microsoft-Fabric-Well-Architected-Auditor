@@ -63,7 +63,7 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(AuditError)
     async def audit_error(request: Request, exc: AuditError):
-        """The run could not be started — bad mode, missing token, unknown check."""
+        """The run could not be started — missing token, unknown check, bad project."""
         return _error(status.HTTP_400_BAD_REQUEST, str(exc), "audit_error")
 
     @app.exception_handler(FileNotFoundError)

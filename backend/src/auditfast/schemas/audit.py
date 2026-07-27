@@ -7,13 +7,6 @@ from enum import Enum
 from pydantic import BaseModel, Field
 
 
-class AuditMode(str, Enum):
-    """Where the audit reads its data from."""
-
-    MOCK = "mock"
-    LIVE = "live"
-
-
 class JobStatus(str, Enum):
     """Lifecycle of a submitted audit."""
 
@@ -26,7 +19,7 @@ class JobStatus(str, Enum):
 class WorkspaceSelection(BaseModel):
     """One workspace to audit, and the layer role it plays."""
 
-    id: str = Field(description="Fabric workspace GUID, or a fixture id in mock mode.")
+    id: str = Field(description="Fabric workspace GUID.")
     role: str | None = Field(
         default=None,
         description="Layer role: Data Prep | Data Storage | Data Logs | "
@@ -36,9 +29,8 @@ class WorkspaceSelection(BaseModel):
 
 
 class AuditRequest(BaseModel):
-    """A request to run an audit."""
+    """A request to run an audit. Always reads the live tenant."""
 
-    mode: AuditMode = AuditMode.MOCK
     project: str | None = Field(
         default=None, description="Project YAML path. Defaults to the server's project."
     )
@@ -51,15 +43,17 @@ class AuditRequest(BaseModel):
         description="Workspaces to audit. Empty means whatever the project declares.",
     )
     auth_session: str | None = Field(
-        default=None, description="Sign-in session id. Required when mode is 'live'."
+        default=None,
+        description="Completed sign-in session id. Required — omitting it, or "
+                    "supplying an expired one, fails with 401.",
     )
 
     model_config = {
         "json_schema_extra": {
             "example": {
-                "mode": "mock",
                 "pillars": ["Security", "Reliability"],
                 "workspaces": [{"id": "ws-prep-01", "role": "Data Prep"}],
+                "auth_session": "3f2a9c14",
             }
         }
     }
@@ -133,7 +127,6 @@ class AuditReport(BaseModel):
 
     audit_id: str | None = None
     project_name: str
-    mode: str
     overall: float | None
     by_pillar: dict[str, PillarScore]
     by_workspace: dict[str, WorkspaceScore]
@@ -163,7 +156,6 @@ class AuditJobOut(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     duration_seconds: float | None = None
-    mode: str
     error: str | None = None
     report: AuditReport | None = None
 
@@ -176,7 +168,6 @@ class AuditJobSummary(BaseModel):
     submitted_at: datetime
     finished_at: datetime | None = None
     duration_seconds: float | None = None
-    mode: str
     project_name: str | None = None
     overall: float | None = None
     workspaces: int = 0
@@ -187,10 +178,13 @@ class SingleCheckRequest(BaseModel):
 
     check_id: str
     workspace_id: str
-    mode: AuditMode = AuditMode.MOCK
     project: str | None = None
     layer: str | None = None
-    auth_session: str | None = None
+    auth_session: str | None = Field(
+        default=None,
+        description="Completed sign-in session id. Required — omitting it, or "
+                    "supplying an expired one, fails with 401.",
+    )
 
 
 class WorkspaceOut(BaseModel):

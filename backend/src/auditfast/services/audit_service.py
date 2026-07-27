@@ -14,7 +14,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..clients import LiveFabricProvider, MockProvider
+from ..clients import LiveFabricProvider
 from ..core.checks.helpers import RemediationBook
 from ..core.checks.registry import REGISTRY
 from ..core.engine import run_audit as run_engine
@@ -26,12 +26,9 @@ from .project import ProjectConfig, load_project, load_remediation
 #: Check id used for workspaces that could not be read at all.
 ACCESS_CHECK_ID = "WS-ACCESS"
 
-MOCK = "mock"
-LIVE = "live"
-
 
 class AuditError(RuntimeError):
-    """A run could not be started — bad mode, missing token, unknown check."""
+    """A run could not be started — missing token, unknown check, bad project."""
 
 
 @dataclass(slots=True)
@@ -39,7 +36,6 @@ class AuditRun:
     """Everything one audit produced."""
 
     project_name: str
-    mode: str
     results: list[CheckResult] = field(default_factory=list)
     errors: list[CheckResult] = field(default_factory=list)
     aggregate: dict = field(default_factory=dict)
@@ -48,15 +44,17 @@ class AuditRun:
 
 # -- provider construction ----------------------------------------------------
 
-def build_provider(config: ProjectConfig, mode: str = MOCK, token: str | None = None):
-    """Create the provider for a run. Mode is the only branch in the system."""
-    if mode == LIVE:
-        if not token:
-            raise AuditError("Live mode requires a sign-in token.")
-        return LiveFabricProvider(token)
-    if not config.tenant_file or not config.tenant_file.exists():
-        raise AuditError(f"Mock tenant fixture not found: {config.tenant_file}")
-    return MockProvider(config.tenant_file)
+def build_provider(config: ProjectConfig, token: str | None = None) -> LiveFabricProvider:
+    """Create the provider for a run.
+
+    Every run reads the live tenant — there is no other source. ``config`` is
+    accepted (and unused beyond validation) so this stays a stable seam: a
+    second provider, if one is ever added, plugs in here without touching
+    every caller.
+    """
+    if not token:
+        raise AuditError("A sign-in token is required to run an audit.")
+    return LiveFabricProvider(token)
 
 
 def _resolve_pillars(names: Iterable[str] | None) -> list[Pillar] | None:
@@ -96,23 +94,14 @@ def _resolve_targets(
 
 # -- listing ------------------------------------------------------------------
 
-def list_workspaces(project_path: str | Path, mode: str = MOCK) -> list[dict]:
-    """Workspaces available for selection, before any sign-in."""
+def list_workspaces(project_path: str | Path) -> list[dict]:
+    """Workspaces declared by the project file, before any sign-in.
+
+    Contents cannot be enumerated without a token, so this only echoes what the
+    project declares. Use :func:`list_live_workspaces` once signed in to see the
+    real tenant.
+    """
     config = load_project(project_path)
-    declared = {ws_id: layer for ws_id, layer in config.targets}
-
-    if mode == MOCK:
-        provider = build_provider(config, MOCK)
-        rows = provider.list_workspaces()
-        # A project file narrows the fixture down to the workspaces it declares.
-        if declared:
-            rows = [r for r in rows if r["id"] in declared]
-        for row in rows:
-            row["role"] = declared.get(row["id"], Layer.parse(row.get("layer"))).value
-        return rows
-
-    # Live: contents cannot be enumerated without a token, so report what the
-    # project declares and let the UI load the real list after sign-in.
     return [
         {"id": ws_id, "name": ws_id, "role": layer.value, "layer": layer.value,
          "items": None, "pipelines": None}
@@ -137,7 +126,6 @@ def diagnose(token: str) -> dict:
 
 def run_audit(
     project_path: str | Path,
-    mode: str = MOCK,
     pillars: Iterable[str] | None = None,
     workspaces: Sequence[dict] | Sequence[str] | None = None,
     out_dir: str | Path | None = None,
@@ -145,7 +133,7 @@ def run_audit(
 ) -> AuditRun:
     """Run an audit and, when ``out_dir`` is given, write the report files."""
     config = load_project(project_path)
-    provider = build_provider(config, mode, token)
+    provider = build_provider(config, token)
     remediation: RemediationBook = load_remediation(config)
 
     raw_results = run_engine(
@@ -164,7 +152,6 @@ def run_audit(
 
     run = AuditRun(
         project_name=config.name,
-        mode=mode,
         results=results,
         errors=errors,
         aggregate=aggregate(results),
@@ -179,7 +166,6 @@ def run_check(
     check_id: str,
     workspace_id: str,
     project_path: str | Path,
-    mode: str = MOCK,
     layer: str | None = None,
     token: str | None = None,
 ) -> list[dict]:
@@ -197,7 +183,7 @@ def run_check(
         raise AuditError(f"Unknown check id: {check_id!r}")
 
     config = load_project(project_path)
-    provider = build_provider(config, mode, token)
+    provider = build_provider(config, token)
 
     declared = {ws: lyr for ws, lyr in config.targets}
     resolved_layer = Layer.parse(layer) if layer else declared.get(workspace_id, Layer.MIXED)
@@ -237,10 +223,10 @@ def write_reports(run: AuditRun, out_dir: str | Path) -> dict[str, str]:
     excel_path = directory / "audit-report.xlsx"
 
     markdown_path.write_text(
-        build_markdown(run.project_name, run.aggregate, run.results, run.mode),
+        build_markdown(run.project_name, run.aggregate, run.results),
         encoding="utf-8",
     )
-    build_excel(str(excel_path), run.project_name, run.aggregate, run.results, run.mode)
+    build_excel(str(excel_path), run.project_name, run.aggregate, run.results)
     return {"markdown": str(markdown_path), "excel": str(excel_path)}
 
 
@@ -249,7 +235,6 @@ def to_json(run: AuditRun) -> dict:
     agg = run.aggregate
     return {
         "project_name": run.project_name,
-        "mode": run.mode,
         "overall": agg.get("overall"),
         "by_pillar": agg.get("by_pillar", {}),
         "by_workspace": agg.get("by_workspace", {}),

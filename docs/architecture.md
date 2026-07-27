@@ -82,7 +82,7 @@ results: one implementation, three front doors.
 | [`core/checks/helpers.py`](../backend/src/auditfast/core/checks/helpers.py) | `Verdict` and the builders |
 | [`core/checks/workspace/`](../backend/src/auditfast/core/checks/workspace/) | 12 workspace checks, one module per pillar |
 | [`core/checks/pipeline/`](../backend/src/auditfast/core/checks/pipeline/) | 8 pipeline checks, one module per pillar |
-| [`clients/`](../backend/src/auditfast/clients/) | `MockProvider`, `LiveFabricProvider`, the `Provider` protocol |
+| [`clients/`](../backend/src/auditfast/clients/) | `LiveFabricProvider` (the only shipped provider) and the `Provider` protocol |
 | [`services/audit_service.py`](../backend/src/auditfast/services/audit_service.py) | The one audit path |
 | [`services/audit_runner.py`](../backend/src/auditfast/services/audit_runner.py) | Background execution, concurrency limits |
 | [`services/catalog_service.py`](../backend/src/auditfast/services/catalog_service.py) | Catalog questions; no I/O |

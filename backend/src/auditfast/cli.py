@@ -4,9 +4,12 @@ A thin adapter, exactly like the REST API: it parses arguments, calls the same
 :mod:`auditfast.services` functions the API calls, and prints the result. No
 auditing logic lives here, which is why CLI and API scores can never diverge.
 
+Every audit reads the live tenant — there is no offline mode. ``run`` always
+signs in via the device-code flow before auditing.
+
 Commands::
 
-    auditfast run     --project config/project.example.yaml [--live]
+    auditfast run     --project config/project.example.yaml
     auditfast serve   [--port 8000] [--reload]
     auditfast checks  [--pillar Security]
 """
@@ -26,35 +29,32 @@ EXIT_BAD_INPUT = 2
 
 
 def cmd_run(args) -> int:
-    """Run an audit and write the report files."""
+    """Sign in, run an audit, and write the report files."""
     project = os.path.abspath(args.project)
     if not os.path.exists(project):
         print(f"Project file not found: {project}", file=sys.stderr)
         return EXIT_BAD_INPUT
 
-    mode = service.LIVE if args.live else service.MOCK
     pillars = [p.strip() for p in args.pillars.split(",") if p.strip()] or None
 
-    token = None
-    if mode == service.LIVE:
-        # Device-code flow works in a terminal: it prints a URL and a code, and
-        # blocks until the auditor completes sign-in in a browser.
-        from .security.device_flow import acquire_token
-        from .services.project import load_project
+    # Device-code flow works in a terminal: it prints a URL and a code, and
+    # blocks until the auditor completes sign-in in a browser.
+    from .security.device_flow import acquire_token
+    from .services.project import load_project
 
-        auth = load_project(project).auth
-        token = acquire_token(
-            auth.get("tenant_id"),
-            auth.get("client_id"),
-            auth.get("scopes", ["https://api.fabric.microsoft.com/.default"]),
-        )
-
-    print(f"Running audit ({mode} mode)...")
-    run = service.run_audit(
-        project, mode=mode, pillars=pillars, out_dir=os.path.abspath(args.out), token=token
+    auth = load_project(project).auth
+    token = acquire_token(
+        auth.get("tenant_id"),
+        auth.get("client_id"),
+        auth.get("scopes", ["https://api.fabric.microsoft.com/.default"]),
     )
 
-    print_summary(run.project_name, run.aggregate, run.mode)
+    print("Running audit...")
+    run = service.run_audit(
+        project, pillars=pillars, out_dir=os.path.abspath(args.out), token=token
+    )
+
+    print_summary(run.project_name, run.aggregate)
     for error in run.errors:
         print(f"  ! {error.workspace}: {error.evidence}", file=sys.stderr)
     print(f"Report : {run.files.get('markdown')}")
@@ -113,11 +113,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    run = sub.add_parser("run", help="Run an audit and write reports")
+    run = sub.add_parser("run", help="Sign in, run an audit, and write reports")
     run.add_argument("--project", required=True, help="Path to the project YAML file")
-    mode = run.add_mutually_exclusive_group()
-    mode.add_argument("--mock", action="store_true", help="Use offline fixtures (default)")
-    mode.add_argument("--live", action="store_true", help="Sign in and read the live tenant")
     run.add_argument("--out", default="output", help="Output directory (default: output)")
     run.add_argument("--pillars", default="", help="Comma-separated pillar subset")
 

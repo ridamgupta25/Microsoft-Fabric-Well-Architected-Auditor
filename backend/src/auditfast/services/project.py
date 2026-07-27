@@ -12,7 +12,6 @@ from pathlib import Path
 
 from ..core.enums import Layer
 
-DEFAULT_TENANT_FILE = "sample_data/tenant.json"
 DEFAULT_REMEDIATION_FILE = "config/remediation.yaml"
 
 
@@ -31,7 +30,6 @@ class ProjectConfig:
     name: str = "Fabric Project"
     settings: dict = field(default_factory=dict)
     targets: list[tuple[str, Layer]] = field(default_factory=list)
-    tenant_file: Path | None = None
     remediation_file: Path | None = None
     auth: dict = field(default_factory=dict)
     raw: dict = field(default_factory=dict)
@@ -41,7 +39,7 @@ class ProjectConfig:
         """Directory relative paths in the YAML resolve against.
 
         Two levels up from the file, so ``backend/config/project.yaml`` resolves
-        ``sample_data/tenant.json`` to ``backend/sample_data/tenant.json``.
+        ``config/remediation.yaml`` to ``backend/config/remediation.yaml``.
         """
         return self.path.parent.parent
 
@@ -78,13 +76,11 @@ def load_project(project_path: str | Path) -> ProjectConfig:
         if entry.get("id")
     ]
 
-    mock_cfg = raw.get("mock") or {}
     return ProjectConfig(
         path=path,
         name=settings.get("name", "Fabric Project"),
         settings=settings,
         targets=targets,
-        tenant_file=_resolve(mock_cfg.get("tenant_file", DEFAULT_TENANT_FILE), base),
         remediation_file=_resolve(raw.get("remediation", DEFAULT_REMEDIATION_FILE), base),
         auth=raw.get("auth") or {},
         raw=raw,

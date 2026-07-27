@@ -9,7 +9,7 @@ def _fmt(pct):
     return "  -  " if pct is None else f"{pct:5.1f}%"
 
 
-def print_summary(project_name: str, agg: dict, mode: str) -> None:
+def print_summary(project_name: str, agg: dict) -> None:
     overall = agg["overall"]
     label, emoji = rating(overall)
     counts = agg["counts"]
@@ -27,7 +27,7 @@ def print_summary(project_name: str, agg: dict, mode: str) -> None:
             f"([green]{counts[Status.PASS]} pass[/green] / "
             f"[yellow]{counts[Status.PARTIAL]} partial[/yellow] / "
             f"[red]{counts[Status.FAIL]} fail[/red])",
-            title=f"AuditFAST Core  ({mode} mode)", border_style="cyan"))
+            title="AuditFAST Core", border_style="cyan"))
 
         table = Table(title="Pillar Scorecard", header_style="bold")
         table.add_column("Pillar")
@@ -56,7 +56,7 @@ def print_summary(project_name: str, agg: dict, mode: str) -> None:
 
     # Plain fallback
     print()
-    print(f"=== AuditFAST Core ({mode} mode) : {project_name} ===")
+    print(f"=== AuditFAST Core : {project_name} ===")
     print(f"Overall: {_fmt(overall)}  {label}   "
           f"({counts[Status.PASS]} pass / {counts[Status.PARTIAL]} partial / {counts[Status.FAIL]} fail)")
     print("\nPillar scorecard:")

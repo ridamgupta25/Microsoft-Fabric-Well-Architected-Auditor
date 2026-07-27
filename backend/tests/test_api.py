@@ -1,13 +1,15 @@
 """REST API behaviour, exercised through the ASGI app.
 
 No server and no browser: the TestClient drives the real app, middleware and
-exception handlers included.
+exception handlers included. Every audit-submission test authenticates with
+:data:`~tests.conftest.AUTHENTICATED_SESSION`, which the ``client`` fixture
+wires to a fake token and a recorded-tenant provider — see conftest.py.
 """
 from __future__ import annotations
 
 import time
 
-from .conftest import EXPECTED_OVERALL
+from .conftest import AUTHENTICATED_SESSION, EXPECTED_OVERALL
 
 
 def _wait_for_audit(client, audit_id: str, timeout: float = 30.0) -> dict:
@@ -19,6 +21,12 @@ def _wait_for_audit(client, audit_id: str, timeout: float = 30.0) -> dict:
             return body
         time.sleep(0.05)
     raise AssertionError(f"audit {audit_id} did not finish within {timeout}s")
+
+
+def _submit(client, **extra) -> str:
+    """Submit an authenticated audit and return its id."""
+    body = {"auth_session": AUTHENTICATED_SESSION, **extra}
+    return client.post("/api/v1/audit", json=body).json()["audit_id"]
 
 
 # -- health --------------------------------------------------------------------
@@ -72,9 +80,11 @@ def test_unknown_check_is_404_with_error_shape(client):
 
 # -- workspaces ----------------------------------------------------------------
 
-def test_workspaces_lists_the_mock_tenant(client):
-    rows = client.get("/api/v1/workspaces", params={"mode": "mock"}).json()
+def test_workspaces_lists_declared_project_workspaces(client):
+    """No token needed: this only echoes what the project file declares."""
+    rows = client.get("/api/v1/workspaces").json()
     assert {r["id"] for r in rows} == {"ws-prep-01", "ws-store-01", "ws-ops-01"}
+    assert all(r["items"] is None for r in rows)
 
 
 def test_live_workspaces_without_sign_in_is_401(client):
@@ -86,7 +96,9 @@ def test_live_workspaces_without_sign_in_is_401(client):
 # -- audit lifecycle -----------------------------------------------------------
 
 def test_audit_is_accepted_then_completes_with_the_expected_score(client):
-    accepted = client.post("/api/v1/audit", json={"mode": "mock"})
+    accepted = client.post(
+        "/api/v1/audit", json={"auth_session": AUTHENTICATED_SESSION}
+    )
     assert accepted.status_code == 202
     body = accepted.json()
     assert body["status"] in {"queued", "running"}
@@ -98,7 +110,7 @@ def test_audit_is_accepted_then_completes_with_the_expected_score(client):
 
 
 def test_report_endpoint_returns_the_full_scorecard(client):
-    audit_id = client.post("/api/v1/audit", json={"mode": "mock"}).json()["audit_id"]
+    audit_id = _submit(client)
     _wait_for_audit(client, audit_id)
 
     report = client.get(f"/api/v1/reports/{audit_id}").json()
@@ -109,7 +121,7 @@ def test_report_endpoint_returns_the_full_scorecard(client):
 
 
 def test_report_includes_the_pillar_by_layer_matrix(client):
-    audit_id = client.post("/api/v1/audit", json={"mode": "mock"}).json()["audit_id"]
+    audit_id = _submit(client)
     _wait_for_audit(client, audit_id)
 
     report = client.get(f"/api/v1/reports/{audit_id}").json()
@@ -118,9 +130,7 @@ def test_report_includes_the_pillar_by_layer_matrix(client):
 
 
 def test_pillar_selection_narrows_the_report(client):
-    audit_id = client.post(
-        "/api/v1/audit", json={"mode": "mock", "pillars": ["Security"]}
-    ).json()["audit_id"]
+    audit_id = _submit(client, pillars=["Security"])
     _wait_for_audit(client, audit_id)
 
     report = client.get(f"/api/v1/reports/{audit_id}").json()
@@ -128,10 +138,7 @@ def test_pillar_selection_narrows_the_report(client):
 
 
 def test_unreadable_workspace_is_an_error_not_a_failing_check(client):
-    audit_id = client.post("/api/v1/audit", json={
-        "mode": "mock",
-        "workspaces": [{"id": "does-not-exist", "role": "Data Prep"}],
-    }).json()["audit_id"]
+    audit_id = _submit(client, workspaces=[{"id": "does-not-exist", "role": "Data Prep"}])
     _wait_for_audit(client, audit_id)
 
     report = client.get(f"/api/v1/reports/{audit_id}").json()
@@ -144,8 +151,9 @@ def test_unknown_audit_is_404(client):
     assert client.get("/api/v1/audit/does-not-exist").status_code == 404
 
 
-def test_live_audit_without_sign_in_is_rejected_before_scheduling(client):
-    response = client.post("/api/v1/audit", json={"mode": "live"})
+def test_audit_without_sign_in_is_rejected_before_scheduling(client):
+    """Every audit reads the live tenant, so a missing session fails immediately."""
+    response = client.post("/api/v1/audit", json={})
     assert response.status_code == 401
     assert response.json()["code"] == "authentication_error"
 
@@ -154,8 +162,8 @@ def test_live_audit_without_sign_in_is_rejected_before_scheduling(client):
 
 def test_single_check_runs_synchronously(client):
     results = client.post("/api/v1/audit/check", json={
-        "check_id": "WS-GIT", "workspace_id": "ws-prep-01",
-        "mode": "mock", "layer": "Data Prep",
+        "check_id": "WS-GIT", "workspace_id": "ws-prep-01", "layer": "Data Prep",
+        "auth_session": AUTHENTICATED_SESSION,
     }).json()
     assert len(results) == 1
     assert results[0]["check_id"] == "WS-GIT"
@@ -164,16 +172,25 @@ def test_single_check_runs_synchronously(client):
 
 def test_single_check_with_unknown_id_is_400(client):
     response = client.post("/api/v1/audit/check", json={
-        "check_id": "NOPE", "workspace_id": "ws-prep-01", "mode": "mock",
+        "check_id": "NOPE", "workspace_id": "ws-prep-01",
+        "auth_session": AUTHENTICATED_SESSION,
     })
     assert response.status_code == 400
     assert response.json()["code"] == "audit_error"
 
 
+def test_single_check_without_sign_in_is_401(client):
+    response = client.post("/api/v1/audit/check", json={
+        "check_id": "WS-GIT", "workspace_id": "ws-prep-01",
+    })
+    assert response.status_code == 401
+    assert response.json()["code"] == "authentication_error"
+
+
 # -- history and recommendations -----------------------------------------------
 
 def test_history_lists_completed_audits(client):
-    audit_id = client.post("/api/v1/audit", json={"mode": "mock"}).json()["audit_id"]
+    audit_id = _submit(client)
     _wait_for_audit(client, audit_id)
 
     page = client.get("/api/v1/history").json()
@@ -188,7 +205,7 @@ def test_history_paging_is_bounded(client):
 
 
 def test_recommendations_are_severity_ordered(client):
-    audit_id = client.post("/api/v1/audit", json={"mode": "mock"}).json()["audit_id"]
+    audit_id = _submit(client)
     _wait_for_audit(client, audit_id)
 
     body = client.get(f"/api/v1/recommendations/{audit_id}").json()
@@ -215,11 +232,11 @@ def test_inbound_correlation_id_is_honoured(client):
 
 
 def test_validation_errors_use_the_standard_error_shape(client):
-    response = client.post("/api/v1/audit", json={"mode": "not-a-mode"})
+    response = client.post("/api/v1/audit", json={"workspaces": "not-a-list"})
     assert response.status_code == 422
     body = response.json()
     assert body["code"] == "validation_error"
-    assert "mode" in body["detail"]
+    assert "workspaces" in body["detail"]
 
 
 def test_openapi_documents_every_endpoint(client):

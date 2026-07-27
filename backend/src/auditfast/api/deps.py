@@ -71,20 +71,18 @@ def organization_id(
 OrganizationDep = Annotated[str | None, Depends(organization_id)]
 
 
-def resolve_live_token(mode: str, auth_session: str | None) -> str | None:
-    """Exchange a sign-in session for a Fabric token when running live.
+def resolve_token(auth_session: str | None) -> str:
+    """Exchange a sign-in session for a Fabric token.
 
-    Mock runs need no token. Live runs without a valid session fail here, before
-    any work is scheduled, so the caller gets an immediate 401 rather than a job
-    that dies asynchronously.
+    Every audit reads the live tenant, so every audit needs a token. Resolving
+    it here — before any work is scheduled — means an unauthenticated request
+    gets an immediate 401 rather than a background job that dies asynchronously.
 
     Raises the domain :class:`AuthError` rather than an ``HTTPException`` so the
     registered handler classifies it as ``authentication_error``; this module
     should not have to know HTTP status codes when the domain already says what
     went wrong.
     """
-    if mode != "live":
-        return None
     token = auth_service.token_for(auth_session)
     if not token:
         raise auth_service.AuthError(

@@ -11,7 +11,7 @@ def _pct(pct):
     return "N/A" if pct is None else round(pct, 1)
 
 
-def build_excel(path: str, project_name: str, agg: dict, results: list, mode: str) -> None:
+def build_excel(path: str, project_name: str, agg: dict, results: list) -> None:
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
 
@@ -33,7 +33,7 @@ def build_excel(path: str, project_name: str, agg: dict, results: list, mode: st
     ws["A1"] = "AuditFAST Core — Fabric Well-Architected Audit"
     ws["A1"].font = title_font
     ws["A2"] = f"Project: {project_name}"
-    ws["A3"] = f"Date: {date.today().isoformat()}    Mode: {mode} (rule-based, no AI)"
+    ws["A3"] = f"Date: {date.today().isoformat()}    Basis: rule-based, no AI"
     o_label, _ = rating(agg["overall"])
     ws["A5"] = "Overall score"
     ws["B5"] = _pct(agg["overall"])

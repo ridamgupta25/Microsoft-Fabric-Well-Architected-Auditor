@@ -2,9 +2,11 @@
 
 Everything needed to set the project up from a fresh clone and get it running.
 
-**Mock mode works completely offline** — no Microsoft Fabric tenant, no sign-in,
-no Azure account. Start there; it exercises the entire stack against a bundled
-fixture.
+**Every audit reads a live Microsoft Fabric tenant** — there is no offline or
+demo mode in the product. You will need at least read (Viewer) access to one
+Fabric workspace to see a real audit run. Sign-in is read-only throughout: the
+tool only issues GET calls plus the read-only `getDefinition`, and never writes
+to your tenant.
 
 ---
 
@@ -16,15 +18,16 @@ fixture.
 | **Node.js** | 18+ | `node --version` | Frontend |
 | **npm** | 9+ | `npm --version` | Frontend |
 | **Git** | any | `git --version` | Cloning |
+| **A Fabric workspace** | — | — | At least Viewer access, to run a real audit |
 
-Optional:
+Recommended:
 
 | Tool | Needed for |
 |------|-----------|
-| **Azure CLI** (`az`) | The easiest live sign-in — `winget install -e --id Microsoft.AzureCLI` |
+| **Azure CLI** (`az`) | The easiest sign-in — `winget install -e --id Microsoft.AzureCLI`, then `az login` once |
 
-You do **not** need Docker, a database, or an Azure subscription to run this
-locally.
+You do **not** need Docker, a database, or your own Entra app registration —
+the built-in sign-in falls back to Microsoft's first-party Azure CLI client.
 
 ---
 
@@ -69,7 +72,11 @@ cd backend
 ..\.venv\Scripts\python.exe -m pytest
 ```
 
-Expected: **52 passed**. The suite is fully offline and deterministic.
+Expected: **53 passed**. The suite is fully offline and deterministic — it runs
+against a recorded tenant fixture under `tests/fixtures/`, not a real Fabric
+tenant, so it needs no credentials and never makes a network call. See
+[migration.md](migration.md#test-strategy) for why that fixture is test
+infrastructure and not a product feature.
 
 ---
 
@@ -124,13 +131,18 @@ makes same-origin requests and no CORS is involved locally.
 
 ### First audit
 
-1. Leave **Mode** on **Mock (offline)** in the header.
-2. Go to **Run audit** — all three fixture workspaces are pre-selected.
-3. Click **Run audit**.
-4. You land on the report: overall **57.9%**, a pillar scorecard, the pillar ×
-   layer matrix, and 27 findings.
+1. Click **Connect to Fabric** in the header.
+2. Sign in — the fastest path is **Reuse my Azure CLI session** if you have
+   already run `az login`; otherwise **Connect with Microsoft** opens an
+   interactive sign-in in a browser on the machine running the API.
+3. Once connected, you land on **Run audit** with every workspace your account
+   can see, pre-selected.
+4. Click **Run audit**.
 
-If you see that, the whole stack is working.
+You land on the report: an overall score, a pillar scorecard, the pillar ×
+layer matrix, and every finding. If you see that, the whole stack is working.
+
+Full sign-in options: [§ 8](#8-signing-in).
 
 ---
 
@@ -146,7 +158,9 @@ If you see that, the whole stack is working.
 
 Swagger UI is the quickest way to explore the backend on its own — every
 endpoint is documented with request/response schemas and a **Try it out**
-button.
+button. Sign-in through Swagger works the same way: call `POST
+/api/v1/login/azure-cli`, copy the returned `session`, then paste it into
+`auth_session` on `POST /api/v1/audit`.
 
 ---
 
@@ -155,26 +169,29 @@ button.
 ```powershell
 cd backend
 
-# Run an audit and write reports
-..\.venv\Scripts\python.exe -m auditfast run --project config/project.example.yaml --mock
+# Run an audit — this signs you in via the device-code flow first
+..\.venv\Scripts\python.exe -m auditfast run --project config/project.example.yaml
 
 # Only some pillars
 ..\.venv\Scripts\python.exe -m auditfast run --project config/project.example.yaml --pillars Security,Reliability
 
-# Browse the rule library
+# Browse the rule library — no sign-in needed
 ..\.venv\Scripts\python.exe -m auditfast checks
 ..\.venv\Scripts\python.exe -m auditfast checks --pillar Security
 ```
+
+`auditfast run` always signs in first: it prints a URL and a short code, waits
+for you to complete sign-in in a browser, then runs. There is no `--mock` /
+`--live` flag — every run is live.
 
 Reports are written to `backend/output/`:
 `audit-report.md` and `audit-report.xlsx` (Scorecard / Checks / Risk Register).
 
 ---
 
-## 8. Live mode (auditing a real Fabric tenant)
+## 8. Signing in
 
-Everything is **read-only**. The tool only issues GET calls plus the read-only
-`getDefinition`, and never writes to your tenant.
+Everything here is **read-only**.
 
 ### Easiest path — Azure CLI
 
@@ -182,20 +199,19 @@ Everything is **read-only**. The tool only issues GET calls plus the read-only
 az login
 ```
 
-Then in the app: switch **Mode** to **Live**, click **Sign in required** in the
-header, and choose **Sign in with Azure CLI**.
+Then in the app: **Connect to Fabric** → **Reuse my Azure CLI session**.
 
 ### Email sign-in
 
-Switch to Live → **Sign in** → enter your email → **Sign in with Microsoft**. A
+**Connect to Fabric** → enter your email → **Connect with Microsoft**. A
 browser window opens *on the machine running the API*. With no client id
 configured, Microsoft's first-party Azure CLI client is used, so no app
 registration is needed.
 
 ### With your own app registration
 
-If Conditional Access blocks the above, register a Microsoft Entra **public
-client** app with delegated, read-only Fabric scopes:
+If Conditional Access blocks both of the above, register a Microsoft Entra
+**public client** app with delegated, read-only Fabric scopes:
 
 - `Workspace.Read.All`
 - `Item.Read.All`
@@ -222,11 +238,12 @@ Serve with it:
 > examples), so real engagement configs containing tenant ids, client ids, and
 > production workspace GUIDs are never committed.
 
-### If a live audit returns less than expected
+### If an audit returns less than expected
 
-Use **Diagnose access** on the sign-in page. It reports per-resource HTTP status
-codes, distinguishing a bad token from missing permission on one sub-resource
-(for example: items readable, role assignments 403).
+Sign in, then open **Troubleshoot access** on the same page. It reports
+per-resource HTTP status codes, distinguishing a bad token from missing
+permission on one sub-resource (for example: items readable, role assignments
+403).
 
 ---
 
@@ -260,18 +277,17 @@ correctly contains storage items and *only* storage items.
 | `project.pipeline_naming_convention` | Regex for `PL-NAME` |
 | `project.orphan_days` | Staleness threshold for `WS-ORPHAN` |
 | `project.max_admins` | Threshold for `WS-LEASTPRIV` |
-| `mock.tenant_file` | Fixture path used in mock mode |
 | `remediation` | Path to the remediation text file |
-| `workspaces[].id` | Workspace GUID (live) or fixture id (mock) |
+| `workspaces[].id` | Fabric workspace GUID |
 | `workspaces[].role` | Layer role — gates pipeline checks, drives the layer checks |
-| `auth.*` | Live mode only. Values wrapped in `<…>` are treated as unset |
+| `auth.*` | Optional. Values wrapped in `<…>` are treated as unset, falling back to the built-in Azure CLI client |
 
 The whole `project:` block is passed to every check as `settings`, so adding a
 tunable is a new key plus a `ctx.setting()` call in the check.
 
 **Path resolution:** relative paths in the YAML resolve against the directory two
 levels up from the file — for `backend/config/project.example.yaml` that is
-`backend/`, so `sample_data/tenant.json` means `backend/sample_data/tenant.json`.
+`backend/`, so `config/remediation.yaml` means `backend/config/remediation.yaml`.
 
 ### Remediation text
 
@@ -313,8 +329,8 @@ Frontend (see [`frontend/.env.example`](../frontend/.env.example)):
 | Frontend shows **API unreachable** | The backend is not running, or is on a different port. Start it, or set `VITE_API_PROXY_TARGET` |
 | `Port 8000 is already in use` | `--port 8001`, and set `VITE_API_PROXY_TARGET` to match |
 | `npm run build` fails on `Cannot find type definition file for 'node'` | `npm install` was not re-run after a dependency change |
-| Live audit returns 401 | The session expired. Sign in again |
-| Live audit returns 403 for a workspace | The signed-in user needs at least Viewer on it. Confirm with **Diagnose access** |
+| An audit is rejected with 401 before it starts | You are not signed in, or the session expired. Reconnect via **Connect to Fabric** |
+| An audit returns 403 for a workspace | The signed-in user needs at least Viewer on it. Confirm with **Troubleshoot access** |
 | `az` sign-in fails | Run `az login` first, on the machine running the API — not your laptop if the API is remote |
 | Tests fail with import errors | Install with the `[dev]` extra: `pip install -e "backend[dev]"` |
 
@@ -327,11 +343,12 @@ Fabric-Well-Architected-Auditor/
 ├─ backend/
 │  ├─ pyproject.toml           # package + tooling config
 │  ├─ config/                  # project + remediation YAML
-│  ├─ sample_data/tenant.json  # offline fixture
-│  ├─ tests/                   # 50 tests, fully offline
+│  ├─ tests/
+│  │  ├─ fixtures/             # recorded-tenant provider + JSON, test-only
+│  │  └─ ...                   # 53 tests, fully offline
 │  └─ src/auditfast/
 │     ├─ core/                 # engine, checks, scoring — depends on nothing
-│     ├─ clients/              # read-only Fabric + fixture providers
+│     ├─ clients/              # the read-only Fabric REST provider
 │     ├─ services/             # orchestration; the single audit path
 │     ├─ api/v1/               # FastAPI routers
 │     ├─ schemas/              # Pydantic request/response models

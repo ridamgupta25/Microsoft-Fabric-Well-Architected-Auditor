@@ -28,7 +28,6 @@ class AuditJob:
     """
 
     id: str
-    mode: str = "mock"
     status: JobStatus = JobStatus.QUEUED
     submitted_at: datetime = field(default_factory=_now)
     started_at: datetime | None = None

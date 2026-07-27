@@ -35,7 +35,6 @@ async def list_history(
                 submitted_at=job.submitted_at,
                 finished_at=job.finished_at,
                 duration_seconds=job.duration_seconds,
-                mode=job.mode,
                 project_name=job.project_name,
                 overall=job.overall,
                 workspaces=job.workspace_count,

@@ -1,11 +1,15 @@
-"""Offline provider backed by a tenant fixture file.
+"""A recorded-tenant provider — test infrastructure, not a product feature.
 
-Reads ``sample_data/tenant.json`` and serves it as workspace contexts. This is
-what makes the whole test suite deterministic and network-free, and what lets the
-UI demo without a Fabric tenant.
+The application ships exactly one provider, :class:`~auditfast.clients.live.LiveFabricProvider`.
+This class exists solely so the test suite can exercise the engine, the check
+library, and the API deterministically and offline, without a real Fabric tenant,
+network access, or credentials in CI. It satisfies the same
+:class:`~auditfast.clients.base.Provider` protocol the live provider does, so
+every test runs against the exact code path production uses — only the data
+source differs.
 
-Unlike the live provider it ignores ``resources`` and always populates
-everything: reading one local JSON file is free, so there is nothing to defer.
+It is never imported by ``auditfast.*`` and is not part of the installed
+package.
 """
 from __future__ import annotations
 
@@ -13,18 +17,20 @@ import json
 from collections.abc import Iterable
 from pathlib import Path
 
-from ..core.enums import Layer, Resource
-from ..core.models import Item, RoleAssignment, WorkspaceContext
-from .base import ALL_RESOURCES
-from .errors import WorkspaceAccessError
+from auditfast.clients.base import ALL_RESOURCES
+from auditfast.clients.errors import WorkspaceAccessError
+from auditfast.core.enums import Layer, Resource
+from auditfast.core.models import Item, RoleAssignment, WorkspaceContext
+
+FIXTURE_FILE = Path(__file__).parent / "tenant.json"
 
 
-class MockProvider:
-    """Serves workspace contexts from a tenant fixture."""
+class RecordedProvider:
+    """Serves workspace contexts recorded in a JSON file, for tests only."""
 
-    def __init__(self, tenant_file: str | Path):
-        self.tenant_file = Path(tenant_file)
-        with self.tenant_file.open(encoding="utf-8") as fh:
+    def __init__(self, fixture_file: str | Path = FIXTURE_FILE):
+        self.fixture_file = Path(fixture_file)
+        with self.fixture_file.open(encoding="utf-8") as fh:
             data = json.load(fh)
         self._workspaces: dict[str, dict] = {w["id"]: w for w in data.get("workspaces", [])}
 
@@ -36,15 +42,11 @@ class MockProvider:
     ) -> WorkspaceContext:
         raw = self._workspaces.get(workspace_id)
         if raw is None:
-            # 404 gives the same "not visible to you" guidance the live provider
-            # produces, which is the accurate description for a fixture too.
             raise WorkspaceAccessError(workspace_id, 404)
 
         return WorkspaceContext(
             id=raw["id"],
             display_name=raw.get("displayName", raw["id"]),
-            # An explicit layer from the caller wins; the fixture's own role is
-            # the fallback so the file stays usable on its own.
             layer=layer if layer is not Layer.MIXED else Layer.parse(raw.get("role")),
             capacity_id=raw.get("capacityId"),
             git_connected=bool(raw.get("gitConnected")),

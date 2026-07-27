@@ -90,7 +90,6 @@ export function RunAuditPage() {
 
     try {
       const accepted = await submitAudit({
-        mode: "live",
         pillars: chosen,
         workspaces: chosenWorkspaces,
         auth_session: session,
