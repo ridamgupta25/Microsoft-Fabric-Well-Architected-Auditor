@@ -18,12 +18,16 @@ Design doc: [`../09-fabric-well-architected-auditor-draft.md`](../09-fabric-well
 
 ## Quick start — interactive web UI (recommended)
 
-From this `auditfast-core/` folder:
+Run from the repository root (`auditfast-core/`). The dependencies live in
+`backend/requirements.txt`, and the app is started from the `backend/` folder:
 
 ```powershell
 py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m auditfast serve --project config/project.example.yaml
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r backend/requirements.txt
+
+cd backend
+python -m auditfast serve --project config/project.example.yaml
 ```
 
 Your browser opens `http://127.0.0.1:8000`. In the app you can:
@@ -37,14 +41,16 @@ Your browser opens `http://127.0.0.1:8000`. In the app you can:
   *common to every project*), and
 - download the **Markdown** and **Excel** reports.
 
-The UI uses the Python standard library only — no web framework dependency.
+The backend is a small **Flask** app (app factory + blueprints); the front end is
+plain **HTML/CSS/JS (ES modules)** served as static files, with no build step.
 
 ## Command-line run (headless / CI)
 
 ```powershell
-.\.venv\Scripts\python.exe -m auditfast run --project config/project.example.yaml --mock
+cd backend
+python -m auditfast run --project config/project.example.yaml --mock
 # optional: only score some pillars
-.\.venv\Scripts\python.exe -m auditfast run --project config/project.example.yaml --mock --pillars Security,Reliability
+python -m auditfast run --project config/project.example.yaml --mock --pillars Security,Reliability
 ```
 
 Outputs:
@@ -52,10 +58,11 @@ Outputs:
 - `output/audit-report.md` — WAF-style Markdown report
 - `output/audit-report.xlsx` — Scorecard / Checks / Risk Register sheets
 
-Run the tests:
+Run the tests (from `backend/`):
 
 ```powershell
-.\.venv\Scripts\python.exe tests/test_smoke.py     # built-in runner (pytest optional)
+cd backend
+python -m pytest -q      # 10 tests: rule engine + API (Flask test client)
 ```
 
 ## Live mode (read-only OAuth2)
@@ -67,7 +74,8 @@ Run the tests:
 3. Run:
 
    ```powershell
-   .\.venv\Scripts\python.exe -m auditfast run --project config/my-project.yaml --live
+   cd backend
+   python -m auditfast run --project config/my-project.yaml --live
    ```
 
    You'll be prompted with a device-code URL to sign in. The tool only ever
@@ -88,27 +96,31 @@ models, reports) are Phase 2 / handled via the Excel checklist.
 
 ```
 auditfast-core/
-├─ auditfast/            # package
-│  ├─ cli.py             # `auditfast run ...` and `auditfast serve`
-│  ├─ webapp.py          # stdlib web server (no framework deps)
-│  ├─ web/index.html     # interactive UI (pillars + workspaces + scorecard)
-│  ├─ service.py         # shared run path (used by CLI + web)
-│  ├─ engine.py          # runs checks across workspaces
-│  ├─ scoring.py         # coverage -> 0-3 -> pillar rollup -> rating
-│  ├─ fabric_client.py   # MockFabricClient + LiveFabricClient (read-only)
-│  ├─ auth.py            # MSAL device-code OAuth2 (read-only)
-│  ├─ checks/            # workspace_checks.py + pipeline_checks.py
-│  ├─ report_markdown.py # WAF-style report
-│  └─ report_excel.py    # Scorecard / Checks / Risk Register
-├─ config/               # project.example.yaml + remediation.yaml
-├─ sample_data/          # tenant.json (offline demo)
-└─ tests/                # smoke tests
+├─ backend/
+│  ├─ auditfast/
+│  │  ├─ cli.py            # `auditfast run ...` and `auditfast serve`
+│  │  ├─ core/             # domain: models, scoring, engine, checks/ (no AI)
+│  │  ├─ clients/          # fabric_client — read-only Fabric adapter (mock + live)
+│  │  ├─ services/         # audit_service + auth_service (orchestration)
+│  │  ├─ reporting/        # markdown / excel / console reports
+│  │  ├─ security/         # device_flow — MSAL read-only OAuth2
+│  │  └─ web/              # create_app() Flask factory + routes/ (JSON API)
+│  ├─ config/             # project.example.yaml + remediation.yaml
+│  ├─ sample_data/        # tenant.json (offline demo)
+│  ├─ tests/              # pytest: rule + API tests
+│  ├─ requirements.txt
+│  ├─ wsgi.py             # production WSGI entry (waitress / gunicorn)
+│  └─ run.py
+└─ frontend/
+   ├─ index.html
+   ├─ css/styles.css
+   └─ js/  core/  features/  ui/  main.js
 ```
 
 ## Extending
 
-- **Add a check:** write a function in `checks/workspace_checks.py` or
-  `checks/pipeline_checks.py`, decorate it with `@workspace_check` /
-  `@pipeline_check`, and add its remediation text to `config/remediation.yaml`.
+- **Add a check:** write a function in `backend/auditfast/core/checks/workspace_checks.py`
+  or `pipeline_checks.py`, decorate it with `@workspace_check` / `@pipeline_check`,
+  and add its remediation text to `backend/config/remediation.yaml`.
 - **Tune conventions:** edit `naming_convention`, `pipeline_naming_convention`,
   `orphan_days`, `max_admins` in the project YAML.
