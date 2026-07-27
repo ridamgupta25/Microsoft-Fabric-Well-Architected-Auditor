@@ -1,34 +1,30 @@
 # Architecture
 
-How the code is organized, what depends on what, and exactly what happens when an
-audit runs.
+How the system is organised, what depends on what, and exactly what happens when
+an audit runs.
 
 ---
 
 ## 1. Vocabulary
 
-Four terms carry the whole domain. Get these right and the code reads easily.
+Five terms carry the whole domain.
 
 | Term | Meaning |
 |------|---------|
-| **Project** | One engagement. Spans **one or more** Fabric workspaces. Defined by a YAML file — see [development.md](development.md#project-configuration). |
-| **Workspace** | A Fabric workspace. Audited as a whole unit in Phase 1. |
-| **Layer role** | What a workspace is *for*: `Data Prep`, `Data Storage`, `Data Logs`, `Data Operations`, `Reporting / Semantic`, or `Mixed`. A project's layers usually live in separate workspaces. |
-| **Pillar** | A Well-Architected pillar: Reliability, Security, Cost Optimization, Operational Excellence, Performance Efficiency. Plus `Foundation`, a cross-cutting bucket for informational results that are never scored. |
+| **Project** | One engagement. Spans **one or more** Fabric workspaces. Defined by a YAML file. |
+| **Workspace** | A Fabric workspace, audited as a unit. |
+| **Layer** | What a workspace is *for*: `Data Prep`, `Data Storage`, `Data Logs`, `Data Operations`, `Reporting / Semantic`, `Mixed`. Your "inner pillars". |
+| **Pillar** | A Well-Architected pillar: Reliability, Security, Cost Optimization, Operational Excellence, Performance Efficiency. Plus `Foundation` — cross-cutting, informational, never scored. |
+| **Scope** | The kind of object a check inspects: `workspace`, `pipeline`, and (reserved) `notebook`, `lakehouse`, `semantic_model`, `report`, `eventhouse`. |
 
-Every check also carries a **`ref`** — a dotted string like `2.4.1` or `6.1.2`.
-This is not decorative: it points at a specific line item in the 13-Area
-deep-dive checklist, and it is the key used to look up remediation text in
-[`remediation.yaml`](../backend/config/remediation.yaml). It is the traceability
-spine between the automated tool and the manual audit instrument.
+Every check also carries a **`ref`** — a dotted string like `2.4.1`. It points at
+a line item in the 13-area deep-dive checklist and is the key used to look up
+remediation text. It is the traceability spine between the automated tool and the
+manual audit instrument.
 
-> **Naming note.** The pillar constants live as plain strings in
-> [`core/models.py`](../backend/auditfast/core/models.py), and the layer roles are
-> defined independently in three places: `EXPECTED_TYPES` in
-> [`workspace_checks.py`](../backend/auditfast/core/checks/workspace_checks.py),
-> `PIPELINE_ROLES` in [`engine.py`](../backend/auditfast/core/engine.py), and the
-> `ROLES` array in [`frontend/js/core/state.js`](../frontend/js/core/state.js).
-> They must be kept in sync by hand today.
+All of these are enums in [`core/enums.py`](../backend/src/auditfast/core/enums.py),
+defined exactly once. Previously pillars were bare strings and layer roles were
+re-declared in three places.
 
 ---
 
@@ -36,36 +32,41 @@ spine between the automated tool and the manual audit instrument.
 
 ```mermaid
 flowchart TD
-    UI[frontend/<br/>vanilla ES modules]
-    CLI[cli.py<br/>argparse]
-    WEB[web/routes/<br/>Flask blueprints]
-    SVC[services/<br/>audit_service, auth_service]
-    CORE[core/<br/>models, checks, engine, scoring]
-    CLI2[clients/<br/>Mock + Live Fabric]
-    REP[reporting/<br/>md, xlsx, console]
-    FAB[(Microsoft Fabric<br/>REST API)]
-    FIX[(sample_data/<br/>tenant.json)]
+    UI[React SPA<br/>separate deployable]
+    API[api/v1<br/>FastAPI routers]
+    CLI[cli.py]
+    MCP[mcp/server.py]
+    SVC[services/<br/>orchestration]
+    CORE[core/<br/>engine · checks · scoring]
+    CLIENTS[clients/<br/>Fabric · fixture]
+    REP[reporting/]
+    DB[(database/<br/>job store)]
+    FAB[(Microsoft Fabric<br/>REST, read-only)]
 
-    UI -->|HTTP JSON| WEB
-    WEB --> SVC
+    UI -->|REST/JSON| API
+    API --> SVC
     CLI --> SVC
+    MCP --> SVC
+    API --> DB
     SVC --> CORE
-    SVC --> CLI2
+    SVC --> CLIENTS
     SVC --> REP
-    CORE --> CLI2
-    CLI2 --> FAB
-    CLI2 --> FIX
+    CORE --> CLIENTS
+    CLIENTS --> FAB
 ```
 
-**The dependency rule: arrows point inward, and `core/` imports nothing outward.**
+**The dependency rule: arrows point inward. `core/` imports nothing outward.**
 
-`core/` is pure domain logic — no Flask, no `requests`, no file I/O beyond what
-the checks are handed. `services/` orchestrates but imports no web framework
-(verify with `grep -r flask backend/auditfast/services/` — it returns nothing).
+`core/` is pure domain logic — no FastAPI, no `requests`, no database.
+`services/` orchestrates but imports no web framework. Verify it:
 
-That single property is what makes the CLI, the Flask API, the tests, and any
-future adapter produce identical numbers, because they all enter through the same
-service functions.
+```powershell
+# Returns nothing — the audit engine has no web dependency.
+Select-String -Path backend/src/auditfast/core/*.py,backend/src/auditfast/services/*.py -Pattern "fastapi|flask"
+```
+
+That property is why the REST API, the CLI, and the MCP server produce identical
+results: one implementation, three front doors.
 
 ---
 
@@ -73,263 +74,268 @@ service functions.
 
 | Path | Responsibility |
 |------|----------------|
-| [`core/models.py`](../backend/auditfast/core/models.py) | `CheckResult` dataclass, `Status` / `Severity` enums, pillar constants |
-| [`core/scoring.py`](../backend/auditfast/core/scoring.py) | Coverage → 0–3 band, rating bands, `aggregate()` roll-up |
-| [`core/engine.py`](../backend/auditfast/core/engine.py) | Iterates workspaces, invokes every registered check, handles unreadable workspaces |
-| [`core/checks/base.py`](../backend/auditfast/core/checks/base.py) | The two registries, the `@workspace_check` / `@pipeline_check` decorators, and four result builders |
-| [`core/checks/workspace_checks.py`](../backend/auditfast/core/checks/workspace_checks.py) | 12 workspace-level checks |
-| [`core/checks/pipeline_checks.py`](../backend/auditfast/core/checks/pipeline_checks.py) | 8 per-pipeline checks |
-| [`clients/fabric_client.py`](../backend/auditfast/clients/fabric_client.py) | `MockFabricClient` + `LiveFabricClient`, both emitting the same context shape |
-| [`services/audit_service.py`](../backend/auditfast/services/audit_service.py) | Load project → build client → run → aggregate → write reports → serialize |
-| [`services/auth_service.py`](../backend/auditfast/services/auth_service.py) | Read-only OAuth2 sign-in; in-memory session store |
-| [`security/device_flow.py`](../backend/auditfast/security/device_flow.py) | MSAL device-code flow for the CLI |
-| [`web/__init__.py`](../backend/auditfast/web/__init__.py) | `create_app()` Flask factory |
-| [`web/routes/`](../backend/auditfast/web/routes/) | Five thin blueprints — see [api.md](api.md) |
-| [`reporting/`](../backend/auditfast/reporting/) | Markdown, Excel (3 sheets), console renderers |
-| [`cli.py`](../backend/auditfast/cli.py) | `auditfast run` and `auditfast serve` |
-
-Entry points: [`__main__.py`](../backend/auditfast/__main__.py) (`python -m auditfast`),
-[`run.py`](../backend/run.py) (no `-m` needed), [`wsgi.py`](../backend/wsgi.py)
-(gunicorn / waitress).
+| [`core/enums.py`](../backend/src/auditfast/core/enums.py) | Pillar, Layer, Scope, Resource, Status, Severity |
+| [`core/models.py`](../backend/src/auditfast/core/models.py) | `WorkspaceContext`, `CheckContext`, `CheckSpec`, `CheckResult` |
+| [`core/scoring.py`](../backend/src/auditfast/core/scoring.py) | Bands, ratings, weighted roll-up, pillar×layer matrix |
+| [`core/engine.py`](../backend/src/auditfast/core/engine.py) | Generic scope-driven dispatch |
+| [`core/checks/registry.py`](../backend/src/auditfast/core/checks/registry.py) | The single registry and the `@check` decorator |
+| [`core/checks/helpers.py`](../backend/src/auditfast/core/checks/helpers.py) | `Verdict` and the builders |
+| [`core/checks/workspace/`](../backend/src/auditfast/core/checks/workspace/) | 12 workspace checks, one module per pillar |
+| [`core/checks/pipeline/`](../backend/src/auditfast/core/checks/pipeline/) | 8 pipeline checks, one module per pillar |
+| [`clients/`](../backend/src/auditfast/clients/) | `MockProvider`, `LiveFabricProvider`, the `Provider` protocol |
+| [`services/audit_service.py`](../backend/src/auditfast/services/audit_service.py) | The one audit path |
+| [`services/audit_runner.py`](../backend/src/auditfast/services/audit_runner.py) | Background execution, concurrency limits |
+| [`services/catalog_service.py`](../backend/src/auditfast/services/catalog_service.py) | Catalog questions; no I/O |
+| [`services/project.py`](../backend/src/auditfast/services/project.py) | Project YAML → `ProjectConfig` |
+| [`services/auth_service.py`](../backend/src/auditfast/services/auth_service.py) | Read-only Entra sign-in |
+| [`api/v1/`](../backend/src/auditfast/api/v1/) | 8 routers, 24 endpoints |
+| [`api/deps.py`](../backend/src/auditfast/api/deps.py) | Dependency injection |
+| [`api/errors.py`](../backend/src/auditfast/api/errors.py) | Exception → HTTP mapping |
+| [`schemas/`](../backend/src/auditfast/schemas/) | Pydantic request/response models |
+| [`config/`](../backend/src/auditfast/config/) | Settings, structured logging |
+| [`database/`](../backend/src/auditfast/database/) | Job model + repository pattern |
+| [`ai/`](../backend/src/auditfast/ai/) | Scaffolding only — nothing implemented |
+| [`mcp/server.py`](../backend/src/auditfast/mcp/server.py) | MCP tools over the same services |
 
 ---
 
-## 4. What happens during a run
-
-Tracing `POST /api/run` end to end.
+## 4. What happens during an audit
 
 ```mermaid
 sequenceDiagram
-    participant B as Browser
-    participant R as audit_routes
+    participant UI as React
+    participant API as api/v1/audit
+    participant R as AuditRunner
     participant S as audit_service
-    participant E as engine
-    participant C as client
-    participant A as scoring
+    participant E as core/engine
+    participant P as Provider
 
-    B->>R: POST /api/run {mode, pillars, workspaces[]}
-    R->>R: resolve auth token (live mode only)
-    R->>S: run_audit(...)
-    S->>S: load project YAML + remediation.yaml
-    S->>C: build Mock or Live client
-    S->>E: run_audit(client, workspaces, settings)
+    UI->>API: POST /api/v1/audit
+    API->>API: resolve token (live only)
+    API->>R: submit(...)
+    R-->>API: audit_id
+    API-->>UI: 202 {audit_id, status}
+    Note over R: background task
+    R->>S: run_audit (in a worker thread)
+    S->>E: run(provider, targets, settings)
     loop each workspace
-        E->>C: get_workspace_context(id, role)
-        C-->>E: normalized context dict
-        E->>E: run 12 workspace checks
-        E->>E: run 8 pipeline checks per pipeline
+        E->>E: select checks for (pillars, layer)
+        E->>P: fetch(id, layer, required resources)
+        loop each scope, each object
+            E->>E: run the checks for that scope
+        end
     end
     E-->>S: list[CheckResult]
-    S->>S: filter by selected pillars
-    S->>A: aggregate(results)
-    S->>S: write Markdown + Excel
-    S-->>R: {agg, results, files}
-    R-->>B: to_json(...)
+    S->>S: aggregate + write reports
+    S-->>R: AuditRun
+    UI->>API: GET /api/v1/audit/{id} (poll)
+    UI->>API: GET /api/v1/reports/{id}
 ```
 
-Step by step:
+**Why fire-and-poll:** a tenant-wide audit issues many sequential Fabric calls
+and can take minutes. A synchronous endpoint would tie up a worker and time out
+at any gateway in front of it.
 
-1. **Parse** — [`audit_routes.py:15-27`](../backend/auditfast/web/routes/audit_routes.py#L15-L27). The UI sends `workspaces` as `[{id, role, name}]`; older callers may send bare id strings, and both are accepted. In live mode the `auth_session` is exchanged for a token, or the request fails with 400.
-2. **Load config** — [`audit_service.py:94-96`](../backend/auditfast/services/audit_service.py#L94-L96). Reads the project YAML, then loads `remediation.yaml` into a module-level dict via `set_remediation()`. *This is global mutable state* — the last caller wins, which matters if you ever run two projects concurrently in one process.
-3. **Build a client** — `MockFabricClient` (reads a JSON fixture) or `LiveFabricClient` (Fabric REST with a bearer token).
-4. **Run the engine** — [`engine.py:27-62`](../backend/auditfast/core/engine.py#L27-L62). For each workspace it fetches the context, runs every workspace check, then — only if the layer role is in `PIPELINE_ROLES` — runs every pipeline check against every pipeline.
-5. **Filter by pillar** — [`audit_service.py:109-111`](../backend/auditfast/services/audit_service.py#L109-L111). Note this happens **after** all checks have run, so in live mode you pay for every API call even for deselected pillars. Unscored results (INFO, access errors) always survive the filter.
-6. **Aggregate** — see [scoring.md](scoring.md).
-7. **Write reports** — Markdown and Excel into `OUT_DIR`, retrievable via `/api/download/<kind>`.
-8. **Serialize** — `to_json()` splits `WS-ACCESS` results out of `results` into a separate `errors` array so unreadable workspaces surface as warnings rather than as ordinary failing checks.
-
-### Unreadable workspaces
-
-A workspace that is missing, forbidden, or unreachable does **not** silently score
-zero. The client raises `WorkspaceAccessError`, the engine converts it into a
-non-scored `WS-ACCESS` result ([`engine.py:13-24`](../backend/auditfast/core/engine.py#L13-L24)),
-and the UI renders it in a warning banner. `WorkspaceAccessError._friendly()`
-maps HTTP 401/403/404 to plain-English guidance.
-
-This distinction is deliberate and worth preserving: *"we could not look"* is not
-the same finding as *"we looked and it was misconfigured."*
+**Why a worker thread:** `run_audit` is synchronous and I/O-bound. Calling it
+directly from an async handler would block the event loop and stall every other
+request. `AuditRunner` dispatches it via `asyncio.to_thread` behind a semaphore
+that caps concurrent audits.
 
 ---
 
-## 5. Contract 1 — the workspace context
+## 5. The engine is generic
 
-The most important interface in the system. Both clients emit exactly this shape,
-which is why every check runs unmodified against offline fixtures.
+The engine knows nothing about any specific check, pillar, or artifact type. It
+dispatches purely on `Scope`:
 
 ```python
-{
-  "id": "ws-prep-01",
-  "displayName": "Sales-Prod-DataPrep",
-  "role": "Data Prep",                    # layer role, injected by the caller
-  "capacityId": "cap-123" | None,
-  "gitConnected": True | False,
-  "deploymentPipeline": True | False,
-  "roleAssignments": [
-      {"principalType": "User"|"Group"|"Guest", "displayName": str, "role": "Admin"|...}
-  ],
-  "items": [
-      {"id": str, "type": "Lakehouse"|"DataPipeline"|..., "displayName": str,
-       "sensitivityLabel": str | None, "lastRunUtc": "2026-01-01T00:00:00Z" | None}
-  ],
-  "pipelines": {"<pipeline name>": <ADF/Fabric pipeline definition dict>}
-}
+for workspace_id, layer in targets:
+    specs = registry.select(pillars=..., layer=layer)
+    resources = registry.required_resources(specs)   # only fetch what's needed
+    workspace = provider.fetch(workspace_id, layer, resources)
+
+    for scope in registry.scopes(specs):
+        for obj_name, obj in workspace.objects(scope):
+            for spec in specs_for(scope):
+                emit(spec.fn(CheckContext(workspace, settings, obj_name, obj)))
 ```
 
-Defined in [`fabric_client.py:11-18`](../backend/auditfast/clients/fabric_client.py#L11-L18).
-It is a plain `dict`, so it is untyped and unvalidated — checks access it with
-`.get()` and defensive defaults throughout.
+Adding a new artifact type — lakehouses, semantic models, notebooks — means:
 
-**Adding a new data source** means writing a class with one method,
-`get_workspace_context(ws_id, role) -> dict`, that returns this shape. Nothing in
-`core/` needs to change.
+1. add a `Scope` member,
+2. teach a provider to yield those objects,
+3. write checks tagged with that scope.
 
-### How the live client fills it
-
-`LiveFabricClient.get_workspace_context()` reads the workspace first and checks
-the HTTP status *before* anything else, so a 403 fails loudly rather than
-producing an empty context. It then issues:
-
-| Call | Fills |
-|------|-------|
-| `GET /workspaces/{id}` | `displayName`, `capacityId`, `deploymentPipeline` |
-| `GET /workspaces/{id}/items` | `items` |
-| `GET /workspaces/{id}/roleAssignments` | `roleAssignments` |
-| `GET /workspaces/{id}/git/connection` | `gitConnected` |
-| `POST /workspaces/{id}/items/{item}/getDefinition` | `pipelines` — one call **per pipeline** |
-
-All calls are read-only (`getDefinition` is a POST but does not mutate).
-
-> **Known issue.** `_get()` ([`fabric_client.py:99-106`](../backend/auditfast/clients/fabric_client.py#L99-L106))
-> swallows every exception and returns `None`. A network blip is therefore
-> indistinguishable from "the feature is not configured", and scores as a
-> failure. `Status.NA` exists in the model but is never produced.
+[`engine.py`](../backend/src/auditfast/core/engine.py) does not change.
 
 ---
 
-## 6. Contract 2 — CheckResult
+## 6. Contract 1 — the workspace context
 
-Every check returns one of these (or a list of them). Defined in
-[`core/models.py:45-64`](../backend/auditfast/core/models.py#L45-L64).
-
-| Field | Notes |
-|-------|-------|
-| `check_id` | Stable code, e.g. `WS-GIT`, `PL-RETRY` |
-| `ref` | Checklist reference — also the remediation lookup key |
-| `title`, `pillar`, `evidence`, `recommendation` | Human-facing |
-| `status` | `PASS` / `PARTIAL` / `FAIL` / `N/A` / `INFO` |
-| `score` | `0`–`3`, or `None` for informational results |
-| `coverage` | `0.0`–`1.0` for proportional checks, else `None` |
-| `severity` | Forced to `Informational` when the check passes |
-| `workspace`, `workspace_role`, `obj` | Where the finding is. `obj` is blank for workspace-level checks |
-| `scored` | `False` excludes the result from all score maths |
-
-`MAX_SCORE = 3` is a class attribute on the dataclass.
-
----
-
-## 7. Check registration — an import side effect
-
-This mechanism is load-bearing and easy to trip over.
-
-The decorators in [`base.py:29-36`](../backend/auditfast/core/checks/base.py#L29-L36)
-append the function to a module-level list at **import time**:
+The most important interface in the system. Every provider emits this, which is
+why checks run unmodified against live data or an offline fixture.
 
 ```python
-WORKSPACE_CHECKS: list = []
-PIPELINE_CHECKS: list = []
-
-def workspace_check(fn):
-    WORKSPACE_CHECKS.append(fn)
-    return fn
+@dataclass
+class WorkspaceContext:
+    id: str
+    display_name: str
+    layer: Layer
+    capacity_id: str | None
+    git_connected: bool
+    deployment_pipeline: bool
+    role_assignments: list[RoleAssignment]
+    items: list[Item]
+    pipelines: dict[str, dict]      # name -> parsed definition
+    unavailable: set[Resource]      # what could NOT be read
 ```
 
-Those imports are triggered by
-[`checks/__init__.py`](../backend/auditfast/core/checks/__init__.py), which imports
-both check modules purely for the side effect. Importing `engine` transitively
-pulls in the package, so by the time anything calls `run_audit()` all 20 checks
-are registered.
+`unavailable` is what separates *"we could not determine this"* from *"this is
+not configured"*. A check whose data landed there reports **N/A** instead of
+failing — a network error must not look like a misconfiguration.
 
-> **Gotcha:** a new check module that is not imported in `checks/__init__.py` will
-> register nothing and fail silently — no error, the checks just never run. See
-> [checks.md](checks.md#adding-a-check).
+**Adding a data source** means writing one method:
 
-Because registration stores only the bare function, a check's pillar, ref and
-severity are hardcoded inside the function body and do not exist until the check
-has already executed. That is why pillar filtering has to happen after the run,
-and why there is currently no way to list the check catalog without running an
-audit.
+```python
+def fetch(self, workspace_id, layer, resources) -> WorkspaceContext: ...
+```
 
----
+Nothing in `core/` changes.
 
-## 8. Authentication
+### Resource-driven fetching
 
-Read-only throughout. Three ways in, all producing a delegated bearer token:
+Checks declare what they need via `requires=`. The engine unions the
+requirements of the *selected* checks and passes that set to the provider, so a
+run that scores no pipeline checks never pays for `getDefinition` — one call per
+pipeline, the most expensive operation in a live audit.
 
-| Flow | Where | Used by |
-|------|-------|---------|
-| Interactive browser sign-in | [`auth_service.login_interactive()`](../backend/auditfast/services/auth_service.py) | Web UI, primary path |
-| Existing `az login` session | `auth_service.login_azcli()` | Web UI, no app registration needed |
-| Device code | `auth_service.start_device_flow()` and [`security/device_flow.py`](../backend/auditfast/security/device_flow.py) | CLI / headless |
-
-Interactive and device-code flows run MSAL on a **background thread** and return
-a session id immediately; the browser polls `/api/auth/poll` until the status
-flips to `done`.
-
-Tokens are held in `_SESSIONS`, a module-level dict
-([`auth_service.py:29`](../backend/auditfast/services/auth_service.py#L29)). They
-live only for the process lifetime and are never written to disk or logged.
-
-Requested scopes default to `Workspace.Read.All` and `Item.Read.All`. When no
-client id is configured the service falls back to Microsoft's first-party Azure
-CLI public client so a user can sign in with just an email — some tenants block
-this via Conditional Access, in which case a real app registration is required.
-
-> **Known issue.** Because `_SESSIONS` is a process-local global, sign-in breaks
-> under any multi-worker WSGI deployment: the poll can land on a different worker
-> than the one holding the session. Fine for `serve`; not production-ready.
+| Resource | Live cost |
+|----------|-----------|
+| `WORKSPACE` | 1 call, always made |
+| `ITEMS` | 1 call |
+| `ROLE_ASSIGNMENTS` | 1 call |
+| `GIT` | 1 call |
+| `PIPELINE_DEFINITIONS` | **one call per pipeline** |
 
 ---
 
-## 9. Front end
+## 7. Contract 2 — checks carry metadata
 
-Vanilla ES modules, no build step, no framework. Flask serves
-[`frontend/index.html`](../frontend/index.html) at `/` and the assets under
-`/static`.
+A check declares everything about itself at registration:
 
-| File | Role |
+```python
+@check(
+    id="PL-RETRY", ref="2.4.1",
+    title="Retry policy configured on activities",
+    pillar=Pillar.RELIABILITY, scope=Scope.PIPELINE,
+    severity=Severity.HIGH, layers=PIPELINE_LAYERS,
+    requires=[Resource.PIPELINE_DEFINITIONS],
+)
+def retry_policy(ctx: CheckContext) -> Verdict:
+    """Activities that call external systems retry before failing."""
+    acts = activities(ctx.obj)
+    with_retry = [a for a in acts if (a.get("policy") or {}).get("retry", 0) >= 1]
+    return covered(len(with_retry), len(acts),
+                   f"{len(with_retry)} of {len(acts)} activities have a retry policy")
+```
+
+The check returns a small `Verdict` — a score plus evidence. The engine combines
+it with the registered `CheckSpec` to build the full `CheckResult`. That split is
+why a check body is three lines instead of ten: id, ref, title, pillar, severity,
+weight, scope, workspace name, and object name all come from elsewhere.
+
+Because metadata exists before execution, the system can:
+
+- list the catalog without running an audit (`GET /catalog/checks`),
+- run one check by id (`POST /audit/check`),
+- filter *before* running, so deselecting a pillar skips its Fabric calls.
+
+See [checks.md](checks.md) for the full catalog and how to add one.
+
+---
+
+## 8. Registration is an import side effect
+
+The `@check` decorator registers at import time. Those imports are triggered by
+[`core/checks/__init__.py`](../backend/src/auditfast/core/checks/__init__.py),
+which imports every check module purely for the side effect.
+
+> **Gotcha:** a new check module not imported there registers nothing, raises
+> nothing, and its checks silently never run. `registered_modules()` exists so a
+> test can assert the list has not drifted, and `/api/v1/health` reports
+> `checks_registered` so an empty catalog is visible rather than silent.
+
+---
+
+## 9. Authentication
+
+Read-only throughout. Three ways in, all yielding a delegated bearer token:
+
+| Flow | Used by |
+|------|---------|
+| Interactive browser sign-in | Web UI, primary |
+| Existing `az login` | Web UI, no app registration needed |
+| Device code | CLI / headless |
+
+MSAL runs on a background thread; the caller receives a session id and polls.
+**The token never leaves the server** — the browser holds only an opaque session
+id, so a compromised browser cannot yield a Fabric access token.
+
+> **Known limitation:** sessions live in a process-local dict, so sign-in does
+> not survive a restart and is not shared across replicas. See
+> [scalability.md](scalability.md#session-storage).
+
+---
+
+## 10. Frontend
+
+React 18 + TypeScript + Vite + Tailwind + Axios, a **completely separate
+deployable**. The API returns JSON only and renders no HTML.
+
+| Path | Role |
 |------|------|
-| [`js/main.js`](../frontend/js/main.js) | Entry point: loads config, wires every DOM event |
-| [`js/core/api.js`](../frontend/js/core/api.js) | The only module that calls `fetch` |
-| [`js/core/state.js`](../frontend/js/core/state.js) | Single mutable `state` object, plus `ROLES` and pillar help text |
-| [`js/core/utils.js`](../frontend/js/core/utils.js) | `esc`, `fmt`, `ratingOf`, `sevColor` |
-| [`js/features/auth.js`](../frontend/js/features/auth.js) | Sign-in and the poll loop |
-| [`js/features/workspaces.js`](../frontend/js/features/workspaces.js) | Workspace list, selection, role assignment |
-| [`js/features/results.js`](../frontend/js/features/results.js) | Renders the scorecard, findings, and check table |
-| [`js/ui/loading.js`](../frontend/js/ui/loading.js), [`js/ui/game.js`](../frontend/js/ui/game.js) | Loading overlay; optional mini-game (removable — delete the import in `main.js`) |
+| `src/services/` | The only modules that call the API; one Axios instance |
+| `src/types/api.ts` | The API contract, mirrored from the Pydantic schemas |
+| `src/hooks/useAsync.ts` | Shared async state: data, loading, error, reload |
+| `src/context/AuditContext.tsx` | Mode, sign-in session, most recent audit |
+| `src/pages/` | Dashboard, Run audit, Report, Catalog, History, Sign in |
+| `src/components/` | `PillarMatrix`, `FindingsTable`, shared UI primitives |
+| `src/utils/format.ts` | Rating bands, percentage and duration formatting |
 
-State is exported as one mutable object rather than as `let` bindings, because an
-imported binding is read-only and could not be reassigned across modules.
-
-`results.js` renders `by_pillar` keyed on the pillar list from `/api/config`, so
-adding a pillar server-side flows through without a front-end change. Adding a
-*layer* dimension would require a new render path.
+In development Vite proxies `/api` to the backend, so the browser makes
+same-origin requests and no CORS is involved. In production the app is built to
+static files and points at the API origin via `VITE_API_BASE_URL`.
 
 ---
 
-## 10. Structural constraints to know before extending
+## 11. Cross-cutting concerns
 
-Honest list of what will resist change, with pointers to the detail.
+| Concern | Where | Note |
+|---------|-------|------|
+| **Settings** | `config/settings.py` | pydantic-settings, `AUDITFAST_` prefix |
+| **Logging** | `config/logging.py` | Structured JSON when hosted; correlation id on every record |
+| **Correlation ids** | `api/middleware.py` | Generated or honoured from the request, echoed in the response |
+| **Errors** | `api/errors.py` | Every failure returns the same JSON shape with a correlation id |
+| **Validation** | `schemas/` | Pydantic; invalid requests fail before reaching a service |
+| **Persistence** | `database/repositories/` | Protocol + in-memory implementation |
 
-| Constraint | Impact |
+Internal exception messages are never returned to clients — they can carry
+workspace ids and file paths. The client gets a correlation id; the detail goes
+to the log.
+
+---
+
+## 12. Known limitations
+
+Honest list, with pointers.
+
+| Limitation | Impact |
 |------------|--------|
-| Checks carry no metadata until they run | Cannot list the catalog, cannot run one check by id, cannot filter before execution |
-| One registry per object type, with a matching branch in the engine | Every new artifact type (lakehouse, semantic model, notebook) needs a new registry and an engine edit |
-| Two different check signatures | `fn(ws, settings)` vs `fn(ws, name, definition, settings)`; each new type invents a third |
-| Layer roles duplicated in three places | Must be edited in sync |
-| Scoring is an unweighted mean | Diverges from the rubric — see [scoring.md](scoring.md#divergence-from-the-rubric-no-weights) |
-| `set_remediation()` mutates module state | Not safe for concurrent multi-project runs |
-| `_SESSIONS` is process-local | Breaks under multi-worker WSGI |
-| No `pyproject.toml` | Tests need a `sys.path.insert` shim ([`test_smoke.py:5`](../backend/tests/test_smoke.py#L5)) |
+| Job store is in-memory | History dies with the process; not shared across replicas |
+| Auth sessions are process-local | Breaks under multi-worker or multi-replica deployment |
+| Reports written to a fixed filename | Concurrent audits overwrite each other's files |
+| All check weights are 1.0 | Roll-up is effectively unweighted; the mechanism exists but is untuned |
+| No AI | Only `ai/` scaffolding; deliberate |
+| Performance Efficiency has 0 checks | The pillar reports "not assessed" |
 
-None of these block Phase 1. All of them will be felt when the check library
-grows past pipelines into the other four layers.
+All are addressed in [scalability.md](scalability.md).

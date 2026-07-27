@@ -1,26 +1,32 @@
 # Checks
 
-The check library is the heart of the tool. This document lists every check that
-exists today and explains how to add one.
+The check library is the heart of the tool. This page lists every check and
+explains how to add one.
 
 ---
 
 ## What a check is
 
 A small **pure function** that inspects one implemented object and returns a
-`CheckResult` with a fixed status, a fixed 0–3 score, and a pre-written
-recommendation. No AI, no network calls of its own, no side effects — it is
-handed data and returns a verdict.
+`Verdict` — a score plus the evidence for it. No AI, no network calls of its own,
+no side effects: it is handed data and returns a judgement.
 
-Two kinds exist today:
+```python
+@check(
+    id="WS-GIT", ref="11.1.2", title="Git integration enabled",
+    pillar=Pillar.OPEX, scope=Scope.WORKSPACE,
+    severity=Severity.MEDIUM, requires=[Resource.GIT],
+)
+def git_connected(ctx: CheckContext) -> Verdict:
+    """The workspace is connected to Git so its items are source-controlled."""
+    ok = ctx.workspace.git_connected
+    return binary(ok, "Workspace is connected to Git" if ok
+                  else "Workspace is not connected to Git")
+```
 
-| Kind | Signature | Runs |
-|------|-----------|------|
-| **Workspace check** | `fn(ws: dict, settings: dict)` | Once per workspace |
-| **Pipeline check** | `fn(ws: dict, name: str, definition: dict, settings: dict)` | Once per pipeline, per workspace |
-
-`ws` is the [workspace context](architecture.md#5-contract-1--the-workspace-context).
-`settings` is the `project:` block of the project YAML.
+Everything else — id, ref, title, pillar, severity, weight, scope, workspace
+name, object name, and the remediation lookup — comes from the registered
+`CheckSpec` and the run context. That is why check bodies stay short.
 
 ---
 
@@ -28,168 +34,164 @@ Two kinds exist today:
 
 ### Workspace checks — 12
 
-Registered in [`workspace_checks.py`](../backend/auditfast/core/checks/workspace_checks.py).
-These are the **common** checks: they run for every workspace in every project
-regardless of source system.
+In [`core/checks/workspace/`](../backend/src/auditfast/core/checks/workspace/),
+one module per pillar. These are the **common** checks: they run for every
+workspace in every project.
 
-| Check ID | Ref | Title | Pillar | Shape | Severity on failure |
-|----------|-----|-------|--------|-------|---------------------|
-| `WS-NAME` | 1.1.7 | Workspace naming convention | Operational Excellence | binary | Low |
-| `WS-ROLES-GROUPS` | 6.1.2 | Roles assigned to security groups, not individuals | Security | coverage | High |
-| `WS-LEASTPRIV` | 6.1.8 | Least-privilege admin grants | Security | scored | High |
-| `WS-GUESTS` | 6.1 | No unmanaged external / guest access | Security | binary | High |
-| `WS-LABELS` | 6.2.4 | Sensitivity labels applied to items | Security | coverage | Medium |
-| `WS-GIT` | 11.1.2 | Git integration enabled | Operational Excellence | binary | Medium |
-| `WS-DEPLOY` | 11.2 | Deployment pipeline configured | Operational Excellence | binary | Medium |
-| `WS-CAPACITY` | 12.1 | Capacity assigned | Cost Optimization | binary | High |
-| `WS-ORPHAN` | 12.3.4 | No orphaned / stale items | Cost Optimization | coverage | Low |
-| `WS-INVENTORY` | 1.1 | Item inventory | Foundation | info | — never scored |
-| `WS-LAYER-CONTENT` | 1.1.2 | Contains the items its layer role expects | Operational Excellence | binary | Medium |
-| `WS-LAYER-SEP` | 1.1.2 | Free of other layers' item types | Operational Excellence | binary | Medium |
+| Check ID | Ref | Title | Pillar | Severity |
+|----------|-----|-------|--------|----------|
+| `WS-NAME` | 1.1.7 | Workspace naming convention | Operational Excellence | Low |
+| `WS-GIT` | 11.1.2 | Git integration enabled | Operational Excellence | Medium |
+| `WS-DEPLOY` | 11.2 | Deployment pipeline configured | Operational Excellence | Medium |
+| `WS-LAYER-CONTENT` | 1.1.2 | Contains the expected items for its layer | Operational Excellence | Medium |
+| `WS-LAYER-SEP` | 1.1.2 | Free of other layers' concerns | Operational Excellence | Medium |
+| `WS-ROLES-GROUPS` | 6.1.2 | Roles assigned to security groups, not individuals | Security | High |
+| `WS-LEASTPRIV` | 6.1.8 | Least-privilege admin grants | Security | High |
+| `WS-GUESTS` | 6.1 | No unmanaged external / guest access | Security | High |
+| `WS-LABELS` | 6.2.4 | Sensitivity labels applied to items | Security | Medium |
+| `WS-CAPACITY` | 12.1 | Capacity assigned | Cost Optimization | High |
+| `WS-ORPHAN` | 12.3.4 | No orphaned / stale items | Cost Optimization | Low |
+| `WS-INVENTORY` | 1.1 | Item inventory | Foundation | — informational |
 
 Notable logic:
 
-- **`WS-LEASTPRIV`** is graded, not binary: `3` at or under `max_admins`, `1` up to
-  two over, `0` beyond that.
-- **`WS-ORPHAN`** treats an item as stale when `lastRunUtc` is missing, unparseable,
-  or older than `orphan_days`.
-- **`WS-LAYER-CONTENT` / `WS-LAYER-SEP`** are the only role-aware checks. They
-  compare the workspace's item types against `EXPECTED_TYPES`
-  ([`workspace_checks.py:16-22`](../backend/auditfast/core/checks/workspace_checks.py#L16-L22)).
-  A workspace whose role has no entry there — including `Mixed` and untagged —
-  returns an informational result instead.
+- **`WS-LEASTPRIV`** is graded, not binary: `3` at or under `max_admins`, `1` up
+  to two over, `0` beyond.
+- **`WS-ORPHAN`** treats an item as stale when `lastRunUtc` is missing,
+  unparseable, or older than `orphan_days` — unprovable use *is* the cost problem.
+- **`WS-LAYER-CONTENT` / `WS-LAYER-SEP`** are the layer-aware pair, comparing the
+  workspace's item types against `LAYER_ITEM_TYPES`. A role with no entry —
+  `Mixed`, or untagged — yields an informational result instead.
 
 ### Pipeline checks — 8
 
-Registered in [`pipeline_checks.py`](../backend/auditfast/core/checks/pipeline_checks.py).
-Each inspects one pipeline definition. They verify that the *implemented*
-pipeline follows best practice; they never trace where data comes from or goes.
+In [`core/checks/pipeline/`](../backend/src/auditfast/core/checks/pipeline/).
+Each inspects one pipeline definition and verifies the *implemented* pipeline
+follows best practice; none trace where data comes from or goes.
 
-| Check ID | Ref | Title | Pillar | Shape | Severity on failure |
-|----------|-----|-------|--------|-------|---------------------|
-| `PL-NAME` | 2.1.1 | Pipeline naming convention | Operational Excellence | binary | Low |
-| `PL-DESC` | 2.1.6 | Descriptions / annotations populated | Operational Excellence | coverage | Low |
-| `PL-PARAM` | 2.1.2 | Parameterized — no hardcoded endpoints | Operational Excellence | scored | Medium |
-| `PL-RETRY` | 2.4.1 | Retry policy configured on activities | Reliability | coverage | High |
-| `PL-FAILPATH` | 2.4.3 | On-failure path defined | Reliability | binary | Medium |
-| `PL-NOTIFY` | 2.4.5 | Failure notification present | Reliability | binary | Medium |
-| `PL-TIMEOUT` | 2.4 | Explicit activity timeouts set | Reliability | coverage | Low |
-| `PL-SECRETS` | 6.4.2 | No hardcoded secrets in pipeline | Security | binary | **Critical** |
+| Check ID | Ref | Title | Pillar | Severity |
+|----------|-----|-------|--------|----------|
+| `PL-NAME` | 2.1.1 | Pipeline naming convention | Operational Excellence | Low |
+| `PL-DESC` | 2.1.6 | Descriptions / annotations populated | Operational Excellence | Low |
+| `PL-PARAM` | 2.1.2 | Parameterized — no hardcoded endpoints | Operational Excellence | Medium |
+| `PL-RETRY` | 2.4.1 | Retry policy configured on activities | Reliability | High |
+| `PL-FAILPATH` | 2.4.3 | On-failure path defined | Reliability | Medium |
+| `PL-NOTIFY` | 2.4.5 | Failure notification present | Reliability | Medium |
+| `PL-TIMEOUT` | 2.4 | Explicit activity timeouts set | Reliability | Low |
+| `PL-SECRETS` | 6.4.2 | No hardcoded secrets in pipeline | Security | **Critical** |
 
 Notable logic:
 
 - **`PL-PARAM`** is three-valued: `0` if a hardcoded endpoint literal is found,
   `3` if parameters are declared and nothing hardcoded, `1` if neither.
 - **`PL-TIMEOUT`** only counts a timeout that is *not* one of Fabric's defaults —
-  `7.00:00:00` and friends are treated as "not explicitly set".
-- **`PL-SECRETS`** and **`PL-PARAM`** regex-scan the serialized definition JSON, so
-  they can produce false positives on parameter names that merely look like
-  secrets. Pattern lists are at the top of the module.
-- **`PL-NOTIFY`** matches on either activity type (`Teams`, `Office365Outlook`,
-  `SendEmail`, `WebHook`) or an activity name matching `notif|alert|email|teams`.
+  `7.00:00:00` and friends mean "nobody set this".
+- **`PL-SECRETS`** reports only the *number* of matching patterns, never the
+  matched text: an audit report must not become a second copy of the secret.
 
 ### Synthetic result
 
-| Check ID | Ref | Meaning |
-|----------|-----|---------|
-| `WS-ACCESS` | — | The workspace could not be read at all. Emitted by [`engine.py`](../backend/auditfast/core/engine.py#L13-L24), never scored, surfaced by the API in a separate `errors` array. |
+| Check ID | Meaning |
+|----------|---------|
+| `WS-ACCESS` | The workspace could not be read at all. Never scored; surfaced by the API in a separate `errors` array. |
 
-### Coverage by pillar
+### Coverage
 
-| Pillar | Checks | Gap |
-|--------|-------:|-----|
-| Operational Excellence | 8 | — |
-| Security | 5 | — |
-| Reliability | 4 | — |
-| Cost Optimization | 2 | Thin — capacity and orphans only |
-| **Performance Efficiency** | **0** | Entirely Phase 2. The UI ships its checkbox unticked by default. |
+| Pillar | Checks |
+|--------|-------:|
+| Operational Excellence | 8 |
+| Security | 5 |
+| Reliability | 4 |
+| Cost Optimization | 2 |
+| **Performance Efficiency** | **0** — not yet automated |
 
-By object type, everything today is either workspace-level or pipeline-level.
-Lakehouse / Delta, notebooks, semantic models, and Eventhouse have **no automated
-checks** and are handled by the manual Excel checklist.
+By object type everything is workspace- or pipeline-level. Lakehouse/Delta,
+notebooks, semantic models and Eventhouse have no automated checks yet; the
+`Scope` members exist so adding them needs no engine change.
+
+Browse it live: `GET /api/v1/catalog/checks`, or `auditfast checks --pillar Security`.
 
 ---
 
 ## Which checks run
 
-Two filters apply, and they behave differently.
+Two filters, both applied **before** execution.
 
-**Layer role** gates pipeline checks only, in the engine:
+**Layer** — a check declares which layers it applies to. Pipeline checks use:
 
 ```python
-PIPELINE_ROLES = {"Data Prep", "Data Operations", "Mixed", ""}
+PIPELINE_LAYERS = (Layer.PREP, Layer.OPERATIONS, Layer.MIXED)
 ```
 
-A workspace tagged `Data Storage`, `Data Logs`, or `Reporting / Semantic` gets the
-12 workspace checks but no pipeline checks, even if it contains pipelines.
+So a `Data Storage` workspace gets the 12 workspace checks and no pipeline
+checks, even if it contains pipelines. Its layer-separation check will still flag
+those pipelines as foreign — that *is* the finding.
 
-**Pillar selection** is applied to the *results*, after everything has run
-([`audit_service.py:109-111`](../backend/auditfast/services/audit_service.py#L109-L111)).
-Deselecting a pillar therefore saves no work — in live mode you still pay for
-every Fabric API call. Unscored results always survive the filter, so
-informational rows and access errors are never hidden.
+**Pillar** — narrows the set before anything is fetched, so deselecting a pillar
+genuinely skips its Fabric API calls.
+
+Because selection precedes fetching, the engine unions the `requires` of the
+selected checks and asks the provider for only that. A run with no pipeline
+checks never pays for `getDefinition` — one call per pipeline.
 
 ---
 
-## Result builders
+## Verdict builders
 
-Never construct a `CheckResult` by hand. Four builders in
-[`base.py`](../backend/auditfast/core/checks/base.py) cover every shape and
-handle severity downgrading and remediation lookup for you.
+Never construct a `CheckResult`. Return a `Verdict` from one of these
+([`core/checks/helpers.py`](../backend/src/auditfast/core/checks/helpers.py)):
 
 | Builder | Use when | Score |
 |---------|----------|-------|
-| `binary_result(ok=...)` | It is either done or not | `3` or `0` |
-| `coverage_result(coverage=...)` | *N of M* objects comply | banded from the ratio — see [scoring.md](scoring.md) |
-| `scored_result(score=...)` | You need graded judgement | you supply `0`–`3` |
-| `info_result()` | Reporting a fact, not a verdict | `None`, `scored=False` |
+| `binary(ok, evidence)` | It is either done or not | `3` or `0` |
+| `covered(n, total, evidence)` | *N of M* objects comply | banded from the ratio |
+| `graded(score, evidence)` | Genuine middle ground | you supply `0`–`3` |
+| `note(evidence)` | Reporting a fact, not a verdict | unscored, `INFO` |
+| `not_applicable(evidence)` | The data could not be read | unscored, `N/A` |
 
-All four automatically:
+`covered()` handles the empty population (an empty collection is vacuously
+compliant), removing the `x / len(items) if items else 1.0` idiom every coverage
+check used to repeat — along with its zero-division risk.
 
-- derive `status` from the score,
-- set `severity` to `Informational` when the check passes, and your
-  `fail_severity` otherwise,
-- look up `recommendation` from `remediation.yaml` by `ref` — **only on failure**.
+`not_applicable()` matters: *"we could not determine this"* must not score the
+same as *"this is not configured"*.
 
 ---
 
 ## Adding a check
 
-### 1. Write the function
+### 1. Write it
 
-In [`workspace_checks.py`](../backend/auditfast/core/checks/workspace_checks.py)
-or [`pipeline_checks.py`](../backend/auditfast/core/checks/pipeline_checks.py):
+Pick the module matching its scope and pillar, e.g.
+[`core/checks/workspace/cost.py`](../backend/src/auditfast/core/checks/workspace/cost.py):
 
 ```python
-@workspace_check
-def ws_dataflow_gen1(ws, s):
-    """Flag deprecated Dataflow Gen1 items."""
-    items = ws.get("items", [])
-    gen1 = [i for i in items if i.get("type") == "Dataflow"]
-    return binary_result(
-        check_id="WS-DF-GEN1", ref="1.2.3",
-        title="No deprecated Dataflow Gen1 items",
-        pillar=OPEX, ok=not gen1,
-        workspace=ws.get("displayName", ""), ws_role=ws.get("role", ""),
-        evidence=f"{len(gen1)} Gen1 dataflow(s) found",
-        fail_severity=Severity.MEDIUM,
-    )
+@check(
+    id="WS-DF-GEN1", ref="1.2.3",
+    title="No deprecated Dataflow Gen1 items",
+    pillar=Pillar.OPEX, scope=Scope.WORKSPACE,
+    severity=Severity.MEDIUM,
+    requires=[Resource.ITEMS],
+)
+def no_dataflow_gen1(ctx: CheckContext) -> Verdict:
+    """Dataflow Gen1 items have been migrated to Gen2."""
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
+    gen1 = [i for i in ctx.workspace.items if i.type == "Dataflow"]
+    return binary(not gen1, f"{len(gen1)} Gen1 dataflow(s) found")
 ```
 
-Rules to follow:
+Rules:
 
-- **Read defensively.** The context is an untyped dict and live data is missing
-  fields constantly. Always `.get()` with a default.
-- **Never divide by zero.** The established idiom is `x / len(items) if items else 1.0`
-  — an empty collection is vacuously compliant.
-- **Write evidence as a fact, not a verdict.** `"3 of 12 items carry a label"`,
-  not `"labels are bad"`. Evidence lands verbatim in the report and the risk
-  register.
-- **Return, don't raise.** An exception aborts the whole workspace. Degrade to a
-  failing or informational result instead.
-- A check may return a **list** of results; the engine flattens it.
+- **Declare `requires`.** It drives fetching. A check reading data it did not
+  declare will see empty values.
+- **Guard unavailable data** with `ctx.workspace.has(...)` → `not_applicable()`.
+- **Write evidence as a fact, with numbers** — `"3 of 12 items carry a label"`,
+  not `"labels are bad"`. Evidence lands verbatim in the report and risk register.
+- **Return, don't raise.** A crash is caught and converted to an unscored `N/A`
+  result, but that is a safety net, not a design.
 
-### 2. Add the remediation text
+### 2. Add remediation text
 
 Keyed by `ref` in [`config/remediation.yaml`](../backend/config/remediation.yaml):
 
@@ -197,54 +199,46 @@ Keyed by `ref` in [`config/remediation.yaml`](../backend/config/remediation.yaml
 "1.2.3": "Migrate Dataflow Gen1 items to Gen2 and retire the originals."
 ```
 
-A missing key is not an error — `rec()` returns `""` and the finding renders with
-an empty recommendation column. Easy to miss in review.
+A missing key silently yields an empty recommendation, so a test asserts every
+scoreable check's ref has text. It will fail if you skip this.
 
-### 3. Make sure it is imported
+### 3. Make sure the module is imported
 
-If you added the check to an existing module, you are done. **If you created a new
-module, add it to [`checks/__init__.py`](../backend/auditfast/core/checks/__init__.py)**:
+Adding to an existing module: done. **Creating a new module?** Import it in
+[`core/checks/__init__.py`](../backend/src/auditfast/core/checks/__init__.py):
 
 ```python
-from . import my_new_checks  # noqa: F401
+from .workspace import my_new_module as _ws_new
 ```
 
-Registration is an import side effect. A module nobody imports registers nothing,
-raises nothing, and its checks simply never run.
+Registration is an import side effect. A module nobody imports registers nothing
+and raises nothing.
 
-### 4. Add fixture data and a test
+### 4. Add fixture data and tests
 
 Give the check something to fail against in
 [`sample_data/tenant.json`](../backend/sample_data/tenant.json), then assert on it
-in [`tests/test_smoke.py`](../backend/tests/test_smoke.py):
+in [`tests/test_engine.py`](../backend/tests/test_engine.py).
 
-```python
-def test_gen1_dataflow_flagged():
-    results = _run()
-    assert any(r.check_id == "WS-DF-GEN1" and r.status == Status.FAIL
-               for r in results)
-```
+`test_registry_is_fully_populated` pins the registry counts and the parity tests
+pin the overall score — both will fail, correctly, and both need updating with
+the new expected numbers.
 
-Note that `test_checks_registered` asserts registry counts, so adding a check may
-require bumping those numbers.
+### 5. Update the catalog table above
 
-### 5. Update this document
-
-Add the row to the catalog above. The table is maintained by hand — there is
-currently no way to generate it, because check metadata does not exist until the
-check runs.
+Maintained by hand. `auditfast checks` prints the live list to copy from.
 
 ---
 
-## Checklist for a new check
+## Checklist
 
-- [ ] Decorated with `@workspace_check` or `@pipeline_check`
-- [ ] Uses a result builder, not a raw `CheckResult`
-- [ ] `check_id` is unique; `ref` points at a real checklist item
-- [ ] Reads the context defensively; no zero-division on empty collections
+- [ ] Decorated with `@check(...)`, unique `id`, real checklist `ref`
+- [ ] Returns a `Verdict` from a builder, never a raw `CheckResult`
+- [ ] `requires` declares every resource it reads
+- [ ] Guards unavailable data with `not_applicable()`
 - [ ] Evidence states a fact and includes the numbers
-- [ ] Remediation text added to `remediation.yaml` under the same `ref`
-- [ ] Module imported in `checks/__init__.py` if it is new
-- [ ] Fixture data added so the check both passes and fails somewhere
-- [ ] Test added; registry-count assertions updated
+- [ ] Remediation text added under the same `ref`
+- [ ] New module imported in `core/checks/__init__.py`
+- [ ] Fixture data added so it both passes and fails somewhere
+- [ ] Tests added; registry counts and parity values updated
 - [ ] Catalog table in this document updated

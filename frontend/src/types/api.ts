@@ -234,3 +234,19 @@ export interface SessionStatusResponse {
   status: SignInStatus;
   error?: string | null;
 }
+
+/** What the signed-in token could read, per workspace. */
+export interface DiagnosticSample {
+  name: string;
+  items_status: number | null;
+  items: number;
+  pipelines: number;
+  roles_status: number | null;
+}
+
+export interface Diagnostics {
+  list_status: number | null;
+  count: number;
+  samples: DiagnosticSample[];
+  error?: string | null;
+}

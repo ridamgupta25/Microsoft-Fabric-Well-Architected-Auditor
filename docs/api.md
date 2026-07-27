@@ -1,323 +1,323 @@
-# JSON API reference
+# API reference
 
-The Flask app serves the single-page front end at `/` and a JSON API under
-`/api/`. Every route is a thin adapter — it parses the request, calls a service
-function, and serializes the result. The audit logic lives in
-[`services/`](../backend/auditfast/services/) and
-[`core/`](../backend/auditfast/core/).
+The backend returns **JSON, files, and status codes only** — never HTML. The
+React app is a separate deployable that consumes it.
 
-Base URL when running `auditfast serve`: `http://127.0.0.1:8000`
+**Interactive docs are generated from the code and are always current:**
+
+| URL | What |
+|-----|------|
+| http://127.0.0.1:8000/docs | **Swagger UI** — try any endpoint in the browser |
+| http://127.0.0.1:8000/redoc | ReDoc reference |
+| http://127.0.0.1:8000/openapi.json | Machine-readable schema |
+
+Treat Swagger UI as the source of truth. This page explains the *design* — the
+shapes and the reasoning — which a generated schema cannot.
+
+Base path: **`/api/v1`**.
 
 ---
 
 ## Conventions
 
-**Errors** return `{"error": "<message>"}` with a non-200 status. The messages are
-written for end users, not developers — they are rendered directly in the UI.
+**Versioned.** Everything sits under `/api/v1`. A breaking change ships as
+`/api/v2` alongside it so existing clients keep working while they migrate.
 
-**CORS** is open to all origins for `/api/*`
-([`web/__init__.py:44`](../backend/auditfast/web/__init__.py#L44)) so a separately
-hosted front end can call the API.
+**One error shape**, whatever fails:
 
-> **The API is unauthenticated.** There is no API key, session cookie, or origin
-> check. The `session` values below authenticate *you to Fabric*, not the caller
-> to this service — and anyone who can reach the port can use a session another
-> user created. Bind to localhost only, which is what `serve` does.
+```json
+{
+  "detail": "Not signed in — complete the Microsoft sign-in first.",
+  "code": "authentication_error",
+  "correlation_id": "3f2a9c14"
+}
+```
+
+`code` is stable and machine-readable; `detail` is written for a user. The
+`correlation_id` matches `X-Correlation-Id` on the response and the server's log
+lines for that request.
+
+| `code` | Status | Meaning |
+|--------|--------|---------|
+| `validation_error` | 422 | Request did not match the schema |
+| `authentication_error` | 401 | Not signed in, or the session expired |
+| `workspace_access_denied` | 403 | The user cannot read that workspace |
+| `audit_error` | 400 | Run could not start — bad mode, unknown check |
+| `not_found` / `http_error` | 404 | No such resource |
+| `provider_error` | 502 | Upstream Fabric problem; retryable |
+| `internal_error` | 500 | Unexpected. Detail is logged, not returned |
+
+**Headers on every response:** `X-Correlation-Id`, `X-Response-Time-ms`. An
+inbound `X-Correlation-Id` is honoured, so a trace started in the frontend
+continues through the backend.
+
+> **The API is unauthenticated.** The `session` values authenticate *you to
+> Fabric*, not the caller to this service. Bind to localhost, or put a gateway in
+> front before exposing it. See [scalability.md](scalability.md#security).
 
 ---
 
-## Endpoints at a glance
+## Endpoints
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET` | [`/api/config`](#get-apiconfig) | Pillars and auth defaults for app startup |
-| `POST` | [`/api/auth/login`](#post-apiauthlogin) | Interactive browser sign-in |
-| `POST` | [`/api/auth/azcli`](#post-apiauthazcli) | Reuse an existing `az login` |
-| `POST` | [`/api/auth/start`](#post-apiauthstart) | Begin a device-code sign-in |
-| `POST` | [`/api/auth/poll`](#post-apiauthpoll) | Poll a sign-in for completion |
-| `GET` | [`/api/workspaces`](#get-apiworkspaces) | Workspaces from the fixture or project file |
-| `POST` | [`/api/workspaces/live`](#post-apiworkspaceslive) | Every workspace the signed-in user can see |
-| `POST` | [`/api/diag`](#post-apidiag) | Probe what the token can actually read |
-| `POST` | [`/api/run`](#post-apirun) | **Run an audit** |
-| `GET` | [`/api/download/{kind}`](#get-apidownloadkind) | Download the generated report |
+| `GET` | `/health` | Health, version, checks loaded |
+| `GET` | `/health/live` | Liveness probe (204, touches nothing) |
+| `GET` | `/health/ready` | Readiness probe |
+| `POST` | `/login` | Start interactive sign-in |
+| `POST` | `/login/azure-cli` | Reuse an existing `az login` |
+| `POST` | `/login/device-code` | Start device-code sign-in |
+| `GET` | `/login/{session}` | Poll a sign-in |
+| `POST` | `/logout` | Discard a session |
+| `GET` | `/workspaces` | Workspaces available for selection |
+| `GET` | `/workspaces/live` | Every workspace the signed-in user can see |
+| `GET` | `/workspaces/diagnostics` | Probe what the token can read |
+| `GET` | `/catalog/pillars` | Pillars and their check counts |
+| `GET` | `/catalog/layers` | Layer roles |
+| `GET` | `/catalog/checks` | The rule library, filterable |
+| `GET` | `/catalog/checks/{id}` | One check's metadata |
+| `GET` | `/catalog/summary` | Coverage by pillar and scope |
+| `POST` | `/audit` | **Submit an audit** (202) |
+| `GET` | `/audit/{id}` | Poll status; includes the report when done |
+| `POST` | `/audit/check` | Run one check synchronously |
+| `GET` | `/reports/{id}` | The finished scorecard |
+| `GET` | `/reports/{id}/download/{kind}` | Markdown or Excel file |
+| `GET` | `/recommendations/{id}` | Findings with remediation, worst first |
+| `GET` | `/history` | Past runs, paged |
 
 ---
 
-## GET /api/config
+## The audit lifecycle
 
-Called once at startup. Drives the pillar checkboxes and pre-fills the sign-in
-form.
+The core flow. Three calls.
 
-```json
-{
-  "project": "config/project.example.yaml",
-  "project_name": "project.example.yaml",
-  "pillars": ["Reliability", "Security", "Cost Optimization",
-              "Operational Excellence", "Performance Efficiency"],
-  "auth": { "tenant_id": "", "client_id": "" }
-}
-```
+### 1. Submit
 
-Placeholder values like `<TENANT_ID>` are blanked out before being returned.
-`pillars` is the server's `PILLARS` constant, so adding a pillar server-side
-flows to the UI with no front-end change.
-
----
-
-## POST /api/auth/login
-
-Opens the Microsoft sign-in in a browser. **Returns immediately** — MSAL runs on a
-background thread. Poll for completion.
-
-```json
-{ "email": "user@contoso.com", "tenant_id": null, "client_id": null }
-```
-
-```json
-{ "session": "3f2a…", "message": "A browser window is opening for user@…" }
-```
-
-With no `client_id` configured, the service falls back to Microsoft's first-party
-Azure CLI public client so the user can sign in with just an email. Tenants that
-block this via Conditional Access require a real app registration.
-
----
-
-## POST /api/auth/azcli
-
-Reuses an existing `az login` session. No app registration needed. Synchronous —
-the returned session is already `done`.
-
-```json
-{ "session": "9c1b…", "status": "done", "message": "Signed in via Azure CLI." }
-```
-
-Returns 400 if the Azure CLI is not installed or not signed in.
-
----
-
-## POST /api/auth/start
-
-Device-code flow, for headless environments.
-
-```json
-{ "tenant_id": "…", "client_id": "…", "scopes": ["…"] }
+```http
+POST /api/v1/audit
 ```
 
 ```json
 {
-  "session": "7e4d…",
-  "user_code": "F8K3NPQR",
-  "verification_uri": "https://microsoft.com/devicelogin",
-  "message": "To sign in, use a web browser to open…",
-  "expires_in": 900
-}
-```
-
-Both `tenant_id` and `client_id` are required here.
-
----
-
-## POST /api/auth/poll
-
-```json
-{ "session": "3f2a…" }
-```
-
-```json
-{ "status": "pending" }
-```
-
-`status` is `pending`, `done`, or `error` (with an `error` field). Always
-HTTP 200, including for `error` — check the body, not the status code. An unknown
-session id also reports `error`.
-
-The UI polls this on an interval until it stops returning `pending`.
-
----
-
-## GET /api/workspaces
-
-Query parameters: `project` (optional, defaults to the server's project) and
-`mode` (`mock` or `live`).
-
-```json
-[
-  { "id": "ws-prep-01", "name": "Sales-Prod-DataPrep",
-    "role": "Data Prep", "items": 6, "pipelines": 2 }
-]
-```
-
-In `mock` mode this reads the tenant fixture and returns real item counts. In
-`live` mode it can only echo what the project YAML declares — `name` equals `id`
-and both counts are `null`, because enumerating contents needs a token. Use
-`/api/workspaces/live` instead once signed in.
-
----
-
-## POST /api/workspaces/live
-
-Enumerates every workspace the signed-in user can access, regardless of the
-project file.
-
-```json
-{ "session": "3f2a…" }
-```
-
-Same row shape as above, with `role: ""` and null counts — the user assigns layer
-roles in the UI. Returns 400 if the session has no token.
-
----
-
-## POST /api/diag
-
-Connectivity probe. Useful when a live run returns nothing and you need to see
-whether the problem is the token, the permissions, or the workspace.
-
-```json
-{
-  "list_status": 200,
-  "count": 14,
-  "samples": [
-    { "name": "Sales-Prod-DataPrep", "items_status": 200,
-      "items": 6, "pipelines": 2, "roles_status": 403 }
-  ],
-  "error": null
-}
-```
-
-Reports raw HTTP status codes per sub-resource for the first three workspaces, so
-partial permissions are visible — the example above shows a token that can read
-items but not role assignments.
-
----
-
-## POST /api/run
-
-The main endpoint.
-
-### Request
-
-```json
-{
-  "project": "config/project.example.yaml",
   "mode": "mock",
   "pillars": ["Security", "Reliability"],
-  "workspaces": [
-    { "id": "ws-prep-01", "role": "Data Prep", "name": "Sales-Prod-DataPrep" }
-  ],
+  "workspaces": [{ "id": "ws-prep-01", "role": "Data Prep" }],
   "auth_session": null
+}
+```
+
+Returns **202 Accepted** immediately:
+
+```json
+{
+  "audit_id": "81fe3389df6b42d7",
+  "status": "running",
+  "submitted_at": "2026-07-27T09:03:00Z"
 }
 ```
 
 | Field | Notes |
 |-------|-------|
-| `project` | Optional; defaults to the server's configured project |
 | `mode` | `mock` or `live`. Live requires `auth_session` |
-| `pillars` | Omit or leave empty to score all pillars |
-| `workspaces` | Objects with `id` and `role`. A bare array of id strings is also accepted, and roles then come from the project file |
-| `auth_session` | Session id from a sign-in endpoint. Required when `mode` is `live` |
+| `pillars` | Empty means all. Deselecting genuinely skips work and Fabric calls |
+| `workspaces` | Empty means whatever the project file declares |
+| `auth_session` | Session id from a sign-in. Validated *before* scheduling, so a bad session fails fast with 401 |
 
-The `role` you send matters: it decides whether pipeline checks run at all, and
-it drives the layer-content and layer-separation checks. See
-[checks.md](checks.md#which-checks-run).
+The `role` matters: it decides whether pipeline checks run at all, and drives the
+layer-content and layer-separation checks.
 
-### Response
+### 2. Poll
+
+```http
+GET /api/v1/audit/{audit_id}
+```
+
+`status` moves `queued` → `running` → `succeeded` | `failed`. Poll until it is
+terminal; the full report is embedded once it succeeds.
+
+### 3. Read the report
+
+```http
+GET /api/v1/reports/{audit_id}
+```
 
 ```json
 {
+  "audit_id": "81fe3389df6b42d7",
   "project_name": "Sales Analytics - Fabric Migration",
   "mode": "mock",
-  "overall": 61.4,
+  "overall": 57.89473684210527,
   "by_pillar": {
-    "Security": { "pct": 70.8, "count": 8 },
+    "Security": { "pct": 48.9, "count": 15 },
     "Performance Efficiency": { "pct": null, "count": 0 }
   },
-  "by_workspace": {
-    "Sales-Prod-DataPrep": {
-      "role": "Data Prep", "pct": 58.3, "count": 24,
-      "by_pillar": { "Security": 66.7, "Reliability": 50.0 }
-    }
+  "by_layer": { "Data Prep": { "pct": 61.7, "count": 27 } },
+  "matrix": {
+    "Security": { "Data Prep": 61.1, "Data Storage": 83.3, "Data Operations": 6.7 }
   },
-  "counts": { "PASS": 14, "PARTIAL": 6, "FAIL": 9, "INFO": 1 },
-  "total_scored": 29,
-  "results": [ /* see below */ ],
-  "errors": [ /* see below */ ],
+  "layers": ["Data Prep", "Data Storage", "Data Operations"],
+  "by_workspace": { "...": {} },
+  "counts": { "PASS": 30, "PARTIAL": 9, "FAIL": 18, "INFO": 3 },
+  "total_scored": 57,
+  "results": [],
+  "errors": [],
   "files": { "markdown": "audit-report.md", "excel": "audit-report.xlsx" }
 }
 ```
 
-A `pct` of `null` means **not assessed**, not zero — render it differently.
+**`pct: null` means *not assessed*, not zero.** Render it differently — a pillar
+with no checks has not failed.
 
-Each entry in `results`:
+**`matrix`** is the pillar × layer view: how each architecture layer scores
+against each pillar. This is the "inner pillars" model.
 
-```json
-{
-  "check_id": "PL-RETRY", "ref": "2.4.1",
-  "title": "Retry policy configured on activities",
-  "pillar": "Reliability", "status": "PARTIAL",
-  "score": 1, "coverage": 0.5,
-  "evidence": "2 of 4 activities have a retry policy",
-  "recommendation": "Configure a retry policy (>= 1) on activities that…",
-  "severity": "High",
-  "workspace": "Sales-Prod-DataPrep", "workspace_role": "Data Prep",
-  "obj": "PL_Bronze_Load", "scored": true, "common": false
-}
-```
-
-`obj` is empty for workspace-level checks. `common` is `true` for those same
-checks — they apply to every project regardless of source system.
-`recommendation` is populated only when the check did not pass.
-
-Workspaces that could not be read are **not** in `results`; they are separated
-into `errors` so they read as warnings rather than as failing checks:
+**`errors`** is separate from `results` on purpose. A workspace that could not be
+read is a warning, not a failing check — *we could not look* is a different
+finding from *we looked and it was misconfigured*, and it must not drag the score
+down:
 
 ```json
-[{ "workspace": "ws-old-01", "role": "Data Prep",
-   "message": "Access denied (HTTP 403): the signed-in user does not have access…",
-   "recommendation": "Confirm the workspace name/ID is correct and that…" }]
+[{
+  "workspace": "ws-old-01",
+  "role": "Data Prep",
+  "message": "Access denied (HTTP 403): the signed-in user does not have access…",
+  "recommendation": "Confirm the workspace name/ID is correct and that…"
+}]
 ```
 
-`files` holds **base names only**; fetch them from `/api/download/`.
-
-### Status codes
-
-| Code | Cause |
-|------|-------|
-| 200 | Ran. May still contain `errors` for individual workspaces |
-| 400 | `mode` is `live` but no valid `auth_session` |
-| 500 | Unhandled failure; the traceback is printed server-side |
+Status codes: **404** no such audit; **409** it exists but has not finished (so a
+polling client can tell "not ready" from "never existed").
 
 ---
 
-## GET /api/download/{kind}
+## Running a single check
 
-`kind` of `md` returns `audit-report.md`; **anything else** returns
-`audit-report.xlsx` (the UI uses `xlsx`). Served as an attachment.
+```http
+POST /api/v1/audit/check
+```
 
-Returns 404 with `{"error": "run an audit first"}` when no report has been
-generated yet.
+```json
+{ "check_id": "WS-GIT", "workspace_id": "ws-prep-01", "mode": "mock", "layer": "Data Prep" }
+```
 
-Files are written to `OUT_DIR` (default `./output`) and **overwritten on every
-run**. There is no run history — the endpoint always returns the most recent
-audit, from whichever project last ran.
+Synchronous, because it only fetches the resources that one check declares and
+returns in well under a second. The fastest way to iterate on a rule.
+
+Only possible because checks carry metadata — there was previously no way to
+address one by id.
+
+---
+
+## The catalog
+
+Answers from registered metadata alone: no tenant, no sign-in, no audit run. Safe
+to call on app load, and the quickest way to review coverage.
+
+```http
+GET /api/v1/catalog/checks?pillar=Security
+```
+
+```json
+[{
+  "id": "PL-SECRETS",
+  "ref": "6.4.2",
+  "title": "No hardcoded secrets in pipeline",
+  "pillar": "Security",
+  "scope": "pipeline",
+  "severity": "Critical",
+  "layers": ["Data Operations", "Data Prep", "Mixed"],
+  "requires": ["pipelineDefinitions"],
+  "weight": 1.0,
+  "description": "No credential literal appears anywhere in the pipeline definition."
+}]
+```
+
+`requires` is what drives resource-aware fetching — see
+[architecture.md](architecture.md#resource-driven-fetching).
+
+---
+
+## Sign-in
+
+All flows are read-only and asynchronous. **The Fabric token never reaches the
+browser**; the client holds an opaque session id.
+
+```http
+POST /api/v1/login          → { "session": "3f2a…", "status": "pending" }
+GET  /api/v1/login/{session} → { "status": "pending" | "done" | "error" }
+```
+
+Polling always returns **HTTP 200**, including for `status: "error"` — a failed
+*sign-in* is a valid answer about the session's state, not a failed request. Read
+the body.
+
+`POST /login/azure-cli` is synchronous: the returned session is already `done`.
+
+### Diagnostics
+
+```http
+GET /api/v1/workspaces/diagnostics?session=…
+```
+
+Reports raw HTTP status per sub-resource for the first few workspaces, so partial
+permissions are visible:
+
+```json
+{
+  "list_status": 200,
+  "count": 14,
+  "samples": [{ "name": "Sales-Prod-DataPrep", "items_status": 200,
+                "items": 6, "pipelines": 2, "roles_status": 403 }]
+}
+```
+
+That example shows a token that can read items but not role assignments — which
+would otherwise look like clean passes.
+
+---
+
+## History
+
+```http
+GET /api/v1/history?limit=25&offset=0
+```
+
+Summaries only; report bodies are large and this endpoint is polled by
+dashboards. `limit` is capped at 100 — an unbounded list endpoint is a future
+outage.
+
+---
+
+## Downloads
+
+```http
+GET /api/v1/reports/{audit_id}/download/markdown
+GET /api/v1/reports/{audit_id}/download/excel
+```
+
+`kind` is a whitelist, so a path fragment in the URL can never read an arbitrary
+file. Excel has three sheets: Scorecard, Checks, Risk Register.
+
+> **Current limitation:** report files are written to a fixed filename in the
+> output directory and overwritten by each run, so a download returns the most
+> recent audit's file regardless of `audit_id`. Fix tracked in
+> [scalability.md](scalability.md#report-storage).
 
 ---
 
 ## Calling the API from tests
 
-Use the Flask test client — no server, no browser. See
-[`tests/test_api.py`](../backend/tests/test_api.py):
+No server, no browser — the TestClient drives the real app, middleware included:
 
 ```python
-from auditfast.web import create_app
+from fastapi.testclient import TestClient
+from auditfast.main import create_app
 
-app = create_app("config/project.example.yaml")
-client = app.test_client()
-
-r = client.post("/api/run", json={
-    "mode": "mock", "pillars": ["Security"],
-    "workspaces": [{"id": "ws-prep-01", "role": "Data Prep"}],
-})
-assert r.get_json()["overall"] is not None
+with TestClient(create_app()) as client:
+    audit_id = client.post("/api/v1/audit", json={"mode": "mock"}).json()["audit_id"]
+    # poll /api/v1/audit/{audit_id} until terminal
+    report = client.get(f"/api/v1/reports/{audit_id}").json()
+    assert report["overall"] == 57.89473684210527
 ```
+
+See [`backend/tests/test_api.py`](../backend/tests/test_api.py).

@@ -5,12 +5,17 @@
  * works rather than freezing on a long request.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 
 import { ErrorBanner, Section, Spinner } from "@/components/ui";
 import { useAuditContext } from "@/context/AuditContext";
 import { useAsync } from "@/hooks/useAsync";
-import { listWorkspaces, pollAudit, submitAudit } from "@/services/auditService";
+import {
+  listLiveWorkspaces,
+  listWorkspaces,
+  pollAudit,
+  submitAudit,
+} from "@/services/auditService";
 import { listLayers, listPillars } from "@/services/catalogService";
 import type { AuditJob } from "@/types/api";
 
@@ -18,7 +23,15 @@ export function RunAuditPage() {
   const navigate = useNavigate();
   const { mode, session, isSignedIn, setLastAuditId, setReport } = useAuditContext();
 
-  const workspaces = useAsync(() => listWorkspaces(mode), [mode]);
+  // Signed in to live mode? Enumerate the tenant. Otherwise fall back to what
+  // the project file declares — listing a tenant needs a token.
+  const workspaces = useAsync(
+    () =>
+      mode === "live" && session
+        ? listLiveWorkspaces(session)
+        : listWorkspaces(mode),
+    [mode, session],
+  );
   const pillars = useAsync(() => listPillars(), []);
   const layers = useAsync(() => listLayers(), []);
 
@@ -114,7 +127,13 @@ export function RunAuditPage() {
     <div className="space-y-6">
       {error && <ErrorBanner message={error} />}
       {mode === "live" && !isSignedIn && (
-        <ErrorBanner message="Live mode needs a read-only Microsoft sign-in. Switch to Mock to explore offline." />
+        <div className="rounded-md border border-orange-200 bg-orange-50 p-3 text-sm text-orange-800 dark:border-orange-900 dark:bg-orange-950 dark:text-orange-300">
+          Live mode needs a read-only Microsoft sign-in.{" "}
+          <Link to="/sign-in" className="font-medium underline">
+            Sign in
+          </Link>{" "}
+          — or switch to Mock in the header to explore offline.
+        </div>
       )}
 
       <Section

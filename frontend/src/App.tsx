@@ -10,6 +10,7 @@ import { DashboardPage } from "@/pages/DashboardPage";
 import { HistoryPage } from "@/pages/HistoryPage";
 import { ReportPage } from "@/pages/ReportPage";
 import { RunAuditPage } from "@/pages/RunAuditPage";
+import { SignInPage } from "@/pages/SignInPage";
 
 export default function App() {
   return (
@@ -21,6 +22,7 @@ export default function App() {
           <Route path="report/:auditId" element={<ReportPage />} />
           <Route path="catalog" element={<CatalogPage />} />
           <Route path="history" element={<HistoryPage />} />
+          <Route path="sign-in" element={<SignInPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
       </Routes>

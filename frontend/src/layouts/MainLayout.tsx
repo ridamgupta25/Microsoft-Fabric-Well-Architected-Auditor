@@ -89,15 +89,16 @@ export function MainLayout() {
               <option value="live">Live (Fabric)</option>
             </select>
             {mode === "live" && (
-              <span
+              <NavLink
+                to="/sign-in"
                 className={`badge ${
                   isSignedIn
                     ? "bg-green-100 text-green-800 dark:bg-green-950 dark:text-green-300"
-                    : "bg-slate-200 text-slate-600 dark:bg-slate-800 dark:text-slate-300"
+                    : "bg-orange-100 text-orange-800 hover:bg-orange-200 dark:bg-orange-950 dark:text-orange-300"
                 }`}
               >
-                {isSignedIn ? "Signed in" : "Not signed in"}
-              </span>
+                {isSignedIn ? "Signed in" : "Sign in required"}
+              </NavLink>
             )}
           </div>
         </div>

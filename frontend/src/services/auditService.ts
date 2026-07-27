@@ -13,6 +13,7 @@ import type {
   AuditReport,
   AuditRequest,
   CheckResult,
+  Diagnostics,
   Page,
   RecommendationList,
   Workspace,
@@ -25,6 +26,20 @@ export async function listWorkspaces(mode: string): Promise<Workspace[]> {
 
 export async function listLiveWorkspaces(session: string): Promise<Workspace[]> {
   const { data } = await apiClient.get<Workspace[]>("/workspaces/live", {
+    params: { session },
+  });
+  return data;
+}
+
+/**
+ * Probe what the signed-in token can actually read.
+ *
+ * Reports per-resource HTTP status codes, so partial permissions (items
+ * readable but role assignments forbidden) are visible instead of silently
+ * producing an incomplete audit.
+ */
+export async function getDiagnostics(session: string): Promise<Diagnostics> {
+  const { data } = await apiClient.get<Diagnostics>("/workspaces/diagnostics", {
     params: { session },
   });
   return data;
