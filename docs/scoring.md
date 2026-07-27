@@ -2,8 +2,8 @@
 
 How a check's verdict becomes a 0–3 score, and how those roll up into pillar
 percentages and a rating. All of this lives in
-[`core/scoring.py`](../backend/auditfast/core/scoring.py) — 83 lines, no I/O,
-trivially unit-testable.
+[`core/scoring.py`](../backend/src/auditfast/core/scoring.py) — pure functions, no
+I/O, trivially unit-testable.
 
 ---
 
@@ -18,7 +18,7 @@ rubric:
 | 1 | Partially Implemented | Exists but with major gaps |
 | 2 | Implemented | Functional, minor issues |
 | 3 | Best Practice | Fully aligned |
-| `None` | Not Applicable | Excluded from scoring entirely |
+| `None` | Not Applicable / informational | Excluded from scoring entirely |
 
 ---
 
@@ -26,14 +26,14 @@ rubric:
 
 Which builder a check uses determines how its score is derived.
 
-**Binary** — `binary_result()`. Pass or fail, nothing between:
+**Binary** — `binary()`. Pass or fail, nothing between:
 
 ```
 ok=True  →  score 3, coverage 1.0
 ok=False →  score 0, coverage 0.0
 ```
 
-**Coverage** — `coverage_result()`. For *N of M objects comply*. The ratio is
+**Coverage** — `covered(n, total)`. For *N of M objects comply*. The ratio is
 clamped to `0.0–1.0` and banded:
 
 | Coverage | Score |
@@ -46,11 +46,15 @@ clamped to `0.0–1.0` and banded:
 Note the top band is exact: 99% of activities having a retry policy scores 2, not
 3. This is deliberate — "almost everywhere" is not best practice.
 
-**Graded** — `scored_result()`. The check supplies `0`–`3` directly, for rules
-with genuine middle ground. `WS-LEASTPRIV` and `PL-PARAM` are the two today.
+**Graded** — `graded(score)`. The check supplies `0`–`3` directly, for rules with
+genuine middle ground. `WS-LEASTPRIV` and `PL-PARAM` are the two today.
 
-**Informational** — `info_result()`. Sets `score=None` and `scored=False`, so the
-result appears in reports but touches no arithmetic.
+**Informational** — `note()`. Sets `score=None` and `scored=False`, so the result
+appears in reports but touches no arithmetic.
+
+**Not applicable** — `not_applicable()`. Also unscored, but semantically
+different from `note()`: it means the data needed to judge could not be read.
+A network failure must not be recorded as a misconfiguration.
 
 ### Score to status
 
@@ -66,7 +70,7 @@ Severity is not independent of outcome. Every builder forces it:
 
 ```
 PASS      →  Informational
-otherwise →  the check's declared fail_severity
+otherwise →  the check's declared severity
 ```
 
 So severity in a report always means *the severity of this finding*, never *the
@@ -81,25 +85,29 @@ importance of this check in the abstract*.
 The core calculation, applied at each level:
 
 ```
-percentage = Σ scores / (3 × count of scored checks) × 100
+percentage = Σ(score × weight) / (3 × Σ weight) × 100
 ```
 
 Only results where `scored is True` **and** `score is not None` are counted.
-Informational rows and `WS-ACCESS` errors are excluded from every denominator.
+Informational rows, `N/A` results, and `WS-ACCESS` errors are excluded from every
+denominator.
 
 | Output | What it aggregates |
 |--------|--------------------|
 | `overall` | Every scored result in the run |
-| `by_pillar[p]` | `{pct, count}` for each of the five pillars |
-| `by_workspace[w]` | `{role, pct, count, by_pillar}` per workspace |
+| `by_pillar[p]` | `{pct, count}` for each of the five scored pillars |
+| `by_workspace[w]` | `{role, layer, pct, count, by_pillar}` per workspace |
+| `by_layer[l]` | `{pct, count}` per architecture layer |
+| `matrix[p][l]` | **Pillar × layer** — the "inner pillars" view |
+| `layers` | The layers actually present in this run |
 | `counts` | Number of results per `Status` |
 | `total_scored` | Size of the scored set |
 
-`by_pillar` iterates the `PILLARS` constant, so `Foundation` never appears — it is
-cross-cutting and informational only. A pillar with no checks yields
-`pct: None`, which the reports render as "Phase 2 / Excel" rather than as zero.
-**Not assessed and scored zero are different things**, and the code is careful
-about it.
+`by_pillar` iterates `Pillar.scored()`, so `Foundation` never appears — it is
+cross-cutting and informational only. A pillar with no checks yields `pct: None`,
+which every consumer renders as "not assessed" rather than as zero. **Not
+assessed and scored zero are different things**, and the code is careful about it
+throughout.
 
 ---
 
@@ -123,12 +131,9 @@ about it.
 
 ---
 
-## 5. Known divergences
+## 5. Weighting, and what is still untuned
 
-Three places where the implementation and the specification disagree. Documented
-rather than silently carried.
-
-### Divergence from the rubric: no weights
+### The mechanism exists; the values do not
 
 `01-scoring-rubric.md` specifies a **weighted** overall score:
 
@@ -136,12 +141,13 @@ rather than silently carried.
 Overall Score = Σ (Area Score × Area Weight)
 ```
 
-with per-area weights — Security 12%, Compliance 12%, Cost 7%, Documentation 4%,
-and so on. The code computes a **flat unweighted mean over every scored check**
-([`scoring.py:47-51`](../backend/auditfast/core/scoring.py#L47-L51)). There is no
-`weight` field on `CheckResult`.
+with per-area weights — Security 12%, Compliance 12%, Cost 7%, Documentation 4%.
 
-The practical effect is that influence follows check *count*, not importance. A
+`CheckSpec` now carries a `weight`, and `aggregate()` applies it. **Every check
+is currently `weight = 1.0`**, so the arithmetic reduces exactly to the flat mean
+the tool has always produced, and the numbers are unchanged.
+
+What that means today: influence still follows check *count*, not importance. A
 single `Data Prep` workspace containing ten pipelines produces:
 
 | Pillar | Scored checks | Share of overall |
@@ -151,40 +157,30 @@ single `Data Prep` workspace containing ten pipelines produces:
 | Security | 14 | 15% |
 | Cost Optimization | 2 | **2%** |
 
-So a naming-convention violation counts exactly as much toward the overall score
-as a hardcoded secret, and Cost Optimization is almost invisible on any
-pipeline-heavy project. Adding more checks to a pillar silently increases its
-weight.
+So a naming-convention violation still counts as much toward the overall score as
+a hardcoded secret. The difference from before is that fixing this is now a
+one-line change per check rather than a rewrite:
 
-Adding a `weight` field (defaulting to `1.0`) is cheap now and expensive to
-retrofit later.
+```python
+@check(id="PL-SECRETS", ..., weight=3.0)
+```
 
-### `Status.NA` is never produced
+Choosing the actual weights is a scoring-policy decision for the audit owners,
+not a refactor, so they are deliberately left at 1.0 until that call is made.
 
-The enum member exists in [`models.py`](../backend/auditfast/core/models.py) and
-the rubric relies on N/A to exclude inapplicable items — but no code path ever
-emits it. Combined with the live client swallowing errors to `None`
-(see [architecture.md](architecture.md#5-contract-1--the-workspace-context)),
-"we could not determine this" currently scores the same as "this is not
-configured": a `0`.
+### Resolved
 
-### Two different fail counts
+Two problems documented in earlier versions of this page are fixed:
 
-`aggregate()["counts"]` tallies **all** results, including the `WS-ACCESS` errors
-whose status is `FAIL`. The API's `to_json()` recomputes its own counts over the
-list with `WS-ACCESS` removed
-([`audit_service.py:148-152`](../backend/auditfast/services/audit_service.py#L148-L152)).
-
-The Markdown report reads the former; the browser reads the latter. On a run
-where a workspace could not be read, **the Markdown report shows one more failure
-than the UI does**. The scores themselves agree — only the headline counts drift.
-
----
+| Was | Now |
+|-----|-----|
+| `Status.NA` existed but was never produced, so a failed Fabric read scored as a failure | Providers record unreadable resources in `WorkspaceContext.unavailable`; affected checks return `not_applicable()` and are excluded from scoring |
+| `aggregate()` and the API computed different failure counts when a workspace was unreadable, so the Markdown report and the UI disagreed | Access errors are separated from results at the service boundary; every consumer reads one aggregate |
 
 ## 6. Testing the maths
 
 The scoring functions are pure, so they test directly with no fixtures — see
-[`tests/test_smoke.py`](../backend/tests/test_smoke.py):
+[`tests/test_engine.py`](../backend/tests/test_engine.py):
 
 ```python
 def test_bands():

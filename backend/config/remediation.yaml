@@ -1,5 +1,9 @@
 # Pre-written remediation text keyed by checklist reference (no AI).
 # Edit these strings to tune the guidance shown for each failing check.
+#
+# A missing key is not an error: the finding simply renders with an empty
+# recommendation column. Every ref used by a check should therefore appear here.
+"1.1.2": "Align the workspace with its layer role: move items that belong to another layer into that layer's workspace, and make sure this one holds the item types its role calls for."
 "1.1.7": "Rename the workspace to follow the org convention <Domain>-<Env>-<Project> (e.g., Sales-Prod-DataPrep)."
 "6.1.2": "Assign workspace roles to Microsoft Entra security groups instead of named individuals; move the listed users into an appropriate group."
 "6.1.8": "Reduce the number of Admin grants to the minimum required; prefer Contributor/Viewer and use security groups."

@@ -189,6 +189,43 @@ def test_badly_named_workspace_fails_naming(provider):
     assert ("salesops", Status.FAIL) in named
 
 
+def test_every_scoreable_check_ref_has_remediation_text():
+    """A ref missing from remediation.yaml renders an empty recommendation.
+
+    That failure is silent — the finding still appears, just with nothing telling
+    anyone what to do about it — so it is pinned here rather than left to review.
+
+    Foundation checks are excluded: they describe the estate rather than judging
+    it, never fail, and so have nothing to remediate.
+    """
+    from auditfast.services.project import load_project, load_remediation
+
+    from .conftest import PROJECT_FILE
+
+    book = load_remediation(load_project(PROJECT_FILE))
+    missing = sorted({
+        f"{spec.id} (ref {spec.ref})"
+        for spec in REGISTRY
+        if spec.pillar is not Pillar.FOUNDATION and not book.get(spec.ref)
+    })
+    assert missing == [], f"checks with no remediation text: {missing}"
+
+
+def test_findings_all_carry_actionable_guidance(provider):
+    """Every failing or partial check must say what to do about it."""
+    from auditfast.services.project import load_project, load_remediation
+
+    from .conftest import PROJECT_FILE
+
+    results = _run(provider, remediation=load_remediation(load_project(PROJECT_FILE)))
+    silent = [
+        (r.check_id, r.workspace)
+        for r in results
+        if r.status in (Status.FAIL, Status.PARTIAL) and not r.recommendation
+    ]
+    assert silent == [], f"findings with no recommendation: {silent}"
+
+
 def test_passing_checks_carry_no_severity_or_remediation(provider):
     """Severity describes a finding, so a pass is always Informational."""
     for r in _run(provider):
