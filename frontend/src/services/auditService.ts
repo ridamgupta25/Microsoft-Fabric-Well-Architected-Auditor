@@ -19,11 +19,6 @@ import type {
   Workspace,
 } from "@/types/api";
 
-export async function listWorkspaces(mode: string): Promise<Workspace[]> {
-  const { data } = await apiClient.get<Workspace[]>("/workspaces", { params: { mode } });
-  return data;
-}
-
 export async function listLiveWorkspaces(session: string): Promise<Workspace[]> {
   const { data } = await apiClient.get<Workspace[]>("/workspaces/live", {
     params: { session },

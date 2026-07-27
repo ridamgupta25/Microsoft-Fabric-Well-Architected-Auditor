@@ -1,9 +1,10 @@
 /**
  * Application state shared across pages.
  *
- * Deliberately small: the sign-in session, the mode, and the most recent audit.
- * Everything else is fetched per-page. Holding report data here would keep large
- * payloads alive long after the page that needed them unmounted.
+ * Deliberately small: the sign-in session and the most recent audit. The app
+ * always audits the live tenant — there is no mode to track. Everything else is
+ * fetched per-page; holding report data here would keep large payloads alive
+ * long after the page that needed them unmounted.
  */
 import {
   createContext,
@@ -14,12 +15,9 @@ import {
   type ReactNode,
 } from "react";
 
-import type { AuditMode, AuditReport } from "@/types/api";
+import type { AuditReport } from "@/types/api";
 
 interface AuditContextValue {
-  mode: AuditMode;
-  setMode: (mode: AuditMode) => void;
-
   /** Opaque sign-in session. Never a Fabric token — that stays server-side. */
   session: string | null;
   setSession: (session: string | null) => void;
@@ -39,7 +37,6 @@ interface AuditContextValue {
 const AuditContext = createContext<AuditContextValue | undefined>(undefined);
 
 export function AuditProvider({ children }: { children: ReactNode }) {
-  const [mode, setMode] = useState<AuditMode>("mock");
   const [session, setSession] = useState<string | null>(null);
   const [lastAuditId, setLastAuditId] = useState<string | null>(null);
   const [report, setReport] = useState<AuditReport | null>(null);
@@ -51,8 +48,6 @@ export function AuditProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<AuditContextValue>(
     () => ({
-      mode,
-      setMode,
       session,
       setSession,
       isSignedIn: session !== null,
@@ -62,7 +57,7 @@ export function AuditProvider({ children }: { children: ReactNode }) {
       setReport,
       reset,
     }),
-    [mode, session, lastAuditId, report, reset],
+    [session, lastAuditId, report, reset],
   );
 
   return <AuditContext.Provider value={value}>{children}</AuditContext.Provider>;
