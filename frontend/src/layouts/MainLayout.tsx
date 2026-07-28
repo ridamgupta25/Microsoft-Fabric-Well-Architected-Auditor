@@ -4,10 +4,12 @@
  * The health badge is deliberately prominent — a degraded rule library means
  * audits would silently score nothing, so it must be visible without digging.
  */
-import { NavLink, Outlet } from "react-router-dom";
+import { useState } from "react";
+import { NavLink, Outlet, useNavigate } from "react-router-dom";
 
 import { useAuditContext } from "@/context/AuditContext";
 import { useAsync } from "@/hooks/useAsync";
+import { logout } from "@/services/authService";
 import { getHealth } from "@/services/catalogService";
 
 const NAV = [
@@ -44,9 +46,105 @@ function HealthIndicator() {
   );
 }
 
-export function MainLayout() {
-  const { isSignedIn } = useAuditContext();
+/**
+ * The account control: a profile menu with sign-out when authenticated, and a
+ * Login button otherwise. The display name comes from the server-side session
+ * — the browser still never holds a Fabric token.
+ */
+function AccountMenu() {
+  const { session, user, setSession, setUser } = useAuditContext();
+  const navigate = useNavigate();
+  const [open, setOpen] = useState(false);
 
+  const signOut = async () => {
+    setOpen(false);
+    if (session) {
+      try {
+        await logout(session);
+      } catch {
+        /* signing out locally is enough even if the server call fails */
+      }
+    }
+    setSession(null);
+    setUser(null);
+    navigate("/");
+  };
+
+  if (!session) {
+    return (
+      <NavLink to="/sign-in" className="btn-primary px-3 py-1.5 text-sm">
+        Login
+      </NavLink>
+    );
+  }
+
+  const name = user?.name || user?.username || "Account";
+  const initials = name
+    .split(/\s+/)
+    .map((part) => part[0] ?? "")
+    .slice(0, 2)
+    .join("")
+    .toUpperCase();
+
+  return (
+    <div
+      className="relative"
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node)) setOpen(false);
+      }}
+    >
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        className="flex items-center gap-2 rounded-full border border-slate-200 py-1 pl-1 pr-3 text-sm font-medium hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+      >
+        <span className="flex h-7 w-7 items-center justify-center rounded-full bg-blue-600 text-xs font-semibold text-white">
+          {initials || "?"}
+        </span>
+        <span className="max-w-[10rem] truncate">{name}</span>
+        <span aria-hidden="true" className="text-slate-400">▾</span>
+      </button>
+
+      {open && (
+        <div
+          role="menu"
+          className="absolute right-0 z-20 mt-2 w-64 overflow-hidden rounded-md border border-slate-200 bg-white shadow-lg dark:border-slate-700 dark:bg-slate-900"
+        >
+          <div className="border-b border-slate-100 px-4 py-3 dark:border-slate-800">
+            <p className="truncate text-sm font-medium">{user?.name ?? "Signed in"}</p>
+            {user?.username && (
+              <p className="truncate text-xs text-slate-500">{user.username}</p>
+            )}
+            <span className="mt-1 inline-flex items-center gap-1 text-xs text-green-700 dark:text-green-400">
+              <span className="h-1.5 w-1.5 rounded-full bg-green-600" aria-hidden="true" />
+              Connected to Fabric
+            </span>
+          </div>
+          <NavLink
+            to="/sign-in"
+            role="menuitem"
+            onClick={() => setOpen(false)}
+            className="block px-4 py-2 text-sm hover:bg-slate-100 dark:hover:bg-slate-800"
+          >
+            Account &amp; diagnostics
+          </NavLink>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={signOut}
+            className="block w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-slate-100 dark:text-red-400 dark:hover:bg-slate-800"
+          >
+            Sign out
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function MainLayout() {
   return (
     <div className="flex min-h-full flex-col">
       <header className="border-b border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900">
@@ -76,22 +174,7 @@ export function MainLayout() {
           </nav>
 
           <div className="ml-auto flex items-center gap-2">
-            <NavLink
-              to="/sign-in"
-              className={`badge gap-1.5 ${
-                isSignedIn
-                  ? "bg-green-100 text-green-800 dark:bg-green-950 dark:text-green-300"
-                  : "bg-orange-100 text-orange-800 hover:bg-orange-200 dark:bg-orange-950 dark:text-orange-300"
-              }`}
-            >
-              <span
-                className={`h-1.5 w-1.5 rounded-full ${
-                  isSignedIn ? "bg-green-600" : "bg-orange-500"
-                }`}
-                aria-hidden="true"
-              />
-              {isSignedIn ? "Connected to Fabric" : "Connect to Fabric"}
-            </NavLink>
+            <AccountMenu />
           </div>
         </div>
       </header>

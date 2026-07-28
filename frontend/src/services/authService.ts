@@ -6,7 +6,7 @@
  * completes.
  */
 import { apiClient } from "./apiClient";
-import type { SessionResponse, SessionStatusResponse } from "@/types/api";
+import type { SessionResponse, SessionStatusResponse, UserProfile } from "@/types/api";
 
 export async function startInteractiveLogin(params: {
   email?: string;
@@ -33,6 +33,12 @@ export async function pollLogin(session: string): Promise<SessionStatusResponse>
 
 export async function logout(session: string): Promise<void> {
   await apiClient.post("/logout", null, { params: { session } });
+}
+
+/** The signed-in user's display identity for a session. Never a token. */
+export async function getMe(session: string): Promise<UserProfile> {
+  const { data } = await apiClient.get<UserProfile>("/me", { params: { session } });
+  return data;
 }
 
 /**

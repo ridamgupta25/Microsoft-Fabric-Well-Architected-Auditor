@@ -14,6 +14,7 @@ from ...schemas.auth import (
     SessionResponse,
     SessionStatus,
     SignInStatus,
+    UserProfile,
 )
 from ...schemas.common import Message
 from ...services import auth_service
@@ -93,6 +94,16 @@ async def poll(session: str) -> SessionStatus:
     state, not a failed request. Read ``status``.
     """
     return SessionStatus(**auth_service.poll(session))
+
+
+@router.get(
+    "/me",
+    response_model=UserProfile,
+    summary="The signed-in user's profile",
+)
+async def me(session: str) -> UserProfile:
+    """Display name / username for a completed session. Never returns a token."""
+    return UserProfile(**auth_service.me(session))
 
 
 @router.post("/logout", response_model=Message, summary="End a sign-in session")

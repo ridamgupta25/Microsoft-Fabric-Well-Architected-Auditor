@@ -230,6 +230,13 @@ export interface SessionStatusResponse {
   error?: string | null;
 }
 
+/** The signed-in user's display identity. Never carries a token. */
+export interface UserProfile {
+  signed_in: boolean;
+  name: string | null;
+  username: string | null;
+}
+
 /** What the signed-in token could read, per workspace. */
 export interface DiagnosticSample {
   name: string;

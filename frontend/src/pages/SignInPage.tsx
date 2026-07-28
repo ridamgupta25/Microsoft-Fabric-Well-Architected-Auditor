@@ -16,12 +16,12 @@ import { useNavigate } from "react-router-dom";
 import { ErrorBanner, Spinner } from "@/components/ui";
 import { useAuditContext } from "@/context/AuditContext";
 import { getDiagnostics } from "@/services/auditService";
-import { loginWithAzureCli, logout, startInteractiveLogin, waitForSignIn } from "@/services/authService";
+import { loginWithAzureCli, logout, startInteractiveLogin, waitForSignIn, getMe } from "@/services/authService";
 import type { Diagnostics } from "@/types/api";
 
 export function SignInPage() {
   const navigate = useNavigate();
-  const { session, setSession, isSignedIn } = useAuditContext();
+  const { session, setSession, isSignedIn, setUser } = useAuditContext();
 
   const [email, setEmail] = useState("");
   const [tenantId, setTenantId] = useState("");
@@ -40,10 +40,12 @@ export function SignInPage() {
   const finish = useCallback(
     (newSession: string) => {
       setSession(newSession);
+      // Load the display profile so the header can greet the user by name.
+      getMe(newSession).then(setUser).catch(() => setUser(null));
       // Connecting exists to see what you can audit — go straight there.
       navigate("/run");
     },
-    [setSession, navigate],
+    [setSession, setUser, navigate],
   );
 
   const signInInteractive = useCallback(async () => {
@@ -94,10 +96,11 @@ export function SignInPage() {
       await logout(session);
     } finally {
       setSession(null);
+      setUser(null);
       setDiagnostics(null);
       setStep(null);
     }
-  }, [session, setSession]);
+  }, [session, setSession, setUser]);
 
   const runDiagnostics = useCallback(async () => {
     if (!session) return;
