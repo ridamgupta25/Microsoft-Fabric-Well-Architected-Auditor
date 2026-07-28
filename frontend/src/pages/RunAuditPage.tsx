@@ -8,7 +8,7 @@
  * Submission is fire-and-poll, so the page shows live status while the backend
  * works rather than freezing on a long request.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 
 import { ErrorBanner, Section, Spinner } from "@/components/ui";
@@ -16,7 +16,7 @@ import { useAuditContext } from "@/context/AuditContext";
 import { useAsync } from "@/hooks/useAsync";
 import { listLiveWorkspaces, pollAudit, submitAudit } from "@/services/auditService";
 import { listLayers, listPillars } from "@/services/catalogService";
-import type { AuditJob } from "@/types/api";
+import type { AuditJob, Workspace } from "@/types/api";
 
 export function RunAuditPage() {
   const navigate = useNavigate();
@@ -33,19 +33,39 @@ export function RunAuditPage() {
 
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [roles, setRoles] = useState<Record<string, string>>({});
+  const [manual, setManual] = useState<Workspace[]>([]);
+  const [removed, setRemoved] = useState<Record<string, boolean>>({});
+  const [newWsId, setNewWsId] = useState("");
+  const [newWsRole, setNewWsRole] = useState("Mixed");
   const [chosenPillars, setChosenPillars] = useState<Record<string, boolean>>({});
   const [job, setJob] = useState<AuditJob | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
+  // The audit queue: live workspaces plus any added by hand, minus any removed.
+  const allWorkspaces = useMemo(() => {
+    const map = new Map<string, Workspace>();
+    for (const w of [...(workspaces.data ?? []), ...manual]) {
+      if (!removed[w.id]) map.set(w.id, w);
+    }
+    return [...map.values()];
+  }, [workspaces.data, manual, removed]);
+
   // Select every workspace by default — auditing everything you can see is the
-  // common case, and deselecting is easier than hunting for the right ones.
+  // common case — while preserving choices the user has already made.
   useEffect(() => {
-    if (!workspaces.data) return;
-    setSelected(Object.fromEntries(workspaces.data.map((w) => [w.id, true])));
-    setRoles(Object.fromEntries(workspaces.data.map((w) => [w.id, w.role || "Mixed"])));
-  }, [workspaces.data]);
+    setSelected((prev) => {
+      const next = { ...prev };
+      for (const w of allWorkspaces) if (!(w.id in next)) next[w.id] = true;
+      return next;
+    });
+    setRoles((prev) => {
+      const next = { ...prev };
+      for (const w of allWorkspaces) if (!(w.id in next)) next[w.id] = w.role || "Mixed";
+      return next;
+    });
+  }, [allWorkspaces]);
 
   // Performance Efficiency has no checks yet, so leave it off by default rather
   // than showing a permanently empty pillar in every report.
@@ -58,65 +78,108 @@ export function RunAuditPage() {
 
   useEffect(() => () => abortRef.current?.abort(), []);
 
-  const run = useCallback(async () => {
-    if (!isSignedIn || !session) {
-      setError("Connect to Fabric before running an audit.");
-      return;
-    }
-
-    const chosenWorkspaces = Object.entries(selected)
-      .filter(([, isOn]) => isOn)
-      .map(([id]) => ({ id, role: roles[id] ?? "Mixed" }));
-    const chosen = Object.entries(chosenPillars)
-      .filter(([, isOn]) => isOn)
-      .map(([name]) => name);
-
-    if (chosenWorkspaces.length === 0) {
-      setError("Select at least one workspace.");
-      return;
-    }
-    if (chosen.length === 0) {
-      setError("Select at least one pillar.");
-      return;
-    }
-
-    setError(null);
-    setSubmitting(true);
-    setJob(null);
-
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    try {
-      const accepted = await submitAudit({
-        pillars: chosen,
-        workspaces: chosenWorkspaces,
-        auth_session: session,
-      });
-      setLastAuditId(accepted.audit_id);
-
-      const finished = await pollAudit(accepted.audit_id, setJob, controller.signal);
-      if (finished.status === "failed") {
-        setError(finished.error ?? "The audit failed.");
+  const submitFor = useCallback(
+    async (specs: { id: string; role: string }[]) => {
+      if (!isSignedIn || !session) {
+        setError("Connect to Fabric before running an audit.");
         return;
       }
-      setReport(finished.report ?? null);
-      navigate(`/report/${accepted.audit_id}`);
-    } catch (err) {
-      if (err instanceof DOMException && err.name === "AbortError") return;
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSubmitting(false);
-    }
-  }, [
-    selected, roles, chosenPillars, isSignedIn, session,
-    setLastAuditId, setReport, navigate,
-  ]);
+      const chosen = Object.entries(chosenPillars)
+        .filter(([, isOn]) => isOn)
+        .map(([name]) => name);
+
+      if (specs.length === 0) {
+        setError("Add or select at least one workspace.");
+        return;
+      }
+      if (chosen.length === 0) {
+        setError("Select at least one pillar.");
+        return;
+      }
+
+      setError(null);
+      setSubmitting(true);
+      setJob(null);
+
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      try {
+        const accepted = await submitAudit({
+          pillars: chosen,
+          workspaces: specs,
+          auth_session: session,
+        });
+        setLastAuditId(accepted.audit_id);
+
+        const finished = await pollAudit(accepted.audit_id, setJob, controller.signal);
+        if (finished.status === "failed") {
+          setError(finished.error ?? "The audit failed.");
+          return;
+        }
+        setReport(finished.report ?? null);
+        navigate(`/report/${accepted.audit_id}`);
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setSubmitting(false);
+      }
+    },
+    [chosenPillars, isSignedIn, session, setLastAuditId, setReport, navigate],
+  );
+
+  const specsFor = useCallback(
+    (list: Workspace[]) => list.map((w) => ({ id: w.id, role: roles[w.id] ?? w.role ?? "Mixed" })),
+    [roles],
+  );
+
+  const run = useCallback(
+    () => submitFor(specsFor(allWorkspaces.filter((w) => selected[w.id]))),
+    [submitFor, specsFor, allWorkspaces, selected],
+  );
+
+  // Requirement 5: iterate the entire tenant in a single action, regardless of
+  // the individual ticks above.
+  const runAll = useCallback(
+    () => submitFor(specsFor(allWorkspaces)),
+    [submitFor, specsFor, allWorkspaces],
+  );
 
   const selectAll = (value: boolean) => {
-    if (!workspaces.data) return;
-    setSelected(Object.fromEntries(workspaces.data.map((w) => [w.id, value])));
+    setSelected(Object.fromEntries(allWorkspaces.map((w) => [w.id, value])));
+  };
+
+  const addWorkspace = () => {
+    const id = newWsId.trim();
+    if (!id) return;
+    setRemoved((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setRoles((prev) => ({ ...prev, [id]: newWsRole }));
+    setManual((prev) =>
+      prev.some((w) => w.id === id)
+        ? prev
+        : [
+            ...prev,
+            { id, name: id, role: newWsRole, layer: newWsRole, items: null, pipelines: null },
+          ],
+    );
+    setSelected((prev) => ({ ...prev, [id]: true }));
+    setNewWsId("");
+  };
+
+  const removeWorkspace = (id: string) => {
+    setRemoved((prev) => ({ ...prev, [id]: true }));
+    setManual((prev) => prev.filter((w) => w.id !== id));
+    setSelected((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
   };
 
   if (!isSignedIn) {
@@ -159,18 +222,69 @@ export function RunAuditPage() {
         {workspaces.error && (
           <ErrorBanner message={workspaces.error} onRetry={workspaces.reload} />
         )}
-        {workspaces.data && workspaces.data.length === 0 && !workspaces.loading && (
+
+        {/* Add a workspace by name or id — for one that is not listed, or to
+            build a specific audit queue by hand. */}
+        <div className="card flex flex-wrap items-end gap-2">
+          <div className="flex-1">
+            <label
+              htmlFor="add-workspace"
+              className="mb-1 block text-xs font-medium text-slate-500"
+            >
+              Add a workspace by name or ID
+            </label>
+            <input
+              id="add-workspace"
+              className="input"
+              placeholder="e.g. Sales-Prod-DataPrep or a workspace GUID"
+              value={newWsId}
+              onChange={(event) => setNewWsId(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  addWorkspace();
+                }
+              }}
+            />
+          </div>
+          <select
+            value={newWsRole}
+            onChange={(event) => setNewWsRole(event.target.value)}
+            className="input w-auto py-2 text-sm"
+            aria-label="Layer role for the new workspace"
+          >
+            {(layers.data ?? [{ name: "Mixed", checks: 0 }]).map((layer) => (
+              <option key={layer.name} value={layer.name}>
+                {layer.name}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={addWorkspace}
+            disabled={!newWsId.trim()}
+          >
+            Add to queue
+          </button>
+        </div>
+
+        {allWorkspaces.length === 0 && !workspaces.loading && (
           <div className="card text-sm text-slate-600 dark:text-slate-400">
-            No workspaces are visible to the signed-in account. Confirm you have at least
-            Viewer access, or check{" "}
+            No workspaces are visible to the signed-in account. Add one above, confirm you
+            have at least Viewer access, or check{" "}
             <Link to="/sign-in" className="font-medium underline">
               access diagnostics
             </Link>
             .
           </div>
         )}
-        {workspaces.data && workspaces.data.length > 0 && (
+        {allWorkspaces.length > 0 && (
           <div className="card scroll-x">
+            <p className="mb-2 text-sm text-slate-500">
+              {allWorkspaces.filter((w) => selected[w.id]).length} of {allWorkspaces.length}{" "}
+              selected for this audit.
+            </p>
             <table className="table-base">
               <thead>
                 <tr>
@@ -179,10 +293,13 @@ export function RunAuditPage() {
                   <th scope="col">Layer role</th>
                   <th scope="col">Items</th>
                   <th scope="col">Pipelines</th>
+                  <th scope="col" className="w-10">
+                    <span className="sr-only">Remove</span>
+                  </th>
                 </tr>
               </thead>
               <tbody>
-                {workspaces.data.map((workspace) => (
+                {allWorkspaces.map((workspace) => (
                   <tr key={workspace.id}>
                     <td>
                       <input
@@ -222,6 +339,17 @@ export function RunAuditPage() {
                     </td>
                     <td>{workspace.items ?? "—"}</td>
                     <td>{workspace.pipelines ?? "—"}</td>
+                    <td>
+                      <button
+                        type="button"
+                        className="text-slate-400 hover:text-red-600 dark:hover:text-red-400"
+                        onClick={() => removeWorkspace(workspace.id)}
+                        aria-label={`Remove ${workspace.name} from the queue`}
+                        title="Remove from the audit queue"
+                      >
+                        ✕
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -263,14 +391,23 @@ export function RunAuditPage() {
         </div>
       </Section>
 
-      <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center gap-3">
         <button
           type="button"
           className="btn-primary"
           onClick={run}
           disabled={submitting || workspaces.loading}
         >
-          {submitting ? "Running…" : "Run audit"}
+          {submitting ? "Running…" : "Run audit on selected"}
+        </button>
+        <button
+          type="button"
+          className="btn-secondary"
+          onClick={runAll}
+          disabled={submitting || workspaces.loading || allWorkspaces.length === 0}
+          title="Audit every workspace in the queue, regardless of the ticks above"
+        >
+          Audit all workspaces
         </button>
         {job && (
           <span className="text-sm text-slate-500">

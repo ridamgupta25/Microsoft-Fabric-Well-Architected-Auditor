@@ -15,13 +15,17 @@ import {
   type ReactNode,
 } from "react";
 
-import type { AuditReport } from "@/types/api";
+import type { AuditReport, UserProfile } from "@/types/api";
 
 interface AuditContextValue {
   /** Opaque sign-in session. Never a Fabric token — that stays server-side. */
   session: string | null;
   setSession: (session: string | null) => void;
   isSignedIn: boolean;
+
+  /** The signed-in user's display identity, or null when signed out. */
+  user: UserProfile | null;
+  setUser: (user: UserProfile | null) => void;
 
   /** Id of the most recently submitted audit, so pages can link to it. */
   lastAuditId: string | null;
@@ -38,6 +42,7 @@ const AuditContext = createContext<AuditContextValue | undefined>(undefined);
 
 export function AuditProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<string | null>(null);
+  const [user, setUser] = useState<UserProfile | null>(null);
   const [lastAuditId, setLastAuditId] = useState<string | null>(null);
   const [report, setReport] = useState<AuditReport | null>(null);
 
@@ -51,13 +56,15 @@ export function AuditProvider({ children }: { children: ReactNode }) {
       session,
       setSession,
       isSignedIn: session !== null,
+      user,
+      setUser,
       lastAuditId,
       setLastAuditId,
       report,
       setReport,
       reset,
     }),
-    [session, lastAuditId, report, reset],
+    [session, user, lastAuditId, report, reset],
   );
 
   return <AuditContext.Provider value={value}>{children}</AuditContext.Provider>;

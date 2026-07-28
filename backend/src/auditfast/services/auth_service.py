@@ -19,6 +19,7 @@ the transport.
 """
 from __future__ import annotations
 
+import base64
 import json
 import threading
 import uuid
@@ -51,6 +52,30 @@ def _clean(value):
     return None if (not value or str(value).startswith("<")) else value
 
 
+def _decode_jwt_claims(token: str | None) -> dict:
+    """Best-effort decode of a JWT payload, for display only (never verified).
+
+    Used to read a friendly name/username out of an Azure CLI access token, which
+    arrives as a raw JWT with no accompanying id-token claims.
+    """
+    if not token or token.count(".") < 2:
+        return {}
+    try:
+        payload = token.split(".")[1]
+        padding = "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload + padding))
+    except Exception:
+        return {}
+
+
+def _profile_from_claims(claims: dict | None) -> dict:
+    """Pull a display name + username out of id-token / access-token claims."""
+    claims = claims or {}
+    username = (claims.get("preferred_username") or claims.get("upn")
+                or claims.get("unique_name") or claims.get("email"))
+    return {"name": claims.get("name") or username, "username": username}
+
+
 def token_for(session_id: str | None) -> str | None:
     """Return the access token for a completed session, or ``None``."""
     sess = _SESSIONS.get(session_id or "")
@@ -64,6 +89,15 @@ def logout(session_id: str | None) -> bool:
     the entry is a complete sign-out.
     """
     return _SESSIONS.pop(session_id or "", None) is not None
+
+
+def me(session_id: str | None) -> dict:
+    """Return the signed-in user's display profile for a session (never a token)."""
+    sess = _SESSIONS.get(session_id or "")
+    if not sess or not sess.get("result"):
+        return {"signed_in": False, "name": None, "username": None}
+    user = sess.get("user") or {}
+    return {"signed_in": True, "name": user.get("name"), "username": user.get("username")}
 
 
 def poll(session_id: str | None) -> dict:
@@ -107,7 +141,7 @@ def login_interactive(email: str, tenant_id, client_id, auth_cfg: dict) -> dict:
         raise AuthError(f"could not initialize sign-in: {exc}", 400) from exc
 
     sid = uuid.uuid4().hex
-    sess = {"result": None, "error": None, "done": False}
+    sess = {"result": None, "error": None, "done": False, "user": None}
     _SESSIONS[sid] = sess
 
     def worker():
@@ -115,6 +149,7 @@ def login_interactive(email: str, tenant_id, client_id, auth_cfg: dict) -> dict:
             res = app.acquire_token_interactive(scopes=scopes, login_hint=email or None)
             if "access_token" in res:
                 sess["result"] = res["access_token"]
+                sess["user"] = _profile_from_claims(res.get("id_token_claims"))
             else:
                 sess["error"] = res.get("error_description", "authentication failed")
         except Exception as exc:  # pragma: no cover
@@ -159,7 +194,8 @@ def login_azcli() -> dict:
         raise AuthError("Could not read token from Azure CLI.", 400)
 
     sid = uuid.uuid4().hex
-    _SESSIONS[sid] = {"result": token, "error": None, "done": True}
+    _SESSIONS[sid] = {"result": token, "error": None, "done": True,
+                      "user": _profile_from_claims(_decode_jwt_claims(token))}
     return {"session": sid, "status": "done", "message": "Signed in via Azure CLI."}
 
 
@@ -182,7 +218,7 @@ def start_device_flow(tenant_id, client_id, scopes) -> dict:
         raise AuthError(flow.get("error_description", "device flow failed"), 400)
 
     sid = uuid.uuid4().hex
-    sess = {"result": None, "error": None, "done": False}
+    sess = {"result": None, "error": None, "done": False, "user": None}
     _SESSIONS[sid] = sess
 
     def worker():
@@ -190,6 +226,7 @@ def start_device_flow(tenant_id, client_id, scopes) -> dict:
             res = app.acquire_token_by_device_flow(flow)
             if "access_token" in res:
                 sess["result"] = res["access_token"]
+                sess["user"] = _profile_from_claims(res.get("id_token_claims"))
             else:
                 sess["error"] = res.get("error_description", "authentication failed")
         except Exception as exc:  # pragma: no cover

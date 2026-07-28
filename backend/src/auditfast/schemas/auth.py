@@ -53,6 +53,14 @@ class SessionStatus(BaseModel):
     error: str | None = None
 
 
+class UserProfile(BaseModel):
+    """The signed-in user's display identity. Never carries a token."""
+
+    signed_in: bool = False
+    name: str | None = Field(default=None, description="Display name, when available.")
+    username: str | None = Field(default=None, description="UPN / email, when available.")
+
+
 class DiagnosticSample(BaseModel):
     """What the token could read for one workspace."""
 
