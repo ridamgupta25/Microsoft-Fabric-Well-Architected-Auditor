@@ -19,9 +19,16 @@ export function ReportPage() {
     [auditId],
   );
 
+  // The title reflects what was actually audited — the workspace name when a
+  // single one is in scope, otherwise a neutral heading — instead of the static
+  // project.name config label that was reused for every run.
+  const auditedWorkspaces = report ? Object.keys(report.by_workspace) : [];
+  const heading =
+    auditedWorkspaces.length === 1 ? auditedWorkspaces[0] : "Fabric Well-Architected Audit";
+
   useEffect(() => {
-    if (report?.project_name) document.title = `${report.project_name} — Audit`;
-  }, [report?.project_name]);
+    if (report) document.title = `${heading} — Audit`;
+  }, [report, heading]);
 
   if (loading) return <Spinner label="Loading report…" />;
   if (error) return <ErrorBanner message={error} onRetry={reload} />;
@@ -32,8 +39,13 @@ export function ReportPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-bold">{report.project_name}</h1>
-        <p className="text-sm text-slate-500">Fabric Well-Architected audit results</p>
+        <h1 className="text-2xl font-bold">{heading}</h1>
+        <p className="text-sm text-slate-500">
+          {auditedWorkspaces.length > 0
+            ? `${auditedWorkspaces.length} workspace${auditedWorkspaces.length === 1 ? "" : "s"} audited`
+            : "Fabric Well-Architected audit results"}
+          {report.errors.length > 0 && ` · ${report.errors.length} skipped for access`}
+        </p>
       </div>
 
       {report.errors.length > 0 && (
