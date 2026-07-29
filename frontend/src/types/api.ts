@@ -52,6 +52,9 @@ export interface CheckSpec {
   layers: string[];
   requires: string[];
   weight: number;
+  required: boolean;
+  manual: boolean;
+  automation: "automated" | "roadmap" | "manual";
   description: string;
 }
 

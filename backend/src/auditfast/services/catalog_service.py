@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from ..core.checks.registry import REGISTRY, CheckRegistry
+from ..core.check.registry import REGISTRY, CheckRegistry
 from ..core.enums import Layer, Pillar, Scope
 
 

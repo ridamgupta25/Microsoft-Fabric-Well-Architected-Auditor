@@ -67,7 +67,7 @@ async def lifespan(app: FastAPI):
 
     settings.output_path.mkdir(parents=True, exist_ok=True)
 
-    from .core.checks.registry import REGISTRY
+    from .core.check.registry import REGISTRY
 
     logger.info(
         "application started",

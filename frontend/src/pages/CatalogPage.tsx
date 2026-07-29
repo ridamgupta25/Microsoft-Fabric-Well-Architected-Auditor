@@ -91,6 +91,8 @@ export function CatalogPage() {
                 <th scope="col">Pillar</th>
                 <th scope="col">Scope</th>
                 <th scope="col">Severity</th>
+                <th scope="col">Required</th>
+                <th scope="col">Type</th>
                 <th scope="col">Layers</th>
               </tr>
             </thead>
@@ -108,6 +110,16 @@ export function CatalogPage() {
                   <td className="whitespace-nowrap">{check.pillar}</td>
                   <td className="whitespace-nowrap">{check.scope}</td>
                   <td><SeverityBadge severity={check.severity} /></td>
+                  <td className="whitespace-nowrap">
+                    {check.required ? "Required" : "Optional"}
+                  </td>
+                  <td className="whitespace-nowrap text-xs text-slate-500">
+                    {check.automation === "automated"
+                      ? "Automated"
+                      : check.automation === "roadmap"
+                        ? "Automatable (planned)"
+                        : "Manual"}
+                  </td>
                   <td className="text-xs text-slate-500">
                     {check.layers.includes("*") ? "All" : check.layers.join(", ")}
                   </td>

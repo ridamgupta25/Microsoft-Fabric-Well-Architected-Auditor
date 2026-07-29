@@ -78,3 +78,5 @@ class DiagnosticsResponse(BaseModel):
     count: int = 0
     samples: list[DiagnosticSample] = Field(default_factory=list)
     error: str | None = None
+    granted_scopes: str = ""
+    token_audience: str = ""

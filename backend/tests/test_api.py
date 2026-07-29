@@ -34,7 +34,7 @@ def _submit(client, **extra) -> str:
 def test_health_reports_a_loaded_rule_library(client):
     body = client.get("/api/v1/health").json()
     assert body["status"] == "ok"
-    assert body["checks_registered"] == 20
+    assert body["checks_registered"] == 148
 
 
 def test_liveness_touches_no_dependencies(client):
@@ -52,7 +52,7 @@ def test_root_returns_json_not_html(client):
 
 def test_catalog_lists_pillars_and_layers(client):
     pillars = client.get("/api/v1/catalog/pillars").json()
-    assert {p["name"] for p in pillars} >= {"Security", "Reliability"}
+    assert {p["name"] for p in pillars} >= {"Security", "Operations & Reliability"}
     layers = client.get("/api/v1/catalog/layers").json()
     assert {layer["name"] for layer in layers} >= {"Data Prep", "Data Storage"}
 
@@ -115,9 +115,9 @@ def test_report_endpoint_returns_the_full_scorecard(client):
 
     report = client.get(f"/api/v1/reports/{audit_id}").json()
     assert report["overall"] == EXPECTED_OVERALL
-    assert report["total_scored"] == 57
-    assert len(report["results"]) == 60
-    assert report["by_pillar"]["Performance Efficiency"]["pct"] is None
+    assert report["total_scored"] == 73
+    assert len(report["results"]) == 77
+    assert report["by_pillar"]["Performance & Capacity"]["pct"] is None
 
 
 def test_report_includes_the_pillar_by_layer_matrix(client):

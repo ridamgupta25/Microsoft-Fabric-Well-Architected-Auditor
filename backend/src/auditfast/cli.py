@@ -106,6 +106,49 @@ def cmd_checks(args) -> int:
     return EXIT_OK
 
 
+def cmd_twin(args) -> int:
+    """Sign in, crawl a workspace, and build + persist its Digital Twin."""
+    project = os.path.abspath(args.project)
+    if not os.path.exists(project):
+        print(f"Project file not found: {project}", file=sys.stderr)
+        return EXIT_BAD_INPUT
+
+    from .clients import LiveFabricProvider
+    from .core.enums import Layer
+    from .security.device_flow import acquire_token
+    from .services import twin_service
+    from .services.graph_store import GraphStore
+    from .services.project import load_project
+
+    auth = load_project(project).auth
+    token = acquire_token(
+        auth.get("tenant_id"),
+        auth.get("client_id"),
+        auth.get("scopes", ["https://api.fabric.microsoft.com/.default"]),
+    )
+
+    provider = LiveFabricProvider(token)
+    store = GraphStore(os.path.abspath(args.store))
+
+    print(f"Discovering workspace {args.workspace} ...")
+    graph = twin_service.refresh_twin(
+        args.workspace, provider, store, layer=Layer.parse(args.layer)
+    )
+    summary = twin_service.twin_summary(graph)
+
+    print(f"\nDigital Twin for {graph.workspace_id}")
+    print(f"  nodes: {summary['node_count']}   edges: {summary['edge_count']}")
+    for node_type, count in sorted(summary["nodes_by_type"].items()):
+        print(f"    {node_type:<22}{count}")
+    if summary["access_findings"]:
+        print("  access findings (could not read):")
+        for finding in summary["access_findings"]:
+            props = finding["properties"]
+            print(f"    ! {props.get('resource')}: {props.get('audit_impact')}")
+    print(f"\nSnapshot: {store.path_for(graph.workspace_id)}")
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="auditfast",
@@ -130,12 +173,18 @@ def build_parser() -> argparse.ArgumentParser:
     checks.add_argument("--layer", default=None, help="Filter by layer role")
     checks.add_argument("--scope", default=None, help="Filter by object kind")
 
+    twin = sub.add_parser("twin", help="Build a workspace's Digital Twin (knowledge graph)")
+    twin.add_argument("--project", required=True, help="Path to the project YAML file")
+    twin.add_argument("--workspace", required=True, help="Workspace id to crawl")
+    twin.add_argument("--layer", default="Mixed", help="Layer role (default: Mixed)")
+    twin.add_argument("--store", default="twins", help="Directory for twin snapshots")
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    handlers = {"run": cmd_run, "serve": cmd_serve, "checks": cmd_checks}
+    handlers = {"run": cmd_run, "serve": cmd_serve, "checks": cmd_checks, "twin": cmd_twin}
     handler = handlers.get(args.command)
     if handler is None:  # pragma: no cover - argparse enforces the choice
         build_parser().print_help()

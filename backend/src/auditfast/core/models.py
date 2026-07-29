@@ -17,7 +17,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from .enums import ITEM_TYPE_SCOPE, Layer, Pillar, Resource, Scope, Severity, Status
+from .enums import ITEM_TYPE_SCOPE, Automation, Layer, Pillar, Resource, Scope, Severity, Status
 
 #: Highest score any single check can award.
 MAX_SCORE = 3
@@ -54,6 +54,7 @@ class RoleAssignment:
     principal_type: str = ""
     display_name: str = ""
     role: str = ""
+    principal_id: str = ""
 
     @classmethod
     def from_api(cls, raw: dict) -> RoleAssignment:
@@ -63,11 +64,13 @@ class RoleAssignment:
                 principal_type=principal.get("type") or "",
                 display_name=principal.get("displayName") or "",
                 role=raw.get("role") or "",
+                principal_id=principal.get("id") or "",
             )
         return cls(  # flat fixture shape
             principal_type=raw.get("principalType") or "",
             display_name=raw.get("displayName") or "",
             role=raw.get("role") or "",
+            principal_id=raw.get("principalId") or "",
         )
 
     @property
@@ -96,6 +99,13 @@ class WorkspaceContext:
     role_assignments: list[RoleAssignment] = field(default_factory=list)
     items: list[Item] = field(default_factory=list)
     pipelines: dict[str, dict] = field(default_factory=dict)
+    notebooks: dict[str, dict] = field(default_factory=dict)
+    tables: dict[str, dict] = field(default_factory=dict)
+    shortcuts: dict[str, list] = field(default_factory=dict)
+    semantic_models: dict[str, dict] = field(default_factory=dict)
+    #: The Git provider connection details (provider, org, repo, branch, dir) when
+    #: the workspace is Git-connected — the authoritative source for item code.
+    git_details: dict = field(default_factory=dict)
     #: Resources the provider tried and failed to read. A check whose data lands
     #: here must report N/A rather than failing: "we could not determine this" is
     #: not the same finding as "this is not configured".
@@ -129,6 +139,9 @@ class WorkspaceContext:
             return
         if scope is Scope.PIPELINE:
             yield from self.pipelines.items()
+            return
+        if scope is Scope.NOTEBOOK:
+            yield from self.notebooks.items()
             return
         for item in self.items:
             if ITEM_TYPE_SCOPE.get(item.type) is scope:
@@ -174,6 +187,16 @@ class CheckSpec:
     requires: frozenset[Resource] = frozenset()
     weight: float = 1.0
     description: str = ""
+    #: Whether the practice is a must-have (True) or a situational nice-to-have
+    #: (False) per industry standard. Surfaced in the catalog for prioritisation.
+    required: bool = True
+    #: A spec the engine never runs: it describes a practice that cannot be
+    #: verified from Fabric data (e.g. "BAA in place") and exists only so the
+    #: catalog is a complete, attestable checklist.
+    manual: bool = False
+    #: How the verdict is (or could be) reached — see :class:`Automation`.
+    #: ``AUTOMATED`` checks run; ``ROADMAP``/``MANUAL`` are attestation-only.
+    automation: Automation = Automation.AUTOMATED
 
     def applies_to(self, layer: Layer) -> bool:
         """Does this check run for a workspace tagged ``layer``?"""
@@ -191,6 +214,9 @@ class CheckSpec:
             "layers": sorted(layer.value for layer in self.layers),
             "requires": sorted(r.value for r in self.requires),
             "weight": self.weight,
+            "required": self.required,
+            "manual": self.manual,
+            "automation": self.automation.value,
             "description": self.description or (self.fn.__doc__ or "").strip(),
         }
 

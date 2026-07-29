@@ -54,6 +54,10 @@ class RecordedProvider:
             role_assignments=[RoleAssignment.from_api(r) for r in raw.get("roleAssignments", [])],
             items=[Item.from_api(i) for i in raw.get("items", [])],
             pipelines=dict(raw.get("pipelines") or {}),
+            notebooks=dict(raw.get("notebooks") or {}),
+            tables=dict(raw.get("tables") or {}),
+            shortcuts=dict(raw.get("shortcuts") or {}),
+            semantic_models=dict(raw.get("semanticModels") or {}),
         )
 
     def list_workspaces(self) -> list[dict]:

@@ -5,7 +5,7 @@ exact score the pre-refactor implementation produced.
 """
 from __future__ import annotations
 
-from auditfast.core.checks.registry import REGISTRY
+from auditfast.core.check.registry import REGISTRY
 from auditfast.core.engine import run_audit
 from auditfast.core.enums import Layer, Pillar, Scope, Status
 from auditfast.core.scoring import aggregate, band_from_coverage, rating
@@ -68,27 +68,57 @@ def test_result_and_scored_counts_are_unchanged(provider):
 
 def test_status_counts_are_unchanged(provider):
     agg = aggregate(_run(provider))
-    assert agg["counts"][Status.PASS] == 30
-    assert agg["counts"][Status.PARTIAL] == 9
-    assert agg["counts"][Status.FAIL] == 18
+    assert agg["counts"][Status.PASS] == 36
+    assert agg["counts"][Status.PARTIAL] == 13
+    assert agg["counts"][Status.FAIL] == 24
     assert agg["counts"][Status.INFO] == 3
 
 
-# -- the check library ---------------------------------------------------------
+def test_notebook_checks_run_on_notebook_definitions(provider):
+    """The notebook checks read the notebook's code cells and flag real issues."""
+    nb = {r.check_id: r for r in _run(provider)
+          if r.scope is Scope.NOTEBOOK and r.obj == "NB_Gold_Build"}
+    assert nb, "no notebook results were produced"
+    assert nb["NB-IMPORTS"].status is Status.FAIL     # from pyspark.sql.functions import *
+    assert nb["NB-DISPLAY"].status is Status.FAIL     # display(df)
+    assert nb["NB-SECRETS"].status is Status.PASS
+    assert nb["NB-PARAMS"].status is Status.PASS
+
+
+def test_table_checks_run_on_table_metadata(provider):
+    """The table checks read the lakehouse table schemas and score them."""
+    tb = {r.check_id: r for r in _run(provider)
+          if r.check_id.startswith("TB-")}
+    assert tb, "no table results were produced"
+    # dim_date + a fact/dim split means the star-schema and date-dimension checks pass.
+    assert tb["TB-STARSCHEMA"].status is Status.PASS
+    assert tb["TB-DATEDIM"].status is Status.PASS
+    assert tb["TB-SURROGATE"].status is Status.PASS
+    # StagingTemp is External/Parquet and non-snake, so these are only partial.
+    assert tb["TB-MANAGED-DELTA"].status is Status.PARTIAL
+    assert tb["TB-NAMING"].status is Status.PARTIAL
 
 def test_registry_is_fully_populated():
-    assert len(REGISTRY) == 20
-    assert len(REGISTRY.select(scope=Scope.WORKSPACE)) == 12
-    assert len(REGISTRY.select(scope=Scope.PIPELINE)) == 8
+    """The automated library is unchanged; manual (attestation) checks are extra."""
+    automated = [s for s in REGISTRY if not s.manual]
+    assert len(automated) == 33
+    assert len([s for s in automated if s.scope is Scope.WORKSPACE]) == 19
+    assert len([s for s in automated if s.scope is Scope.PIPELINE]) == 9
+    assert len([s for s in automated if s.scope is Scope.NOTEBOOK]) == 5
 
 
 def test_every_check_has_traceable_metadata():
-    """Metadata must be complete: it drives filtering, fetching, and the catalog."""
+    """Metadata must be complete: it drives filtering, fetching, and the catalog.
+
+    Manual checks are attestation-only and read no data, so the required-resources
+    rule does not apply to them.
+    """
     for spec in REGISTRY:
         assert spec.id and spec.ref, f"{spec.id}: missing id/ref"
         assert spec.title, f"{spec.id}: missing title"
-        assert spec.requires, f"{spec.id}: declares no required resources"
         assert spec.weight > 0, f"{spec.id}: non-positive weight"
+        if not spec.manual:
+            assert spec.requires, f"{spec.id}: declares no required resources"
 
 
 def test_check_ids_are_unique():
@@ -100,11 +130,11 @@ def test_duplicate_registration_is_rejected():
     """A copy-pasted check id must fail loudly, not silently shadow the original."""
     import pytest
 
-    from auditfast.core.checks.registry import CheckRegistry, DuplicateCheckError, check
+    from auditfast.core.check.registry import CheckRegistry, DuplicateCheckError, check
 
     registry = CheckRegistry()
     kwargs = dict(
-        ref="1.1", title="t", pillar=Pillar.OPEX, scope=Scope.WORKSPACE, registry=registry
+        ref="1.1", title="t", pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, registry=registry
     )
     check(id="X-DUP", **kwargs)(lambda ctx: None)
     with pytest.raises(DuplicateCheckError):
@@ -117,15 +147,16 @@ def test_explicit_registry_is_isolated_from_the_global_one():
     A ``registry or REGISTRY`` fallback would therefore leak test checks into the
     global catalog; this pins the identity check that prevents it.
     """
-    from auditfast.core.checks.registry import CheckRegistry, check
+    from auditfast.core.check.registry import CheckRegistry, check
 
     registry = CheckRegistry()
-    check(id="X-ISOLATED", ref="0.0", title="t", pillar=Pillar.OPEX,
+    check(id="X-ISOLATED", ref="0.0", title="t", pillar=Pillar.OPERATIONS,
           scope=Scope.WORKSPACE, registry=registry)(lambda ctx: None)
 
     assert registry.get("X-ISOLATED") is not None
     assert REGISTRY.get("X-ISOLATED") is None, "test check leaked into the global registry"
-    assert len(REGISTRY) == 20
+    before = len([s for s in REGISTRY if not s.manual])
+    assert before == 33
 
 
 # -- selection and dispatch ----------------------------------------------------
@@ -206,7 +237,9 @@ def test_every_scoreable_check_ref_has_remediation_text():
     missing = sorted({
         f"{spec.id} (ref {spec.ref})"
         for spec in REGISTRY
-        if spec.pillar is not Pillar.FOUNDATION and not book.get(spec.ref)
+        if spec.pillar is not Pillar.FOUNDATION
+        and not spec.manual
+        and not book.get(spec.ref)
     })
     assert missing == [], f"checks with no remediation text: {missing}"
 
@@ -246,12 +279,12 @@ def test_missing_workspace_is_reported_not_scored(provider):
 
 def test_a_crashing_check_does_not_abort_the_run(provider):
     """One broken rule must not take the whole audit down."""
-    from auditfast.core.checks.registry import CheckRegistry, check
+    from auditfast.core.check.registry import CheckRegistry, check
 
     registry = CheckRegistry()
 
     @check(id="X-BOOM", ref="0.0", title="explodes",
-           pillar=Pillar.OPEX, scope=Scope.WORKSPACE, registry=registry)
+           pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, registry=registry)
     def _boom(ctx):
         raise RuntimeError("kaboom")
 
