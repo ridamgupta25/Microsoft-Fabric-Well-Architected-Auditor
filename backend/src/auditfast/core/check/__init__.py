@@ -35,7 +35,7 @@ from .registry import (
 )
 
 #: Leaf module names that carry check registrations.
-_CHECK_MODULES = {"automated", "manual"}
+_CHECK_MODULES = {"automated", "manual", "roadmap"}
 
 
 def _discover() -> tuple[str, ...]:

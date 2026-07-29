@@ -199,8 +199,16 @@ class CheckSpec:
     automation: Automation = Automation.AUTOMATED
 
     def applies_to(self, layer: Layer) -> bool:
-        """Does this check run for a workspace tagged ``layer``?"""
-        return Layer.ANY in self.layers or layer in self.layers
+        """Does this check run for a workspace tagged ``layer``?
+
+        A workspace tagged ``MIXED`` plays every role, so *every* check runs on
+        it regardless of the layers the check itself declares.
+        """
+        return (
+            Layer.ANY in self.layers
+            or layer is Layer.MIXED
+            or layer in self.layers
+        )
 
     def to_dict(self) -> dict:
         """Serializable form — used by the catalog API and the MCP tools."""
