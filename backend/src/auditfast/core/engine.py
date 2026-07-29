@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 
 from ..clients.errors import WorkspaceAccessError
-from .check.helpers import EMPTY_REMEDIATION, RemediationBook, Verdict
+from .check.helpers import EMPTY_REMEDIATION, RemediationBook, Verdict, not_applicable
 from .check.registry import REGISTRY, CheckRegistry
 from .enums import Layer, Pillar, Resource, Scope, Severity, Status
 from .models import CheckContext, CheckResult, CheckSpec, WorkspaceContext
@@ -28,6 +28,22 @@ from .scoring import status_from_score
 
 #: One workspace to audit: its id and the layer role it plays.
 Target = tuple[str, Layer]
+
+#: Friendly plural names used in the "no objects of this kind" N/A message, so a
+#: check that cannot run for lack of an object still appears with a clear reason.
+_SCOPE_LABEL: dict[Scope, str] = {
+    Scope.PIPELINE: "data pipelines",
+    Scope.NOTEBOOK: "notebooks",
+    Scope.LAKEHOUSE: "lakehouses or warehouses",
+    Scope.SEMANTIC_MODEL: "semantic models",
+    Scope.REPORT: "reports",
+    Scope.EVENTHOUSE: "eventhouses",
+}
+
+
+def _scope_label(scope: Scope) -> str:
+    return _SCOPE_LABEL.get(scope, f"{scope.value} objects")
+
 
 _ACCESS_RECOMMENDATION = (
     "Confirm the workspace name/ID is correct and that the signed-in user has at "
@@ -157,7 +173,17 @@ def run_audit(
 
         for scope in registry.scopes(specs):
             scope_specs = by_scope.get(scope) or []
-            for obj_name, obj in workspace.objects(scope):
+            objects = list(workspace.objects(scope))
+            if not objects and scope is not Scope.WORKSPACE:
+                # The checks apply to this layer, but the workspace holds no object
+                # of their kind. Emit a visible N/A per check (with the reason) so
+                # no selected check is silently absent from the report.
+                note = not_applicable(
+                    f"No {_scope_label(scope)} were found in this workspace")
+                for spec in scope_specs:
+                    results.append(build_result(spec, workspace, note, "", remediation))
+                continue
+            for obj_name, obj in objects:
                 # A workspace-scoped result has no object name of its own.
                 result_obj = "" if scope is Scope.WORKSPACE else obj_name
                 ctx = CheckContext(

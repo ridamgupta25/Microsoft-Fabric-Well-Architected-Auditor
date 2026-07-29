@@ -6,6 +6,8 @@ model. Each check is workspace-scoped and aggregates across every table found.
 """
 from __future__ import annotations
 
+import re
+
 from auditfast.core.check._tables import (
     AUDIT_COLUMNS,
     TABLE_LAYERS,
@@ -21,6 +23,9 @@ from auditfast.core.enums import Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
 
 _NO_TABLES = "No lakehouse/warehouse tables were read for this workspace"
+
+#: Column names implying a date/time value, for the data-type check.
+_DATE_NAME = re.compile(r"(date|timestamp|_dt$|_time$)", re.IGNORECASE)
 
 
 @check(
@@ -113,3 +118,57 @@ def table_surrogate_keys(ctx: CheckContext) -> Verdict:
     ok = [n for n, t in dims.items()
           if any(c.endswith(("_sk", "_key")) for c in col_names(t))]
     return covered(len(ok), len(dims), f"{len(ok)} of {len(dims)} dimensions have a surrogate key")
+
+
+@check(
+    id="TB-COL-NAMING", ref="4.2.3", title="Column names are consistent and self-documenting",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
+)
+def table_column_naming(ctx: CheckContext) -> Verdict:
+    """Table columns follow a consistent snake_case convention."""
+    tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
+    if not tables:
+        return not_applicable("No table column metadata available")
+    names = [c.get("name", "") for t in tables.values() for c in columns(t)]
+    ok = [n for n in names if is_snake_case(n)]
+    return covered(len(ok), len(names), f"{len(ok)} of {len(names)} columns use snake_case names")
+
+
+@check(
+    id="TB-DATATYPES", ref="4.2.4", title="Date/time columns use a temporal type (not string)",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
+)
+def table_data_types(ctx: CheckContext) -> Verdict:
+    """Columns whose name implies a date/time are typed as temporal, not string."""
+    tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
+    if not tables:
+        return not_applicable("No table column metadata available")
+    date_cols = [(c.get("name", ""), (c.get("type", "") or "").lower())
+                 for t in tables.values() for c in columns(t)
+                 if _DATE_NAME.search(c.get("name", ""))]
+    if not date_cols:
+        return not_applicable("No date/time-named columns to type-check")
+    ok = [n for n, ty in date_cols if ty and not ty.startswith(("string", "varchar", "char"))]
+    return covered(len(ok), len(date_cols),
+                   f"{len(ok)} of {len(date_cols)} date/time columns use a temporal type")
+
+
+@check(
+    id="TB-SCD2", ref="4.4.10", title="SCD Type 2 dimensions track validity and a current flag",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
+)
+def table_scd2(ctx: CheckContext) -> Verdict:
+    """Slowly-changing dimensions carry valid_from, valid_to, and is_current together."""
+    dims = {n: t for n, t in ctx.workspace.tables.items() if is_dimension(n) and columns(t)}
+    if not dims:
+        return not_applicable("No dimension tables with column metadata")
+    tracked = ("valid_from", "valid_to", "is_current")
+    scd2 = {n: t for n, t in dims.items() if any(col in col_names(t) for col in tracked)}
+    if not scd2:
+        return not_applicable("No SCD Type 2 dimensions detected")
+    ok = [n for n, t in scd2.items() if all(col in col_names(t) for col in tracked)]
+    return covered(len(ok), len(scd2),
+                   f"{len(ok)} of {len(scd2)} SCD2 dimensions track valid_from/valid_to/is_current")

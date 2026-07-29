@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from auditfast.core.check.registry import REGISTRY
 from auditfast.core.engine import run_audit
-from auditfast.core.enums import Layer, Pillar, Scope, Status
+from auditfast.core.enums import Automation, Layer, Pillar, Scope, Status
 from auditfast.core.scoring import aggregate, band_from_coverage, rating
 
 from .conftest import (
@@ -68,10 +68,29 @@ def test_result_and_scored_counts_are_unchanged(provider):
 
 def test_status_counts_are_unchanged(provider):
     agg = aggregate(_run(provider))
-    assert agg["counts"][Status.PASS] == 36
-    assert agg["counts"][Status.PARTIAL] == 13
+    assert agg["counts"][Status.PASS] == 38
+    assert agg["counts"][Status.PARTIAL] == 14
     assert agg["counts"][Status.FAIL] == 24
     assert agg["counts"][Status.INFO] == 3
+
+
+def test_mixed_layer_runs_every_layers_checks():
+    """A workspace tagged Mixed plays every role, so every check applies to it."""
+    mixed = REGISTRY.select(layer=Layer.MIXED)
+    prep = REGISTRY.select(layer=Layer.PREP)
+    assert len(mixed) == len(list(REGISTRY))   # Mixed selects the whole library
+    assert len(mixed) > len(prep)              # a single layer is a strict subset
+
+
+def test_no_selected_check_is_missing_when_its_objects_are_absent(provider):
+    """An object-scoped check with no object still appears, as N/A with a reason."""
+    results = _run(provider)
+    # The fixture's operations workspace has no notebook, but notebook checks apply
+    # to the Data Operations layer — they must still be reported, not dropped.
+    na_notebook = [r for r in results
+                   if r.check_id.startswith("NB-") and r.status is Status.NA]
+    assert na_notebook
+    assert any("No notebooks" in r.evidence for r in na_notebook)
 
 
 def test_notebook_checks_run_on_notebook_definitions(provider):
@@ -99,12 +118,15 @@ def test_table_checks_run_on_table_metadata(provider):
     assert tb["TB-NAMING"].status is Status.PARTIAL
 
 def test_registry_is_fully_populated():
-    """The automated library is unchanged; manual (attestation) checks are extra."""
-    automated = [s for s in REGISTRY if not s.manual]
-    assert len(automated) == 33
-    assert len([s for s in automated if s.scope is Scope.WORKSPACE]) == 19
-    assert len([s for s in automated if s.scope is Scope.PIPELINE]) == 9
-    assert len([s for s in automated if s.scope is Scope.NOTEBOOK]) == 5
+    """36 checks are evaluated; every other check still runs as a gated N/A."""
+    evaluated = [s for s in REGISTRY if s.automation is Automation.AUTOMATED]
+    assert len(evaluated) == 36
+    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 22
+    assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 9
+    assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 5
+    # The rest run as gated N/A that names the access they need — never skipped.
+    assert len([s for s in REGISTRY if s.automation is Automation.ROADMAP]) == 112
+    assert all(not s.manual for s in REGISTRY)
 
 
 def test_every_check_has_traceable_metadata():
@@ -155,8 +177,8 @@ def test_explicit_registry_is_isolated_from_the_global_one():
 
     assert registry.get("X-ISOLATED") is not None
     assert REGISTRY.get("X-ISOLATED") is None, "test check leaked into the global registry"
-    before = len([s for s in REGISTRY if not s.manual])
-    assert before == 33
+    before = len([s for s in REGISTRY if s.automation is Automation.AUTOMATED])
+    assert before == 36
 
 
 # -- selection and dispatch ----------------------------------------------------
@@ -239,6 +261,7 @@ def test_every_scoreable_check_ref_has_remediation_text():
         for spec in REGISTRY
         if spec.pillar is not Pillar.FOUNDATION
         and not spec.manual
+        and spec.automation is not Automation.ROADMAP
         and not book.get(spec.ref)
     })
     assert missing == [], f"checks with no remediation text: {missing}"

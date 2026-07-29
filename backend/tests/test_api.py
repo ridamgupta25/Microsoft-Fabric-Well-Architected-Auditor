@@ -115,8 +115,8 @@ def test_report_endpoint_returns_the_full_scorecard(client):
 
     report = client.get(f"/api/v1/reports/{audit_id}").json()
     assert report["overall"] == EXPECTED_OVERALL
-    assert report["total_scored"] == 73
-    assert len(report["results"]) == 77
+    assert report["total_scored"] == 76
+    assert len(report["results"]) == 180
     assert report["by_pillar"]["Performance & Capacity"]["pct"] is None
 
 
