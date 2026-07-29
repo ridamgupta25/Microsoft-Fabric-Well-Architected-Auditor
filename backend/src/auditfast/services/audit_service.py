@@ -15,8 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..clients import LiveFabricProvider
-from ..core.checks.helpers import RemediationBook
-from ..core.checks.registry import REGISTRY
+from ..core.check.helpers import RemediationBook
+from ..core.check.registry import REGISTRY
 from ..core.engine import run_audit as run_engine
 from ..core.enums import Layer, Pillar
 from ..core.models import CheckResult
@@ -118,8 +118,19 @@ def list_live_workspaces(token: str) -> list[dict]:
 
 
 def diagnose(token: str) -> dict:
-    """Probe what the token can actually read, per sub-resource."""
-    return LiveFabricProvider(token).probe()
+    """Probe what the token can actually read, per sub-resource.
+
+    Also surfaces the token's granted scopes and audience, which is what makes a
+    missing-permission problem (for example: no Item.ReadWrite for getDefinition)
+    diagnosable without guessing.
+    """
+    from .auth_service import _decode_jwt_claims
+
+    result = LiveFabricProvider(token).probe()
+    claims = _decode_jwt_claims(token)
+    result["granted_scopes"] = claims.get("scp", "")
+    result["token_audience"] = claims.get("aud", "")
+    return result
 
 
 # -- running ------------------------------------------------------------------
@@ -200,7 +211,7 @@ def run_check(
 
 def _single_check_registry(check_id: str):
     """A throwaway registry holding one check, so the engine runs only that one."""
-    from ..core.checks.registry import CheckRegistry
+    from ..core.check.registry import CheckRegistry
 
     narrow = CheckRegistry()
     spec = REGISTRY.get(check_id)

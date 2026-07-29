@@ -65,6 +65,17 @@
             ]
           }
         }
+      },
+      "notebooks": {
+        "NB_Gold_Build": {
+          "cells": [
+            { "cell_type": "code", "metadata": { "tags": ["parameters"] }, "source": "load_date = \"\"\nenv = \"prod\"" },
+            { "cell_type": "markdown", "source": "# Build the Gold sales table" },
+            { "cell_type": "code", "source": "from pyspark.sql.functions import *\n\ndf = spark.table(\"silver.customer\")\ndisplay(df)" },
+            { "cell_type": "code", "source": "gold = df.groupBy(\"region\").agg(sum(\"amount\").alias(\"total\"))\ngold.write.mode(\"overwrite\").saveAsTable(\"gold.sales\")" }
+          ],
+          "metadata": { "language_info": { "name": "python" } }
+        }
       }
     },
     {
@@ -106,6 +117,12 @@
             ]
           }
         }
+      },
+      "tables": {
+        "fact_sales": { "type": "Managed", "format": "Delta", "columns": [ { "name": "sales_sk", "type": "bigint" }, { "name": "customer_sk", "type": "bigint" }, { "name": "date_sk", "type": "int" }, { "name": "amount", "type": "decimal(18,2)" }, { "name": "created_date", "type": "timestamp" }, { "name": "modified_date", "type": "timestamp" } ] },
+        "dim_customer": { "type": "Managed", "format": "Delta", "columns": [ { "name": "customer_sk", "type": "bigint" }, { "name": "customer_id", "type": "string" }, { "name": "name", "type": "string" }, { "name": "valid_from", "type": "timestamp" }, { "name": "valid_to", "type": "timestamp" }, { "name": "is_current", "type": "boolean" }, { "name": "created_date", "type": "timestamp" } ] },
+        "dim_date": { "type": "Managed", "format": "Delta", "columns": [ { "name": "date_sk", "type": "int" }, { "name": "full_date", "type": "date" }, { "name": "fiscal_year", "type": "int" }, { "name": "quarter", "type": "int" } ] },
+        "StagingTemp": { "type": "External", "format": "Parquet", "columns": [ { "name": "col1", "type": "string" }, { "name": "load_dt", "type": "string" } ] }
       }
     },
     {

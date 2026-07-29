@@ -33,25 +33,29 @@ class StrEnum(str, Enum):
 
 
 class Pillar(StrEnum):
-    """Well-Architected pillars.
+    """The audit pillars — quality attributes aligned to team ownership.
 
-    ``FOUNDATION`` is cross-cutting: it holds informational results (inventory,
-    access errors) that describe the estate rather than judging it, and is never
-    scored. Governance findings roll up into ``OPEX``, matching the Area 8
-    mapping in the design specification.
+    Six scored pillars, each with a clear owner (Security team, Governance/
+    Compliance, DevOps/SRE, Performance engineers, FinOps, Data engineers).
+
+    ``FOUNDATION`` is cross-cutting and internal: it holds informational results
+    (inventory, access errors) that describe the estate rather than judging it,
+    and is never scored — so it is deliberately excluded from :meth:`scored`.
     """
 
-    RELIABILITY = "Reliability"
     SECURITY = "Security"
-    COST = "Cost Optimization"
-    OPEX = "Operational Excellence"
-    PERFORMANCE = "Performance Efficiency"
+    GOVERNANCE = "Governance & Compliance"
+    OPERATIONS = "Operations & Reliability"
+    PERFORMANCE = "Performance & Capacity"
+    COST = "Cost & Resource Optimization"
+    DATA = "Data Management & Quality"
     FOUNDATION = "Foundation"
 
     @classmethod
     def scored(cls) -> list[Pillar]:
         """The pillars that appear on the scorecard, in report order."""
-        return [cls.RELIABILITY, cls.SECURITY, cls.COST, cls.OPEX, cls.PERFORMANCE]
+        return [cls.SECURITY, cls.GOVERNANCE, cls.OPERATIONS,
+                cls.PERFORMANCE, cls.COST, cls.DATA]
 
 
 class Layer(StrEnum):
@@ -94,6 +98,27 @@ class Layer(StrEnum):
         return cls.MIXED
 
 
+class Automation(StrEnum):
+    """How a check's verdict is (or could be) reached.
+
+    Honesty about verifiability: not every industry-standard point can be read
+    from Fabric. This separates what the tool checks today from what it *could*
+    check with more integration, and what only a human can attest.
+
+    - ``AUTOMATED``: verified now from data the provider fetches.
+    - ``ROADMAP``: technically automatable, but needs a Fabric API the provider
+      does not yet call (e.g. notebook definitions, Delta table metadata,
+      capacity metrics). Listed as a manual attestation until then.
+    - ``MANUAL``: never machine-verifiable — a legal agreement, an organisational
+      process, a documentation/judgement call, or row-level data profiling that
+      is out of scope for a configuration auditor.
+    """
+
+    AUTOMATED = "automated"
+    ROADMAP = "roadmap"
+    MANUAL = "manual"
+
+
 class Scope(StrEnum):
     """What kind of object a check inspects.
 
@@ -126,6 +151,10 @@ class Resource(StrEnum):
     ROLE_ASSIGNMENTS = "roleAssignments"
     GIT = "git"
     PIPELINE_DEFINITIONS = "pipelineDefinitions"
+    NOTEBOOK_DEFINITIONS = "notebookDefinitions"
+    TABLE_SCHEMAS = "tableSchemas"
+    SHORTCUTS = "shortcuts"
+    SEMANTIC_MODEL_DEFINITIONS = "semanticModelDefinitions"
 
 
 class Status(StrEnum):

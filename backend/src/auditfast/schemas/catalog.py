@@ -20,6 +20,21 @@ class CheckSpecOut(BaseModel):
     layers: list[str] = Field(description="Layer roles it applies to; '*' means all.")
     requires: list[str] = Field(description="Data the provider must fetch for it.")
     weight: float = Field(description="Relative influence on the roll-up.")
+    required: bool = Field(
+        default=True,
+        description="Whether the point is expected in every project (True) or is "
+        "situational / optional (False).",
+    )
+    manual: bool = Field(
+        default=False,
+        description="True for attestation-only checks the engine never runs.",
+    )
+    automation: str = Field(
+        default="automated",
+        description="How the verdict is reached: 'automated' (runs now), "
+        "'roadmap' (automatable once the provider integrates the needed Fabric "
+        "API), or 'manual' (only a human can attest).",
+    )
     description: str = ""
 
 

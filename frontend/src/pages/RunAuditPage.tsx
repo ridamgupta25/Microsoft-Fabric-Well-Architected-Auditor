@@ -67,8 +67,8 @@ export function RunAuditPage() {
     });
   }, [allWorkspaces]);
 
-  // Performance Efficiency has no checks yet, so leave it off by default rather
-  // than showing a permanently empty pillar in every report.
+  // A pillar with no runnable checks is left off by default rather than showing
+  // a permanently empty pillar in every report.
   useEffect(() => {
     if (!pillars.data) return;
     setChosenPillars(

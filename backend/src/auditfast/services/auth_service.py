@@ -1,8 +1,10 @@
 """Read-only OAuth2 sign-in and the in-memory session store.
 
 Framework-agnostic by design: plain functions that acquire a delegated,
-**read-only** token via MSAL (interactive, device-code, or by reusing an
-existing ``az login``) and stash it in a session keyed by an opaque id.
+**least-privilege** token via MSAL (interactive, device-code, or by reusing an
+existing ``az login``) and stash it in a session keyed by an opaque id. The tool
+only ever reads; the single ReadWrite scope exists solely because Fabric gates
+``getDefinition`` (a read of an item's content) behind it.
 
 The token never leaves the server — clients hold only the session id, so a
 compromised browser cannot yield a Fabric access token. Tokens live for the
@@ -24,15 +26,23 @@ import json
 import threading
 import uuid
 
-# Fabric read-only scopes requested by default (no write/admin scope ever).
+# Fabric scopes requested at sign-in. Item.ReadWrite.All is required only because
+# Fabric gates getDefinition (reading an item's *content* — e.g. a notebook or
+# pipeline) behind a ReadWrite scope; the tool still issues reads exclusively and
+# never writes. No admin or tenant-settings scope is ever requested.
 _DEFAULT_FABRIC_SCOPES = [
     "https://api.fabric.microsoft.com/Workspace.Read.All",
-    "https://api.fabric.microsoft.com/Item.Read.All",
+    "https://api.fabric.microsoft.com/Item.ReadWrite.All",
+    "https://api.fabric.microsoft.com/OneLake.Read.All",
 ]
 # Microsoft's first-party Azure CLI public client - lets a user sign in with
 # just their email when no app registration is available.
 _AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
 _POWERBI_DEFAULT_SCOPE = ["https://analysis.windows.net/powerbi/api/.default"]
+#: The Fabric API, requested as .default so the built-in Azure CLI client's full
+#: set of pre-authorized Fabric permissions (including the item read/write needed
+#: for getDefinition) is included. Power BI .default did not carry them.
+_FABRIC_DEFAULT_SCOPE = ["https://api.fabric.microsoft.com/.default"]
 
 # session_id -> {"result": <token>|None, "error": <str>|None, "done": <bool>}
 _SESSIONS: dict[str, dict] = {}
@@ -130,7 +140,10 @@ def login_interactive(email: str, tenant_id, client_id, auth_cfg: dict) -> dict:
     using_builtin = False
     if not client:
         client = _AZURE_CLI_CLIENT_ID
-        scopes = _POWERBI_DEFAULT_SCOPE
+        # Target the Fabric API with .default so the built-in client's full set of
+        # pre-authorized Fabric permissions (item read/write, needed to read
+        # notebook/pipeline/semantic-model definitions) is included.
+        scopes = _FABRIC_DEFAULT_SCOPE
         using_builtin = True
 
     authority = (f"https://login.microsoftonline.com/{tenant}" if tenant

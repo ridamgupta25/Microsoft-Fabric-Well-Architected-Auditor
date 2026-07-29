@@ -20,8 +20,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 
 from ..clients.errors import WorkspaceAccessError
-from .checks.helpers import EMPTY_REMEDIATION, RemediationBook, Verdict
-from .checks.registry import REGISTRY, CheckRegistry
+from .check.helpers import EMPTY_REMEDIATION, RemediationBook, Verdict
+from .check.registry import REGISTRY, CheckRegistry
 from .enums import Layer, Pillar, Resource, Scope, Severity, Status
 from .models import CheckContext, CheckResult, CheckSpec, WorkspaceContext
 from .scoring import status_from_score
@@ -133,7 +133,9 @@ def run_audit(
     results: list[CheckResult] = []
 
     for workspace_id, layer in targets:
-        specs = registry.select(pillars=wanted_pillars, layer=layer)
+        # Manual (attestation-only) specs are catalogued but never executed.
+        specs = [s for s in registry.select(pillars=wanted_pillars, layer=layer)
+                 if not s.manual]
         if not specs:
             continue
 

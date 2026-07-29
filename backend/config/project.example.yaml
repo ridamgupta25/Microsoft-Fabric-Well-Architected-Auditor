@@ -20,11 +20,19 @@ workspaces:
   - id: "ws-ops-01"
     role: "Data Operations"
 
-# Read-only Entra app registration for signing in (optional — the CLI and API
-# both fall back to Microsoft's first-party Azure CLI client if this is unset).
+# Entra app registration for signing in (optional — the CLI and API both fall
+# back to Microsoft's first-party Azure CLI client if this is unset).
+#
+# IMPORTANT: the built-in Azure CLI client CANNOT read item *definitions*.
+# Reading notebook / pipeline / semantic-model CODE goes through the Fabric
+# getDefinition API, which requires the Item.ReadWrite.All scope — a scope the
+# built-in client does not grant (you will see getDefinition return HTTP 401).
+# To read code, register your own Entra app, add the delegated scopes below,
+# consent to it, and set its tenant_id + client_id here.
 auth:
   tenant_id: "<TENANT_ID>"
   client_id: "<ENTRA_APP_CLIENT_ID>"
   scopes:
     - "https://api.fabric.microsoft.com/Workspace.Read.All"
-    - "https://api.fabric.microsoft.com/Item.Read.All"
+    - "https://api.fabric.microsoft.com/Item.ReadWrite.All"   # required for getDefinition (item code)
+    - "https://api.fabric.microsoft.com/OneLake.Read.All"      # required for lakehouse shortcuts

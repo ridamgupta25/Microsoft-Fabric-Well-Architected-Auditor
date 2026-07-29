@@ -89,7 +89,7 @@ def load_project(project_path: str | Path) -> ProjectConfig:
 
 def load_remediation(config: ProjectConfig):
     """Build the remediation book for a project, empty when the file is absent."""
-    from ..core.checks.helpers import RemediationBook
+    from ..core.check.helpers import RemediationBook
 
     path = config.remediation_file
     if path and path.exists():

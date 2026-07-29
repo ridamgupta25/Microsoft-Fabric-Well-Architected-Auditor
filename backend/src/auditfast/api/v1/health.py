@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Response, status
 
 from ... import __version__
-from ...core.checks.registry import REGISTRY
+from ...core.check.registry import REGISTRY
 from ...schemas.common import HealthResponse, HealthStatus
 from ..deps import SettingsDep
 
