@@ -37,6 +37,24 @@ class Settings(BaseSettings):
     default_project: str = "config/project.example.yaml"
     output_dir: str = "output"
 
+    # -- knowledge-base cache -------------------------------------------------
+    # Audits are served from an on-disk snapshot of each workspace (the KB) so a
+    # run does not re-crawl Fabric every time. The live API is called only on a
+    # cache miss or once a snapshot ages past the hard TTL.
+    cache_enabled: bool = Field(
+        default=True, description="Serve audits from the on-disk workspace knowledge base."
+    )
+    cache_dir: str = "kb-cache"
+    cache_ttl_seconds: float = Field(
+        default=86_400.0,
+        description="Hard staleness: a snapshot older than this is re-crawled live.",
+    )
+    cache_soft_seconds: float = Field(
+        default=3_600.0,
+        description="Soft staleness: older snapshots are served at once, then refreshed in the background.",
+    )
+    cache_background_refresh: bool = True
+
     # -- CORS -----------------------------------------------------------------
     # The React dev server runs on a different origin, so the API must allow it
     # explicitly. In production this should be the deployed frontend origin only.

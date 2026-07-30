@@ -14,10 +14,13 @@ library, the engine, or the reports changing at all.
 from .base import ALL_RESOURCES, Provider
 from .errors import ProviderError, WorkspaceAccessError
 from .live import LiveFabricProvider
+from .powerbi import PowerBIClient, PowerBIError
 
 __all__ = [
     "ALL_RESOURCES",
     "LiveFabricProvider",
+    "PowerBIClient",
+    "PowerBIError",
     "Provider",
     "ProviderError",
     "WorkspaceAccessError",

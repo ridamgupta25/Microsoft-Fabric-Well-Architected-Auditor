@@ -114,10 +114,13 @@ export function RunAuditPage() {
         setLastAuditId(accepted.audit_id);
 
         const finished = await pollAudit(accepted.audit_id, setJob, controller.signal);
-        if (finished.status === "failed") {
+        if (finished.status === "failed" && !finished.report) {
           setError(finished.error ?? "The audit failed.");
           return;
         }
+        // Open the report on success, on a still-running timeout, or on a failure
+        // that still produced results — it renders whatever completed (a partial
+        // report shows a banner and the workspaces evaluated so far).
         setReport(finished.report ?? null);
         navigate(`/report/${accepted.audit_id}`);
       } catch (err) {

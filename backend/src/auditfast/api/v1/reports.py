@@ -49,17 +49,20 @@ async def get_report(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No audit found with id {audit_id!r}.",
         )
+    # Return whatever results exist — including a partial report while the audit
+    # is still running, or the results gathered before a failure — so a slow or
+    # interrupted run still shows the workspaces it managed to evaluate.
+    if job.report is not None:
+        return AuditReport(**job.report)
     if job.status is JobStatus.FAILED:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Audit {audit_id} failed: {job.error}",
         )
-    if job.report is None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Audit {audit_id} is {job.status.value}; no report yet.",
-        )
-    return AuditReport(**job.report)
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=f"Audit {audit_id} is {job.status.value}; no report yet.",
+    )
 
 
 @router.get(

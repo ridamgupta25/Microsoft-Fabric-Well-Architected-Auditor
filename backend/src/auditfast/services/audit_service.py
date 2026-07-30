@@ -10,11 +10,12 @@ cheap to add.
 """
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..clients import LiveFabricProvider
+from ..config.settings import get_settings
 from ..core.check.helpers import RemediationBook
 from ..core.check.registry import REGISTRY
 from ..core.engine import run_audit as run_engine
@@ -40,21 +41,40 @@ class AuditRun:
     errors: list[CheckResult] = field(default_factory=list)
     aggregate: dict = field(default_factory=dict)
     files: dict[str, str] = field(default_factory=dict)
+    #: Knowledge-base provenance: whether this report was served from the disk
+    #: cache and whether a fresher live crawl is being (or should be) fetched.
+    kb: dict = field(default_factory=dict)
 
 
 # -- provider construction ----------------------------------------------------
 
-def build_provider(config: ProjectConfig, token: str | None = None) -> LiveFabricProvider:
+def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: bool = False):
     """Create the provider for a run.
 
-    Every run reads the live tenant — there is no other source. ``config`` is
-    accepted (and unused beyond validation) so this stays a stable seam: a
-    second provider, if one is ever added, plugs in here without touching
-    every caller.
+    Every run reads the live tenant, but through the on-disk **knowledge base**:
+    the returned :class:`CachingProvider` serves each workspace from its cached
+    snapshot and calls Fabric only on a cache miss or once the snapshot is past
+    its TTL. ``refresh=True`` forces a fresh live crawl (rebuilding the KB).
+    Caching can be turned off entirely with ``AUDITFAST_CACHE_ENABLED=false``, in
+    which case the raw live provider is returned.
     """
     if not token:
         raise AuditError("A sign-in token is required to run an audit.")
-    return LiveFabricProvider(token)
+    live = LiveFabricProvider(token)
+    settings = get_settings()
+    if not settings.cache_enabled:
+        return live
+    from .context_store import CachingProvider, ContextStore
+
+    store = ContextStore(settings.resolve(settings.cache_dir))
+    return CachingProvider(
+        live,
+        store,
+        ttl_seconds=settings.cache_ttl_seconds,
+        soft_seconds=settings.cache_soft_seconds,
+        background_refresh=settings.cache_background_refresh,
+        force_refresh=refresh,
+    )
 
 
 def _resolve_pillars(names: Iterable[str] | None) -> list[Pillar] | None:
@@ -135,17 +155,48 @@ def diagnose(token: str) -> dict:
 
 # -- running ------------------------------------------------------------------
 
+def _build_run(project_name: str, raw_results: list[CheckResult]) -> AuditRun:
+    """Split access-errors from scored results and aggregate.
+
+    Workspaces that could not be read are warnings, not failing checks. Keeping
+    them out of the scored set means every consumer — console, Markdown, Excel,
+    and the browser — reports the same pass/partial/fail counts.
+    """
+    errors = [r for r in raw_results if r.check_id == ACCESS_CHECK_ID]
+    results = [r for r in raw_results if r.check_id != ACCESS_CHECK_ID]
+    return AuditRun(
+        project_name=project_name,
+        results=results,
+        errors=errors,
+        aggregate=aggregate(results),
+    )
+
+
 def run_audit(
     project_path: str | Path,
     pillars: Iterable[str] | None = None,
     workspaces: Sequence[dict] | Sequence[str] | None = None,
     out_dir: str | Path | None = None,
     token: str | None = None,
+    on_progress: Callable[[dict], None] | None = None,
+    refresh: bool = False,
 ) -> AuditRun:
-    """Run an audit and, when ``out_dir`` is given, write the report files."""
+    """Run an audit and, when ``out_dir`` is given, write the report files.
+
+    ``on_progress``, if given, receives a partial report dict after each
+    workspace — so a caller can surface results before the whole run finishes.
+
+    The run is served from the on-disk knowledge base; pass ``refresh=True`` to
+    force a fresh live crawl and rebuild the KB.
+    """
     config = load_project(project_path)
-    provider = build_provider(config, token)
+    provider = build_provider(config, token, refresh=refresh)
     remediation: RemediationBook = load_remediation(config)
+
+    def _progress(partial: list[CheckResult]) -> None:
+        report = to_json(_build_run(config.name, partial))
+        report["partial"] = True
+        on_progress(report)  # type: ignore[misc]
 
     raw_results = run_engine(
         provider,
@@ -153,21 +204,12 @@ def run_audit(
         config.settings,
         pillars=_resolve_pillars(pillars),
         remediation=remediation,
+        on_progress=_progress if on_progress else None,
     )
 
-    # Workspaces that could not be read are warnings, not failing checks. Keeping
-    # them out of the scored set means every consumer — console, Markdown, Excel,
-    # and the browser — reports the same pass/partial/fail counts.
-    errors = [r for r in raw_results if r.check_id == ACCESS_CHECK_ID]
-    results = [r for r in raw_results if r.check_id != ACCESS_CHECK_ID]
-
-    run = AuditRun(
-        project_name=config.name,
-        results=results,
-        errors=errors,
-        aggregate=aggregate(results),
-    )
-
+    run = _build_run(config.name, raw_results)
+    served = bool(getattr(provider, "served_from_cache", False))
+    run.kb = {"served_from_cache": served, "refreshing": served and not refresh}
     if out_dir:
         run.files = write_reports(run, out_dir)
     return run
@@ -255,6 +297,7 @@ def to_json(run: AuditRun) -> dict:
         "counts": agg.get("counts", {}),
         "total_scored": agg.get("total_scored", 0),
         "results": [r.to_dict() for r in run.results],
+        "kb": run.kb,
         "errors": [
             {
                 "workspace": r.workspace,

@@ -155,6 +155,8 @@ export interface WorkspaceScore {
 
 export interface AuditReport {
   audit_id?: string | null;
+  /** True while the audit is still running — results so far only. */
+  partial?: boolean;
   project_name: string;
   overall: number | null;
   by_pillar: Record<string, PillarScore>;

@@ -115,9 +115,9 @@ def test_report_endpoint_returns_the_full_scorecard(client):
 
     report = client.get(f"/api/v1/reports/{audit_id}").json()
     assert report["overall"] == EXPECTED_OVERALL
-    assert report["total_scored"] == 76
-    assert len(report["results"]) == 180
-    assert report["by_pillar"]["Performance & Capacity"]["pct"] is None
+    assert report["total_scored"] == 98
+    assert len(report["results"]) == 211
+    assert report["by_pillar"]["Governance & Compliance"]["pct"] is None
 
 
 def test_report_includes_the_pillar_by_layer_matrix(client):
