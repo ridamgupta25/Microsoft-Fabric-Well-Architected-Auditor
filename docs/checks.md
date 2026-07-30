@@ -14,7 +14,7 @@ no side effects: it is handed data and returns a judgement.
 ```python
 @check(
     id="WS-GIT", ref="11.1.2", title="Git integration enabled",
-    pillar=Pillar.OPEX, scope=Scope.WORKSPACE,
+    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE,
     severity=Severity.MEDIUM, requires=[Resource.GIT],
 )
 def git_connected(ctx: CheckContext) -> Verdict:
@@ -32,62 +32,37 @@ name, object name, and the remediation lookup — comes from the registered
 
 ## Catalog
 
-### Workspace checks — 12
+**148 checks** live under [`core/check/<pillar>/<layer>/`](../backend/src/auditfast/core/check/),
+split into three module kinds per pillar × layer:
 
-In [`core/checks/workspace/`](../backend/src/auditfast/core/checks/workspace/),
-one module per pillar. These are the **common** checks: they run for every
-workspace in every project.
+| Module | Automation | Meaning |
+|--------|-----------|---------|
+| `automated.py` | `automated` | Verified now from data the provider fetches — **64** checks |
+| `roadmap.py` | `roadmap` | Automatable, but needs a Fabric API not yet called — reported as an attestation and **generated** (**84** checks; see *Promoting* below) |
+| `manual.py` | `manual` | Never machine-verifiable — a legal / process / judgement attestation |
 
-| Check ID | Ref | Title | Pillar | Severity |
-|----------|-----|-------|--------|----------|
-| `WS-NAME` | 1.1.7 | Workspace naming convention | Operational Excellence | Low |
-| `WS-GIT` | 11.1.2 | Git integration enabled | Operational Excellence | Medium |
-| `WS-DEPLOY` | 11.2 | Deployment pipeline configured | Operational Excellence | Medium |
-| `WS-LAYER-CONTENT` | 1.1.2 | Contains the expected items for its layer | Operational Excellence | Medium |
-| `WS-LAYER-SEP` | 1.1.2 | Free of other layers' concerns | Operational Excellence | Medium |
-| `WS-ROLES-GROUPS` | 6.1.2 | Roles assigned to security groups, not individuals | Security | High |
-| `WS-LEASTPRIV` | 6.1.8 | Least-privilege admin grants | Security | High |
-| `WS-GUESTS` | 6.1 | No unmanaged external / guest access | Security | High |
-| `WS-LABELS` | 6.2.4 | Sensitivity labels applied to items | Security | Medium |
-| `WS-CAPACITY` | 12.1 | Capacity assigned | Cost Optimization | High |
-| `WS-ORPHAN` | 12.3.4 | No orphaned / stale items | Cost Optimization | Low |
-| `WS-INVENTORY` | 1.1 | Item inventory | Foundation | — informational |
+### By pillar
 
-Notable logic:
+| Pillar | Checks |
+|--------|-------:|
+| Data Management & Quality | 53 |
+| Operations & Reliability | 33 |
+| Performance & Capacity | 23 |
+| Security | 16 |
+| Cost & Resource Optimization | 15 |
+| Governance & Compliance | 7 |
+| Foundation (informational, unscored) | 1 |
 
-- **`WS-LEASTPRIV`** is graded, not binary: `3` at or under `max_admins`, `1` up
-  to two over, `0` beyond.
-- **`WS-ORPHAN`** treats an item as stale when `lastRunUtc` is missing,
-  unparseable, or older than `orphan_days` — unprovable use *is* the cost problem.
-- **`WS-LAYER-CONTENT` / `WS-LAYER-SEP`** are the layer-aware pair, comparing the
-  workspace's item types against `LAYER_ITEM_TYPES`. A role with no entry —
-  `Mixed`, or untagged — yields an informational result instead.
+### By scope
 
-### Pipeline checks — 8
+| Scope | Checks | Examples |
+|-------|-------:|----------|
+| `workspace` | 107 | naming, roles via security groups, least-privilege admins, sensitivity labels, capacity assigned, Git enabled, deployment pipeline, orphaned items, layer content / separation, inventory |
+| `pipeline` | 12 | naming, descriptions, parameterization, retry policy, on-failure path, failure notification, timeouts, no hardcoded secrets |
+| `notebook` | 29 | Delta MERGE / OPTIMIZE / VACUUM / Z-ORDER / V-ORDER, table properties, retention, Spark env & pinned libraries, shuffle / cache / repartition, `SELECT *` |
 
-In [`core/checks/pipeline/`](../backend/src/auditfast/core/checks/pipeline/).
-Each inspects one pipeline definition and verifies the *implemented* pipeline
-follows best practice; none trace where data comes from or goes.
-
-| Check ID | Ref | Title | Pillar | Severity |
-|----------|-----|-------|--------|----------|
-| `PL-NAME` | 2.1.1 | Pipeline naming convention | Operational Excellence | Low |
-| `PL-DESC` | 2.1.6 | Descriptions / annotations populated | Operational Excellence | Low |
-| `PL-PARAM` | 2.1.2 | Parameterized — no hardcoded endpoints | Operational Excellence | Medium |
-| `PL-RETRY` | 2.4.1 | Retry policy configured on activities | Reliability | High |
-| `PL-FAILPATH` | 2.4.3 | On-failure path defined | Reliability | Medium |
-| `PL-NOTIFY` | 2.4.5 | Failure notification present | Reliability | Medium |
-| `PL-TIMEOUT` | 2.4 | Explicit activity timeouts set | Reliability | Low |
-| `PL-SECRETS` | 6.4.2 | No hardcoded secrets in pipeline | Security | **Critical** |
-
-Notable logic:
-
-- **`PL-PARAM`** is three-valued: `0` if a hardcoded endpoint literal is found,
-  `3` if parameters are declared and nothing hardcoded, `1` if neither.
-- **`PL-TIMEOUT`** only counts a timeout that is *not* one of Fabric's defaults —
-  `7.00:00:00` and friends mean "nobody set this".
-- **`PL-SECRETS`** reports only the *number* of matching patterns, never the
-  matched text: an audit report must not become a second copy of the secret.
+The reserved scopes `lakehouse`, `semantic_model`, `report`, and `eventhouse`
+await the data needed to judge them.
 
 ### Synthetic result
 
@@ -95,21 +70,8 @@ Notable logic:
 |----------|---------|
 | `WS-ACCESS` | The workspace could not be read at all. Never scored; surfaced by the API in a separate `errors` array. |
 
-### Coverage
-
-| Pillar | Checks |
-|--------|-------:|
-| Operational Excellence | 8 |
-| Security | 5 |
-| Reliability | 4 |
-| Cost Optimization | 2 |
-| **Performance Efficiency** | **0** — not yet automated |
-
-By object type everything is workspace- or pipeline-level. Lakehouse/Delta,
-notebooks, semantic models and Eventhouse have no automated checks yet; the
-`Scope` members exist so adding them needs no engine change.
-
-Browse it live: `GET /api/v1/catalog/checks`, or `auditfast checks --pillar Security`.
+The catalog is **not** maintained by hand here — browse the live source of truth:
+`GET /api/v1/catalog/checks`, or `auditfast checks --pillar Security`.
 
 ---
 
@@ -123,7 +85,7 @@ Two filters, both applied **before** execution.
 PIPELINE_LAYERS = (Layer.PREP, Layer.OPERATIONS, Layer.MIXED)
 ```
 
-So a `Data Storage` workspace gets the 12 workspace checks and no pipeline
+So a `Data Storage` workspace gets the workspace-scoped checks and no pipeline
 checks, even if it contains pipelines. Its layer-separation check will still flag
 those pipelines as foreign — that *is* the finding.
 
@@ -139,7 +101,7 @@ checks never pays for `getDefinition` — one call per pipeline.
 ## Verdict builders
 
 Never construct a `CheckResult`. Return a `Verdict` from one of these
-([`core/checks/helpers.py`](../backend/src/auditfast/core/checks/helpers.py)):
+([`core/check/helpers.py`](../backend/src/auditfast/core/check/helpers.py)):
 
 | Builder | Use when | Score |
 |---------|----------|-------|
@@ -160,16 +122,26 @@ same as *"this is not configured"*.
 
 ## Adding a check
 
+> **Assisted path.** Before writing one by hand, assess a plain-language
+> best-practice point with `POST /api/v1/checklist/assess` (or the **Checklist**
+> page): it tells you whether an existing check already covers it and, if not,
+> drafts a proposal (pillar/scope/severity + a ready-to-edit `@check` skeleton +
+> a remediation stub). The `.github/` agents (`checklist-author` →
+> `check-researcher` → `check-implementer` → `check-reviewer`) then turn that
+> proposal into a merged, tested check. The steps below are exactly what those
+> agents automate — and what you follow to do it by hand. See
+> [AGENTS.md §11](../AGENTS.md) and [`.github/README.md`](../.github/README.md).
+
 ### 1. Write it
 
-Pick the module matching its scope and pillar, e.g.
-[`core/checks/workspace/cost.py`](../backend/src/auditfast/core/checks/workspace/cost.py):
+Pick the `automated.py` under the pillar × layer it belongs to, e.g.
+`core/check/data_management_quality/data_prep/automated.py`:
 
 ```python
 @check(
     id="WS-DF-GEN1", ref="1.2.3",
     title="No deprecated Dataflow Gen1 items",
-    pillar=Pillar.OPEX, scope=Scope.WORKSPACE,
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE,
     severity=Severity.MEDIUM,
     requires=[Resource.ITEMS],
 )
@@ -202,17 +174,17 @@ Keyed by `ref` in [`config/remediation.yaml`](../backend/config/remediation.yaml
 A missing key silently yields an empty recommendation, so a test asserts every
 scoreable check's ref has text. It will fail if you skip this.
 
-### 3. Make sure the module is imported
+### 3. The loader finds it automatically
 
-Adding to an existing module: done. **Creating a new module?** Import it in
-[`core/checks/__init__.py`](../backend/src/auditfast/core/checks/__init__.py):
+The check package **auto-discovers** every leaf module named `automated`,
+`manual`, or `roadmap` by walking the tree — adding a check to an existing
+`automated.py`, or creating a new `<pillar>/<layer>/automated.py`, needs **no**
+`__init__.py` edit. Shared helpers must be named with a leading underscore
+(e.g. `_spark.py`, `_pipeline.py`) so the loader skips them.
 
-```python
-from .workspace import my_new_module as _ws_new
-```
-
-Registration is an import side effect. A module nobody imports registers nothing
-and raises nothing.
+Registration is still an import side effect: `registered_modules()` and
+`/api/v1/health`'s `checks_registered` exist so a missing registration is
+visible rather than silent.
 
 ### 4. Add fixture data and tests
 
@@ -227,9 +199,17 @@ part of the shipped product.
 pin the overall score — both will fail, correctly, and both need updating with
 the new expected numbers.
 
-### 5. Update the catalog table above
+### 5. Promoting a `roadmap` point to `automated`
 
-Maintained by hand. `auditfast checks` prints the live list to copy from.
+`roadmap.py` modules are **generated** by [`build-manual-checks.py`](../../build-manual-checks.py).
+To turn a roadmap attestation into a verified automated check:
+
+1. write the evaluator in the pillar/layer `automated.py` with its `ref`;
+2. add that `ref` to the `AUTOMATED` set in `build-manual-checks.py`;
+3. run `python build-manual-checks.py` to regenerate the `roadmap.py` modules —
+   the promoted `ref` drops out, so there is no duplicate-id clash;
+4. add remediation text (step 2 above) and update the pinned test counts
+   (step 4 above).
 
 ---
 
@@ -241,7 +221,6 @@ Maintained by hand. `auditfast checks` prints the live list to copy from.
 - [ ] Guards unavailable data with `not_applicable()`
 - [ ] Evidence states a fact and includes the numbers
 - [ ] Remediation text added under the same `ref`
-- [ ] New module imported in `core/checks/__init__.py`
+- [ ] Module named `automated` / `manual` / `roadmap` (auto-loaded); helpers prefixed `_`
 - [ ] Fixture data added so it both passes and fails somewhere
 - [ ] Tests added; registry counts and parity values updated
-- [ ] Catalog table in this document updated

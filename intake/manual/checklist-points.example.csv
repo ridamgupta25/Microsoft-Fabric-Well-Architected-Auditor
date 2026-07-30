@@ -1,0 +1,6 @@
+point,pillar,scope,notes
+Delta tables are OPTIMIZE-compacted after large writes,Performance & Capacity,notebook,already covered by DELTA-OPTIMIZE — expect a match
+Row-level security is enforced on the semantic model,Security,semantic_model,likely a new check
+Pipelines retry failed activities with backoff,Operations & Reliability,pipeline,check for existing PL-RETRY
+Notebooks broadcast small dimension tables to avoid shuffle joins,Performance & Capacity,notebook,new performance check candidate
+Sensitivity labels are applied to every lakehouse,Governance & Compliance,workspace,roadmap vs automated depends on API access

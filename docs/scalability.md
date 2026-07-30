@@ -20,6 +20,7 @@ statements matter.
 | Job store | In-memory dict | **Yes** — dies with the process, not shared |
 | Auth sessions | Process-local dict | **Yes** — breaks on multi-worker/replica |
 | Report files | Fixed filename on local disk | **Yes** — concurrent runs overwrite |
+| Knowledge-base cache | On-disk snapshot per workspace; re-crawl only on miss/stale | **Yes** — local disk, not shared across replicas |
 | Multi-tenancy | Header + repository filter, not enforced | **Yes** — no auth on the API itself |
 | Scheduled audits | Not implemented | Yes, for the feature |
 | Database | None | Yes, for history and scheduling |
@@ -80,6 +81,18 @@ last regardless of the id.
 short-lived SAS URL. This also makes the API pod stateless, which is a
 prerequisite for autoscaling.
 
+The on-disk **knowledge base** (`kb-cache/`, one JSON snapshot per workspace)
+has the same local-disk constraint and the same fix: move it behind a shared
+store (Blob, or Redis/Postgres) keyed by workspace id, so snapshots are shared
+across replicas and a background refresh on one pod is visible to all. The cache
+is **per-workspace, not per-check**, but a partial crawl is no longer frozen:
+each `getDefinition`/table failure is recorded on `WorkspaceContext.read_failures`
+(forbidden vs transient), `is_complete` gates it, and the `CachingProvider`
+**re-crawls an incomplete snapshot instead of serving it**. A separate
+`ArchivingProvider` also writes a permanent, timestamped copy of every run to
+`Fabric workspace kb/` — also local-disk, so it would move to Blob for a
+multi-replica deployment.
+
 ---
 
 ## 3. Scaling to 500+ organizations
@@ -111,13 +124,21 @@ curves: one audit generates minutes of work from a single request.
 
 At thousands of workspaces the binding constraint is Microsoft's throttling, not
 your CPU. A live audit issues, per workspace: 1 workspace call, 1 items, 1 roles,
-1 git, **plus one `getDefinition` per pipeline**.
+1 git, **plus one `getDefinition` per pipeline, notebook, and semantic model**.
+
+> **Today's bottleneck:** those `getDefinition` calls run **one at a time,
+> sequentially, with a 60s timeout each**, so a 1000+ item workspace can take
+> many minutes (or tens of minutes when the tenant throttles) on the first,
+> uncached crawl. **Parallelising the per-item reads across a bounded thread
+> pool (honouring Retry-After) is the single highest-value performance fix** and
+> is the main open item.
 
 Priorities:
 
 1. **Resource-driven fetching is already implemented** — checks declare
    `requires`, and deselecting a pillar genuinely skips its calls. This is the
-   single largest lever and it is live.
+   single largest lever and it is live. (`read_failures` also records a blocked
+   read once, so a permission-limited tenant does not re-pay for the same 401s.)
 2. **Cache workspace metadata** with a short TTL; re-auditing the same workspace
    within minutes should not re-read it.
 3. **Honour `Retry-After`** with exponential backoff in `LiveFabricProvider`.
@@ -257,17 +278,26 @@ Two rules enforce that boundary:
 2. Every AI dependency is an optional extra (`pip install auditfast[ai]`),
    imported lazily, so the engine runs with none of it installed.
 
-### Structure (scaffolded, unimplemented)
+### Structure (partly implemented)
 
 ```
 ai/
-  recommendations/   findings -> richer remediation prose
-  rag/               retrieval over checklist, Fabric docs, past audits
-  agents/            triage, prioritisation, remediation planning
-  orchestrator/      provider routing, retries, token budgets, fallback
-  prompts/           versioned templates, kept out of code
-  embeddings/        chunking + vector store adapters
+  matching.py        IMPLEMENTED — deterministic checklist-point -> existing-check dedup
+  authoring.py       IMPLEMENTED — draft a @check proposal from a plain-language point
+  orchestrator/      IMPLEMENTED — optional Azure OpenAI advisory (off unless ai_enabled)
+  agents/            IMPLEMENTED — authoring_task() steps for the design-time agents
+  recommendations/   planned — findings -> richer remediation prose
+  rag/               planned — retrieval over checklist, Fabric docs, past audits
+  prompts/           planned — versioned templates, kept out of code
+  embeddings/        planned — chunking + vector store adapters
 ```
+
+The **checklist-intake** layer above is live behind `POST /api/v1/checklist/assess`
+and the Checklist page: `matching.py` dedups a point against the registry and
+`authoring.py` drafts a `@check` proposal, all deterministically and token-free.
+The optional model advisory (`orchestrator/`) enriches only that flow, is off by
+default, and is **never** in the scoring path. The `.github/` agents then turn an
+accepted proposal into a merged, tested check.
 
 ### Suggested sequence
 

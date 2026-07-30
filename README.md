@@ -11,8 +11,12 @@ input always produces the same score.
 - **Multi-workspace per project.** Register the workspaces that make up a
   project, tag each with its layer role, and get one aggregated score plus a
   per-workspace and **pillar × layer** breakdown.
-- **No AI.** An AI-assisted layer is scaffolded but deliberately unimplemented;
-  scoring must stay reproducible.
+- **Cached & incremental.** Each workspace is crawled once into an on-disk
+  knowledge base and re-read from it on later runs, so repeat audits are
+  near-instant and re-crawl Fabric only when a snapshot goes stale.
+- **AI stays out of scoring.** A deterministic **checklist-intake** layer — dedup
+  a best-practice point against the catalog, or draft a `@check` proposal — is
+  live; an optional model advisory is off by default, so scoring stays reproducible.
 
 ---
 
@@ -75,7 +79,7 @@ Risk Register).
 
 ```powershell
 cd backend
-..\.venv\Scripts\python.exe -m pytest      # 53 passed, fully offline against a recorded test fixture
+..\.venv\Scripts\python.exe -m pytest      # 171 passed, fully offline against a recorded test fixture
 ```
 
 ---
@@ -84,15 +88,17 @@ cd backend
 
 ```
 backend/src/auditfast/
-  core/       engine · checks · scoring · models   ← depends on nothing
-  clients/    the read-only Fabric REST provider
-  services/   orchestration; the single audit path, framework-free
-  api/v1/     FastAPI routers, versioned
+  core/       engine · check/ · scoring · models   ← depends on nothing
+  clients/    the read-only Fabric REST provider (classifies read failures)
+  services/   the single audit path + KB cache, archive, and checklist-intake, framework-free
+  api/v1/     FastAPI routers, versioned (audit, catalog, checklist, …)
   cli.py      mcp/    two further adapters over the same services
   schemas/    config/  database/  reporting/  security/
-  ai/         scaffolding only — nothing implemented
+  ai/         checklist-intake: matching + authoring (+ optional advisory, off by default)
 frontend/src/
-  pages/  components/  layouts/  services/  hooks/  context/  types/
+  pages/  components/  layouts/  services/  hooks/  context/  types/   (incl. ChecklistPage)
+.github/      agentic authoring layer (agents, skills, instructions, harness, mcp)
+intake/  output/   inputs the authoring agents read · generated reports + KB archive
 ```
 
 The dependency rule is one-way: **`core/` imports nothing outward.** The REST
@@ -106,20 +112,26 @@ the work runs in the background, because a tenant-wide run can take minutes.
 
 ## What it checks
 
-| Level | Checks |
-|-------|--------|
-| **Workspace** (12) | naming, roles use security groups, least-privilege admins, no guest access, sensitivity labels, Git enabled, deployment pipeline, capacity assigned, orphaned items, item inventory, layer content, layer separation |
-| **Pipeline** (8, each) | naming, descriptions, parameterization, retry policy, on-failure path, failure notification, explicit timeouts, no hardcoded secrets |
+**148 checks** across seven pillars — 64 verified today (`automated`), 84
+automatable-but-pending (`roadmap`).
+
+| Scope | Checks | Examples |
+|-------|-------:|----------|
+| **Workspace** | 107 | naming, roles via security groups, least-privilege admins, guest access, sensitivity labels, Git, deployment pipeline, capacity, orphaned items, layer content / separation, inventory |
+| **Pipeline** | 12 | naming, descriptions, parameterization, retry, on-failure path, failure notification, timeouts, no hardcoded secrets |
+| **Notebook** | 29 | Delta MERGE / OPTIMIZE / VACUUM / Z-ORDER / V-ORDER, table properties, retention, Spark env & pinned libraries, shuffle / cache / repartition, `SELECT *` |
 
 | Pillar | Checks |
 |--------|-------:|
-| Operational Excellence | 8 |
-| Security | 5 |
-| Reliability | 4 |
-| Cost Optimization | 2 |
-| Performance Efficiency | **0** — not yet automated |
+| Data Management & Quality | 53 |
+| Operations & Reliability | 33 |
+| Performance & Capacity | 23 |
+| Security | 16 |
+| Cost & Resource Optimization | 15 |
+| Governance & Compliance | 7 |
+| Foundation (informational, unscored) | 1 |
 
-Notebooks, Lakehouse/Delta, semantic models, and Eventhouse are not yet
+Lakehouse / Delta storage, semantic models, and Eventhouse are not yet
 automated. The engine dispatches on object *scope*, so adding them requires no
 engine change.
 

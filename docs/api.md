@@ -83,6 +83,7 @@ continues through the backend.
 | `GET` | `/reports/{id}` | The finished scorecard |
 | `GET` | `/reports/{id}/download/{kind}` | Markdown or Excel file |
 | `GET` | `/recommendations/{id}` | Findings with remediation, worst first |
+| `POST` | `/checklist/assess` | Assess a checklist point: already covered by a check, or a draft proposal (token-free) |
 | `GET` | `/history` | Past runs, paged |
 
 ---
@@ -147,7 +148,7 @@ GET /api/v1/reports/{audit_id}
   "overall": 57.89473684210527,
   "by_pillar": {
     "Security": { "pct": 48.9, "count": 15 },
-    "Performance Efficiency": { "pct": null, "count": 0 }
+    "Governance & Compliance": { "pct": null, "count": 0 }
   },
   "by_layer": { "Data Prep": { "pct": 61.7, "count": 27 } },
   "matrix": {
@@ -159,6 +160,7 @@ GET /api/v1/reports/{audit_id}
   "total_scored": 57,
   "results": [],
   "errors": [],
+  "kb": { "served_from_cache": false, "refreshing": false },
   "files": { "markdown": "audit-report.md", "excel": "audit-report.xlsx" }
 }
 ```
@@ -170,18 +172,31 @@ with no checks has not failed.
 against each pillar. This is the "inner pillars" model.
 
 **`errors`** is separate from `results` on purpose. A workspace that could not be
-read is a warning, not a failing check — *we could not look* is a different
-finding from *we looked and it was misconfigured*, and it must not drag the score
-down:
+read (`WS-ACCESS`) **or a partial crawl** (`WS-READ-INCOMPLETE` — some
+`getDefinition`/table reads were blocked or throttled) is a warning, not a
+failing check — *we could not look* is a different finding from *we looked and it
+was misconfigured*, and it must not drag the score down:
 
 ```json
-[{
-  "workspace": "ws-old-01",
-  "role": "Data Prep",
-  "message": "Access denied (HTTP 403): the signed-in user does not have access…",
-  "recommendation": "Confirm the workspace name/ID is correct and that…"
-}]
+[
+  {
+    "workspace": "ws-old-01",
+    "role": "Data Prep",
+    "message": "Access denied (HTTP 403): the signed-in user does not have access…",
+    "recommendation": "Confirm the workspace name/ID is correct and that…"
+  },
+  {
+    "workspace": "Explore Fabric - NOIDA",
+    "role": "Mixed",
+    "message": "42 of 138 notebook definitions could not be read — 42 forbidden (HTTP 401/403). Re-sign-in with Item.ReadWrite.All…",
+    "recommendation": ""
+  }
+]
 ```
+
+The Markdown/Excel report surfaces the same information in a **Crawl completeness**
+section, so a permission/throttle gap is visible instead of hiding behind a low
+score.
 
 Status codes: **404** no such audit; **409** it exists but has not finished (so a
 polling client can tell "not ready" from "never existed").
@@ -203,6 +218,27 @@ returns in well under a second. The fastest way to iterate on a rule.
 
 Only possible because checks carry metadata — there was previously no way to
 address one by id.
+
+---
+
+## Assessing a checklist point
+
+```http
+POST /api/v1/checklist/assess
+```
+
+```json
+{ "point": "Delta tables are OPTIMIZE-compacted after large writes" }
+```
+
+**Token-free** — it answers from the registered catalog (and an optional model),
+never contacting Fabric, so it always returns and never fails on a read. The
+response says whether the point is already `covered` (with the matching checks and
+a confidence score) or `not_covered` (with a draft `@check` proposal — inferred
+pillar/scope/severity, a ready-to-edit code skeleton, and the steps to promote
+it). It **never registers a check**, so the catalog and the score cannot move.
+See [AGENTS.md §11](../AGENTS.md) and [`.github/`](../.github/README.md) for the
+agentic authoring loop that turns a proposal into a merged check.
 
 ---
 

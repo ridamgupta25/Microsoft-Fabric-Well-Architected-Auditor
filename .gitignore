@@ -22,6 +22,10 @@ frontend/dist/
 # Generated audit output
 output/
 
+# Knowledge base — crawled tenant metadata (workspace GUIDs, item names); never commit
+kb-cache/
+Fabric workspace kb/
+
 # Local engagement configs (keep the examples).
 # NOTE: a pattern containing a slash is anchored to this file's directory, so
 # the path must be the real one — `config/*.yaml` would only match a top-level

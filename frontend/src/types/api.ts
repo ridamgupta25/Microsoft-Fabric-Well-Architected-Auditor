@@ -58,6 +58,47 @@ export interface CheckSpec {
   description: string;
 }
 
+// -- checklist intake ---------------------------------------------------------
+
+export interface CheckMatch {
+  check_id: string;
+  ref: string;
+  title: string;
+  pillar: string;
+  scope: string;
+  severity: Severity;
+  automation: "automated" | "roadmap" | "manual";
+  /** 0-1 similarity to the submitted point; higher is closer. */
+  confidence: number;
+  reason: string;
+}
+
+export interface CheckProposal {
+  point: string;
+  suggested_id: string;
+  suggested_ref: string;
+  pillar: string;
+  scope: string;
+  severity: Severity;
+  requires: string[];
+  title: string;
+  rationale: string;
+  code_skeleton: string;
+  remediation_stub: string;
+}
+
+export interface ChecklistAssessment {
+  point: string;
+  status: "covered" | "not_covered" | "invalid";
+  covered: boolean;
+  /** Whether AI-authored advisory was available; false = deterministic text. */
+  ai_enabled: boolean;
+  matches: CheckMatch[];
+  proposal: CheckProposal | null;
+  advisory: string;
+  next_steps: string[];
+}
+
 export interface PillarInfo {
   name: string;
   checks: number;
