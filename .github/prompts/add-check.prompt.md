@@ -4,6 +4,8 @@ argument-hint: "The checklist point to add, e.g. 'Delta tables are OPTIMIZE-comp
 ---
 Add this checklist point to the auditor: ${input:point}
 
+The complete lookup for every decision below — pillar/layer/scope folders, `requires[]`, verdict helpers, the context API, id/ref conventions, and pinned counts — is [check-authoring-cookbook.instructions.md](../instructions/check-authoring-cookbook.instructions.md) (auto-attached under `core/check/**`).
+
 Work the check-authoring loop — do not skip the dedup or the harness:
 
 1. **Dedup.** Call `POST /api/v1/checklist/assess` (or `intake_service.assess_point`) with the point. If it returns `covered`, stop and report the existing check id — do not add a duplicate.

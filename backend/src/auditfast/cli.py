@@ -9,9 +9,10 @@ signs in via the device-code flow before auditing.
 
 Commands::
 
-    auditfast run     --project config/project.example.yaml
-    auditfast serve   [--port 8000] [--reload]
-    auditfast checks  [--pillar Security]
+    auditfast run       --project config/project.example.yaml
+    auditfast serve     [--port 8000] [--reload]
+    auditfast checks    [--pillar Security]
+    auditfast checklist my-checklist.csv   [--no-run]
 """
 from __future__ import annotations
 
@@ -149,6 +150,60 @@ def cmd_twin(args) -> int:
     return EXIT_OK
 
 
+def cmd_checklist(args) -> int:
+    """Assess a user-supplied checklist file and run the matches over the KB.
+
+    Offline by default: covered points are evaluated against the on-disk
+    knowledge base (the ``kb-cache`` snapshots) with no sign-in. This is the
+    "the client handed us their own checklist" path — separate from a full audit.
+    """
+    import json
+
+    from .services import checklist_batch
+
+    path = os.path.abspath(args.file)
+    if not os.path.exists(path):
+        print(f"Checklist file not found: {path}", file=sys.stderr)
+        return EXIT_BAD_INPUT
+
+    with open(path, encoding="utf-8-sig") as fh:
+        content = fh.read()
+    try:
+        points = checklist_batch.parse_checklist(content, filename=path)
+    except checklist_batch.ChecklistParseError as exc:
+        print(f"Could not parse the checklist: {exc}", file=sys.stderr)
+        return EXIT_BAD_INPUT
+
+    workspace_ids = [w.strip() for w in (args.workspaces or "").split(",") if w.strip()] or None
+    result = checklist_batch.run_checklist(
+        points,
+        workspace_ids=workspace_ids,
+        run_checks=not args.no_run,
+    )
+
+    summary = result["summary"]
+    print(f"\nAssessed {summary['total_points']} point(s): "
+          f"{summary['covered']} covered, {summary['not_covered']} not covered, "
+          f"{summary['invalid']} invalid.")
+    print(f"Evaluated {summary['evaluated_points']} point(s) over "
+          f"{summary['workspaces']} workspace(s) in the knowledge base.")
+    if summary["verdicts"]:
+        verdicts = ", ".join(f"{s}: {c}" for s, c in sorted(summary["verdicts"].items()))
+        print(f"Workspace verdicts: {verdicts}")
+
+    out_dir = os.path.abspath(args.out)
+    os.makedirs(out_dir, exist_ok=True)
+    md_path = os.path.join(out_dir, "checklist-report.md")
+    json_path = os.path.join(out_dir, "checklist-report.json")
+    with open(md_path, "w", encoding="utf-8") as fh:
+        fh.write(checklist_batch.render_markdown(result))
+    with open(json_path, "w", encoding="utf-8") as fh:
+        json.dump(result, fh, indent=2)
+    print(f"\nReport : {md_path}")
+    print(f"JSON   : {json_path}")
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="auditfast",
@@ -179,12 +234,24 @@ def build_parser() -> argparse.ArgumentParser:
     twin.add_argument("--layer", default="Mixed", help="Layer role (default: Mixed)")
     twin.add_argument("--store", default="twins", help="Directory for twin snapshots")
 
+    checklist = sub.add_parser(
+        "checklist",
+        help="Assess a custom checklist file (CSV/JSON/Markdown) over the offline KB",
+    )
+    checklist.add_argument("file", help="Path to the checklist file (.csv/.json/.md/.txt)")
+    checklist.add_argument("--workspaces", default="",
+                           help="Comma-separated workspace ids (default: every cached workspace)")
+    checklist.add_argument("--out", default="output", help="Output directory (default: output)")
+    checklist.add_argument("--no-run", action="store_true",
+                           help="Only assess/dedup the points; do not evaluate them over the KB")
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    handlers = {"run": cmd_run, "serve": cmd_serve, "checks": cmd_checks, "twin": cmd_twin}
+    handlers = {"run": cmd_run, "serve": cmd_serve, "checks": cmd_checks,
+                "twin": cmd_twin, "checklist": cmd_checklist}
     handler = handlers.get(args.command)
     if handler is None:  # pragma: no cover - argparse enforces the choice
         build_parser().print_help()

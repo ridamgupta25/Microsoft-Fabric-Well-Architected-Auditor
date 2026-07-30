@@ -4,6 +4,10 @@ applyTo: "backend/src/auditfast/core/check/**"
 ---
 # Authoring a check
 
+> Full reference (enums, helpers, context API, worked examples, pinned counts):
+> [check-authoring-cookbook.instructions.md](check-authoring-cookbook.instructions.md).
+> This file is the one-page invariants summary.
+
 - A check is a **pure function** of its `CheckContext`. No network, no clock, no randomness, no LLM. Same input → same score.
 - Return `not_applicable(...)` when the data needed was unavailable (`not ctx.workspace.has(Resource.X)`). **Never FAIL on missing data** — "could not determine" ≠ "misconfigured". This is what keeps a new check from turning into a "could not fetch" failure.
 - Build verdicts with the helpers only (`core/check/helpers.py`): `binary(ok, ev)` → 3/0 · `covered(n, total, ev)` → banded ratio · `graded(0..3, ev)` · `note(ev)` → INFO, unscored · `not_applicable(ev)` → N/A, unscored.

@@ -99,6 +99,68 @@ export interface ChecklistAssessment {
   next_steps: string[];
 }
 
+// -- checklist batch (a whole uploaded checklist) -----------------------------
+
+export interface ChecklistEvaluation {
+  workspace: string;
+  /** 'kb' (offline snapshot), 'live', or 'none' (no data). */
+  source: string;
+  status: string;
+  objects: number;
+  counts: Record<string, number>;
+  evidence: string;
+  recommendation: string;
+}
+
+export interface ChecklistBatchItem {
+  point: string;
+  hint_pillar: string | null;
+  hint_scope: string | null;
+  notes: string | null;
+  status: "covered" | "not_covered" | "invalid";
+  covered: boolean;
+  matches: CheckMatch[];
+  proposal: CheckProposal | null;
+  advisory: string;
+  next_steps: string[];
+  evaluated_check: string | null;
+  evaluations: ChecklistEvaluation[];
+}
+
+export interface ChecklistBatchSummary {
+  total_points: number;
+  covered: number;
+  not_covered: number;
+  invalid: number;
+  evaluated_points: number;
+  workspaces: number;
+  run_checks: boolean;
+  verdicts: Record<string, number>;
+}
+
+export interface ChecklistWorkspace {
+  id: string;
+  name: string;
+  layer?: string | null;
+  items?: number | null;
+  pipelines?: number | null;
+}
+
+export interface ChecklistBatchResult {
+  summary: ChecklistBatchSummary;
+  workspaces: ChecklistWorkspace[];
+  items: ChecklistBatchItem[];
+}
+
+export interface ChecklistBatchRequest {
+  content?: string;
+  filename?: string;
+  points?: string[];
+  workspace_ids?: string[];
+  run_checks?: boolean;
+  auth_session?: string | null;
+}
+
 export interface PillarInfo {
   name: string;
   checks: number;

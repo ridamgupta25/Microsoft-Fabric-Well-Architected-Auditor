@@ -28,16 +28,36 @@ The dedup + proposal step is served by the backend
 [`ai/`](../backend/src/auditfast/ai) matcher/author; the authoring loop is the
 agents here.
 
+## Running a whole custom checklist (the batch path)
+
+Separately from authoring one point, a user can bring **their own checklist**
+(CSV / JSON / Markdown) and run it through the auditor in bulk:
+
+```
+Checklist file ──▶ checklist_batch.parse_checklist ──▶ per point: assess (dedup)
+                                                          │
+                                    covered (automated) ──┴─▶ evaluate over the
+                                                              offline KB (kb-cache/)
+                                                              ↳ live fallback if no snapshot
+                                    not_covered ───────────▶ draft proposal → /add-check
+```
+
+Surfaced everywhere the single-point tool is:
+`POST /api/v1/checklist/batch`, the CLI `auditfast checklist <file>`, the MCP
+`assess_checklist_batch` tool, and the **Checklist** page's *Run a custom
+checklist* upload. Driven by the [`/run-checklist`](prompts/run-checklist.prompt.md)
+prompt. It is **additive** — it never registers a check and never changes a score.
+
 ## Contents (maps to the target architecture)
 
 | Folder | Role |
 |--------|------|
 | [`agents/`](agents) | The multi-agent authoring workflow: `checklist-author` → `check-researcher` → `check-implementer` → `check-reviewer`. |
 | [`skills/`](skills) | `check-authoring` — the end-to-end workflow, with links to `fabric-skills/` and the MCP tools. |
-| [`prompts/`](prompts) | `add-check` — a `/add-check` slash command that runs the whole loop for one point. |
+| [`prompts/`](prompts) | `add-check` — a `/add-check` command that authors one point; `run-checklist` — a `/run-checklist` command that runs a whole custom checklist. |
 | [`mcp/`](mcp) | Which MCP servers the agents use. Wired for VS Code in [`.vscode/mcp.json`](../.vscode/mcp.json) (local auditor + hosted FabricIQ). |
 | [`harness/`](harness) | The validate-a-generated-check gate — an **executable** [`validate_check.py`](harness/validate_check.py) plus pytest + ruff + registry-count. |
-| [`instructions/`](instructions) | `check-authoring` invariants, auto-attached when editing `core/check/**`. |
+| [`instructions/`](instructions) | `check-authoring` invariants + a `check-authoring-cookbook` (the complete Pillar/Layer/Scope/Resource/helper enumeration) + a `fabric-skills-reference` surface→skill→MCP map, all auto-attached when editing `core/check/**`. |
 
 ## The one rule
 Everything here obeys AGENTS.md: **scoring stays deterministic and reproducible.**

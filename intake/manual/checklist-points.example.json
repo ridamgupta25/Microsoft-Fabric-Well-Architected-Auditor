@@ -1,0 +1,34 @@
+{
+  "points": [
+    {
+      "point": "Delta tables are OPTIMIZE-compacted after large writes",
+      "pillar": "Performance & Capacity",
+      "scope": "notebook",
+      "notes": "already covered by DELTA-OPTIMIZE — expect a match"
+    },
+    {
+      "point": "Row-level security is enforced on the semantic model",
+      "pillar": "Security",
+      "scope": "semantic_model",
+      "notes": "likely a new check"
+    },
+    {
+      "point": "Pipelines retry failed activities with backoff",
+      "pillar": "Operations & Reliability",
+      "scope": "pipeline",
+      "notes": "check for existing PL-RETRY"
+    },
+    {
+      "point": "Notebooks broadcast small dimension tables to avoid shuffle joins",
+      "pillar": "Performance & Capacity",
+      "scope": "notebook",
+      "notes": "new performance check candidate"
+    },
+    {
+      "point": "Sensitivity labels are applied to every lakehouse",
+      "pillar": "Governance & Compliance",
+      "scope": "workspace",
+      "notes": "roadmap vs automated depends on API access"
+    }
+  ]
+}
