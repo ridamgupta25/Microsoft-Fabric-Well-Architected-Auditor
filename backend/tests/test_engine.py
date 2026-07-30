@@ -48,8 +48,8 @@ def test_rating_labels():
 def test_not_assessed_is_not_zero(provider):
     """A pillar with no checks scores None, never 0.0 — they mean different things."""
     agg = aggregate(_run(provider))
-    assert agg["by_pillar"][Pillar.PERFORMANCE]["pct"] is None
-    assert agg["by_pillar"][Pillar.PERFORMANCE]["count"] == 0
+    assert agg["by_pillar"][Pillar.GOVERNANCE]["pct"] is None
+    assert agg["by_pillar"][Pillar.GOVERNANCE]["count"] == 0
 
 
 # -- parity with the pre-refactor implementation -------------------------------
@@ -68,9 +68,9 @@ def test_result_and_scored_counts_are_unchanged(provider):
 
 def test_status_counts_are_unchanged(provider):
     agg = aggregate(_run(provider))
-    assert agg["counts"][Status.PASS] == 38
-    assert agg["counts"][Status.PARTIAL] == 14
-    assert agg["counts"][Status.FAIL] == 24
+    assert agg["counts"][Status.PASS] == 46
+    assert agg["counts"][Status.PARTIAL] == 16
+    assert agg["counts"][Status.FAIL] == 36
     assert agg["counts"][Status.INFO] == 3
 
 
@@ -117,15 +117,41 @@ def test_table_checks_run_on_table_metadata(provider):
     assert tb["TB-MANAGED-DELTA"].status is Status.PARTIAL
     assert tb["TB-NAMING"].status is Status.PARTIAL
 
+
+def test_pipeline_load_checks_run(provider):
+    """The pipeline load-pattern checks read the pipeline definitions and score them."""
+    results = _run(provider)
+    inc = {r.obj: r for r in results if r.check_id == "PL-INCREMENTAL"}
+    assert inc, "no incremental-load results were produced"
+    assert inc["PL_Silver_Merge"].status is Status.PASS   # MERGE INTO = incremental
+    assert inc["PL_Bronze_Load"].status is Status.FAIL     # plain Copy, no watermark
+    orch = [r for r in results
+            if r.check_id == "PL-ORCHESTRATION" and r.status is Status.FAIL]
+    assert orch  # ws-prep-01 has two pipelines but none orchestrates the others
+
+
+def test_progress_callback_fires_per_workspace(provider):
+    """on_progress is called once per audited workspace, with cumulative results.
+
+    This is what lets a slow run surface a *partial* report — the results so far
+    — instead of an all-or-nothing wait.
+    """
+    snapshots: list[int] = []
+    results = _run(provider, on_progress=lambda partial: snapshots.append(len(partial)))
+    assert len(snapshots) == len(FIXTURE_TARGETS)   # one snapshot per workspace
+    assert snapshots == sorted(snapshots)           # cumulative — never shrinks
+    assert snapshots[-1] == len(results)            # final snapshot is the whole run
+
+
 def test_registry_is_fully_populated():
-    """36 checks are evaluated; every other check still runs as a gated N/A."""
+    """64 checks are evaluated; every other check still runs as a gated N/A."""
     evaluated = [s for s in REGISTRY if s.automation is Automation.AUTOMATED]
-    assert len(evaluated) == 36
-    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 22
-    assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 9
-    assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 5
+    assert len(evaluated) == 64
+    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 23
+    assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 12
+    assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 29
     # The rest run as gated N/A that names the access they need — never skipped.
-    assert len([s for s in REGISTRY if s.automation is Automation.ROADMAP]) == 112
+    assert len([s for s in REGISTRY if s.automation is Automation.ROADMAP]) == 84
     assert all(not s.manual for s in REGISTRY)
 
 
@@ -178,7 +204,7 @@ def test_explicit_registry_is_isolated_from_the_global_one():
     assert registry.get("X-ISOLATED") is not None
     assert REGISTRY.get("X-ISOLATED") is None, "test check leaked into the global registry"
     before = len([s for s in REGISTRY if s.automation is Automation.AUTOMATED])
-    assert before == 36
+    assert before == 64
 
 
 # -- selection and dispatch ----------------------------------------------------

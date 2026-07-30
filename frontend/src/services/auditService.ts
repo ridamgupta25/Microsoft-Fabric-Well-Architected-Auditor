@@ -94,26 +94,34 @@ const TERMINAL_STATUSES = new Set(["succeeded", "failed"]);
  * @param onProgress Called on each poll so the UI can show live status.
  * @param signal Abort to stop polling when the user navigates away — otherwise
  *   the loop outlives the component that started it.
+ * @param timeoutMs Optional upper bound. Defaults to `0` — **no timeout**: the
+ *   audit now runs off a disk-cached knowledge base and refreshes in the
+ *   background, so polling simply continues until it reaches a terminal state
+ *   (or `signal` aborts). Pass a positive value only to cap the wait.
  */
 export async function pollAudit(
   auditId: string,
   onProgress?: (job: AuditJob) => void,
   signal?: AbortSignal,
   intervalMs = 1000,
-  timeoutMs = 600_000,
+  timeoutMs = 0,
 ): Promise<AuditJob> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : Number.POSITIVE_INFINITY;
+  let last: AuditJob | null = null;
 
   for (;;) {
     if (signal?.aborted) throw new DOMException("Polling aborted", "AbortError");
 
     const job = await getAudit(auditId);
+    last = job;
     onProgress?.(job);
     if (TERMINAL_STATUSES.has(job.status)) return job;
 
-    if (Date.now() > deadline) {
-      throw new Error(`Audit ${auditId} did not finish within ${timeoutMs / 1000}s.`);
-    }
+    // Only relevant when a positive timeoutMs was supplied. Past the deadline,
+    // stop waiting but do NOT error: the audit keeps running on the server and
+    // has usually produced a partial report already. Return the last status so
+    // the caller can show what completed so far.
+    if (Date.now() > deadline) return last;
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
 }

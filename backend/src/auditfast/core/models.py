@@ -14,7 +14,7 @@ Four types carry the whole domain:
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from .enums import ITEM_TYPE_SCOPE, Automation, Layer, Pillar, Resource, Scope, Severity, Status
@@ -146,6 +146,48 @@ class WorkspaceContext:
         for item in self.items:
             if ITEM_TYPE_SCOPE.get(item.type) is scope:
                 yield (item.display_name or item.id, item)
+
+    # -- persistence (the knowledge-base cache) -------------------------------
+    def to_dict(self) -> dict:
+        """A JSON-safe snapshot of this workspace, for the on-disk KB cache."""
+        return {
+            "id": self.id,
+            "display_name": self.display_name,
+            "layer": self.layer.value,
+            "capacity_id": self.capacity_id,
+            "git_connected": self.git_connected,
+            "deployment_pipeline": self.deployment_pipeline,
+            "role_assignments": [asdict(r) for r in self.role_assignments],
+            "items": [asdict(i) for i in self.items],
+            "pipelines": self.pipelines,
+            "notebooks": self.notebooks,
+            "tables": self.tables,
+            "shortcuts": self.shortcuts,
+            "semantic_models": self.semantic_models,
+            "git_details": self.git_details,
+            "unavailable": sorted(r.value for r in self.unavailable),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> WorkspaceContext:
+        """Rebuild a context from :meth:`to_dict` output (the KB cache)."""
+        return cls(
+            id=data["id"],
+            display_name=data.get("display_name", ""),
+            layer=Layer(data["layer"]) if data.get("layer") else Layer.MIXED,
+            capacity_id=data.get("capacity_id"),
+            git_connected=bool(data.get("git_connected", False)),
+            deployment_pipeline=bool(data.get("deployment_pipeline", False)),
+            role_assignments=[RoleAssignment(**r) for r in data.get("role_assignments", [])],
+            items=[Item(**i) for i in data.get("items", [])],
+            pipelines=dict(data.get("pipelines", {})),
+            notebooks=dict(data.get("notebooks", {})),
+            tables=dict(data.get("tables", {})),
+            shortcuts=dict(data.get("shortcuts", {})),
+            semantic_models=dict(data.get("semantic_models", {})),
+            git_details=dict(data.get("git_details", {})),
+            unavailable={Resource(v) for v in data.get("unavailable", [])},
+        )
 
 
 @dataclass(frozen=True, slots=True)

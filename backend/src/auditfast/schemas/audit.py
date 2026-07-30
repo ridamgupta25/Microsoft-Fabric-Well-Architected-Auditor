@@ -126,6 +126,10 @@ class AuditReport(BaseModel):
     """The full result of a completed audit."""
 
     audit_id: str | None = None
+    partial: bool = Field(
+        default=False,
+        description="True while the audit is still running — results so far only.",
+    )
     project_name: str
     overall: float | None
     by_pillar: dict[str, PillarScore]

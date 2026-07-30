@@ -27,13 +27,21 @@ Design notes:
   because MCP calls are already request/response with a client-side timeout, and
   an agent has nowhere useful to put a job id.
 * No tool ever returns the token it was given.
+
+This server also exposes the six **FabricIQ** Power BI tools
+(``discover_artifacts``, ``resolve_report_id_from_url``, ``get_report_metadata``,
+``get_semantic_model_schema``, ``value_search``, ``execute_query``) — native,
+read-only re-creations of Microsoft's hosted FabricIQ MCP server, wrapping
+:mod:`auditfast.services.fabriciq_service`. They take a **Power BI-audience**
+token (``https://analysis.windows.net/powerbi/api``), which is a different
+audience from the Fabric token the audit tools use.
 """
 from __future__ import annotations
 
 from typing import Any
 
 from ..config.settings import get_settings
-from ..services import audit_service, catalog_service
+from ..services import audit_service, catalog_service, fabriciq_service
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -167,6 +175,105 @@ def summarize_findings(token: str, project: str | None = None) -> dict:
             for r in findings[:40]
         ],
     }
+
+
+# -- FabricIQ: native, read-only Power BI tools --------------------------------
+#
+# These re-create Microsoft's hosted FabricIQ MCP tools directly on the Power BI
+# REST API + DAX executeQueries endpoint, so the auditor owns the implementation
+# and stays read-only. ``resolve_report_id_from_url`` is pure parsing and needs
+# no token; the other five need a bearer token for the *Power BI* audience
+# (``https://analysis.windows.net/powerbi/api``) — a DIFFERENT audience from the
+# Fabric token the audit tools above use. Passing the wrong one yields 401.
+
+@mcp.tool()
+def resolve_report_id_from_url(url: str) -> dict:
+    """Parse a Power BI/Fabric report URL into its workspace and report GUIDs.
+
+    Pure string parsing, no sign-in. Flags workspace-app URLs, where the path
+    report id is a per-app instance id rather than the published-report GUID.
+    """
+    return fabriciq_service.resolve_report_id_from_url(url)
+
+
+@mcp.tool()
+def discover_artifacts(
+    token: str,
+    search_query: str,
+    artifact_types: list[str] | None = None,
+    max_results: int = 50,
+) -> dict:
+    """Search accessible Power BI workspaces for reports and semantic models.
+
+    Call this first when you have a name but no GUID. ``artifact_types`` narrows
+    to ``["Report"]`` or ``["SemanticModel"]``; omit for both. Reports are
+    returned before standalone models. Needs a Power BI-audience ``token``.
+    """
+    return fabriciq_service.discover_artifacts(
+        token, search_query, artifact_types=artifact_types, max_results=max_results
+    )
+
+
+@mcp.tool()
+def get_report_metadata(
+    token: str, report_id: str, workspace_id: str | None = None
+) -> dict:
+    """Report properties, pages, and the underlying semantic model GUID.
+
+    The ``semanticModel`` field is the id to pass to the schema/query/value
+    tools. Needs a Power BI-audience ``token``.
+    """
+    return fabriciq_service.get_report_metadata(token, report_id, workspace_id)
+
+
+@mcp.tool()
+def get_semantic_model_schema(
+    token: str, artifact_id: str, workspace_id: str | None = None
+) -> dict:
+    """Tables, columns, measures, and relationships of a semantic model.
+
+    Built from read-only ``INFO.VIEW.*`` DAX. Read this before writing queries.
+    Needs a Power BI-audience ``token``.
+    """
+    return fabriciq_service.get_semantic_model_schema(token, artifact_id, workspace_id)
+
+
+@mcp.tool()
+def value_search(
+    token: str,
+    artifact_id: str,
+    search_terms: list[str],
+    workspace_id: str | None = None,
+    max_columns: int = 25,
+    max_rows: int = 20,
+) -> dict:
+    """Find which column holds a value, and its exact spelling, before filtering.
+
+    Scans visible text columns with case-insensitive DAX ``SEARCH`` so a filter
+    uses the canonical value. Needs a Power BI-audience ``token``.
+    """
+    return fabriciq_service.value_search(
+        token, artifact_id, search_terms,
+        workspace_id=workspace_id, max_columns=max_columns, max_rows=max_rows,
+    )
+
+
+@mcp.tool()
+def execute_query(
+    token: str,
+    artifact_id: str,
+    dax_queries: list[str],
+    max_rows: int = 250,
+    workspace_id: str | None = None,
+) -> dict:
+    """Run 1–4 read-only DAX ``EVALUATE`` queries and return tabular results.
+
+    Exactly one ``EVALUATE`` per query; up to 1,000 rows each (default 250).
+    Needs a Power BI-audience ``token``.
+    """
+    return fabriciq_service.execute_query(
+        token, artifact_id, dax_queries, max_rows=max_rows, workspace_id=workspace_id
+    )
 
 
 def main() -> None:

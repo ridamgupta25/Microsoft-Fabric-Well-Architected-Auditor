@@ -17,7 +17,7 @@ does not change.
 """
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 
 from ..clients.errors import WorkspaceAccessError
 from .check.helpers import EMPTY_REMEDIATION, RemediationBook, Verdict, not_applicable
@@ -131,6 +131,7 @@ def run_audit(
     registry: CheckRegistry = REGISTRY,
     pillars: Iterable[Pillar] | None = None,
     remediation: RemediationBook = EMPTY_REMEDIATION,
+    on_progress: Callable[[list[CheckResult]], None] | None = None,
 ) -> list[CheckResult]:
     """Audit every target workspace and return a flat list of results.
 
@@ -195,5 +196,10 @@ def run_audit(
                         results.append(
                             build_result(spec, workspace, verdict, result_obj, remediation)
                         )
+
+        # Emit a partial snapshot after each workspace, so a long-running audit
+        # can be shown and polled before every workspace has been processed.
+        if on_progress is not None:
+            on_progress(list(results))
 
     return results

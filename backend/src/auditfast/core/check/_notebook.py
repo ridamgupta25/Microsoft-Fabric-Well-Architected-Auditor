@@ -30,3 +30,14 @@ def has_parameters_cell(definition: dict) -> bool:
         if "parameters" in tags:
             return True
     return False
+
+
+def markdown_sources(definition: dict) -> list[str]:
+    """Return the concatenated source of every markdown cell in the notebook."""
+    out: list[str] = []
+    for cell in (definition or {}).get("cells") or []:
+        if cell.get("cell_type") != "markdown":
+            continue
+        src = cell.get("source")
+        out.append("".join(src) if isinstance(src, list) else (src or ""))
+    return out

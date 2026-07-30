@@ -9,15 +9,26 @@ import { FindingsTable } from "@/components/FindingsTable";
 import { PillarMatrix } from "@/components/PillarMatrix";
 import { EmptyState, ErrorBanner, ScoreBar, Section, Spinner } from "@/components/ui";
 import { useAsync } from "@/hooks/useAsync";
-import { getReport, reportDownloadUrl } from "@/services/auditService";
+import { getAudit, reportDownloadUrl } from "@/services/auditService";
 import { formatPercent, ratingFor } from "@/utils/format";
 
 export function ReportPage() {
   const { auditId = "" } = useParams();
-  const { data: report, loading, error, reload } = useAsync(
-    () => getReport(auditId),
+  const { data: job, loading, error, reload } = useAsync(
+    () => getAudit(auditId),
     [auditId],
   );
+
+  const report = job?.report ?? null;
+  const running = job?.status === "queued" || job?.status === "running";
+
+  // While the audit is still running, refresh so partial results appear and
+  // grow with each completed workspace instead of showing a "no report" error.
+  useEffect(() => {
+    if (!running) return;
+    const timer = setTimeout(reload, 2500);
+    return () => clearTimeout(timer);
+  }, [running, job, reload]);
 
   // The title reflects what was actually audited — the workspace name when a
   // single one is in scope, otherwise a neutral heading — instead of the static
@@ -30,9 +41,17 @@ export function ReportPage() {
     if (report) document.title = `${heading} — Audit`;
   }, [report, heading]);
 
-  if (loading) return <Spinner label="Loading report…" />;
-  if (error) return <ErrorBanner message={error} onRetry={reload} />;
-  if (!report) return <EmptyState title="No report" />;
+  if (loading && !job) return <Spinner label="Loading report…" />;
+  if (!report) {
+    if (running) {
+      return <Spinner label="Audit running — waiting for the first workspace to finish…" />;
+    }
+    if (job?.status === "failed") {
+      return <ErrorBanner message={job.error ?? "The audit failed."} onRetry={reload} />;
+    }
+    if (error) return <ErrorBanner message={error} onRetry={reload} />;
+    return <EmptyState title="No report" />;
+  }
 
   const rating = ratingFor(report.overall);
 
@@ -47,6 +66,26 @@ export function ReportPage() {
           {report.errors.length > 0 && ` · ${report.errors.length} skipped for access`}
         </p>
       </div>
+
+      {report.partial && (
+        <section className="rounded-md border border-blue-200 bg-blue-50 p-4 dark:border-blue-900 dark:bg-blue-950">
+          <h2 className="flex items-center gap-2 text-base font-semibold text-blue-900 dark:text-blue-300">
+            <span aria-hidden="true">⏳</span>
+            Partial report — audit still running
+          </h2>
+          <p className="mt-1 text-xs text-blue-700 dark:text-blue-400">
+            These are the workspaces evaluated so far; the run is still in progress
+            on the server. Use <strong>Reload results</strong> to fetch the latest.
+          </p>
+          <button
+            type="button"
+            onClick={reload}
+            className="mt-3 rounded-md border border-blue-300 bg-white px-3 py-1.5 text-xs font-medium text-blue-800 hover:bg-blue-100 dark:border-blue-800 dark:bg-blue-900 dark:text-blue-200"
+          >
+            Reload results
+          </button>
+        </section>
+      )}
 
       {report.errors.length > 0 && (
         <section className="rounded-md border border-orange-200 bg-orange-50 p-4 dark:border-orange-900 dark:bg-orange-950">

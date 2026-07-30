@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from functools import partial
 from typing import Any
 
 from ..config.logging import correlation_id, get_logger
@@ -109,6 +110,13 @@ class AuditRunner:
             await self._repository.update(job)
             logger.info("audit started", extra={"audit_id": job.id})
 
+            def _on_progress(partial_report: dict[str, Any]) -> None:
+                # Store the partial report as each workspace lands. The in-memory
+                # store holds jobs by reference, so a concurrent poll sees it at
+                # once; the job stays RUNNING until the whole run finishes.
+                partial_report["audit_id"] = job.id
+                job.report = partial_report
+
             try:
                 run = await asyncio.to_thread(
                     audit_service.run_audit,
@@ -117,6 +125,7 @@ class AuditRunner:
                     workspaces,
                     out_dir,
                     token,
+                    on_progress=_on_progress,
                 )
                 report: dict[str, Any] = audit_service.to_json(run)
                 report["audit_id"] = job.id
@@ -134,6 +143,66 @@ class AuditRunner:
                 logger.exception("audit failed", extra={"audit_id": job.id})
             finally:
                 await self._repository.update(job)
+
+        # The report was served from the knowledge base — kick a background live
+        # crawl to refresh the KB and replace the report in place, so the user
+        # sees results at once and fresh numbers land shortly after.
+        if (report := job.report) and report.get("kb", {}).get("served_from_cache"):
+            refresh_task = asyncio.create_task(
+                self._refresh_in_background(
+                    job,
+                    project_path=project_path,
+                    pillars=pillars,
+                    workspaces=workspaces,
+                    out_dir=out_dir,
+                    token=token,
+                    parent_correlation_id=parent_correlation_id,
+                )
+            )
+            self._tasks.add(refresh_task)
+            refresh_task.add_done_callback(self._tasks.discard)
+
+    async def _refresh_in_background(
+        self,
+        job: AuditJob,
+        *,
+        project_path: str,
+        pillars: list[str] | None,
+        workspaces: list[dict] | None,
+        out_dir: str | None,
+        token: str | None,
+        parent_correlation_id: str = "-",
+    ) -> None:
+        """Re-crawl the tenant live, rebuild the KB, and update the report.
+
+        Runs after a cache-served audit has already been returned. The job stays
+        succeeded; only its ``report`` is replaced, so a client that re-reads the
+        report sees the freshened numbers.
+        """
+        correlation_id.set(parent_correlation_id)
+        async with self._semaphore:
+            try:
+                run = await asyncio.to_thread(
+                    partial(
+                        audit_service.run_audit,
+                        project_path,
+                        pillars,
+                        workspaces,
+                        out_dir,
+                        token,
+                        refresh=True,
+                    )
+                )
+                report = audit_service.to_json(run)
+                report["audit_id"] = job.id
+                job.report = report
+                await self._repository.update(job)
+                logger.info(
+                    "audit knowledge base refreshed",
+                    extra={"audit_id": job.id, "overall": report.get("overall")},
+                )
+            except Exception:  # noqa: BLE001 - a failed refresh must not surface
+                logger.exception("audit KB refresh failed", extra={"audit_id": job.id})
 
     # -- reading --------------------------------------------------------------
     async def get(self, job_id: str, organization_id: str | None = None) -> AuditJob | None:
