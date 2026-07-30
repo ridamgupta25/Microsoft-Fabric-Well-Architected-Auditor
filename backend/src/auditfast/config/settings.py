@@ -55,6 +55,18 @@ class Settings(BaseSettings):
     )
     cache_background_refresh: bool = True
 
+    # -- knowledge-base archive ----------------------------------------------
+    # A permanent, timestamped history of every crawled workspace, separate from
+    # the single-file cache above. Each audit writes a new dated folder, so the
+    # full crawl history is kept on disk rather than overwritten.
+    kb_archive_enabled: bool = Field(
+        default=True, description="Write a timestamped KB snapshot of each crawl to disk."
+    )
+    kb_archive_dir: str = Field(
+        default="Fabric workspace kb",
+        description="Root folder for the permanent, per-run KB archive.",
+    )
+
     # -- CORS -----------------------------------------------------------------
     # The React dev server runs on a different origin, so the API must allow it
     # explicitly. In production this should be the deployed frontend origin only.

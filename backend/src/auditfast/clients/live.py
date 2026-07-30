@@ -101,35 +101,65 @@ class LiveFabricProvider:
         except ValueError:
             return None
 
+    #: getDefinition statuses worth retrying — transient throttling / 5xx. A
+    #: 401/403 is a permission verdict, not a blip, so it is never retried.
+    _RETRYABLE = frozenset({429, 500, 502, 503, 504})
+
     def _definition_parts(
         self, workspace_id: str, item_id: str, fmt: str | None = None
-    ) -> list[dict]:
+    ) -> tuple[list[dict], str]:
         """Read an item's definition parts via the read-only getDefinition LRO.
 
-        getDefinition is a long-running operation: it answers 200 with the body
-        inline for small items, or 202 with a ``Location`` to poll until the
-        operation completes and its result carries the parts. A read-only token
-        is rejected with 401 — getDefinition requires an Item.ReadWrite scope.
+        Returns ``(parts, failure)`` where ``failure`` is:
+
+        * ``""`` — the read completed (``parts`` may still be empty for a
+          genuinely empty item);
+        * ``"forbidden"`` — a 401/403 permission denial (Fabric gates
+          getDefinition behind the Item.ReadWrite scope). It will not recover
+          without a different token, so the caller records a known gap;
+        * ``"transient"`` — a throttling/5xx/timeout/transport error that
+          survived retries. It *may* recover, so a partial crawl carrying one
+          must be re-fetched rather than cached.
+
+        Distinguishing the two is what lets the knowledge base avoid freezing a
+        temporary throttle into a permanent-looking gap.
+
+        getDefinition is a long-running operation: 200 with the body inline for
+        small items, or 202 with a ``Location`` to poll until it completes.
         """
         url = f"{self.BASE}/workspaces/{workspace_id}/items/{item_id}/getDefinition"
         if fmt:
             url += f"?format={fmt}"
-        try:
-            response = self._session.post(url, timeout=self._timeout)
-        except Exception as exc:
-            log.warning("item %s getDefinition transport error: %s", item_id, exc)
-            return []
-        if response.status_code == 200:
-            body = self._json(response)
-        elif response.status_code == 202:
-            body = self._await_operation(response)
-        else:
-            log.warning("item %s getDefinition -> HTTP %s", item_id, response.status_code)
-            return []
-        parts = ((body or {}).get("definition") or {}).get("parts") or []
-        if not parts:
-            log.warning("item %s getDefinition returned no definition parts", item_id)
-        return parts
+        for attempt in range(3):
+            try:
+                response = self._session.post(url, timeout=self._timeout)
+            except Exception as exc:
+                if attempt < 2:
+                    time.sleep(min(2.0 * (attempt + 1), 5.0))
+                    continue
+                log.warning("item %s getDefinition transport error: %s", item_id, exc)
+                return [], "transient"
+            status = response.status_code
+            if status == 200:
+                body = self._json(response)
+            elif status == 202:
+                body = self._await_operation(response)
+                if body is None:
+                    return [], "transient"  # the LRO failed or timed out
+            elif status in (401, 403):
+                log.warning("item %s getDefinition -> HTTP %s (forbidden)", item_id, status)
+                return [], "forbidden"
+            elif status in self._RETRYABLE and attempt < 2:
+                time.sleep(min(2.0 * (attempt + 1), 5.0))
+                continue
+            else:
+                log.warning("item %s getDefinition -> HTTP %s", item_id, status)
+                return [], "transient"
+            parts = ((body or {}).get("definition") or {}).get("parts") or []
+            if not parts:
+                log.warning("item %s getDefinition returned no definition parts", item_id)
+            return parts, ""
+        return [], "transient"
 
     def _await_operation(self, response) -> Any:
         """Poll a 202 long-running operation to completion, returning its result body."""
@@ -164,49 +194,63 @@ class LiveFabricProvider:
         log.warning("getDefinition operation timed out: %s", location)
         return None
 
-    def _pipeline_definition(self, workspace_id: str, item_id: str) -> dict | None:
-        """Read a pipeline's content (a read-only getDefinition) as parsed JSON."""
-        for part in self._definition_parts(workspace_id, item_id):
+    def _pipeline_definition(self, workspace_id: str, item_id: str) -> tuple[dict | None, str]:
+        """Read a pipeline's content (getDefinition) as parsed JSON.
+
+        Returns ``(definition, failure)`` — see :meth:`_definition_parts`.
+        """
+        parts, failure = self._definition_parts(workspace_id, item_id)
+        for part in parts:
             if part.get("path", "").endswith(("pipeline-content.json", "pipelineContent.json")):
                 try:
                     payload = base64.b64decode(part["payload"]).decode("utf-8")
-                    return json.loads(payload)
+                    return json.loads(payload), ""
                 except Exception:
-                    return None
-        return None
+                    return None, ""
+        return None, failure
 
-    def _notebook_definition(self, workspace_id: str, item_id: str) -> dict | None:
-        """Read a notebook's content (a read-only getDefinition) as an .ipynb dict."""
-        for part in self._definition_parts(workspace_id, item_id, fmt="ipynb"):
+    def _notebook_definition(self, workspace_id: str, item_id: str) -> tuple[dict | None, str]:
+        """Read a notebook's content (getDefinition) as an .ipynb dict.
+
+        Returns ``(definition, failure)`` — see :meth:`_definition_parts`.
+        """
+        parts, failure = self._definition_parts(workspace_id, item_id, fmt="ipynb")
+        for part in parts:
             path = part.get("path", "")
             if not path.endswith((".ipynb", "notebook-content.py")):
                 continue
             try:
                 payload = base64.b64decode(part["payload"]).decode("utf-8")
             except Exception:
-                return None
+                return None, ""
             if path.endswith(".ipynb"):
                 try:
-                    return json.loads(payload)
+                    return json.loads(payload), ""
                 except Exception:
-                    return None
+                    return None, ""
             # A .py export: wrap the raw source as a single code cell.
-            return {"cells": [{"cell_type": "code", "source": payload}]}
-        return None
+            return {"cells": [{"cell_type": "code", "source": payload}]}, ""
+        return None, failure
 
-    def _lakehouse_tables(self, workspace_id: str, item_id: str) -> list[dict]:
+    def _lakehouse_tables(self, workspace_id: str, item_id: str) -> tuple[list[dict], str]:
         """List a lakehouse's tables via REST (name/type/format; no columns).
 
-        The Fabric *List Tables* endpoint returns rows under ``data`` (not the
-        usual ``value`` collection key), so it is read directly here.
+        Returns ``(rows, failure)`` — see :meth:`_definition_parts` for the
+        ``failure`` values. The Fabric *List Tables* endpoint returns rows under
+        ``data`` (not the usual ``value`` collection key), so it is read directly.
         """
         status, body = self._get(
             f"/workspaces/{workspace_id}/lakehouses/{item_id}/tables"
         )
+        if status in (401, 403):
+            log.warning("lakehouse %s list-tables -> HTTP %s (forbidden)", item_id, status)
+            return [], "forbidden"
+        if status is None or status == 429 or (isinstance(status, int) and status >= 500):
+            log.warning("lakehouse %s list-tables -> HTTP %s (transient)", item_id, status)
+            return [], "transient"
         if status != 200 or not isinstance(body, dict):
-            log.warning("lakehouse %s list-tables -> HTTP %s", item_id, status)
-            return []
-        return body.get("data") or []
+            return [], ""  # e.g. 404 — no SQL endpoint / no tables; not a read failure
+        return body.get("data") or [], ""
 
     def _item_shortcuts(self, workspace_id: str, item_id: str) -> list[dict]:
         """List an item's OneLake shortcuts (name/path/target type), all pages."""
@@ -223,17 +267,41 @@ class LiveFabricProvider:
             })
         return shortcuts
 
-    def _semantic_model_definition(self, workspace_id: str, item_id: str) -> dict | None:
-        """Fetch a semantic model's TMSL definition and reduce it to model facts."""
-        for part in self._definition_parts(workspace_id, item_id, fmt="TMSL"):
+    def _semantic_model_definition(self, workspace_id: str, item_id: str) -> tuple[dict | None, str]:
+        """Fetch a semantic model's TMSL definition and reduce it to model facts.
+
+        Returns ``(model, failure)`` — see :meth:`_definition_parts`.
+        """
+        parts, failure = self._definition_parts(workspace_id, item_id, fmt="TMSL")
+        for part in parts:
             try:
                 payload = base64.b64decode(part["payload"]).decode("utf-8")
                 document = json.loads(payload)
             except Exception:
                 continue
             if isinstance(document, dict) and ("model" in document or "tables" in document):
-                return parse_tmsl(document)
-        return None
+                return parse_tmsl(document), ""
+        return None, failure
+
+    @staticmethod
+    def _record_failures(ctx: WorkspaceContext, resource: Resource,
+                         attempted: int, read: int, forbidden: int, transient: int) -> None:
+        """Record a one-per-item read outcome on the context.
+
+        When some items of a type could not be read, store the counts so the gap
+        is visible ("N of M could not be read"). When *none* could be read, also
+        mark the resource unavailable so its checks report N/A with the reason.
+        """
+        if attempted and (forbidden or transient):
+            ctx.read_failures[resource.value] = {
+                "attempted": attempted,
+                "read": read,
+                "failed": forbidden + transient,
+                "forbidden": forbidden,
+                "transient": transient,
+            }
+            if read == 0:
+                ctx.unavailable.add(resource)
 
     # -- the provider contract -------------------------------------------------
     def fetch(
@@ -294,20 +362,40 @@ class LiveFabricProvider:
         # The expensive one — one call per pipeline. Only paid for when a
         # selected check actually reads a pipeline definition.
         if Resource.PIPELINE_DEFINITIONS in wanted:
+            attempted = read = forbidden = transient = 0
             for item in ctx.items:
                 if item.type != "DataPipeline":
                     continue
-                definition = self._pipeline_definition(workspace_id, item.id)
-                if definition:
-                    ctx.pipelines[item.display_name or item.id] = definition
+                attempted += 1
+                definition, failure = self._pipeline_definition(workspace_id, item.id)
+                if failure == "forbidden":
+                    forbidden += 1
+                elif failure == "transient":
+                    transient += 1
+                else:
+                    read += 1
+                    if definition:
+                        ctx.pipelines[item.display_name or item.id] = definition
+            self._record_failures(ctx, Resource.PIPELINE_DEFINITIONS,
+                                  attempted, read, forbidden, transient)
 
         # Notebook definitions: same one-call-per-item getDefinition pattern.
         if Resource.NOTEBOOK_DEFINITIONS in wanted:
             found = [i for i in ctx.items if i.type == "Notebook"]
+            attempted = read = forbidden = transient = 0
             for item in found:
-                definition = self._notebook_definition(workspace_id, item.id)
-                if definition:
-                    ctx.notebooks[item.display_name or item.id] = definition
+                attempted += 1
+                definition, failure = self._notebook_definition(workspace_id, item.id)
+                if failure == "forbidden":
+                    forbidden += 1
+                elif failure == "transient":
+                    transient += 1
+                else:
+                    read += 1
+                    if definition:
+                        ctx.notebooks[item.display_name or item.id] = definition
+            self._record_failures(ctx, Resource.NOTEBOOK_DEFINITIONS,
+                                  attempted, read, forbidden, transient)
             log.info("fetch %s: %d notebooks found, %d definitions read",
                      workspace_id, len(found), len(ctx.notebooks))
 
@@ -316,15 +404,26 @@ class LiveFabricProvider:
         # N/A rather than failing when they are absent.
         if Resource.TABLE_SCHEMAS in wanted:
             lakehouses = [i for i in ctx.items if i.type == "Lakehouse"]
+            attempted = read = forbidden = transient = 0
             for item in lakehouses:
-                for tbl in self._lakehouse_tables(workspace_id, item.id):
-                    name = tbl.get("name")
-                    if name:
-                        ctx.tables[name] = {
-                            "type": tbl.get("type", ""),
-                            "format": tbl.get("format", ""),
-                            "columns": [],
-                        }
+                attempted += 1
+                tables, failure = self._lakehouse_tables(workspace_id, item.id)
+                if failure == "forbidden":
+                    forbidden += 1
+                elif failure == "transient":
+                    transient += 1
+                else:
+                    read += 1
+                    for tbl in tables:
+                        name = tbl.get("name")
+                        if name:
+                            ctx.tables[name] = {
+                                "type": tbl.get("type", ""),
+                                "format": tbl.get("format", ""),
+                                "columns": [],
+                            }
+            self._record_failures(ctx, Resource.TABLE_SCHEMAS,
+                                  attempted, read, forbidden, transient)
             log.info("fetch %s: %d lakehouses, %d tables read",
                      workspace_id, len(lakehouses), len(ctx.tables))
 
@@ -342,15 +441,23 @@ class LiveFabricProvider:
 
         # Semantic-model measures + relationships, parsed from the TMSL definition.
         if Resource.SEMANTIC_MODEL_DEFINITIONS in wanted:
-            parsed = 0
+            attempted = read = forbidden = transient = 0
             for item in ctx.items:
                 if item.type != "SemanticModel":
                     continue
-                model = self._semantic_model_definition(workspace_id, item.id)
-                if model:
-                    ctx.semantic_models[item.display_name or item.id] = model
-                    parsed += 1
-            log.info("fetch %s: %d semantic models parsed", workspace_id, parsed)
+                attempted += 1
+                model, failure = self._semantic_model_definition(workspace_id, item.id)
+                if failure == "forbidden":
+                    forbidden += 1
+                elif failure == "transient":
+                    transient += 1
+                else:
+                    read += 1
+                    if model:
+                        ctx.semantic_models[item.display_name or item.id] = model
+            self._record_failures(ctx, Resource.SEMANTIC_MODEL_DEFINITIONS,
+                                  attempted, read, forbidden, transient)
+            log.info("fetch %s: %d semantic models parsed", workspace_id, len(ctx.semantic_models))
 
         return ctx
 

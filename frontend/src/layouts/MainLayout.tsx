@@ -16,6 +16,7 @@ const NAV = [
   { to: "/", label: "Dashboard", end: true },
   { to: "/run", label: "Run audit" },
   { to: "/catalog", label: "Checks" },
+  { to: "/checklist", label: "Checklist" },
   { to: "/history", label: "History" },
 ];
 

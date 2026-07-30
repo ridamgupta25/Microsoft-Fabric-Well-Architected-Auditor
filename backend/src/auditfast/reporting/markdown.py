@@ -11,10 +11,11 @@ def _fmt(pct):
     return "—" if pct is None else f"{pct:.1f}%"
 
 
-def build_markdown(project_name: str, agg: dict, results: list) -> str:
+def build_markdown(project_name: str, agg: dict, results: list, errors: list | None = None) -> str:
     overall = agg["overall"]
     o_label, o_emoji = rating(overall)
     counts = agg["counts"]
+    na_count = sum(1 for r in results if r.status == Status.NA)
     lines: list[str] = []
 
     lines.append("# Fabric Well-Architected Audit — AuditFAST Core")
@@ -28,8 +29,26 @@ def build_markdown(project_name: str, agg: dict, results: list) -> str:
     lines.append("")
     lines.append(f"**{_fmt(overall)} — {o_emoji} {o_label}**  ")
     lines.append(f"{counts[Status.PASS]} pass · {counts[Status.PARTIAL]} partial · "
-                 f"{counts[Status.FAIL]} fail · {agg['total_scored']} checks scored")
+                 f"{counts[Status.FAIL]} fail · {na_count} not assessed · "
+                 f"{agg['total_scored']} checks scored")
     lines.append("")
+
+    # Crawl completeness — access + partial-read warnings, up top so an
+    # incomplete crawl is never mistaken for a genuinely low score.
+    errors = errors or []
+    if errors:
+        lines.append("## \u26a0\ufe0f Crawl completeness")
+        lines.append("")
+        lines.append(f"{len(errors)} workspace/resource read(s) did not complete. "
+                     "Affected checks are reported N/A, not failed — the score below "
+                     "reflects only what could actually be read from the tenant.")
+        lines.append("")
+        lines.append("| Workspace | What could not be read |")
+        lines.append("|-----------|------------------------|")
+        for r in errors:
+            msg = (getattr(r, "evidence", "") or "").replace("|", "\\|")
+            lines.append(f"| {getattr(r, 'workspace', '')} | {msg} |")
+        lines.append("")
 
     # Pillar scorecard
     lines.append("## Pillar Scorecard")
@@ -73,6 +92,33 @@ def build_markdown(project_name: str, agg: dict, results: list) -> str:
                 f"{r.workspace} | {obj} | {r.status.value} | {ev} | {rec} |")
     lines.append("")
 
+    # Not assessed (N/A): checks whose data could not be read. These are the
+    # "why are checks missing?" answer — grouped by reason so a permission or
+    # access gap is visible instead of the checks silently vanishing.
+    na_results = [r for r in results if r.status == Status.NA]
+    if na_results:
+        lines.append(f"## Not assessed — N/A ({len(na_results)})")
+        lines.append("")
+        lines.append("These checks could not be evaluated — usually because the data they "
+                     "read could not be fetched (most often a sign-in token that lacks the "
+                     "scope to read role assignments, Git, or item definitions via "
+                     "`getDefinition`). They are **not** failures and do not affect the score. "
+                     "Re-sign-in with full consent (Item.ReadWrite.All + Workspace.Read.All), "
+                     "then re-run to assess them.")
+        lines.append("")
+        lines.append("| Reason | Checks | Pillars affected |")
+        lines.append("|--------|-------:|------------------|")
+        groups: dict[str, list] = {}
+        for r in na_results:
+            key = (r.evidence or "Not applicable").strip()
+            group = groups.setdefault(key, [0, set()])
+            group[0] += 1
+            group[1].add(str(r.pillar))
+        for reason, (count, pillars) in sorted(groups.items(), key=lambda kv: -kv[1][0]):
+            reason_txt = reason.replace("|", "\\|")
+            lines.append(f"| {reason_txt} | {count} | {', '.join(sorted(pillars))} |")
+        lines.append("")
+
     # Inventory (informational)
     info = [r for r in results if r.status == Status.INFO]
     if info:
@@ -86,9 +132,11 @@ def build_markdown(project_name: str, agg: dict, results: list) -> str:
 
     lines.append("---")
     lines.append("")
-    lines.append("> Scope: this report covers the **best-practice / architecture level** for the "
-                 "**Pipelines + workspace** checks automated in Phase 1. Deep-dive items "
-                 "(data profiling, line-by-line code, semantic-model/report internals) and "
-                 "document-based items (DR, compliance, runbooks) are completed in the Excel checklist.")
+    lines.append("> Scope: rule-based best-practice / architecture level across **workspace, "
+                 "pipeline, and notebook (Spark/Delta)** checks. Items shown as **N/A** could "
+                 "not be read from the tenant with the current sign-in (see *Not assessed* "
+                 "above) — they are not failures. Deep-dive items (data profiling, line-by-line "
+                 "code, semantic-model/report internals) and document-based items (DR, "
+                 "compliance, runbooks) are completed in the Excel checklist.")
     lines.append("")
     return "\n".join(lines)

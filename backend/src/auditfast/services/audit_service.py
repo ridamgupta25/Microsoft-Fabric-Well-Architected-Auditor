@@ -18,6 +18,7 @@ from ..clients import LiveFabricProvider
 from ..config.settings import get_settings
 from ..core.check.helpers import RemediationBook
 from ..core.check.registry import REGISTRY
+from ..core.engine import READ_INCOMPLETE_CHECK_ID
 from ..core.engine import run_audit as run_engine
 from ..core.enums import Layer, Pillar
 from ..core.models import CheckResult
@@ -62,19 +63,27 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
         raise AuditError("A sign-in token is required to run an audit.")
     live = LiveFabricProvider(token)
     settings = get_settings()
-    if not settings.cache_enabled:
-        return live
-    from .context_store import CachingProvider, ContextStore
+    provider = live
+    if settings.cache_enabled:
+        from .context_store import CachingProvider, ContextStore
 
-    store = ContextStore(settings.resolve(settings.cache_dir))
-    return CachingProvider(
-        live,
-        store,
-        ttl_seconds=settings.cache_ttl_seconds,
-        soft_seconds=settings.cache_soft_seconds,
-        background_refresh=settings.cache_background_refresh,
-        force_refresh=refresh,
-    )
+        store = ContextStore(settings.resolve(settings.cache_dir))
+        provider = CachingProvider(
+            live,
+            store,
+            ttl_seconds=settings.cache_ttl_seconds,
+            soft_seconds=settings.cache_soft_seconds,
+            background_refresh=settings.cache_background_refresh,
+            force_refresh=refresh,
+        )
+    # A permanent, timestamped snapshot of every crawl, written on top of
+    # whatever provider serves it (cache or live) so each audit run is archived.
+    if settings.kb_archive_enabled:
+        from .context_store import ArchivingProvider, KBArchive
+
+        archive = KBArchive(settings.resolve(settings.kb_archive_dir))
+        provider = ArchivingProvider(provider, archive)
+    return provider
 
 
 def _resolve_pillars(names: Iterable[str] | None) -> list[Pillar] | None:
@@ -162,8 +171,9 @@ def _build_run(project_name: str, raw_results: list[CheckResult]) -> AuditRun:
     them out of the scored set means every consumer — console, Markdown, Excel,
     and the browser — reports the same pass/partial/fail counts.
     """
-    errors = [r for r in raw_results if r.check_id == ACCESS_CHECK_ID]
-    results = [r for r in raw_results if r.check_id != ACCESS_CHECK_ID]
+    error_ids = {ACCESS_CHECK_ID, READ_INCOMPLETE_CHECK_ID}
+    errors = [r for r in raw_results if r.check_id in error_ids]
+    results = [r for r in raw_results if r.check_id not in error_ids]
     return AuditRun(
         project_name=project_name,
         results=results,
@@ -276,7 +286,7 @@ def write_reports(run: AuditRun, out_dir: str | Path) -> dict[str, str]:
     excel_path = directory / "audit-report.xlsx"
 
     markdown_path.write_text(
-        build_markdown(run.project_name, run.aggregate, run.results),
+        build_markdown(run.project_name, run.aggregate, run.results, run.errors),
         encoding="utf-8",
     )
     build_excel(str(excel_path), run.project_name, run.aggregate, run.results)

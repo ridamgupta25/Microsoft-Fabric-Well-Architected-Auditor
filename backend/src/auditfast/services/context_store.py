@@ -26,6 +26,7 @@ import re
 import threading
 import time
 from collections.abc import Iterable
+from datetime import datetime
 from pathlib import Path
 
 from ..clients.base import ALL_RESOURCES, Provider
@@ -161,7 +162,16 @@ class CachingProvider:
         if not self._force:
             cached = self._store.load(workspace_id)
             age = self._store.age_seconds(workspace_id)
-            if cached is not None and age is not None and age <= self._ttl:
+            # An incomplete snapshot (a definition/table read failed, or items /
+            # role assignments were unavailable) is never served as if whole —
+            # that would freeze a permission or throttle gap into a believable
+            # low score. Re-crawl instead, so the missing pieces get another try.
+            if (
+                cached is not None
+                and age is not None
+                and age <= self._ttl
+                and cached.is_complete
+            ):
                 self.served_from_cache = True
                 if age > self._soft:
                     self._schedule_refresh(workspace_id, layer)
@@ -206,3 +216,88 @@ class CachingProvider:
                     self._refreshing.discard(workspace_id)
 
         threading.Thread(target=_work, name=f"kb-refresh-{workspace_id}", daemon=True).start()
+
+
+class KBArchive:
+    """Permanent, timestamped archive of every crawled workspace snapshot.
+
+    Unlike :class:`ContextStore` (one overwriting file per workspace, used as the
+    cache), this never overwrites: each audit run writes a fresh, dated folder so
+    the full crawl history is kept on disk. Layout::
+
+        <root>/<workspace>/<workspace>_<YYYYMMDD_HHMMSS>/
+            workspace.json   full snapshot (WorkspaceContext.to_dict)
+            summary.json     counts, completeness, unavailable, read failures
+    """
+
+    def __init__(self, root: str | Path):
+        self.root = Path(root)
+
+    def save(self, ctx: WorkspaceContext) -> Path:
+        """Write a new dated snapshot folder for ``ctx`` and return its path."""
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe = _safe_name(ctx.name or ctx.id)
+        folder = self.root / safe / f"{safe}_{stamp}"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "workspace.json").write_text(
+            json.dumps(ctx.to_dict(), indent=2, default=str), encoding="utf-8"
+        )
+        (folder / "summary.json").write_text(
+            json.dumps(self._summary(ctx, stamp), indent=2, default=str), encoding="utf-8"
+        )
+        log.info("KB archived %s -> %s", ctx.id, folder)
+        return folder
+
+    @staticmethod
+    def _summary(ctx: WorkspaceContext, stamp: str) -> dict:
+        return {
+            "workspace_id": ctx.id,
+            "workspace": ctx.name,
+            "captured_at": stamp,
+            "layer": ctx.layer.value,
+            "complete": ctx.is_complete,
+            "items": len(ctx.items),
+            "notebooks_read": len(ctx.notebooks),
+            "pipelines_read": len(ctx.pipelines),
+            "tables_read": len(ctx.tables),
+            "semantic_models_read": len(ctx.semantic_models),
+            "unavailable": sorted(r.value for r in ctx.unavailable),
+            "read_failures": ctx.read_failures,
+        }
+
+
+class ArchivingProvider:
+    """Wraps any provider and archives every context it returns.
+
+    Applied on top of the cache (or the raw live provider) so *every* audit run
+    writes a fresh timestamped KB snapshot, whether the data came from disk or a
+    live crawl. A failed archive write never breaks an audit.
+    """
+
+    def __init__(self, inner: Provider, archive: KBArchive):
+        self._inner = inner
+        self._archive = archive
+
+    def fetch(
+        self,
+        workspace_id: str,
+        layer: Layer = Layer.MIXED,
+        resources: Iterable[Resource] = ALL_RESOURCES,
+    ) -> WorkspaceContext:
+        ctx = self._inner.fetch(workspace_id, layer, resources)
+        try:
+            self._archive.save(ctx)
+        except Exception as exc:  # noqa: BLE001 - archiving must not fail an audit
+            log.warning("KB archive write failed for %s: %s", workspace_id, exc)
+        return ctx
+
+    def list_workspaces(self) -> list[dict]:
+        return self._inner.list_workspaces()
+
+    def probe(self, *args, **kwargs):
+        probe = getattr(self._inner, "probe", None)
+        return probe(*args, **kwargs) if probe else {}
+
+    @property
+    def served_from_cache(self) -> bool:
+        return bool(getattr(self._inner, "served_from_cache", False))

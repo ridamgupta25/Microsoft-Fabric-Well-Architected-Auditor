@@ -152,10 +152,10 @@ single `Data Prep` workspace containing ten pipelines produces:
 
 | Pillar | Scored checks | Share of overall |
 |--------|--------------:|-----------------:|
-| Reliability | 40 | 44% |
-| Operational Excellence | 35 | 38% |
+| Data Management & Quality | 40 | 44% |
+| Operations & Reliability | 35 | 38% |
 | Security | 14 | 15% |
-| Cost Optimization | 2 | **2%** |
+| Cost & Resource Optimization | 2 | **2%** |
 
 So a naming-convention violation still counts as much toward the overall score as
 a hardcoded secret. The difference from before is that fixing this is now a

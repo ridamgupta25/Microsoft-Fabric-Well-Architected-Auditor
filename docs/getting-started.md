@@ -59,10 +59,10 @@ py -m venv .venv
 **Verify:**
 
 ```powershell
-.\.venv\Scripts\python.exe -c "from auditfast.core.checks import REGISTRY; print(len(REGISTRY), 'checks loaded')"
+.\.venv\Scripts\python.exe -c "from auditfast.core.check.registry import REGISTRY; print(len(REGISTRY), 'checks loaded')"
 ```
 
-Expected: `20 checks loaded`. If this prints `0`, the check modules failed to
+Expected: `148 checks loaded`. If this prints `0`, the check modules failed to
 import and every audit would silently score nothing.
 
 ### Run the tests
@@ -72,7 +72,7 @@ cd backend
 ..\.venv\Scripts\python.exe -m pytest
 ```
 
-Expected: **53 passed**. The suite is fully offline and deterministic — it runs
+Expected: **171 passed**. The suite is fully offline and deterministic — it runs
 against a recorded tenant fixture under `tests/fixtures/`, not a real Fabric
 tenant, so it needs no credentials and never makes a network call. See
 [migration.md](migration.md#test-strategy) for why that fixture is test
@@ -116,6 +116,23 @@ You should see:
 API      http://127.0.0.1:8000
 Docs     http://127.0.0.1:8000/docs
 ```
+
+> **`serve` does not hot-reload.** After changing backend code, stop and restart
+> it — a running server keeps its old code (and its old knowledge base) until
+> then. The frontend (Vite) *does* hot-reload.
+>
+> **Knowledge-base cache.** Audits are served from an on-disk snapshot under
+> `backend/kb-cache/` (created on the first live crawl) and re-crawl Fabric only
+> on a cache miss or once a snapshot ages past its TTL. Tune with
+> `AUDITFAST_CACHE_TTL_SECONDS` / `AUDITFAST_CACHE_SOFT_SECONDS`, or disable with
+> `AUDITFAST_CACHE_ENABLED=false`. Delete `backend/kb-cache/` to force a full
+> re-crawl. An **incomplete crawl is never cached** — the provider re-crawls
+> until the reads succeed.
+>
+> Separately, every run writes a permanent, timestamped snapshot to the **KB
+> archive** at `backend/Fabric workspace kb/<workspace>/<workspace>_<timestamp>/`.
+> Change its location with `AUDITFAST_KB_ARCHIVE_DIR` (an absolute path is used
+> as-is) or turn it off with `AUDITFAST_KB_ARCHIVE_ENABLED=false`.
 
 ### Terminal 2 — frontend
 
@@ -172,8 +189,8 @@ cd backend
 # Run an audit — this signs you in via the device-code flow first
 ..\.venv\Scripts\python.exe -m auditfast run --project config/project.example.yaml
 
-# Only some pillars
-..\.venv\Scripts\python.exe -m auditfast run --project config/project.example.yaml --pillars Security,Reliability
+# Only some pillars (use the full pillar name)
+..\.venv\Scripts\python.exe -m auditfast run --project config/project.example.yaml --pillars Security
 
 # Browse the rule library — no sign-in needed
 ..\.venv\Scripts\python.exe -m auditfast checks
@@ -268,7 +285,7 @@ workspaces:
 ```
 
 The `role` matters: it decides which checks run. A `Data Storage` workspace gets
-the 12 workspace checks but no pipeline checks, and is assessed on whether it
+the workspace-scoped checks but no pipeline checks, and is assessed on whether it
 correctly contains storage items and *only* storage items.
 
 | Key | Effect |
@@ -325,7 +342,7 @@ Frontend (see [`frontend/.env.example`](../frontend/.env.example)):
 | Symptom | Cause and fix |
 |---------|---------------|
 | `ModuleNotFoundError: auditfast` | The package is not installed. Run `pip install -e "backend[dev]"` from the repo root |
-| `0 checks loaded` / health says `degraded` | A check module failed to import. Run `python -c "import auditfast.core.checks"` to see the real error |
+| `0 checks loaded` / health says `degraded` | A check module failed to import. Run `python -c "import auditfast.core.check"` to see the real error |
 | Frontend shows **API unreachable** | The backend is not running, or is on a different port. Start it, or set `VITE_API_PROXY_TARGET` |
 | `Port 8000 is already in use` | `--port 8001`, and set `VITE_API_PROXY_TARGET` to match |
 | `npm run build` fails on `Cannot find type definition file for 'node'` | `npm install` was not re-run after a dependency change |
@@ -354,7 +371,7 @@ Fabric-Well-Architected-Auditor/
 │     ├─ schemas/              # Pydantic request/response models
 │     ├─ config/               # settings + logging
 │     ├─ database/             # job store (in-memory today)
-│     ├─ ai/                   # scaffolding only — nothing implemented
+│     ├─ ai/                   # checklist-intake (matching, authoring) + optional advisory
 │     ├─ mcp/                  # MCP adapter (optional extra)
 │     ├─ cli.py  main.py
 │     └─ reporting/  security/

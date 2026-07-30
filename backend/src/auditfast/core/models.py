@@ -110,10 +110,29 @@ class WorkspaceContext:
     #: here must report N/A rather than failing: "we could not determine this" is
     #: not the same finding as "this is not configured".
     unavailable: set[Resource] = field(default_factory=set)
+    #: Per-resource read outcomes for the one-call-per-item definition/table
+    #: reads (notebooks, pipelines, tables, semantic models). Maps a Resource
+    #: *value* to counts (attempted/read/failed/forbidden/transient), so a
+    #: *partial* crawl ("42 of 138 notebook definitions could not be read") is
+    #: visible instead of silently shrinking the object set. Set by the provider.
+    read_failures: dict[str, dict] = field(default_factory=dict)
 
     def has(self, resource: Resource) -> bool:
         """True when ``resource`` was read successfully and can be judged."""
         return resource not in self.unavailable
+
+    @property
+    def is_complete(self) -> bool:
+        """True when the crawl read everything it attempted.
+
+        Incomplete when a per-item definition/table read failed (tracked in
+        :attr:`read_failures`) or a core list read — items or role assignments —
+        was unavailable. Such a snapshot must not be cached and served as if
+        whole: it would freeze a permission/throttle gap into a believable-looking
+        low score. A lone GIT read failure is tolerated (cheap, rarely blocking).
+        """
+        blocking = {Resource.ITEMS, Resource.ROLE_ASSIGNMENTS}
+        return not self.read_failures and not (self.unavailable & blocking)
 
     @property
     def name(self) -> str:
@@ -166,6 +185,7 @@ class WorkspaceContext:
             "semantic_models": self.semantic_models,
             "git_details": self.git_details,
             "unavailable": sorted(r.value for r in self.unavailable),
+            "read_failures": self.read_failures,
         }
 
     @classmethod
@@ -187,6 +207,7 @@ class WorkspaceContext:
             semantic_models=dict(data.get("semantic_models", {})),
             git_details=dict(data.get("git_details", {})),
             unavailable={Resource(v) for v in data.get("unavailable", [])},
+            read_failures=dict(data.get("read_failures", {})),
         )
 
 

@@ -14,8 +14,9 @@ Five terms carry the whole domain.
 | **Project** | One engagement. Spans **one or more** Fabric workspaces. Defined by a YAML file. |
 | **Workspace** | A Fabric workspace, audited as a unit. |
 | **Layer** | What a workspace is *for*: `Data Prep`, `Data Storage`, `Data Logs`, `Data Operations`, `Reporting / Semantic`, `Mixed`. Your "inner pillars". |
-| **Pillar** | A Well-Architected pillar: Reliability, Security, Cost Optimization, Operational Excellence, Performance Efficiency. Plus `Foundation` — cross-cutting, informational, never scored. |
-| **Scope** | The kind of object a check inspects: `workspace`, `pipeline`, and (reserved) `notebook`, `lakehouse`, `semantic_model`, `report`, `eventhouse`. |
+| **Pillar** | One of seven quality attributes: `Security`, `Governance & Compliance`, `Operations & Reliability`, `Performance & Capacity`, `Cost & Resource Optimization`, `Data Management & Quality`. Plus `Foundation` — cross-cutting, informational, never scored. |
+| **Scope** | The kind of object a check inspects: `workspace`, `pipeline`, `notebook`, and (reserved) `lakehouse`, `semantic_model`, `report`, `eventhouse`. |
+| **Automation** | How a check's verdict is reached: `automated` (verified now), `roadmap` (automatable but needs data the provider does not yet fetch — reported as an attestation), `manual` (never machine-verifiable). |
 
 Every check also carries a **`ref`** — a dotted string like `2.4.1`. It points at
 a line item in the 13-area deep-dive checklist and is the key used to look up
@@ -75,27 +76,30 @@ results: one implementation, three front doors.
 | Path | Responsibility |
 |------|----------------|
 | [`core/enums.py`](../backend/src/auditfast/core/enums.py) | Pillar, Layer, Scope, Resource, Status, Severity |
-| [`core/models.py`](../backend/src/auditfast/core/models.py) | `WorkspaceContext`, `CheckContext`, `CheckSpec`, `CheckResult` |
+| [`core/models.py`](../backend/src/auditfast/core/models.py) | `WorkspaceContext` (+ `read_failures`, `is_complete`), `CheckContext`, `CheckSpec`, `CheckResult` |
 | [`core/scoring.py`](../backend/src/auditfast/core/scoring.py) | Bands, ratings, weighted roll-up, pillar×layer matrix |
 | [`core/engine.py`](../backend/src/auditfast/core/engine.py) | Generic scope-driven dispatch |
-| [`core/checks/registry.py`](../backend/src/auditfast/core/checks/registry.py) | The single registry and the `@check` decorator |
-| [`core/checks/helpers.py`](../backend/src/auditfast/core/checks/helpers.py) | `Verdict` and the builders |
-| [`core/checks/workspace/`](../backend/src/auditfast/core/checks/workspace/) | 12 workspace checks, one module per pillar |
-| [`core/checks/pipeline/`](../backend/src/auditfast/core/checks/pipeline/) | 8 pipeline checks, one module per pillar |
+| [`core/check/registry.py`](../backend/src/auditfast/core/check/registry.py) | The single registry (`REGISTRY`) and the `@check` decorator |
+| [`core/check/helpers.py`](../backend/src/auditfast/core/check/helpers.py) | `Verdict` and the builders |
+| [`core/check/<pillar>/<layer>/`](../backend/src/auditfast/core/check/) | 148 checks — `automated`, `manual`, and generated `roadmap` modules per pillar × layer |
 | [`clients/`](../backend/src/auditfast/clients/) | `LiveFabricProvider` (the only shipped provider) and the `Provider` protocol |
-| [`services/audit_service.py`](../backend/src/auditfast/services/audit_service.py) | The one audit path |
-| [`services/audit_runner.py`](../backend/src/auditfast/services/audit_runner.py) | Background execution, concurrency limits |
+| [`services/audit_service.py`](../backend/src/auditfast/services/audit_service.py) | The one audit path; builds the caching provider |
+| [`services/context_store.py`](../backend/src/auditfast/services/context_store.py) | The KB: `ContextStore` (disk cache) + `CachingProvider` + `KBArchive` + `ArchivingProvider` (permanent timestamped archive) |
+| [`services/audit_runner.py`](../backend/src/auditfast/services/audit_runner.py) | Background execution, concurrency limits, background KB refresh |
 | [`services/catalog_service.py`](../backend/src/auditfast/services/catalog_service.py) | Catalog questions; no I/O |
 | [`services/project.py`](../backend/src/auditfast/services/project.py) | Project YAML → `ProjectConfig` |
 | [`services/auth_service.py`](../backend/src/auditfast/services/auth_service.py) | Read-only Entra sign-in |
-| [`api/v1/`](../backend/src/auditfast/api/v1/) | 8 routers, 24 endpoints |
+| [`services/intake_service.py`](../backend/src/auditfast/services/intake_service.py) | Checklist-intake: dedup a point vs the registry, draft a proposal (token-free, never mutates `REGISTRY`) |
+| [`api/v1/`](../backend/src/auditfast/api/v1/) | 9 routers (incl. `checklist`), the REST surface — `POST /checklist/assess` added |
 | [`api/deps.py`](../backend/src/auditfast/api/deps.py) | Dependency injection |
 | [`api/errors.py`](../backend/src/auditfast/api/errors.py) | Exception → HTTP mapping |
 | [`schemas/`](../backend/src/auditfast/schemas/) | Pydantic request/response models |
 | [`config/`](../backend/src/auditfast/config/) | Settings, structured logging |
 | [`database/`](../backend/src/auditfast/database/) | Job model + repository pattern |
-| [`ai/`](../backend/src/auditfast/ai/) | Scaffolding only — nothing implemented |
-| [`mcp/server.py`](../backend/src/auditfast/mcp/server.py) | MCP tools over the same services |
+| [`ai/matching.py`](../backend/src/auditfast/ai/matching.py) | Deterministic checklist-point → existing-check matcher (dedup) |
+| [`ai/authoring.py`](../backend/src/auditfast/ai/authoring.py) | Draft a `@check` proposal from a plain-language point |
+| [`ai/orchestrator/`](../backend/src/auditfast/ai/orchestrator/) | Optional Azure OpenAI advisory — off unless `ai_enabled`; never in the scoring path |
+| [`mcp/server.py`](../backend/src/auditfast/mcp/server.py) | MCP tools over the same services (catalog, audit, FabricIQ) |
 
 ---
 
@@ -108,7 +112,7 @@ sequenceDiagram
     participant R as AuditRunner
     participant S as audit_service
     participant E as core/engine
-    participant P as Provider
+    participant P as CachingProvider
 
     UI->>API: POST /api/v1/audit
     API->>API: resolve token (live only)
@@ -117,10 +121,15 @@ sequenceDiagram
     API-->>UI: 202 {audit_id, status}
     Note over R: background task
     R->>S: run_audit (in a worker thread)
-    S->>E: run(provider, targets, settings)
+    S->>E: run(caching provider, targets, settings)
     loop each workspace
         E->>E: select checks for (pillars, layer)
         E->>P: fetch(id, layer, required resources)
+        alt fresh snapshot in KB (age ≤ TTL)
+            P-->>E: cached WorkspaceContext (no Fabric call)
+        else miss or past TTL
+            P->>P: crawl Fabric live, save snapshot to kb-cache/
+        end
         loop each scope, each object
             E->>E: run the checks for that scope
         end
@@ -140,6 +149,14 @@ at any gateway in front of it.
 directly from an async handler would block the event loop and stall every other
 request. `AuditRunner` dispatches it via `asyncio.to_thread` behind a semaphore
 that caps concurrent audits.
+
+**Why a knowledge-base cache:** a full live crawl issues one `getDefinition` per
+notebook and per pipeline and can take minutes. The `CachingProvider` serves each
+workspace from an on-disk snapshot (the KB) so repeat runs are near-instant, and
+re-crawls Fabric only on a cache miss or once a snapshot ages past its TTL. When
+a run is served from cache, `AuditRunner` re-runs it with `refresh=True` in the
+background and updates the stored report — "show cached now, refresh silently".
+See [§6a](#6a-the-knowledge-base-cache).
 
 ---
 
@@ -186,13 +203,29 @@ class WorkspaceContext:
     deployment_pipeline: bool
     role_assignments: list[RoleAssignment]
     items: list[Item]
-    pipelines: dict[str, dict]      # name -> parsed definition
-    unavailable: set[Resource]      # what could NOT be read
+    pipelines: dict[str, dict]        # name -> parsed pipeline definition
+    notebooks: dict[str, dict]        # name -> parsed .ipynb
+    tables: dict[str, dict]           # lakehouse table name -> {type, format, columns}
+    shortcuts: dict[str, list]        # lakehouse -> OneLake shortcuts
+    semantic_models: dict[str, dict]  # name -> parsed TMSL facts
+    git_details: dict                 # provider/org/repo/branch/dir when Git-connected
+    unavailable: set[Resource]        # what could NOT be read at all
+    read_failures: dict[str, dict]    # per-resource partial-read counts (see below)
 ```
 
 `unavailable` is what separates *"we could not determine this"* from *"this is
 not configured"*. A check whose data landed there reports **N/A** instead of
 failing — a network error must not look like a misconfiguration.
+
+`read_failures` records **partial** one-per-item read failures (notebooks,
+pipelines, tables, semantic models): for each resource, how many were
+`attempted`, `read`, and `failed`, split into `forbidden` (401/403) and
+`transient` (429/5xx/timeout). `is_complete` (a property) is false when any
+`read_failures` exist or `items`/`role_assignments` are `unavailable` — the
+signal the `CachingProvider` uses to refuse to serve a partial snapshot.
+
+The context is JSON-serializable via `to_dict()` / `from_dict()`, which is what
+the knowledge-base cache persists to disk ([§6a](#6a-the-knowledge-base-cache)).
 
 **Adding a data source** means writing one method:
 
@@ -216,6 +249,58 @@ pipeline, the most expensive operation in a live audit.
 | `ROLE_ASSIGNMENTS` | 1 call |
 | `GIT` | 1 call |
 | `PIPELINE_DEFINITIONS` | **one call per pipeline** |
+| `NOTEBOOK_DEFINITIONS` | **one `getDefinition` per notebook** (a long-running operation) |
+| `TABLE_SCHEMAS` | one list-tables call per lakehouse (columns need the SQL endpoint; left empty) |
+| `SHORTCUTS` | one call per lakehouse |
+| `SEMANTIC_MODEL_DEFINITIONS` | one `getDefinition` per semantic model (TMSL) |
+
+---
+
+## 6a. The knowledge-base cache
+
+A full live crawl is expensive — the `getDefinition` calls above dominate. So the
+provider the engine actually receives is a **`CachingProvider`**
+([`services/context_store.py`](../backend/src/auditfast/services/context_store.py))
+wrapping the live provider and a **`ContextStore`** (one JSON snapshot per
+workspace under `kb-cache/`).
+
+```mermaid
+flowchart TD
+    F[CachingProvider.fetch] --> Q{snapshot in KB?}
+    Q -- "age ≤ TTL (24h)" --> S[serve from disk · served_from_cache=true]
+    Q -- "miss / past TTL" --> C[crawl Fabric live · ALL resources · save snapshot]
+    S --> H{age > soft (1h)?}
+    H -- yes --> B[background daemon thread refreshes snapshot]
+    H -- no --> D[return]
+    C --> D
+    B --> D
+```
+
+- **Granularity is per workspace, not per check.** On a refresh the provider
+  crawls *all* resources at once and stores one snapshot; on a hit it returns
+  that snapshot and no check calls Fabric itself.
+- **Freshness** is governed by two windows: a hard **TTL** (`AUDITFAST_CACHE_TTL_SECONDS`,
+  default 24h — older snapshots are re-crawled inline) and a soft window
+  (`AUDITFAST_CACHE_SOFT_SECONDS`, default 1h — older snapshots are served at once
+  and refreshed in the background).
+- **Completeness-aware.** Each per-item `getDefinition`/table read is classified
+  as `forbidden` (401/403 — won't recover with the same token) or `transient`
+  (429/5xx/timeout — may recover), and the counts are recorded on
+  `WorkspaceContext.read_failures`. `WorkspaceContext.is_complete` is false when
+  any definition/table read failed or `items`/`role_assignments` were
+  unavailable, and the **`CachingProvider` never serves an incomplete snapshot**
+  — it re-crawls, so a permission/throttle gap is not frozen for the TTL. The
+  engine surfaces the gap as a `WS-READ-INCOMPLETE` warning (the report's *Crawl
+  completeness* section and the audit `errors[]`).
+- **Permanent archive.** An **`ArchivingProvider`** wraps whatever provider
+  serves a run and writes a fresh, timestamped snapshot **every run** to
+  `Fabric workspace kb/<workspace>/<workspace>_<YYYYMMDD_HHMMSS>/`
+  (`workspace.json` + `summary.json`). It never overwrites, so the full crawl
+  history is kept — separate from the single-file cache.
+- **Config:** `AUDITFAST_CACHE_ENABLED` (default true; set false to always crawl
+  live), `AUDITFAST_CACHE_DIR` (`kb-cache`), the two windows above, plus
+  `AUDITFAST_KB_ARCHIVE_ENABLED` (default true) and `AUDITFAST_KB_ARCHIVE_DIR`
+  (`Fabric workspace kb`).
 
 ---
 
@@ -227,7 +312,7 @@ A check declares everything about itself at registration:
 @check(
     id="PL-RETRY", ref="2.4.1",
     title="Retry policy configured on activities",
-    pillar=Pillar.RELIABILITY, scope=Scope.PIPELINE,
+    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE,
     severity=Severity.HIGH, layers=PIPELINE_LAYERS,
     requires=[Resource.PIPELINE_DEFINITIONS],
 )
@@ -256,14 +341,17 @@ See [checks.md](checks.md) for the full catalog and how to add one.
 
 ## 8. Registration is an import side effect
 
-The `@check` decorator registers at import time. Those imports are triggered by
-[`core/checks/__init__.py`](../backend/src/auditfast/core/checks/__init__.py),
-which imports every check module purely for the side effect.
+The `@check` decorator registers at import time. [`core/check/__init__.py`](../backend/src/auditfast/core/check/__init__.py)
+**auto-discovers** them by walking the package tree and importing every leaf
+module named `automated`, `manual`, or `roadmap` — so a new
+`<pillar>/<layer>/automated.py` is picked up with no `__init__.py` edit. Helper
+modules whose name starts with `_` (e.g. `_spark.py`) are skipped.
 
-> **Gotcha:** a new check module not imported there registers nothing, raises
-> nothing, and its checks silently never run. `registered_modules()` exists so a
-> test can assert the list has not drifted, and `/api/v1/health` reports
-> `checks_registered` so an empty catalog is visible rather than silent.
+> **Gotcha:** a check module *not* named `automated` / `manual` / `roadmap` (or
+> hidden behind a `_` prefix) registers nothing, raises nothing, and its checks
+> silently never run. `registered_modules()` exists so a test can assert the
+> tree was fully imported, and `/api/v1/health` reports `checks_registered` so
+> an empty catalog is visible rather than silent.
 
 ---
 
@@ -280,6 +368,14 @@ Read-only throughout. Three ways in, all yielding a delegated bearer token:
 MSAL runs on a background thread; the caller receives a session id and polls.
 **The token never leaves the server** — the browser holds only an opaque session
 id, so a compromised browser cannot yield a Fabric access token.
+
+**Normal delegated access is the design target.** Most reads — workspace, items,
+role assignments, git connection, and notebook/pipeline/semantic-model
+definitions via `getDefinition` — work with ordinary workspace access;
+tenant-admin is **not** required. Checks whose data genuinely needs
+tenant-admin, capacity-metrics, or audit-log APIs are marked `roadmap` and
+report an attestation rather than guessing. When a definition cannot be read the
+affected checks degrade to **N/A**, never FAIL.
 
 > **Known limitation:** sessions live in a process-local dict, so sign-in does
 > not survive a restart and is not shared across replicas. See
@@ -305,6 +401,10 @@ deployable**. The API returns JSON only and renders no HTML.
 In development Vite proxies `/api` to the backend, so the browser makes
 same-origin requests and no CORS is involved. In production the app is built to
 static files and points at the API origin via `VITE_API_BASE_URL`.
+
+The Run-audit page **polls `GET /audit/{id}` until a terminal state with no
+client-side timeout** — a tenant-wide crawl can take minutes, and the KB plus
+background refresh keep repeat runs fast. (The former 600s cap was removed.)
 
 ---
 
@@ -335,7 +435,9 @@ Honest list, with pointers.
 | Auth sessions are process-local | Breaks under multi-worker or multi-replica deployment |
 | Reports written to a fixed filename | Concurrent audits overwrite each other's files |
 | All check weights are 1.0 | Roll-up is effectively unweighted; the mechanism exists but is untuned |
-| No AI | Only `ai/` scaffolding; deliberate |
-| Performance Efficiency has 0 checks | The pillar reports "not assessed" |
+| AI is advisory-only | The checklist-intake layer (`ai/matching`, `ai/authoring`) is real, but the optional model advisory is off by default and **never** in the scoring path |
+| KB cache is per-workspace, not per-check | A partial crawl records `read_failures` and is flagged incomplete, so the `CachingProvider` re-crawls rather than serving it; the granularity is still whole-workspace |
+| Crawl is sequential | `getDefinition` is read one item at a time with a 60s timeout, so a 1000+ item workspace can take many minutes on the first crawl — parallelisation is the open item |
+| KB snapshots live on local disk | Not shared across replicas (the permanent archive too) |
 
 All are addressed in [scalability.md](scalability.md).

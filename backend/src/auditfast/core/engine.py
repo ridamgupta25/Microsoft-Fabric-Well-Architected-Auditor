@@ -45,6 +45,39 @@ def _scope_label(scope: Scope) -> str:
     return _SCOPE_LABEL.get(scope, f"{scope.value} objects")
 
 
+#: The definition resource each object scope depends on. When the provider could
+#: not read it (e.g. the token lacked the Item.ReadWrite scope getDefinition
+#: needs), the objects are absent *because the read was blocked*, not because the
+#: workspace has none — a different, actionable N/A reason.
+_SCOPE_DEFINITION_RESOURCE: dict[Scope, Resource] = {
+    Scope.PIPELINE: Resource.PIPELINE_DEFINITIONS,
+    Scope.NOTEBOOK: Resource.NOTEBOOK_DEFINITIONS,
+    Scope.SEMANTIC_MODEL: Resource.SEMANTIC_MODEL_DEFINITIONS,
+}
+
+
+def _no_objects_reason(scope: Scope, workspace: WorkspaceContext) -> str:
+    """Why a scope yielded no objects: genuinely none, or a blocked read."""
+    resource = _SCOPE_DEFINITION_RESOURCE.get(scope)
+    if resource is not None and resource.value in workspace.read_failures:
+        stat = workspace.read_failures[resource.value]
+        return (
+            f"{stat.get('failed', 0)} of {stat.get('attempted', 0)} "
+            f"{_scope_label(scope)} could not be read "
+            f"({stat.get('forbidden', 0)} forbidden HTTP 401/403, "
+            f"{stat.get('transient', 0)} throttled/timeout HTTP 429/5xx) — their "
+            f"definitions were blocked. The sign-in token may lack Item.ReadWrite.All "
+            f"or a higher workspace role."
+        )
+    if resource is not None and resource in workspace.unavailable:
+        return (
+            f"{_scope_label(scope).capitalize()} exist but their definitions could "
+            f"not be read — the sign-in token may lack the Item.ReadWrite.All scope "
+            f"Fabric requires for getDefinition. Re-sign-in to grant it, then re-run."
+        )
+    return f"No {_scope_label(scope)} were found in this workspace"
+
+
 _ACCESS_RECOMMENDATION = (
     "Confirm the workspace name/ID is correct and that the signed-in user has at "
     "least Viewer access, then re-run."
@@ -63,6 +96,51 @@ def access_error_result(workspace_id: str, layer: Layer, message: str) -> CheckR
         evidence=message, recommendation=_ACCESS_RECOMMENDATION,
         severity=Severity.CRITICAL, workspace=workspace_id, layer=layer,
         obj="", scope=Scope.WORKSPACE, scored=False,
+    )
+
+
+#: Check id for the "part of this crawl could not be read" warning.
+READ_INCOMPLETE_CHECK_ID = "WS-READ-INCOMPLETE"
+
+#: Human labels for the resources whose per-item reads can partially fail.
+_RESOURCE_LABEL: dict[str, str] = {
+    "notebookDefinitions": "notebook definitions",
+    "pipelineDefinitions": "pipeline definitions",
+    "tableSchemas": "lakehouse table listings",
+    "semanticModelDefinitions": "semantic model definitions",
+}
+
+
+def read_incomplete_result(workspace: WorkspaceContext, resource_value: str, stat: dict) -> CheckResult:
+    """A visible, unscored warning that part of a crawl could not be read.
+
+    Emitted so a permission-limited or throttled crawl says "42 of 138 notebook
+    definitions could not be read (HTTP 401/403)" instead of silently producing a
+    believable-looking low score. Never scored: a read we could not make is not a
+    failing best practice.
+    """
+    label = _RESOURCE_LABEL.get(resource_value, resource_value)
+    attempted = stat.get("attempted", 0)
+    failed = stat.get("failed", 0)
+    forbidden = stat.get("forbidden", 0)
+    transient = stat.get("transient", 0)
+    kinds = []
+    if forbidden:
+        kinds.append(f"{forbidden} forbidden (HTTP 401/403)")
+    if transient:
+        kinds.append(f"{transient} throttled/timed out (HTTP 429/5xx/timeout)")
+    evidence = (
+        f"{failed} of {attempted} {label} could not be read — {', '.join(kinds)}. "
+        f"Re-sign-in with Item.ReadWrite.All and a workspace role that can read item "
+        f"definitions, then re-run to assess them."
+    )
+    return CheckResult(
+        check_id=READ_INCOMPLETE_CHECK_ID, ref="-",
+        title="Incomplete crawl — data could not be read",
+        pillar=Pillar.FOUNDATION, status=Status.NA, score=None, coverage=None,
+        evidence=evidence, recommendation="",
+        severity=Severity.HIGH, workspace=workspace.name, layer=workspace.layer,
+        obj=label, scope=Scope.WORKSPACE, scored=False,
     )
 
 
@@ -168,6 +246,12 @@ def run_audit(
                 workspace_id, layer, f"Could not read workspace '{workspace_id}': {exc}"))
             continue
 
+        # Surface any partial crawl — definitions/tables that could not be read —
+        # as visible, unscored warnings, so a permission/throttle gap never hides
+        # behind a believable-looking low score.
+        for resource_value, stat in sorted(workspace.read_failures.items()):
+            results.append(read_incomplete_result(workspace, resource_value, stat))
+
         by_scope: dict[Scope, list[CheckSpec]] = {}
         for spec in specs:
             by_scope.setdefault(spec.scope, []).append(spec)
@@ -177,10 +261,10 @@ def run_audit(
             objects = list(workspace.objects(scope))
             if not objects and scope is not Scope.WORKSPACE:
                 # The checks apply to this layer, but the workspace holds no object
-                # of their kind. Emit a visible N/A per check (with the reason) so
-                # no selected check is silently absent from the report.
-                note = not_applicable(
-                    f"No {_scope_label(scope)} were found in this workspace")
+                # of their kind — either genuinely none, or their definitions could
+                # not be read. Emit a visible N/A per check (with the accurate
+                # reason) so no selected check is silently absent from the report.
+                note = not_applicable(_no_objects_reason(scope, workspace))
                 for spec in scope_specs:
                     results.append(build_result(spec, workspace, note, "", remediation))
                 continue
