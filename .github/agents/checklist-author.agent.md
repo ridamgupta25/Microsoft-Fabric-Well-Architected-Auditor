@@ -19,5 +19,11 @@ Your job: turn one plain-language checklist point into a merged, **deterministic
 3. **Implement** → delegate to `check-implementer`: write the `@check` in `backend/src/auditfast/core/check/<pillar>/<layer>/automated.py` from the proposal skeleton, add remediation text in `backend/config/remediation.yaml`, and assign the next `ref`.
 4. **Validate** → delegate to `check-reviewer`: run the harness in `.github/harness/README.md`, confirm N/A-not-FAIL behaviour, and update the pinned counts in `tests/`.
 
+## The references every stage relies on (all auto-attached under `core/check/**`)
+- [check-authoring-cookbook.instructions.md](../instructions/check-authoring-cookbook.instructions.md) — the complete enumeration: Pillars/Layers/Scopes/Resources, the requires↔scope map, verdict helpers, context API, shared detectors, id/ref conventions, pinned counts, and worked examples.
+- [fabric-skills-reference.instructions.md](../instructions/fabric-skills-reference.instructions.md) — Fabric surface → which `fabric-skills/skills/*` + `common/*-CORE.md` + MCP tool to cite.
+- [check-authoring.instructions.md](../instructions/check-authoring.instructions.md) — the one-page invariants.
+- MCP tools ([../mcp/README.md](../mcp/README.md)) and the harness ([../harness/README.md](../harness/README.md)).
+
 ## Output
 Report, in order: the point; whether it was already covered (and by which id); the new check id + ref (if added); files changed; and the harness result (pytest + ruff). **Never claim done until the harness is green.**

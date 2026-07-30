@@ -14,6 +14,20 @@ N/A-not-FAIL behaviour in one shot:
 It exits non-zero only when the id is not registered, and warns (not fails) on a
 missing remediation ref or a check that FAILs when its required data is absent.
 
+**Reading its output:**
+- `FAIL <id>: not registered` (exit 2) — the module isn't an auto-imported leaf
+  (`automated.py`/`roadmap.py`), or its name starts with `_`. Move it.
+- `OK registered: <id> ref=… <pillar> / <scope> requires=[…]` — the `@check`
+  side effect fired; confirm the printed pillar/scope/requires match the intent.
+- `OK remediation present` / `WARN no remediation for ref …` — add the `ref` to
+  `config/remediation.yaml` (a repo-wide test enforces this).
+- `OK degrades to N/A (not FAIL)` — good. `WARN FAILs when its required data is
+  unavailable` — the check returns FAIL/0 on missing data; add the
+  `if not ctx.workspace.has(Resource.X): return not_applicable(...)` guard.
+- For a non-`WORKSPACE` scope it prints `INFO … confirm it returns
+  not_applicable()` — the smoke can't synthesise the object, so verify the N/A
+  guard by eye or with a targeted test.
+
 ## 1. Registry loaded and count known
 ```powershell
 ..\.venv\Scripts\python.exe -c "from auditfast.core.check.registry import REGISTRY; print(len(REGISTRY), 'checks')"

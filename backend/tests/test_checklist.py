@@ -7,9 +7,12 @@ register a check, so the pinned registry count and score cannot move.
 """
 from __future__ import annotations
 
+import pytest
+
 from auditfast.ai import authoring, matching
 from auditfast.core.check.registry import REGISTRY
-from auditfast.services import intake_service
+from auditfast.services import checklist_batch, intake_service
+from auditfast.services.checklist_batch import ChecklistParseError, ChecklistPoint
 
 # -- matching ------------------------------------------------------------------
 
@@ -103,3 +106,162 @@ def test_assess_endpoint_drafts_a_proposal(client):
 def test_assess_endpoint_rejects_an_empty_point(client):
     response = client.post("/api/v1/checklist/assess", json={"point": ""})
     assert response.status_code == 422
+
+
+# =============================================================================
+# Batch — parsing a whole uploaded checklist
+# =============================================================================
+
+def test_parse_csv_with_headers():
+    text = (
+        "point,pillar,scope,notes\n"
+        "Git integration is enabled,Operations,workspace,expect a match\n"
+        "Row-level security is enforced,Security,semantic_model,new\n"
+    )
+    points = checklist_batch.parse_checklist(text, filename="c.csv")
+    assert [p.point for p in points] == [
+        "Git integration is enabled",
+        "Row-level security is enforced",
+    ]
+    assert points[0].pillar == "Operations"
+    assert points[0].scope == "workspace"
+    assert points[1].notes == "new"
+
+
+def test_parse_csv_without_point_header_uses_first_column():
+    text = "Git integration is enabled\nCapacity is assigned\n"
+    points = checklist_batch.parse_checklist(text, filename="c.csv")
+    assert [p.point for p in points] == [
+        "Git integration is enabled",
+        "Capacity is assigned",
+    ]
+
+
+def test_parse_json_array_of_strings():
+    points = checklist_batch.parse_checklist(
+        '["Git integration is enabled", "Capacity is assigned"]', filename="c.json"
+    )
+    assert [p.point for p in points] == [
+        "Git integration is enabled",
+        "Capacity is assigned",
+    ]
+
+
+def test_parse_json_objects_and_points_key():
+    text = '{"points": [{"point": "Git integration is enabled", "scope": "workspace"}]}'
+    points = checklist_batch.parse_checklist(text, filename="c.json")
+    assert points[0].point == "Git integration is enabled"
+    assert points[0].scope == "workspace"
+
+
+def test_parse_text_strips_bullets_headings_and_checkboxes():
+    text = (
+        "# My checklist\n"
+        "\n"
+        "- [ ] Git integration is enabled\n"
+        "* Capacity is assigned\n"
+        "1. Row-level security is enforced\n"
+        "| --- | --- |\n"
+    )
+    points = checklist_batch.parse_checklist(text, filename="c.md")
+    assert [p.point for p in points] == [
+        "Git integration is enabled",
+        "Capacity is assigned",
+        "Row-level security is enforced",
+    ]
+
+
+def test_parse_detects_format_from_content_without_filename():
+    assert checklist_batch.parse_checklist('["A point"]')[0].point == "A point"
+    assert checklist_batch.parse_checklist("just one line")[0].point == "just one line"
+
+
+def test_parse_empty_checklist_raises():
+    with pytest.raises(ChecklistParseError):
+        checklist_batch.parse_checklist("   \n\n")
+
+
+# =============================================================================
+# Batch — running a checklist (offline, deterministic)
+# =============================================================================
+
+def test_run_checklist_classifies_each_point_without_running():
+    points = [
+        ChecklistPoint("Git integration is enabled"),
+        ChecklistPoint("Notebooks broadcast small dimension tables to avoid shuffle joins"),
+    ]
+    result = checklist_batch.run_checklist(points, run_checks=False)
+    assert result["summary"]["total_points"] == 2
+    assert result["summary"]["covered"] == 1
+    assert result["summary"]["not_covered"] == 1
+    assert result["items"][0]["status"] == "covered"
+    assert result["items"][0]["matches"][0]["check_id"] == "WS-GIT"
+    assert result["items"][0]["evaluations"] == []  # run_checks=False never evaluates
+    assert result["items"][1]["status"] == "not_covered"
+    assert result["items"][1]["proposal"] is not None
+
+
+def test_run_checklist_evaluates_covered_check_offline_is_na_without_snapshot():
+    # No snapshot for this workspace and no token => a deterministic N/A row,
+    # never a FAIL — extending coverage can never invent a failing verdict.
+    result = checklist_batch.run_checklist(
+        [ChecklistPoint("Git integration is enabled")],
+        workspace_ids=["ws-does-not-exist"],
+        run_checks=True,
+    )
+    item = result["items"][0]
+    assert item["evaluated_check"] == "WS-GIT"
+    assert len(item["evaluations"]) == 1
+    evaluation = item["evaluations"][0]
+    assert evaluation["source"] == "none"
+    assert evaluation["status"] == "N/A"
+
+
+def test_run_checklist_never_mutates_the_registry():
+    before = len(REGISTRY)
+    checklist_batch.run_checklist(
+        [ChecklistPoint("A brand new retention policy point")], run_checks=False
+    )
+    assert len(REGISTRY) == before
+
+
+# =============================================================================
+# Batch — the endpoint
+# =============================================================================
+
+def test_batch_endpoint_parses_content(client):
+    response = client.post(
+        "/api/v1/checklist/batch",
+        json={
+            "content": "Git integration is enabled\nRow-level security is enforced\n",
+            "filename": "checklist.md",
+            "run_checks": False,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["summary"]["total_points"] == 2
+    assert body["items"][0]["matches"][0]["check_id"] == "WS-GIT"
+
+
+def test_batch_endpoint_accepts_points_list(client):
+    response = client.post(
+        "/api/v1/checklist/batch",
+        json={"points": ["Git integration is enabled"], "run_checks": False},
+    )
+    assert response.status_code == 200
+    assert response.json()["items"][0]["status"] == "covered"
+
+
+def test_batch_endpoint_rejects_missing_content_and_points(client):
+    response = client.post("/api/v1/checklist/batch", json={"run_checks": False})
+    assert response.status_code == 422
+
+
+def test_batch_endpoint_rejects_unparseable_content(client):
+    response = client.post(
+        "/api/v1/checklist/batch",
+        json={"content": "   \n\n", "run_checks": False},
+    )
+    assert response.status_code == 422
+

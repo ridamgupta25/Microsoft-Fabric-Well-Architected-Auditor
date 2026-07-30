@@ -41,7 +41,13 @@ from __future__ import annotations
 from typing import Any
 
 from ..config.settings import get_settings
-from ..services import audit_service, catalog_service, fabriciq_service
+from ..services import (
+    audit_service,
+    catalog_service,
+    checklist_batch,
+    fabriciq_service,
+    intake_service,
+)
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -94,6 +100,52 @@ def describe_check(check_id: str) -> dict:
 def catalog_summary() -> dict:
     """Coverage at a glance: total checks, grouped by pillar and object kind."""
     return catalog_service.catalog_summary()
+
+
+# -- checklist intake: dedup a point, or assess a whole custom checklist -------
+
+@mcp.tool()
+def assess_checklist_point(point: str) -> dict:
+    """Assess one best-practice point against the catalog (dedup), token-free.
+
+    Returns whether the point is already covered by a registered check (and by
+    which), or a draft ``@check`` proposal when it is not. Never registers a
+    check or changes a score — the deterministic path to answer "does the tool
+    already do this?" before authoring a new rule.
+    """
+    return intake_service.assess_point(point)
+
+
+@mcp.tool()
+def assess_checklist_batch(
+    points: list[str] | None = None,
+    content: str | None = None,
+    filename: str | None = None,
+    workspace_ids: list[str] | None = None,
+    run_checks: bool = True,
+) -> dict:
+    """Assess a whole custom checklist and run the matches over the offline KB.
+
+    Supply ``points`` (a list of statements) or ``content`` (raw CSV/JSON/Markdown
+    file text, with ``filename`` to hint the format). Each point is deduped
+    against the catalog; for a point already covered by an automated check, that
+    check is evaluated over the on-disk knowledge base (token-free — no live read
+    from here). Uncovered points return a draft proposal to author. This never
+    registers a check and never changes a score.
+    """
+    if points:
+        parsed = [checklist_batch.ChecklistPoint(point=p) for p in points if p and p.strip()]
+    elif content:
+        try:
+            parsed = checklist_batch.parse_checklist(content, filename=filename)
+        except checklist_batch.ChecklistParseError as exc:
+            return {"error": str(exc)}
+    else:
+        return {"error": "Provide either 'points' or 'content'."}
+
+    return checklist_batch.run_checklist(
+        parsed, workspace_ids=workspace_ids, run_checks=run_checks, token=None
+    )
 
 
 # -- workspaces ----------------------------------------------------------------
