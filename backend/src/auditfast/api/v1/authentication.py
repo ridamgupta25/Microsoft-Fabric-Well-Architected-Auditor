@@ -9,7 +9,11 @@ from __future__ import annotations
 from fastapi import APIRouter, status
 
 from ...schemas.auth import (
+    AuthorizeRequest,
+    AuthorizeResponse,
+    CallbackRequest,
     DeviceFlowRequest,
+    LoginConfig,
     LoginRequest,
     SessionResponse,
     SessionStatus,
@@ -19,7 +23,7 @@ from ...schemas.auth import (
 from ...schemas.common import Message
 from ...services import auth_service
 from ...services import project as project_config
-from ..deps import ProjectDep
+from ..deps import ProjectDep, SettingsDep
 
 router = APIRouter(tags=["authentication"])
 
@@ -80,6 +84,59 @@ async def login_device_code(request: DeviceFlowRequest) -> SessionResponse:
         request.tenant_id, request.client_id, request.scopes or None
     )
     return SessionResponse(**result)
+
+
+@router.get(
+    "/login/config",
+    response_model=LoginConfig,
+    summary="Which sign-in methods the server offers",
+)
+async def login_config(settings: SettingsDep) -> LoginConfig:
+    """Lets the UI show redirect sign-in only when the server is configured for it."""
+    return LoginConfig(redirect_enabled=settings.redirect_sign_in_enabled)
+
+
+@router.post(
+    "/login/authorize",
+    response_model=AuthorizeResponse,
+    summary="Begin redirect (Authorization Code) sign-in",
+)
+async def authorize(request: AuthorizeRequest, settings: SettingsDep) -> AuthorizeResponse:
+    """Return the Microsoft URL to send the user's browser to.
+
+    The standard hosted-web sign-in: the user authenticates on Microsoft's page
+    in their own browser and is redirected to ``redirect_uri`` with a code, which
+    :func:`callback` exchanges server-side. Needs an Entra app registration whose
+    redirect URI matches ``redirect_uri``.
+    """
+    result = auth_service.start_auth_code_flow(
+        request.redirect_uri,
+        settings.auth_client_id,
+        settings.auth_tenant_id,
+        settings.auth_client_secret,
+    )
+    return AuthorizeResponse(**result)
+
+
+@router.post(
+    "/login/callback",
+    response_model=SessionResponse,
+    summary="Complete redirect sign-in",
+)
+async def callback(request: CallbackRequest, settings: SettingsDep) -> SessionResponse:
+    """Exchange the redirect's authorization code for a token, server-side.
+
+    Returns an opaque session id; the Fabric token never reaches the browser.
+    """
+    result = auth_service.complete_auth_code_flow(
+        request.auth_response,
+        settings.auth_client_id,
+        settings.auth_tenant_id,
+        settings.auth_client_secret,
+    )
+    return SessionResponse(
+        session=result["session"], message=result["message"], status=SignInStatus.DONE
+    )
 
 
 @router.get(

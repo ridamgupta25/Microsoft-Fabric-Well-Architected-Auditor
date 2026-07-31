@@ -385,6 +385,18 @@ export interface SessionStatusResponse {
   error?: string | null;
 }
 
+/** Which sign-in methods the server offers, so the UI shows the right one. */
+export interface LoginConfig {
+  /** True when the redirect Authorization Code flow is configured on the server. */
+  redirect_enabled: boolean;
+}
+
+/** The Microsoft URL to redirect the browser to, and the CSRF state. */
+export interface AuthorizeResponse {
+  auth_url: string;
+  state: string;
+}
+
 /** The signed-in user's display identity. Never carries a token. */
 export interface UserProfile {
   signed_in: boolean;

@@ -37,6 +37,39 @@ class DeviceFlowRequest(BaseModel):
     scopes: list[str] = Field(default_factory=list)
 
 
+class LoginConfig(BaseModel):
+    """Which sign-in methods the server offers, so the UI shows the right one."""
+
+    redirect_enabled: bool = Field(
+        default=False,
+        description="True when the redirect Authorization Code flow is configured.",
+    )
+
+
+class AuthorizeRequest(BaseModel):
+    """Begin the redirect sign-in for a given callback URL."""
+
+    redirect_uri: str = Field(
+        description="Where Microsoft returns the user; must match the Entra app "
+        "registration exactly (e.g. https://host/auth/callback).",
+    )
+
+
+class AuthorizeResponse(BaseModel):
+    """The Microsoft URL to send the browser to, and the CSRF state to echo back."""
+
+    auth_url: str
+    state: str
+
+
+class CallbackRequest(BaseModel):
+    """The query parameters Microsoft redirected back with (code, state, …)."""
+
+    auth_response: dict[str, str] = Field(
+        description="All query params from the redirect callback.",
+    )
+
+
 class SessionResponse(BaseModel):
     """An opaque session the client polls until sign-in completes."""
 

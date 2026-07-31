@@ -213,17 +213,37 @@ def login_azcli() -> dict:
 
 
 def start_device_flow(tenant_id, client_id, scopes) -> dict:
-    """Begin a device-code sign-in (used by the CLI / headless scenarios)."""
+    """Begin a device-code sign-in — the browser-based flow for a hosted app.
+
+    The user opens the returned ``verification_uri`` in **their own** browser,
+    enters the ``user_code``, and completes sign-in there; the token is acquired
+    and stored server-side, so it never reaches the browser. This is the flow to
+    use when the app is hosted/remote (a tunnel, a server), because the
+    interactive flow would open a browser on the *server* instead.
+
+    Like the interactive flow, it falls back to Microsoft's built-in Azure CLI
+    public client so **no app registration is required**.
+    """
     try:
         import msal
     except ImportError as exc:
         raise AuthError("msal is not installed", 500) from exc
-    if not tenant_id or not client_id:
-        raise AuthError("tenant_id and client_id are required", 400)
+
+    client = _clean(client_id)
+    tenant = _clean(tenant_id)
     scopes = scopes or _DEFAULT_FABRIC_SCOPES
+
+    # No app registered? Use Microsoft's built-in Azure CLI client so the user can
+    # sign in with just their Microsoft account (no admin needed), targeting the
+    # Fabric API with .default to include its pre-authorized permissions.
+    if not client:
+        client = _AZURE_CLI_CLIENT_ID
+        scopes = _FABRIC_DEFAULT_SCOPE
+
+    authority = (f"https://login.microsoftonline.com/{tenant}" if tenant
+                 else "https://login.microsoftonline.com/organizations")
     try:
-        app = msal.PublicClientApplication(
-            client_id, authority=f"https://login.microsoftonline.com/{tenant_id}")
+        app = msal.PublicClientApplication(client, authority=authority)
         flow = app.initiate_device_flow(scopes=scopes)
     except Exception as exc:
         raise AuthError(f"could not start sign-in: {exc}", 400) from exc
@@ -255,3 +275,109 @@ def start_device_flow(tenant_id, client_id, scopes) -> dict:
         "message": flow.get("message"),
         "expires_in": flow.get("expires_in"),
     }
+
+
+# -- redirect Authorization Code flow (hosted web sign-in) --------------------
+# The standard browser redirect flow for a hosted app: the user signs in on
+# Microsoft's page in their own browser and is redirected back with a code, which
+# the server exchanges for a token. Needs an Entra app registration whose redirect
+# URI matches the frontend's callback. Pending flows are held server-side, keyed
+# by the CSRF `state` MSAL generates, between the redirect out and the callback.
+_PENDING_FLOWS: dict[str, dict] = {}
+_FLOWS_LOCK = threading.Lock()
+#: Cap the pending-flow store so an abandoned-sign-in flood can't grow it forever.
+_MAX_PENDING_FLOWS = 500
+
+
+def _auth_code_app(client_id, tenant, client_secret):
+    """Build the MSAL app for the redirect flow — confidential if a secret is set."""
+    import msal
+
+    authority = f"https://login.microsoftonline.com/{tenant or 'organizations'}"
+    if client_secret:
+        return msal.ConfidentialClientApplication(
+            client_id, authority=authority, client_credential=client_secret
+        )
+    return msal.PublicClientApplication(client_id, authority=authority)
+
+
+def start_auth_code_flow(
+    redirect_uri: str, client_id, tenant_id, client_secret, scopes=None
+) -> dict:
+    """Begin the redirect flow: return the Microsoft URL to send the user to.
+
+    ``redirect_uri`` must exactly match one registered on the Entra app. The
+    returned ``auth_url`` is where the browser is sent; MSAL's ``state`` ties the
+    eventual callback back to this flow (and defends against CSRF).
+    """
+    try:
+        import msal  # noqa: F401
+    except ImportError as exc:
+        raise AuthError("msal is not installed", 500) from exc
+
+    client = _clean(client_id)
+    if not client:
+        raise AuthError(
+            "Redirect sign-in is not configured. Set AUDITFAST_AUTH_CLIENT_ID and "
+            "AUDITFAST_AUTH_TENANT_ID on the server.", 400)
+    if not redirect_uri:
+        raise AuthError("a redirect_uri is required", 400)
+
+    app = _auth_code_app(client, _clean(tenant_id), _clean(client_secret))
+    try:
+        flow = app.initiate_auth_code_flow(
+            scopes=scopes or _DEFAULT_FABRIC_SCOPES, redirect_uri=redirect_uri
+        )
+    except Exception as exc:
+        raise AuthError(f"could not start sign-in: {exc}", 400) from exc
+    if "auth_uri" not in flow:
+        raise AuthError(flow.get("error_description", "could not start sign-in"), 400)
+
+    with _FLOWS_LOCK:
+        if len(_PENDING_FLOWS) >= _MAX_PENDING_FLOWS:
+            _PENDING_FLOWS.clear()  # drop stale/abandoned flows wholesale
+        _PENDING_FLOWS[flow["state"]] = flow
+    return {"auth_url": flow["auth_uri"], "state": flow["state"]}
+
+
+def complete_auth_code_flow(
+    auth_response: dict, client_id, tenant_id, client_secret, scopes=None
+) -> dict:
+    """Finish the redirect flow: exchange the returned code for a token.
+
+    ``auth_response`` is the set of query parameters Microsoft redirected back
+    with (``code``, ``state``, …). The token is stored server-side and only a
+    session id is returned to the browser.
+    """
+    try:
+        import msal  # noqa: F401
+    except ImportError as exc:
+        raise AuthError("msal is not installed", 500) from exc
+
+    state = (auth_response or {}).get("state")
+    if not state:
+        raise AuthError("missing state in the sign-in response", 400)
+    with _FLOWS_LOCK:
+        flow = _PENDING_FLOWS.pop(state, None)
+    if flow is None:
+        raise AuthError("this sign-in expired or was already used — please try again", 400)
+    if auth_response.get("error"):
+        raise AuthError(
+            auth_response.get("error_description") or auth_response["error"], 400)
+
+    app = _auth_code_app(_clean(client_id), _clean(tenant_id), _clean(client_secret))
+    try:
+        res = app.acquire_token_by_auth_code_flow(
+            flow, auth_response, scopes=scopes or _DEFAULT_FABRIC_SCOPES
+        )
+    except Exception as exc:
+        raise AuthError(f"sign-in failed: {exc}", 400) from exc
+    if "access_token" not in res:
+        raise AuthError(res.get("error_description", "authentication failed"), 400)
+
+    sid = uuid.uuid4().hex
+    _SESSIONS[sid] = {
+        "result": res["access_token"], "error": None, "done": True,
+        "user": _profile_from_claims(res.get("id_token_claims")),
+    }
+    return {"session": sid, "status": "done", "message": "Signed in."}

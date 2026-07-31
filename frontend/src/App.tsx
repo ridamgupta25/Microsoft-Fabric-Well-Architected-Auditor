@@ -5,6 +5,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 
 import { AuditProvider } from "@/context/AuditContext";
 import { MainLayout } from "@/layouts/MainLayout";
+import { AuthCallbackPage } from "@/pages/AuthCallbackPage";
 import { CatalogPage } from "@/pages/CatalogPage";
 import { ChecklistPage } from "@/pages/ChecklistPage";
 import { DashboardPage } from "@/pages/DashboardPage";
@@ -17,6 +18,8 @@ export default function App() {
   return (
     <AuditProvider>
       <Routes>
+        {/* OAuth redirect landing — bare (no app chrome), handles ?code&state. */}
+        <Route path="auth/callback" element={<AuthCallbackPage />} />
         <Route element={<MainLayout />}>
           <Route index element={<DashboardPage />} />
           <Route path="run" element={<RunAuditPage />} />
