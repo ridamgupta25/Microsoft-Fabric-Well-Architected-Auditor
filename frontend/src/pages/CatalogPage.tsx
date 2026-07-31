@@ -118,7 +118,9 @@ export function CatalogPage() {
                       ? "Automated"
                       : check.automation === "roadmap"
                         ? "Automatable (planned)"
-                        : "Manual"}
+                        : check.automation === "interactive"
+                          ? "Self-assessed"
+                          : "Manual"}
                   </td>
                   <td className="text-xs text-slate-500">
                     {check.layers.includes("*") ? "All" : check.layers.join(", ")}

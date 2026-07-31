@@ -6,6 +6,8 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
+from .catalog import CheckOptionOut
+
 
 class JobStatus(str, Enum):
     """Lifecycle of a submitted audit."""
@@ -151,6 +153,43 @@ class AuditReport(BaseModel):
     )
 
 
+class QuestionnaireItem(BaseModel):
+    """One interactive, self-assessed checklist point for a run."""
+
+    id: str
+    ref: str
+    title: str
+    pillar: str
+    scope: str
+    severity: str
+    layers: list[str]
+    question: str = Field(description="The question shown to the reviewer.")
+    options: list[CheckOptionOut] = Field(description="The scored answers to choose from.")
+    required: bool = True
+    automation: str = "interactive"
+    description: str = ""
+
+
+class AuditAnswersRequest(BaseModel):
+    """The reviewer's answers to a run's interactive questionnaire.
+
+    Maps each interactive check id to the chosen option ``value``. Use
+    ``"__skip__"`` (or simply omit a check) to skip it — skipped points are
+    recorded as N/A and never scored.
+    """
+
+    answers: dict[str, str] = Field(
+        default_factory=dict,
+        description="Interactive check id -> chosen option value (or '__skip__').",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {"answers": {"Q-SEC-LABELS": "enforced", "Q-OPS-DR": "__skip__"}}
+        }
+    }
+
+
 class AuditJobOut(BaseModel):
     """Status of a submitted audit, with the report once it has finished."""
 
@@ -162,6 +201,15 @@ class AuditJobOut(BaseModel):
     duration_seconds: float | None = None
     error: str | None = None
     report: AuditReport | None = None
+    questionnaire: list[QuestionnaireItem] = Field(
+        default_factory=list,
+        description="Interactive, self-assessed checklist points to answer while the "
+        "automated audit runs. Grouped in the UI by pillar and layer.",
+    )
+    answers_submitted: bool = Field(
+        default=False,
+        description="True once the reviewer's questionnaire answers have been recorded.",
+    )
 
 
 class AuditJobSummary(BaseModel):

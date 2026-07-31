@@ -11,6 +11,10 @@ input always produces the same score.
 - **Multi-workspace per project.** Register the workspaces that make up a
   project, tag each with its layer role, and get one aggregated score plus a
   per-workspace and **pillar × layer** breakdown.
+- **Automated + self-assessed.** Most checks are verified from the tenant; the
+  points a machine can't read (a tested DR plan, a documented cost review) are
+  **interactive** — the reviewer picks a scored option during the audit, Azure
+  Well-Architected Review style, and skipping records N/A rather than a low score.
 - **Cached & incremental.** Each workspace is crawled once into an on-disk
   knowledge base and re-read from it on later runs, so repeat audits are
   near-instant and re-crawl Fabric only when a snapshot goes stale.
@@ -79,7 +83,7 @@ Risk Register).
 
 ```powershell
 cd backend
-..\.venv\Scripts\python.exe -m pytest      # 171 passed, fully offline against a recorded test fixture
+..\.venv\Scripts\python.exe -m pytest      # 192 passed, fully offline against a recorded test fixture
 ```
 
 ---
@@ -112,23 +116,24 @@ the work runs in the background, because a tenant-wide run can take minutes.
 
 ## What it checks
 
-**148 checks** across seven pillars — 64 verified today (`automated`), 84
+**164 checks** across seven pillars — 64 verified today (`automated`), 16
+self-assessed (`interactive`, Azure Well-Architected Review style), and 84
 automatable-but-pending (`roadmap`).
 
 | Scope | Checks | Examples |
 |-------|-------:|----------|
-| **Workspace** | 107 | naming, roles via security groups, least-privilege admins, guest access, sensitivity labels, Git, deployment pipeline, capacity, orphaned items, layer content / separation, inventory |
+| **Workspace** | 123 | naming, roles via security groups, least-privilege admins, guest access, sensitivity labels, Git, deployment pipeline, capacity, orphaned items, layer content / separation, inventory, self-assessed governance/DR/cost points |
 | **Pipeline** | 12 | naming, descriptions, parameterization, retry, on-failure path, failure notification, timeouts, no hardcoded secrets |
 | **Notebook** | 29 | Delta MERGE / OPTIMIZE / VACUUM / Z-ORDER / V-ORDER, table properties, retention, Spark env & pinned libraries, shuffle / cache / repartition, `SELECT *` |
 
 | Pillar | Checks |
 |--------|-------:|
-| Data Management & Quality | 53 |
-| Operations & Reliability | 33 |
-| Performance & Capacity | 23 |
-| Security | 16 |
-| Cost & Resource Optimization | 15 |
-| Governance & Compliance | 7 |
+| Data Management & Quality | 56 |
+| Operations & Reliability | 36 |
+| Performance & Capacity | 25 |
+| Security | 19 |
+| Cost & Resource Optimization | 17 |
+| Governance & Compliance | 10 |
 | Foundation (informational, unscored) | 1 |
 
 Lakehouse / Delta storage, semantic models, and Eventhouse are not yet

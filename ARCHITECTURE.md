@@ -69,7 +69,7 @@ Every dimension the tool reasons about is an enum defined exactly once in
 | **Pillar** | One of **7**: Security · Governance & Compliance · Operations & Reliability · Performance & Capacity · Cost & Resource Optimization · Data Management & Quality · **Foundation** (cross-cutting, informational, **never scored**). |
 | **Scope** | What a check inspects: `workspace`, `pipeline`, `notebook` (+ reserved `lakehouse`, `semantic_model`, `report`, `eventhouse`). |
 | **Resource** | A unit of data the provider fetches. Checks declare `requires=[...]`; the engine fetches only the union the selected checks need. |
-| **Automation** | How a verdict is reached: `automated` (verified now), `roadmap` (automatable but needs data not yet fetched — reported as an attestation), `manual` (never machine-verifiable). |
+| **Automation** | How a verdict is reached: `automated` (verified now), `roadmap` (automatable but needs data not yet fetched — reported as an attestation), `interactive` (**self-assessed** — the reviewer picks a scored option during the audit, Azure Well-Architected Review style), `manual` (never machine-verifiable). |
 | **`ref`** | A dotted string like `2.4.1` pointing at the deep-dive checklist and used to look up remediation text — the **traceability spine** between the automated tool and the manual audit instrument. |
 
 ---
@@ -122,7 +122,7 @@ what keeps guarantee #5 true by construction.
 | [`core/models.py`](backend/src/auditfast/core/models.py) | `WorkspaceContext`, `CheckContext`, `CheckSpec`, `CheckResult` |
 | [`core/engine.py`](backend/src/auditfast/core/engine.py) | Generic, scope-driven dispatch |
 | [`core/scoring.py`](backend/src/auditfast/core/scoring.py) | 0–3 bands → weighted roll-up → pillar × layer matrix |
-| [`core/check/`](backend/src/auditfast/core/check/) | The 148-check library + registry + verdict helpers |
+| [`core/check/`](backend/src/auditfast/core/check/) | The 164-check library + registry + verdict helpers |
 | [`clients/`](backend/src/auditfast/clients/) | `LiveFabricProvider` (the only shipped provider) + the `Provider` protocol |
 | [`services/`](backend/src/auditfast/services/) | The one audit path, the KB cache, the checklist intake + batch runner, auth, catalog |
 | [`ai/`](backend/src/auditfast/ai/) | Deterministic dedup + proposal drafting; optional advisory (off by default) |
@@ -221,31 +221,39 @@ cover every check: `binary(ok, ev)` → 3/0 · `covered(n, total, ev)` → bande
 · `graded(0–3, ev)` · `note(ev)` → INFO, unscored · `not_applicable(ev)` → N/A,
 unscored. That last one is guarantee #3, in code.
 
-**Registration is an import side effect.** The `@check` decorator registers into a
-process-wide `REGISTRY` at import time; the package auto-discovers every leaf
-module named `automated` / `manual` / `roadmap` and imports it. A module not
+**Registration is an import side effect.** The `@check` decorator (or
+`questionnaire_check` for interactive points) registers into a process-wide
+`REGISTRY` at import time; the package auto-discovers every leaf module named
+`automated` / `manual` / `questionnaire` / `roadmap` and imports it. A module not
 imported (or hidden behind a `_` prefix) registers nothing — so `/health` reports
 `checks_registered` and a test pins the count, making an empty catalog *visible*
 rather than silent.
 
 ### Current coverage
 
-**148 checks — 64 `automated`, 84 `roadmap`, 0 `manual`.**
+**164 checks — 64 `automated`, 16 `interactive` (self-assessed), 84 `roadmap`, 0 `manual`.**
 
 | Pillar | Checks | | By scope | Checks |
 |--------|-------:|-|----------|-------:|
-| Data Management & Quality | 53 | | workspace | 107 |
-| Operations & Reliability | 33 | | notebook | 29 |
-| Performance & Capacity | 23 | | pipeline | 12 |
-| Security | 16 | | | |
-| Cost & Resource Optimization | 15 | | | |
-| Governance & Compliance | 7 | | | |
+| Data Management & Quality | 56 | | workspace | 123 |
+| Operations & Reliability | 36 | | notebook | 29 |
+| Performance & Capacity | 25 | | pipeline | 12 |
+| Security | 19 | | | |
+| Cost & Resource Optimization | 17 | | | |
+| Governance & Compliance | 10 | | | |
 | Foundation (unscored) | 1 | | | |
 
 `roadmap` checks are honest placeholders: automatable *in principle*, but needing
 an API the provider does not yet call (tenant-admin, capacity metrics, an
 un-crawled definition). They appear in the catalog as attestations so no checklist
 point is silently missing — and are promoted to `automated` as data becomes reachable.
+
+`interactive` checks are the **Azure Well-Architected Review** model: points a
+machine cannot read from a workspace (a tested DR plan, a documented cost review)
+but a reviewer *can* attest. During a run the reviewer picks a scored option; the
+engine skips them and [`services/questionnaire_service.py`](backend/src/auditfast/services/questionnaire_service.py)
+scores the answer 0–3 and merges it per applicable workspace. **Skipping records
+N/A, never a low score** — so a self-assessment left blank can't drag the number down.
 
 ---
 
@@ -403,7 +411,7 @@ the payoff of the pure-core + generic-engine design.
 
 ## 13. Quality & determinism in practice
 
-- **185 tests, fully offline.** The suite runs against a recorded-tenant fixture —
+- **192 tests, fully offline.** The suite runs against a recorded-tenant fixture —
   no live Fabric call — so determinism is *tested*, not merely intended. Pinned
   values (`checks_registered`, the overall score, scored-check and result-row
   counts) fail loudly if any check, band, or roll-up drifts.
@@ -424,7 +432,7 @@ the payoff of the pure-core + generic-engine design.
 | Agents / tooling | Model Context Protocol (FastMCP) · GitHub Copilot authoring layer |
 | Reports | Markdown · Excel (openpyxl) |
 | Persistence | On-disk knowledge base (JSON) + permanent timestamped archive |
-| Tests | pytest + FastAPI TestClient — 185, fully offline |
+| Tests | pytest + FastAPI TestClient — 192, fully offline |
 
 ---
 

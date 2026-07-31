@@ -40,9 +40,13 @@ reproducible.
   in a check body. A check is a **pure function** of its `CheckContext`.
 - A check reports **N/A**, never FAIL, when the data could not be read. "We could
   not determine this" ≠ "this is misconfigured".
-- Checks are registered by an **import side effect** (the `@check` decorator). A
-  new check module that is not auto-imported registers nothing and silently never
-  runs. See §7.
+- Checks are registered by an **import side effect** (the `@check` decorator, or
+  `questionnaire_check` for interactive ones). A new check module that is not
+  auto-imported registers nothing and silently never runs. See §7.
+- **Interactive (self-assessed) checks are the only `manual=True` specs.** The
+  engine skips them; the reviewer answers a scored question during the audit and
+  the answer is merged into the report afterwards (§6a). They still obey
+  N/A-not-FAIL: *skipped* ⇒ N/A, never a low score.
 
 **Where things go:**
 
@@ -52,7 +56,7 @@ reproducible.
 - New artifact type → add a `Scope` member + a provider that yields it; the
   engine does not change.
 
-**Always run the tests after a change** (§9). Expected: **171 passed**, offline.
+**Always run the tests after a change** (§9). Expected: **192 passed**, offline.
 
 ---
 
@@ -74,13 +78,14 @@ auditfast-core/
           registry.py          REGISTRY + the @check decorator
           helpers.py           Verdict builders: binary/covered/graded/note/not_applicable
           _notebook.py _pipeline.py ...  shared detectors (underscore = not auto-loaded)
-          <pillar>/<layer>/{automated,manual,roadmap}.py
+          <pillar>/<layer>/{automated,manual,questionnaire,roadmap}.py
       clients/                 LiveFabricProvider (the only shipped provider) + Provider protocol
         live.py                Fabric REST reads (GET + read-only getDefinition; classifies failures)
         powerbi.py             Power BI REST reads for the FabricIQ tools
       services/                Orchestration; framework-free
         audit_service.py       The one audit path: build_provider → run_engine → aggregate
-        audit_runner.py        Background execution, concurrency semaphore, background KB refresh
+        audit_runner.py        Background execution, concurrency semaphore, background KB refresh; computes the questionnaire + merges answers
+        questionnaire_service.py  Interactive (self-assessed) checks: build the questionnaire + score answers into a report (§6a)
         context_store.py       The KB: ContextStore + CachingProvider + KBArchive + ArchivingProvider (§5)
         intake_service.py      Checklist-intake: dedup a point vs REGISTRY, draft a proposal (§11)
         auth_service.py        Read-only Entra sign-in (token stays server-side)
@@ -123,7 +128,7 @@ defined once.
 | **Layer** | What a workspace is *for*: `Data Prep`, `Data Storage`, `Data Logs`, `Data Operations`, `Reporting / Semantic`, `Mixed`. (`*`/`ANY` is a check-side sentinel meaning "every layer".) |
 | **Pillar** | One of **7**: `Security`, `Governance & Compliance`, `Operations & Reliability`, `Performance & Capacity`, `Cost & Resource Optimization`, `Data Management & Quality`, and `Foundation` (cross-cutting, informational, **never scored**). |
 | **Scope** | The object a check inspects: `workspace`, `pipeline`, `notebook` (plus reserved `lakehouse`, `semantic_model`, `report`, `eventhouse`). |
-| **Automation** | How a check's verdict is reached: `automated` (verified now), `roadmap` (automatable but needs data not yet fetched — reported as an attestation), `manual` (never machine-verifiable). |
+| **Automation** | How a check's verdict is reached: `automated` (verified now), `roadmap` (automatable but needs data not yet fetched — reported as an attestation), `interactive` (**self-assessed** — the reviewer chooses a scored option during the audit, Azure Well-Architected Review style), `manual` (never machine-verifiable). |
 | **Resource** | A unit of data a check needs the provider to fetch. Checks declare `requires=`; the engine fetches only the union of the selected checks' needs. |
 | **`ref`** | A dotted string like `3.3.1` pointing at the deep-dive checklist; the key used to look up remediation text. The traceability spine. |
 
@@ -195,19 +200,19 @@ for workspace_id, layer in targets:
 
 ## 6. The check system
 
-**Current coverage: 148 checks** — 64 `automated`, 84 `roadmap`, 0 `manual`.
+**Current coverage: 164 checks** — 64 `automated`, 16 `interactive` (self-assessed), 84 `roadmap`, 0 `manual`.
 
 | Pillar | Checks |
 |--------|-------:|
-| Data Management & Quality | 53 |
-| Operations & Reliability | 33 |
-| Performance & Capacity | 23 |
-| Security | 16 |
-| Cost & Resource Optimization | 15 |
-| Governance & Compliance | 7 |
+| Data Management & Quality | 56 |
+| Operations & Reliability | 36 |
+| Performance & Capacity | 25 |
+| Security | 19 |
+| Cost & Resource Optimization | 17 |
+| Governance & Compliance | 10 |
 | Foundation (unscored) | 1 |
 
-By scope: workspace 107, pipeline 12, notebook 29. Browse the live catalog with
+By scope: workspace 123, pipeline 12, notebook 29. Browse the live catalog with
 `GET /api/v1/catalog/checks` or `auditfast checks --pillar Security` — that is the
 source of truth, not a hand-maintained list.
 
@@ -230,10 +235,12 @@ def delta_optimize(ctx: CheckContext) -> Verdict:
 
 ### Adding / promoting a check
 
-- The `automated`, `manual`, and `roadmap` leaf modules under each
-  `core/check/<pillar>/<layer>/` are auto-imported by the loader. Modules whose
-  name starts with `_` (e.g. `_spark.py`) are **skipped** — use them for shared
-  helpers.
+- The `automated`, `manual`, `questionnaire`, and `roadmap` leaf modules under
+  each `core/check/<pillar>/<layer>/` are auto-imported by the loader. Modules
+  whose name starts with `_` (e.g. `_spark.py`) are **skipped** — use them for
+  shared helpers.
+- **Interactive (self-assessed) checks** live in `questionnaire.py` modules and
+  are registered with `questionnaire_check(...)` (not `@check`) — see §6a.
 - `roadmap.py` files are **generated** by [`build-manual-checks.py`](../build-manual-checks.py)
   (repo root). To **promote** a roadmap point to a real automated check:
   1. write the evaluator in the pillar/layer `automated.py` with its `ref`,
@@ -244,15 +251,49 @@ def delta_optimize(ctx: CheckContext) -> Verdict:
      (enforced by tests),
   5. update the pinned counts in `tests/` (registry totals, score, row counts).
 
+### 6a. Interactive (self-assessed) checks
+
+Some Well-Architected points can't be read from Fabric but *can* be scored by
+asking the reviewer — the **Azure Well-Architected Review** model. These are
+**interactive** checks (`automation=interactive`, `manual=True`), authored with
+`questionnaire_check(...)` in a `questionnaire.py` module:
+
+```python
+questionnaire_check(
+    id="Q-OPS-DR", ref="Q-OPS-1", title="DR / restore plan documented and tested",
+    pillar=Pillar.OPERATIONS, layers=(Layer.ANY,),
+    question="Is there a documented, tested disaster-recovery plan for this workspace?",
+    options=(
+        Option("tested", "Documented and restore-tested within the last year", 3),
+        Option("documented", "Documented but never tested", 1, guidance="Run a restore drill…"),
+        Option("none", "No DR plan", 0, guidance="Document a recovery plan…"),
+    ),
+)
+```
+
+- The **engine skips them** (they are `manual=True`). Instead
+  [`services/questionnaire_service.py`](backend/src/auditfast/services/questionnaire_service.py)
+  builds the questionnaire for a run (filtered by the selected pillars and the
+  workspaces' layers) and, when the reviewer answers, **scores each option 0–3**
+  and merges the result into the report — **fanned out to every audited workspace
+  whose layer the check applies to**.
+- **Skip ⇒ N/A, unscored** (never a low score). Each non-passing option carries
+  `guidance` that becomes the finding's recommendation, so interactive checks are
+  **exempt from the `remediation.yaml` requirement**.
+- Merging is **idempotent** and re-applied after the KB background refresh, so an
+  answer can never be double-counted or lost. The runtime wiring is: submit
+  computes the questionnaire; `POST /api/v1/audit/{id}/answers` records the
+  answers; the merge lands as soon as the automated crawl finishes.
+
 ---
 
 ## 7. Registration is an import side effect
 
 `@check` registers into the module-level `REGISTRY` at import time; the check
-package's loader imports every leaf `automated`/`manual`/`roadmap` module for that
-side effect. **A module not imported registers nothing and raises nothing.**
-`/api/v1/health` reports `checks_registered`, and a test asserts the registry
-count has not drifted, so an empty catalog is visible instead of silent.
+package's loader imports every leaf `automated`/`manual`/`questionnaire`/`roadmap`
+module for that side effect. **A module not imported registers nothing and raises
+nothing.** `/api/v1/health` reports `checks_registered`, and a test asserts the
+registry count has not drifted, so an empty catalog is visible instead of silent.
 
 ---
 
@@ -293,14 +334,14 @@ cd backend
 # Run the frontend (separate terminal, from auditfast-core/frontend)
 npm install ; npm run dev                                       # http://localhost:5173
 
-# Tests — expected: 171 passed, fully offline
+# Tests — expected: 192 passed, fully offline
 cd backend
 ..\.venv\Scripts\python.exe -m pytest -q
 
 # Lint
 ..\.venv\Scripts\python.exe -m ruff check src
 
-# Sanity: how many checks registered (expected 148)
+# Sanity: how many checks registered (expected 164)
 ..\.venv\Scripts\python.exe -c "from auditfast.core.check.registry import REGISTRY; print(len(REGISTRY), 'checks')"
 ```
 
@@ -315,6 +356,7 @@ cd backend
 | Area | State |
 |------|-------|
 | Automated checks | 64 today (workspace + pipeline + Spark/Delta notebook checks). 84 more are `roadmap`. |
+| Interactive checks | 16 self-assessed (Azure WAF-style) questionnaire points, scored 0–3 from the reviewer's answer and merged per workspace; *skipped* ⇒ N/A. |
 | Foundation pillar | Informational only — never scored (inventory, access errors, `WS-READ-INCOMPLETE` warnings). |
 | Crawl completeness | `getDefinition`/table failures are tracked (`read_failures`, forbidden vs transient), surfaced as `WS-READ-INCOMPLETE` + a report section, and an incomplete snapshot is never cached (§5). |
 | Crawl performance | `getDefinition` is read one item at a time (60s timeout) — a 1000+ item workspace can take many minutes on first crawl. Parallelisation is the open scalability item. |

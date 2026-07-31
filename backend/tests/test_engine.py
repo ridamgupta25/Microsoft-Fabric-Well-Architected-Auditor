@@ -152,7 +152,12 @@ def test_registry_is_fully_populated():
     assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 29
     # The rest run as gated N/A that names the access they need — never skipped.
     assert len([s for s in REGISTRY if s.automation is Automation.ROADMAP]) == 84
-    assert all(not s.manual for s in REGISTRY)
+    # Interactive (self-assessed) checks are the only manual specs; the engine
+    # skips them and the reviewer answers a scored question instead.
+    assert len([s for s in REGISTRY if s.automation is Automation.INTERACTIVE]) == 16
+    assert all(
+        s.automation is Automation.INTERACTIVE for s in REGISTRY if s.manual
+    )
 
 
 def test_every_check_has_traceable_metadata():

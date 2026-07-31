@@ -28,7 +28,7 @@ from ..config.logging import correlation_id, get_logger
 from ..database.models import AuditJob
 from ..database.repositories.base import AuditJobRepository
 from ..schemas.audit import JobStatus
-from . import audit_service
+from . import audit_service, questionnaire_service
 
 logger = get_logger(__name__)
 
@@ -71,6 +71,7 @@ class AuditRunner:
                 "pillars": pillars or [],
                 "workspaces": workspaces or [],
             },
+            questionnaire=questionnaire_service.build_questionnaire(pillars, workspaces),
         )
         await self._repository.add(job)
 
@@ -129,6 +130,7 @@ class AuditRunner:
                 )
                 report: dict[str, Any] = audit_service.to_json(run)
                 report["audit_id"] = job.id
+                report = self._merge_answers(job, report)
                 job.mark_succeeded(report)
                 logger.info(
                     "audit finished",
@@ -195,6 +197,7 @@ class AuditRunner:
                 )
                 report = audit_service.to_json(run)
                 report["audit_id"] = job.id
+                report = self._merge_answers(job, report)
                 job.report = report
                 await self._repository.update(job)
                 logger.info(
@@ -204,10 +207,49 @@ class AuditRunner:
             except Exception:  # noqa: BLE001 - a failed refresh must not surface
                 logger.exception("audit KB refresh failed", extra={"audit_id": job.id})
 
+    # -- interactive questionnaire -------------------------------------------
+    async def submit_answers(
+        self,
+        job_id: str,
+        answers: dict[str, str],
+        organization_id: str | None = None,
+    ) -> AuditJob | None:
+        """Record the reviewer's questionnaire answers and score them in.
+
+        Idempotent: only ids that belong to this run's questionnaire are kept,
+        and the merge strips any prior interactive results first, so re-submitting
+        (or a later KB refresh) always lands the same numbers. If the report has
+        not been produced yet, the answers are stored and applied when the audit
+        finishes.
+        """
+        job = await self._repository.get(job_id, organization_id)
+        if job is None:
+            return None
+
+        valid_ids = {q.get("id") for q in job.questionnaire}
+        job.answers = {k: v for k, v in (answers or {}).items() if k in valid_ids}
+        job.answers_submitted = True
+        if job.report is not None:
+            job.report = self._merge_answers(job, job.report)
+        await self._repository.update(job)
+        logger.info(
+            "audit answers recorded",
+            extra={"audit_id": job.id, "answers": len(job.answers)},
+        )
+        return job
+
+    def _merge_answers(self, job: AuditJob, report: dict[str, Any]) -> dict[str, Any]:
+        """Fold the reviewer's self-assessed answers into a report."""
+        if not job.answers:
+            return report
+        question_ids = [q["id"] for q in job.questionnaire if q.get("id")]
+        return questionnaire_service.merge_answers_into_report(
+            report, job.answers, question_ids
+        )
+
     # -- reading --------------------------------------------------------------
     async def get(self, job_id: str, organization_id: str | None = None) -> AuditJob | None:
         return await self._repository.get(job_id, organization_id)
-
     async def history(
         self,
         limit: int = 25,

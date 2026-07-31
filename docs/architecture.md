@@ -16,7 +16,7 @@ Five terms carry the whole domain.
 | **Layer** | What a workspace is *for*: `Data Prep`, `Data Storage`, `Data Logs`, `Data Operations`, `Reporting / Semantic`, `Mixed`. Your "inner pillars". |
 | **Pillar** | One of seven quality attributes: `Security`, `Governance & Compliance`, `Operations & Reliability`, `Performance & Capacity`, `Cost & Resource Optimization`, `Data Management & Quality`. Plus `Foundation` — cross-cutting, informational, never scored. |
 | **Scope** | The kind of object a check inspects: `workspace`, `pipeline`, `notebook`, and (reserved) `lakehouse`, `semantic_model`, `report`, `eventhouse`. |
-| **Automation** | How a check's verdict is reached: `automated` (verified now), `roadmap` (automatable but needs data the provider does not yet fetch — reported as an attestation), `manual` (never machine-verifiable). |
+| **Automation** | How a check's verdict is reached: `automated` (verified now), `roadmap` (automatable but needs data the provider does not yet fetch — reported as an attestation), `interactive` (**self-assessed** — the reviewer picks a scored option during the audit, Azure Well-Architected Review style), `manual` (never machine-verifiable). |
 
 Every check also carries a **`ref`** — a dotted string like `2.4.1`. It points at
 a line item in the 13-area deep-dive checklist and is the key used to look up
@@ -75,17 +75,18 @@ results: one implementation, three front doors.
 
 | Path | Responsibility |
 |------|----------------|
-| [`core/enums.py`](../backend/src/auditfast/core/enums.py) | Pillar, Layer, Scope, Resource, Status, Severity |
-| [`core/models.py`](../backend/src/auditfast/core/models.py) | `WorkspaceContext` (+ `read_failures`, `is_complete`), `CheckContext`, `CheckSpec`, `CheckResult` |
+| [`core/enums.py`](../backend/src/auditfast/core/enums.py) | Pillar, Layer, Scope, Automation, Resource, Status, Severity |
+| [`core/models.py`](../backend/src/auditfast/core/models.py) | `WorkspaceContext` (+ `read_failures`, `is_complete`), `CheckContext`, `CheckSpec`, `CheckResult`, `CheckOption` |
 | [`core/scoring.py`](../backend/src/auditfast/core/scoring.py) | Bands, ratings, weighted roll-up, pillar×layer matrix |
 | [`core/engine.py`](../backend/src/auditfast/core/engine.py) | Generic scope-driven dispatch |
-| [`core/check/registry.py`](../backend/src/auditfast/core/check/registry.py) | The single registry (`REGISTRY`) and the `@check` decorator |
+| [`core/check/registry.py`](../backend/src/auditfast/core/check/registry.py) | The single registry (`REGISTRY`), the `@check` decorator, and `questionnaire_check` for interactive points |
 | [`core/check/helpers.py`](../backend/src/auditfast/core/check/helpers.py) | `Verdict` and the builders |
-| [`core/check/<pillar>/<layer>/`](../backend/src/auditfast/core/check/) | 148 checks — `automated`, `manual`, and generated `roadmap` modules per pillar × layer |
+| [`core/check/<pillar>/<layer>/`](../backend/src/auditfast/core/check/) | 164 checks — `automated`, `questionnaire` (interactive), `manual`, and generated `roadmap` modules per pillar × layer |
 | [`clients/`](../backend/src/auditfast/clients/) | `LiveFabricProvider` (the only shipped provider) and the `Provider` protocol |
 | [`services/audit_service.py`](../backend/src/auditfast/services/audit_service.py) | The one audit path; builds the caching provider |
 | [`services/context_store.py`](../backend/src/auditfast/services/context_store.py) | The KB: `ContextStore` (disk cache) + `CachingProvider` + `KBArchive` + `ArchivingProvider` (permanent timestamped archive) |
-| [`services/audit_runner.py`](../backend/src/auditfast/services/audit_runner.py) | Background execution, concurrency limits, background KB refresh |
+| [`services/audit_runner.py`](../backend/src/auditfast/services/audit_runner.py) | Background execution, concurrency limits, background KB refresh; computes the questionnaire and merges the reviewer's answers |
+| [`services/questionnaire_service.py`](../backend/src/auditfast/services/questionnaire_service.py) | Interactive (self-assessed) checks: build a run's questionnaire and score answers 0–3 into the report, per applicable workspace |
 | [`services/catalog_service.py`](../backend/src/auditfast/services/catalog_service.py) | Catalog questions; no I/O |
 | [`services/project.py`](../backend/src/auditfast/services/project.py) | Project YAML → `ProjectConfig` |
 | [`services/auth_service.py`](../backend/src/auditfast/services/auth_service.py) | Read-only Entra sign-in |
@@ -343,15 +344,17 @@ See [checks.md](checks.md) for the full catalog and how to add one.
 
 The `@check` decorator registers at import time. [`core/check/__init__.py`](../backend/src/auditfast/core/check/__init__.py)
 **auto-discovers** them by walking the package tree and importing every leaf
-module named `automated`, `manual`, or `roadmap` — so a new
+module named `automated`, `manual`, `questionnaire`, or `roadmap` — so a new
 `<pillar>/<layer>/automated.py` is picked up with no `__init__.py` edit. Helper
 modules whose name starts with `_` (e.g. `_spark.py`) are skipped.
+(`questionnaire.py` modules register interactive points via `questionnaire_check`,
+which is the same import-side-effect mechanism.)
 
-> **Gotcha:** a check module *not* named `automated` / `manual` / `roadmap` (or
-> hidden behind a `_` prefix) registers nothing, raises nothing, and its checks
-> silently never run. `registered_modules()` exists so a test can assert the
-> tree was fully imported, and `/api/v1/health` reports `checks_registered` so
-> an empty catalog is visible rather than silent.
+> **Gotcha:** a check module *not* named `automated` / `manual` / `questionnaire`
+> / `roadmap` (or hidden behind a `_` prefix) registers nothing, raises nothing,
+> and its checks silently never run. `registered_modules()` exists so a test can
+> assert the tree was fully imported, and `/api/v1/health` reports
+> `checks_registered` so an empty catalog is visible rather than silent.
 
 ---
 

@@ -56,7 +56,7 @@ flowchart LR
 | Domain | Pure Python — no framework dependency |
 | Auth | MSAL, read-only delegated Entra scopes |
 | Reports | openpyxl (Excel), Markdown |
-| Tests | pytest + FastAPI TestClient — 171, fully offline |
+| Tests | pytest + FastAPI TestClient — 192, fully offline |
 
 Three adapters sit over one service layer: the **REST API**, the **CLI**, and an
 **MCP server**. They cannot disagree, because there is one implementation with
@@ -66,24 +66,27 @@ three front doors.
 
 ## Current coverage
 
-**148 checks** — 64 verified today (`automated`), 84 automatable-but-not-yet
-(`roadmap`), across seven pillars.
+**164 checks** — 64 verified today (`automated`), 16 self-assessed (`interactive`,
+Azure Well-Architected Review style), 84 automatable-but-not-yet (`roadmap`),
+across seven pillars.
 
 | Pillar | Checks |
 |--------|-------:|
-| Data Management & Quality | 53 |
-| Operations & Reliability | 33 |
-| Performance & Capacity | 23 |
-| Security | 16 |
-| Cost & Resource Optimization | 15 |
-| Governance & Compliance | 7 |
+| Data Management & Quality | 56 |
+| Operations & Reliability | 36 |
+| Performance & Capacity | 25 |
+| Security | 19 |
+| Cost & Resource Optimization | 17 |
+| Governance & Compliance | 10 |
 | Foundation (informational, unscored) | 1 |
 
 Automated today: workspace-level, Data Pipeline, and Spark/Delta **notebook**
-checks. `roadmap` checks need a Fabric API the provider does not yet call
-(capacity metrics, audit logs, SQL-endpoint column schemas) and are reported as
-attestations until promoted. The `Scope` members for Lakehouse, semantic models,
-and Eventhouse exist so adding them requires no engine change.
+checks. **Interactive** checks are scored from the reviewer's answer to a question
+asked during the run (skipping records N/A, never a low score). `roadmap` checks
+need a Fabric API the provider does not yet call (capacity metrics, audit logs,
+SQL-endpoint column schemas) and are reported as attestations until promoted. The
+`Scope` members for Lakehouse, semantic models, and Eventhouse exist so adding
+them requires no engine change.
 
 **AI stays out of the scoring path.** New in this release: a **checklist-intake**
 layer (`ai/matching.py` dedup + `ai/authoring.py` proposal drafting) behind

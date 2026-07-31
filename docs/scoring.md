@@ -56,6 +56,14 @@ appears in reports but touches no arithmetic.
 different from `note()`: it means the data needed to judge could not be read.
 A network failure must not be recorded as a misconfiguration.
 
+**Interactive (self-assessed)** — not a builder. An `interactive` check has no
+evaluator; the reviewer picks one of its scored `options` during the audit and
+[`questionnaire_service`](../backend/src/auditfast/services/questionnaire_service.py)
+turns that choice into a normal scored result carrying the option's `score`
+(`0`–`3`). It then rolls up **exactly like any other scored check**. A *skipped*
+or unanswered point becomes an unscored `N/A` — so a blank self-assessment is
+excluded from the denominator, never counted as a zero.
+
 ### Score to status
 
 ```
@@ -95,7 +103,7 @@ denominator.
 | Output | What it aggregates |
 |--------|--------------------|
 | `overall` | Every scored result in the run |
-| `by_pillar[p]` | `{pct, count}` for each of the five scored pillars |
+| `by_pillar[p]` | `{pct, count}` for each of the six scored pillars |
 | `by_workspace[w]` | `{role, layer, pct, count, by_pillar}` per workspace |
 | `by_layer[l]` | `{pct, count}` per architecture layer |
 | `matrix[p][l]` | **Pillar × layer** — the "inner pillars" view |

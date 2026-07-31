@@ -37,6 +37,13 @@ class AuditJob:
     error: str | None = None
     #: Reserved for multi-tenancy — every query will filter on this.
     organization_id: str | None = None
+    #: Interactive, self-assessed checklist points computed for this run — the
+    #: questions the reviewer answers while the automated audit crawls.
+    questionnaire: list[dict[str, Any]] = field(default_factory=list)
+    #: The reviewer's chosen option per interactive check id (or '__skip__').
+    answers: dict[str, str] = field(default_factory=dict)
+    #: True once :attr:`answers` have been recorded, even if all were skipped.
+    answers_submitted: bool = False
 
     @property
     def duration_seconds(self) -> float | None:

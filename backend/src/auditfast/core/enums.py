@@ -109,13 +109,20 @@ class Automation(StrEnum):
     - ``ROADMAP``: technically automatable, but needs a Fabric API the provider
       does not yet call (e.g. notebook definitions, Delta table metadata,
       capacity metrics). Listed as a manual attestation until then.
-    - ``MANUAL``: never machine-verifiable — a legal agreement, an organisational
-      process, a documentation/judgement call, or row-level data profiling that
-      is out of scope for a configuration auditor.
+    - ``INTERACTIVE``: not machine-verifiable, but *self-assessed* — the reviewer
+      picks one of a fixed set of options during the audit and that choice is
+      scored, just like the Azure Well-Architected Review questionnaire. The
+      engine never runs it (the human supplies the verdict); its answer is merged
+      into the audit afterwards.
+    - ``MANUAL``: never machine-verifiable and not offered as a scored question —
+      a legal agreement, an organisational process, a documentation/judgement
+      call, or row-level data profiling that is out of scope for a configuration
+      auditor.
     """
 
     AUTOMATED = "automated"
     ROADMAP = "roadmap"
+    INTERACTIVE = "interactive"
     MANUAL = "manual"
 
 
