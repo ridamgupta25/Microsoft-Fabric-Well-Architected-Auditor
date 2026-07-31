@@ -32,32 +32,33 @@ name, object name, and the remediation lookup — comes from the registered
 
 ## Catalog
 
-**148 checks** live under [`core/check/<pillar>/<layer>/`](../backend/src/auditfast/core/check/),
-split into three module kinds per pillar × layer:
+**164 checks** live under [`core/check/<pillar>/<layer>/`](../backend/src/auditfast/core/check/),
+split into four module kinds per pillar × layer:
 
 | Module | Automation | Meaning |
 |--------|-----------|---------|
 | `automated.py` | `automated` | Verified now from data the provider fetches — **64** checks |
+| `questionnaire.py` | `interactive` | **Self-assessed** — the reviewer answers a scored question during the audit (Azure Well-Architected Review style); registered with `questionnaire_check(...)` — **16** checks |
 | `roadmap.py` | `roadmap` | Automatable, but needs a Fabric API not yet called — reported as an attestation and **generated** (**84** checks; see *Promoting* below) |
-| `manual.py` | `manual` | Never machine-verifiable — a legal / process / judgement attestation |
+| `manual.py` | `manual` | Never machine-verifiable — a legal / process / judgement attestation (**0** today) |
 
 ### By pillar
 
 | Pillar | Checks |
 |--------|-------:|
-| Data Management & Quality | 53 |
-| Operations & Reliability | 33 |
-| Performance & Capacity | 23 |
-| Security | 16 |
-| Cost & Resource Optimization | 15 |
-| Governance & Compliance | 7 |
+| Data Management & Quality | 56 |
+| Operations & Reliability | 36 |
+| Performance & Capacity | 25 |
+| Security | 19 |
+| Cost & Resource Optimization | 17 |
+| Governance & Compliance | 10 |
 | Foundation (informational, unscored) | 1 |
 
 ### By scope
 
 | Scope | Checks | Examples |
 |-------|-------:|----------|
-| `workspace` | 107 | naming, roles via security groups, least-privilege admins, sensitivity labels, capacity assigned, Git enabled, deployment pipeline, orphaned items, layer content / separation, inventory |
+| `workspace` | 123 | naming, roles via security groups, least-privilege admins, sensitivity labels, capacity assigned, Git enabled, deployment pipeline, orphaned items, layer content / separation, inventory, the 16 self-assessed governance / DR / cost / data-quality points |
 | `pipeline` | 12 | naming, descriptions, parameterization, retry policy, on-failure path, failure notification, timeouts, no hardcoded secrets |
 | `notebook` | 29 | Delta MERGE / OPTIMIZE / VACUUM / Z-ORDER / V-ORDER, table properties, retention, Spark env & pinned libraries, shuffle / cache / repartition, `SELECT *` |
 
@@ -120,6 +121,58 @@ same as *"this is not configured"*.
 
 ---
 
+## Interactive (self-assessed) checks
+
+Some Well-Architected points can't be read from a workspace — whether a
+disaster-recovery plan has actually been restore-tested, whether a cost review
+happens on a schedule — but a reviewer *can* attest to them. These are
+**interactive** checks (`automation=interactive`), the **Azure Well-Architected
+Review** model: the reviewer picks a scored option during the audit.
+
+They live in `questionnaire.py` modules and are registered with
+`questionnaire_check(...)` rather than `@check`:
+
+```python
+from auditfast.core.check import Option, questionnaire_check
+
+questionnaire_check(
+    id="Q-OPS-DR", ref="Q-OPS-1",
+    title="Disaster-recovery / restore plan documented and tested",
+    pillar=Pillar.OPERATIONS, layers=(Layer.ANY,),
+    question="Is there a documented, restore-tested DR plan for this workspace?",
+    options=(
+        Option("tested", "Documented and restore-tested within the last year", 3),
+        Option("documented", "Documented but never tested", 1,
+               guidance="Run a restore drill to prove the RTO/RPO are achievable."),
+        Option("none", "No DR plan", 0,
+               guidance="Document a recovery plan with target RTO/RPO and test it."),
+    ),
+)
+```
+
+How they behave:
+
+- **The engine skips them** (they are `manual=True`).
+  [`services/questionnaire_service.py`](../backend/src/auditfast/services/questionnaire_service.py)
+  builds the questionnaire for a run — filtered by the selected pillars and the
+  audited workspaces' layers — and, when the reviewer answers, scores each option
+  **0–3** and merges the result into the report, **fanned out to every workspace
+  whose layer the check applies to**.
+- **Skipping records N/A, never a low score.** A blank self-assessment can't drag
+  the number down.
+- Each non-passing option carries `guidance`, which becomes the finding's
+  recommendation — so interactive checks are **exempt from the `remediation.yaml`
+  requirement** (their guidance lives on the options).
+- Merging is **idempotent** and re-applied after the KB background refresh, so an
+  answer can never be double-counted or lost.
+
+The runtime wiring: submitting an audit computes the questionnaire and returns it
+on `GET /api/v1/audit/{id}`; the frontend shows it while the crawl runs;
+`POST /api/v1/audit/{id}/answers` records the answers, which are scored in as soon
+as the automated crawl finishes.
+
+---
+
 ## Adding a check
 
 > **Assisted path.** Before writing one by hand, assess a plain-language
@@ -177,9 +230,9 @@ scoreable check's ref has text. It will fail if you skip this.
 ### 3. The loader finds it automatically
 
 The check package **auto-discovers** every leaf module named `automated`,
-`manual`, or `roadmap` by walking the tree — adding a check to an existing
-`automated.py`, or creating a new `<pillar>/<layer>/automated.py`, needs **no**
-`__init__.py` edit. Shared helpers must be named with a leading underscore
+`manual`, `questionnaire`, or `roadmap` by walking the tree — adding a check to an
+existing `automated.py`, or creating a new `<pillar>/<layer>/automated.py`, needs
+**no** `__init__.py` edit. Shared helpers must be named with a leading underscore
 (e.g. `_spark.py`, `_pipeline.py`) so the loader skips them.
 
 Registration is still an import side effect: `registered_modules()` and
@@ -221,6 +274,6 @@ To turn a roadmap attestation into a verified automated check:
 - [ ] Guards unavailable data with `not_applicable()`
 - [ ] Evidence states a fact and includes the numbers
 - [ ] Remediation text added under the same `ref`
-- [ ] Module named `automated` / `manual` / `roadmap` (auto-loaded); helpers prefixed `_`
+- [ ] Module named `automated` / `manual` / `questionnaire` / `roadmap` (auto-loaded); helpers prefixed `_`
 - [ ] Fixture data added so it both passes and fails somewhere
 - [ ] Tests added; registry counts and parity values updated

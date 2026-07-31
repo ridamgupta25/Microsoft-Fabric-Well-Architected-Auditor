@@ -1,21 +1,23 @@
 """The deterministic check library.
 
 Importing this package registers every check. The library is organised on disk as
-``<pillar>/<layer>/{automated,manual}.py``; each module is imported purely for its
-side effect — the ``@check`` / ``manual_check`` calls run at import time and
-populate :data:`auditfast.core.check.registry.REGISTRY`.
+``<pillar>/<layer>/{automated,manual,questionnaire}.py``; each module is imported
+purely for its side effect — the ``@check`` / ``manual_check`` / ``questionnaire_check``
+calls run at import time and populate
+:data:`auditfast.core.check.registry.REGISTRY`.
 
 Modules are discovered automatically by walking the sub-packages, so a new
-``automated.py`` or ``manual.py`` is picked up without editing this file. Helper
-modules whose name starts with ``_`` (e.g. ``_pipeline``) are skipped.
-:func:`registered_modules` reports what was loaded, so a test can assert the tree
-on disk was fully imported.
+``automated.py``, ``manual.py`` or ``questionnaire.py`` is picked up without
+editing this file. Helper modules whose name starts with ``_`` (e.g. ``_pipeline``)
+are skipped. :func:`registered_modules` reports what was loaded, so a test can
+assert the tree on disk was fully imported.
 """
 from __future__ import annotations
 
 import importlib
 import pkgutil
 
+from ..models import CheckOption
 from .helpers import (
     RemediationBook,
     Verdict,
@@ -32,10 +34,15 @@ from .registry import (
     DuplicateCheckError,
     check,
     manual_check,
+    questionnaire_check,
 )
 
+#: An interactive check's answer, re-exported here so questionnaire modules can
+#: import it alongside :func:`questionnaire_check` from one place.
+Option = CheckOption
+
 #: Leaf module names that carry check registrations.
-_CHECK_MODULES = {"automated", "manual", "roadmap"}
+_CHECK_MODULES = {"automated", "manual", "questionnaire", "roadmap"}
 
 
 def _discover() -> tuple[str, ...]:
@@ -63,6 +70,8 @@ __all__ = [
     "REGISTRY",
     "CheckRegistry",
     "DuplicateCheckError",
+    "Option",
+    "CheckOption",
     "RemediationBook",
     "Verdict",
     "binary",
@@ -73,5 +82,6 @@ __all__ = [
     "manual_check",
     "not_applicable",
     "note",
+    "questionnaire_check",
     "registered_modules",
 ]

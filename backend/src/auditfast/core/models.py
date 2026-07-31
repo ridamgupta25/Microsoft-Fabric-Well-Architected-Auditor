@@ -231,6 +231,31 @@ class CheckContext:
 
 
 @dataclass(frozen=True, slots=True)
+class CheckOption:
+    """One selectable answer for an interactive (self-assessed) check.
+
+    Modelled on the Azure Well-Architected Review questionnaire: the reviewer
+    picks exactly one option and its :attr:`score` (0-3) is what the check
+    contributes, per workspace, to the roll-up. A ``score`` of ``None`` marks a
+    "skip / not applicable" choice — recorded as N/A and never scored.
+    """
+
+    value: str
+    label: str
+    score: int | None = None
+    #: Shown as the recommendation when the chosen option does not fully pass.
+    guidance: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "value": self.value,
+            "label": self.label,
+            "score": self.score,
+            "guidance": self.guidance,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class CheckSpec:
     """A check's metadata — everything knowable about it *without running it*.
 
@@ -260,6 +285,17 @@ class CheckSpec:
     #: How the verdict is (or could be) reached — see :class:`Automation`.
     #: ``AUTOMATED`` checks run; ``ROADMAP``/``MANUAL`` are attestation-only.
     automation: Automation = Automation.AUTOMATED
+    #: The question shown to a reviewer for an ``INTERACTIVE`` check. Falls back
+    #: to :attr:`title` when blank.
+    question: str = ""
+    #: The fixed answers a reviewer chooses between for an ``INTERACTIVE`` check.
+    #: Empty for every automated/roadmap/manual check.
+    options: tuple[CheckOption, ...] = ()
+
+    @property
+    def interactive(self) -> bool:
+        """True when a reviewer answers this check via a scored questionnaire."""
+        return bool(self.options)
 
     def applies_to(self, layer: Layer) -> bool:
         """Does this check run for a workspace tagged ``layer``?
@@ -288,6 +324,9 @@ class CheckSpec:
             "required": self.required,
             "manual": self.manual,
             "automation": self.automation.value,
+            "interactive": self.interactive,
+            "question": self.question or self.title,
+            "options": [option.to_dict() for option in self.options],
             "description": self.description or (self.fn.__doc__ or "").strip(),
         }
 
@@ -348,3 +387,30 @@ class CheckResult:
             # source system; the UI flags them as such.
             "common": self.scope is Scope.WORKSPACE,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CheckResult:
+        """Rebuild a result from :meth:`to_dict` output.
+
+        Used when re-aggregating a persisted report — for example to merge a
+        reviewer's interactive answers into an already-computed audit — so the
+        stored scorecard can be recomputed without re-crawling the tenant.
+        """
+        return cls(
+            check_id=data["check_id"],
+            ref=data.get("ref", ""),
+            title=data.get("title", ""),
+            pillar=Pillar(data["pillar"]),
+            status=Status(data["status"]),
+            score=data.get("score"),
+            coverage=data.get("coverage"),
+            evidence=data.get("evidence", ""),
+            recommendation=data.get("recommendation", ""),
+            severity=Severity(data.get("severity", Severity.INFO.value)),
+            workspace=data.get("workspace", ""),
+            layer=Layer.parse(data.get("layer") or data.get("workspace_role")),
+            obj=data.get("obj", ""),
+            scope=Scope(data.get("scope", Scope.WORKSPACE.value)),
+            weight=data.get("weight", 1.0),
+            scored=data.get("scored", True),
+        )

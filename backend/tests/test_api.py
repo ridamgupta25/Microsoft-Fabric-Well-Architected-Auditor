@@ -34,7 +34,7 @@ def _submit(client, **extra) -> str:
 def test_health_reports_a_loaded_rule_library(client):
     body = client.get("/api/v1/health").json()
     assert body["status"] == "ok"
-    assert body["checks_registered"] == 148
+    assert body["checks_registered"] == 164
 
 
 def test_liveness_touches_no_dependencies(client):

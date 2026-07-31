@@ -30,6 +30,9 @@ export type CheckStatus = "PASS" | "PARTIAL" | "FAIL" | "N/A" | "INFO";
 
 export type Severity = "Critical" | "High" | "Medium" | "Low" | "Informational";
 
+/** How a check's verdict is reached. */
+export type Automation = "automated" | "roadmap" | "interactive" | "manual";
+
 // -- health -------------------------------------------------------------------
 
 export interface Health {
@@ -41,6 +44,16 @@ export interface Health {
 }
 
 // -- catalog ------------------------------------------------------------------
+
+/** One selectable answer for an interactive (self-assessed) check. */
+export interface CheckOption {
+  value: string;
+  label: string;
+  /** 0-3 the answer contributes; null for a not-applicable choice. */
+  score: number | null;
+  /** Recommendation shown when the choice does not fully pass. */
+  guidance: string;
+}
 
 export interface CheckSpec {
   id: string;
@@ -54,7 +67,13 @@ export interface CheckSpec {
   weight: number;
   required: boolean;
   manual: boolean;
-  automation: "automated" | "roadmap" | "manual";
+  automation: Automation;
+  /** True when the reviewer answers this via a scored question. */
+  interactive: boolean;
+  /** The question shown for an interactive check. */
+  question: string;
+  /** The scored answers for an interactive check; empty otherwise. */
+  options: CheckOption[];
   description: string;
 }
 
@@ -67,7 +86,7 @@ export interface CheckMatch {
   pillar: string;
   scope: string;
   severity: Severity;
-  automation: "automated" | "roadmap" | "manual";
+  automation: Automation;
   /** 0-1 similarity to the submitted point; higher is closer. */
   confidence: number;
   reason: string;
@@ -190,6 +209,30 @@ export interface Workspace {
 
 // -- audit --------------------------------------------------------------------
 
+/** One interactive, self-assessed checklist point to answer during a run. */
+export interface QuestionnaireItem {
+  id: string;
+  ref: string;
+  title: string;
+  pillar: string;
+  scope: string;
+  severity: Severity;
+  layers: string[];
+  question: string;
+  options: CheckOption[];
+  required: boolean;
+  automation: Automation;
+  description: string;
+}
+
+/** Sentinel answer value that skips an interactive check (records it as N/A). */
+export const SKIP_ANSWER = "__skip__";
+
+export interface AuditAnswersRequest {
+  /** Interactive check id -> chosen option value (or SKIP_ANSWER). */
+  answers: Record<string, string>;
+}
+
 export interface WorkspaceSelection {
   id: string;
   role?: string | null;
@@ -284,6 +327,10 @@ export interface AuditJob {
   duration_seconds?: number | null;
   error?: string | null;
   report?: AuditReport | null;
+  /** Interactive checklist points to answer while the automated audit runs. */
+  questionnaire: QuestionnaireItem[];
+  /** True once the reviewer's questionnaire answers have been recorded. */
+  answers_submitted: boolean;
 }
 
 export interface AuditJobSummary {

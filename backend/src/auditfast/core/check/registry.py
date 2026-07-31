@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Sequence
 
 from ..enums import Automation, Layer, Pillar, Resource, Scope, Severity
-from ..models import CheckContext, CheckSpec
+from ..models import CheckContext, CheckOption, CheckSpec
 
 
 class DuplicateCheckError(ValueError):
@@ -120,6 +120,8 @@ def check(
     required: bool = True,
     manual: bool = False,
     automation: Automation = Automation.AUTOMATED,
+    question: str = "",
+    options: Sequence[CheckOption] = (),
     registry: CheckRegistry | None = None,
 ) -> Callable:
     """Register a check function and return it unchanged.
@@ -136,6 +138,8 @@ def check(
         weight: Relative influence on the roll-up. Defaults to ``1.0``, which
             reproduces a flat unweighted mean.
         description: Optional long text; falls back to the function docstring.
+        question: For an interactive check, the question shown to the reviewer.
+        options: For an interactive check, the scored answers to choose between.
     """
 
     def decorate(fn: Callable[[CheckContext], object]):
@@ -159,6 +163,8 @@ def check(
                 required=required,
                 manual=manual,
                 automation=automation,
+                question=question,
+                options=tuple(options),
             )
         )
         return fn
@@ -201,5 +207,53 @@ def manual_check(
         required=required,
         manual=True,
         automation=automation,
+        registry=registry,
+    )(lambda ctx: _manual_verdict())
+
+
+def questionnaire_check(
+    *,
+    id: str,
+    ref: str,
+    title: str,
+    pillar: Pillar,
+    options: Sequence[CheckOption],
+    question: str = "",
+    layers: Sequence[Layer] = (Layer.ANY,),
+    scope: Scope = Scope.WORKSPACE,
+    severity: Severity = Severity.MEDIUM,
+    required: bool = True,
+    registry: CheckRegistry | None = None,
+) -> None:
+    """Register an interactive, self-assessed checklist point.
+
+    The point cannot be read from Fabric, but — unlike a plain manual attestation
+    — it *can* be scored by asking the reviewer to pick one of ``options`` during
+    the audit, exactly like the Azure Well-Architected Review questionnaire. The
+    engine never runs it (``manual=True``); the chosen option's score is merged
+    into the audit afterwards, per workspace whose layer the check applies to.
+
+    Skipping is always available and records N/A (unscored); it does not need to
+    be one of ``options``.
+    """
+    from .helpers import manual as _manual_verdict
+
+    if not options:
+        raise ValueError(f"interactive check {id!r} must declare at least one option")
+
+    check(
+        id=id,
+        ref=ref,
+        title=title,
+        pillar=pillar,
+        scope=scope,
+        severity=severity,
+        layers=layers,
+        requires=(),
+        required=required,
+        manual=True,
+        automation=Automation.INTERACTIVE,
+        question=question or title,
+        options=options,
         registry=registry,
     )(lambda ctx: _manual_verdict())

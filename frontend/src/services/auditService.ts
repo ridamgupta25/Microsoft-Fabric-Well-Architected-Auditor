@@ -8,6 +8,7 @@
 import { apiClient, downloadUrl } from "./apiClient";
 import type {
   AuditAccepted,
+  AuditAnswersRequest,
   AuditJob,
   AuditJobSummary,
   AuditReport,
@@ -47,6 +48,22 @@ export async function submitAudit(request: AuditRequest): Promise<AuditAccepted>
 
 export async function getAudit(auditId: string): Promise<AuditJob> {
   const { data } = await apiClient.get<AuditJob>(`/audit/${auditId}`);
+  return data;
+}
+
+/**
+ * Record the reviewer's answers to a run's interactive questionnaire.
+ *
+ * Answers map each interactive check id to a chosen option value (or the skip
+ * sentinel). Safe to call while the audit is still running — scoring folds them
+ * in as soon as the automated crawl finishes.
+ */
+export async function submitAuditAnswers(
+  auditId: string,
+  answers: Record<string, string>,
+): Promise<AuditJob> {
+  const body: AuditAnswersRequest = { answers };
+  const { data } = await apiClient.post<AuditJob>(`/audit/${auditId}/answers`, body);
   return data;
 }
 

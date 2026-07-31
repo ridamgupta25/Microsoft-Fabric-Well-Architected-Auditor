@@ -8,6 +8,20 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 
+class CheckOptionOut(BaseModel):
+    """One selectable answer for an interactive (self-assessed) check."""
+
+    value: str = Field(description="Stable answer key sent back when chosen.")
+    label: str = Field(description="Human-readable answer shown to the reviewer.")
+    score: int | None = Field(
+        default=None,
+        description="0-3 the answer contributes; null for a not-applicable choice.",
+    )
+    guidance: str = Field(
+        default="", description="Recommendation shown when the choice does not fully pass."
+    )
+
+
 class CheckSpecOut(BaseModel):
     """One check's definition, as registered."""
 
@@ -33,7 +47,19 @@ class CheckSpecOut(BaseModel):
         default="automated",
         description="How the verdict is reached: 'automated' (runs now), "
         "'roadmap' (automatable once the provider integrates the needed Fabric "
-        "API), or 'manual' (only a human can attest).",
+        "API), 'interactive' (self-assessed via a scored question during the "
+        "audit), or 'manual' (only a human can attest).",
+    )
+    interactive: bool = Field(
+        default=False,
+        description="True when the reviewer answers this via a scored question.",
+    )
+    question: str = Field(
+        default="", description="The question shown for an interactive check."
+    )
+    options: list[CheckOptionOut] = Field(
+        default_factory=list,
+        description="The scored answers for an interactive check; empty otherwise.",
     )
     description: str = ""
 

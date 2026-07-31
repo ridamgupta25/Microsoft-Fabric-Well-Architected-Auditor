@@ -230,13 +230,16 @@ check has an entry. Reuse an existing `ref`'s text if you reuse the `ref`.
 
 Adding **one automated** check moves pinned counts — update them to the true value
 (never weaken a test):
-- `checks_registered == 148` → +1 in [tests/test_api.py](../../backend/tests/test_api.py)
+- `checks_registered == 164` → +1 in [tests/test_api.py](../../backend/tests/test_api.py)
 - `EXPECTED_OVERALL`, `EXPECTED_SCORED_CHECKS = 98`, `EXPECTED_RESULT_ROWS = 211`
   in [tests/conftest.py](../../backend/tests/conftest.py)
 - the evaluated-count `== 64` in [tests/test_engine.py](../../backend/tests/test_engine.py)
 
-A **roadmap/manual** attestation moves `checks_registered` and result-row counts but
-**not** `EXPECTED_OVERALL` / `EXPECTED_SCORED_CHECKS` (it is never scored).
+A **roadmap/manual/interactive** attestation moves `checks_registered` and
+result-row counts but **not** `EXPECTED_OVERALL` / `EXPECTED_SCORED_CHECKS` (it is
+never scored by the engine). An **interactive** (`questionnaire_check`) point also
+updates the interactive-count `== 16` in
+[tests/test_engine.py](../../backend/tests/test_engine.py).
 
 ---
 

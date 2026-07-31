@@ -11,10 +11,12 @@ from fastapi import APIRouter, HTTPException, status
 
 from ...schemas.audit import (
     AuditAccepted,
+    AuditAnswersRequest,
     AuditJobOut,
     AuditReport,
     AuditRequest,
     CheckResultOut,
+    QuestionnaireItem,
     SingleCheckRequest,
 )
 from ...services import audit_service
@@ -85,6 +87,47 @@ async def get_audit(
         duration_seconds=job.duration_seconds,
         error=job.error,
         report=AuditReport(**job.report) if job.report else None,
+        questionnaire=[QuestionnaireItem(**item) for item in job.questionnaire],
+        answers_submitted=job.answers_submitted,
+    )
+
+
+@router.post(
+    "/{audit_id}/answers",
+    response_model=AuditJobOut,
+    summary="Submit interactive questionnaire answers",
+    responses={404: {"description": "No audit with that id."}},
+)
+async def submit_audit_answers(
+    audit_id: str,
+    request: AuditAnswersRequest,
+    runner: RunnerDep,
+    organization_id: OrganizationDep,
+) -> AuditJobOut:
+    """Record the reviewer's answers to a run's self-assessed checklist points.
+
+    Each answer maps an interactive check id to a chosen option ``value`` (or
+    ``"__skip__"`` to skip). Scoring folds the answers into the report as soon as
+    the automated crawl finishes, so they can be submitted while the audit is
+    still running.
+    """
+    job = await runner.submit_answers(audit_id, request.answers, organization_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No audit found with id {audit_id!r}.",
+        )
+    return AuditJobOut(
+        audit_id=job.id,
+        status=job.status,
+        submitted_at=job.submitted_at,
+        started_at=job.started_at,
+        finished_at=job.finished_at,
+        duration_seconds=job.duration_seconds,
+        error=job.error,
+        report=AuditReport(**job.report) if job.report else None,
+        questionnaire=[QuestionnaireItem(**item) for item in job.questionnaire],
+        answers_submitted=job.answers_submitted,
     )
 
 

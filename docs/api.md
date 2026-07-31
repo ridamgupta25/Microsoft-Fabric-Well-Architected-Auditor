@@ -78,7 +78,8 @@ continues through the backend.
 | `GET` | `/catalog/checks/{id}` | One check's metadata |
 | `GET` | `/catalog/summary` | Coverage by pillar and scope |
 | `POST` | `/audit` | **Submit an audit** (202) |
-| `GET` | `/audit/{id}` | Poll status; includes the report when done |
+| `GET` | `/audit/{id}` | Poll status; includes the report when done, plus the interactive questionnaire |
+| `POST` | `/audit/{id}/answers` | Submit the reviewer's answers to the self-assessed questionnaire |
 | `POST` | `/audit/check` | Run one check synchronously |
 | `GET` | `/reports/{id}` | The finished scorecard |
 | `GET` | `/reports/{id}/download/{kind}` | Markdown or Excel file |
@@ -134,6 +135,61 @@ GET /api/v1/audit/{audit_id}
 
 `status` moves `queued` → `running` → `succeeded` | `failed`. Poll until it is
 terminal; the full report is embedded once it succeeds.
+
+The poll response also carries the run's **interactive questionnaire** — the
+self-assessed points to answer while the crawl runs (see below) — and
+`answers_submitted`, which flips to `true` once they are recorded:
+
+```json
+{
+  "audit_id": "81fe3389df6b42d7",
+  "status": "running",
+  "answers_submitted": false,
+  "questionnaire": [
+    {
+      "id": "Q-OPS-DR",
+      "ref": "Q-OPS-1",
+      "title": "Disaster-recovery / restore plan documented and tested",
+      "pillar": "Operations & Reliability",
+      "scope": "workspace",
+      "severity": "High",
+      "layers": ["*"],
+      "question": "Is there a documented, restore-tested DR plan for this workspace?",
+      "options": [
+        { "value": "tested", "label": "Documented and restore-tested within the last year", "score": 3, "guidance": "" },
+        { "value": "documented", "label": "Documented but never tested", "score": 1, "guidance": "Run a restore drill…" },
+        { "value": "none", "label": "No DR plan", "score": 0, "guidance": "Document a recovery plan…" }
+      ],
+      "required": true,
+      "automation": "interactive"
+    }
+  ]
+}
+```
+
+### 2a. Answer the self-assessed questionnaire
+
+Some Well-Architected points can't be read from a workspace (a *tested* DR plan, a
+documented cost review) but a reviewer can attest to them — the **Azure
+Well-Architected Review** model. The `questionnaire` above lists those points,
+filtered to the run's selected pillars and the audited workspaces' layers. Submit
+the reviewer's choices at any time (even while the audit is still running):
+
+```http
+POST /api/v1/audit/{audit_id}/answers
+```
+
+```json
+{ "answers": { "Q-OPS-DR": "tested", "Q-COST-REVIEW": "__skip__" } }
+```
+
+Each answer maps an interactive check id to a chosen option `value`. Use
+`"__skip__"` (or simply omit an id) to skip a point. Scoring folds the answers
+into the report as soon as the automated crawl finishes, **fanned out to every
+audited workspace whose layer the check applies to**; each option contributes its
+`score` (0–3), while a **skip records N/A and never lowers the score**. The merge
+is idempotent and re-applied after the KB background refresh, so answers are never
+double-counted or lost.
 
 ### 3. Read the report
 
@@ -262,12 +318,21 @@ GET /api/v1/catalog/checks?pillar=Security
   "layers": ["Data Operations", "Data Prep", "Mixed"],
   "requires": ["pipelineDefinitions"],
   "weight": 1.0,
+  "automation": "automated",
+  "interactive": false,
+  "question": "",
+  "options": [],
   "description": "No credential literal appears anywhere in the pipeline definition."
 }]
 ```
 
 `requires` is what drives resource-aware fetching — see
 [architecture.md](architecture.md#resource-driven-fetching).
+
+An **interactive** check (`automation: "interactive"`, `interactive: true`) carries
+a non-empty `question` and a list of scored `options` — `{ value, label, score,
+guidance }` — instead of reading a resource. Those are the points the reviewer
+self-assesses during an audit (see [The audit lifecycle § 2a](#2a-answer-the-self-assessed-questionnaire)).
 
 ---
 

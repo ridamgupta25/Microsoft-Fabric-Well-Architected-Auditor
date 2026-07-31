@@ -11,12 +11,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 
+import { QuestionnairePanel } from "@/components/QuestionnairePanel";
 import { ErrorBanner, Section, Spinner } from "@/components/ui";
 import { useAuditContext } from "@/context/AuditContext";
 import { useAsync } from "@/hooks/useAsync";
-import { listLiveWorkspaces, pollAudit, submitAudit } from "@/services/auditService";
+import {
+  listLiveWorkspaces,
+  pollAudit,
+  submitAudit,
+  submitAuditAnswers,
+} from "@/services/auditService";
 import { listLayers, listPillars } from "@/services/catalogService";
 import type { AuditJob, Workspace } from "@/types/api";
+
+const TERMINAL_STATUSES = new Set<AuditJob["status"]>(["succeeded", "failed"]);
 
 export function RunAuditPage() {
   const navigate = useNavigate();
@@ -42,6 +50,18 @@ export function RunAuditPage() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+
+  // -- interactive questionnaire (self-assessed points) --------------------
+  // While the automated crawl runs, the reviewer answers the points a machine
+  // cannot verify. `phase` flips the page from selection to the live view.
+  const [phase, setPhase] = useState<"select" | "running">("select");
+  const [auditId, setAuditId] = useState<string | null>(null);
+  const [finalJob, setFinalJob] = useState<AuditJob | null>(null);
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [answersSubmitted, setAnswersSubmitted] = useState(false);
+  const [finishing, setFinishing] = useState(false);
+
+  const questionnaire = job?.questionnaire ?? [];
 
   // The audit queue: live workspaces plus any added by hand, minus any removed.
   const allWorkspaces = useMemo(() => {
@@ -100,6 +120,9 @@ export function RunAuditPage() {
       setError(null);
       setSubmitting(true);
       setJob(null);
+      setFinalJob(null);
+      setAnswers({});
+      setAnswersSubmitted(false);
 
       abortRef.current?.abort();
       const controller = new AbortController();
@@ -112,17 +135,16 @@ export function RunAuditPage() {
           auth_session: session,
         });
         setLastAuditId(accepted.audit_id);
-
-        const finished = await pollAudit(accepted.audit_id, setJob, controller.signal);
-        if (finished.status === "failed" && !finished.report) {
-          setError(finished.error ?? "The audit failed.");
-          return;
-        }
-        // Open the report on success, on a still-running timeout, or on a failure
-        // that still produced results — it renders whatever completed (a partial
-        // report shows a banner and the workspaces evaluated so far).
-        setReport(finished.report ?? null);
-        navigate(`/report/${accepted.audit_id}`);
+        setAuditId(accepted.audit_id);
+        // Show the live view with the questionnaire straight away; the poll runs
+        // in the background and records the terminal job when the crawl finishes.
+        setPhase("running");
+        pollAudit(accepted.audit_id, setJob, controller.signal)
+          .then(setFinalJob)
+          .catch((err) => {
+            if (err instanceof DOMException && err.name === "AbortError") return;
+            setError(err instanceof Error ? err.message : String(err));
+          });
       } catch (err) {
         if (err instanceof DOMException && err.name === "AbortError") return;
         setError(err instanceof Error ? err.message : String(err));
@@ -130,7 +152,7 @@ export function RunAuditPage() {
         setSubmitting(false);
       }
     },
-    [chosenPillars, isSignedIn, session, setLastAuditId, setReport, navigate],
+    [chosenPillars, isSignedIn, session, setLastAuditId],
   );
 
   const specsFor = useCallback(
@@ -149,6 +171,53 @@ export function RunAuditPage() {
     () => submitFor(specsFor(allWorkspaces)),
     [submitFor, specsFor, allWorkspaces],
   );
+
+  // Once the crawl has finished, open the report — but only after the reviewer
+  // has answered (or when there is nothing to answer). A failed run with no
+  // report drops back to selection with the error shown.
+  useEffect(() => {
+    if (phase !== "running" || !finalJob || !auditId) return;
+    if (finalJob.status === "failed" && !finalJob.report) {
+      setError(finalJob.error ?? "The audit failed.");
+      setPhase("select");
+      return;
+    }
+    const hasQuestions = (job?.questionnaire ?? finalJob.questionnaire ?? []).length > 0;
+    if (!hasQuestions || answersSubmitted) {
+      setReport(finalJob.report ?? null);
+      navigate(`/report/${auditId}`);
+    }
+  }, [phase, finalJob, auditId, job, answersSubmitted, navigate, setReport]);
+
+  // Send the reviewer's self-assessed answers, then let the effect above open
+  // the report as soon as the crawl is also done (it may already be).
+  const submitAnswers = useCallback(async () => {
+    if (!auditId) return;
+    setFinishing(true);
+    setError(null);
+    try {
+      const updated = await submitAuditAnswers(auditId, answers);
+      setAnswersSubmitted(true);
+      if (TERMINAL_STATUSES.has(updated.status)) setFinalJob(updated);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setFinishing(false);
+    }
+  }, [auditId, answers]);
+
+  const setAnswer = useCallback((id: string, value: string) => {
+    setAnswers((prev) => ({ ...prev, [id]: value }));
+  }, []);
+
+  const cancelRun = useCallback(() => {
+    abortRef.current?.abort();
+    setPhase("select");
+    setJob(null);
+    setFinalJob(null);
+    setAuditId(null);
+    setAnswersSubmitted(false);
+  }, []);
 
   const selectAll = (value: boolean) => {
     setSelected(Object.fromEntries(allWorkspaces.map((w) => [w.id, value])));
@@ -199,6 +268,85 @@ export function RunAuditPage() {
         <Link to="/sign-in" className="btn-primary mt-2">
           Connect to Fabric
         </Link>
+      </div>
+    );
+  }
+
+  if (phase === "running") {
+    const crawlDone = finalJob != null;
+    const statusLabel = crawlDone
+      ? "Automated checks complete"
+      : job?.report?.partial
+        ? "Auditing your workspaces…"
+        : "Starting the audit…";
+    return (
+      <div className="space-y-6">
+        {error && <ErrorBanner message={error} />}
+
+        <Section
+          title="Audit in progress"
+          description="The automated checks run against your workspaces while you answer the self-assessed points below. Your answers are scored alongside the automated results."
+          actions={
+            <button type="button" className="btn-secondary" onClick={cancelRun}>
+              Cancel
+            </button>
+          }
+        >
+          <div className="card flex items-center gap-3">
+            {!crawlDone ? (
+              <Spinner label={statusLabel} />
+            ) : (
+              <span className="flex items-center gap-2 text-sm font-medium text-green-700 dark:text-green-400">
+                <span className="block h-2.5 w-2.5 rounded-full bg-green-500" aria-hidden="true" />
+                {statusLabel}
+              </span>
+            )}
+            {auditId && (
+              <span className="ml-auto font-mono text-xs text-slate-400">{auditId}</span>
+            )}
+          </div>
+        </Section>
+
+        {questionnaire.length > 0 ? (
+          <Section
+            title="Self-assessed checklist"
+            description="Points a machine cannot verify from the workspace. Choose the option that best matches, or skip. Grouped by pillar and layer."
+          >
+            <QuestionnairePanel
+              items={questionnaire}
+              answers={answers}
+              onChange={setAnswer}
+              disabled={answersSubmitted}
+            />
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                className="btn-primary"
+                onClick={submitAnswers}
+                disabled={finishing || answersSubmitted}
+              >
+                {answersSubmitted
+                  ? crawlDone
+                    ? "Opening report…"
+                    : "Answers saved — finishing audit…"
+                  : finishing
+                    ? "Saving…"
+                    : "Submit answers & view report"}
+              </button>
+              {answersSubmitted && !crawlDone && <Spinner label="Waiting for the crawl to finish…" />}
+              {!answersSubmitted && (
+                <span className="text-sm text-slate-500">
+                  Unanswered points are recorded as skipped (N/A).
+                </span>
+              )}
+            </div>
+          </Section>
+        ) : (
+          <div className="card text-sm text-slate-600 dark:text-slate-400">
+            No self-assessed points apply to the selected workspaces. The report opens
+            automatically once the automated checks finish.
+          </div>
+        )}
       </div>
     );
   }
