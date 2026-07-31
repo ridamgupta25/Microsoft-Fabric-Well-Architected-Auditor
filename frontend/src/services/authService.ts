@@ -6,7 +6,44 @@
  * completes.
  */
 import { apiClient } from "./apiClient";
-import type { SessionResponse, SessionStatusResponse, UserProfile } from "@/types/api";
+import type {
+  AuthorizeResponse,
+  LoginConfig,
+  SessionResponse,
+  SessionStatusResponse,
+  UserProfile,
+} from "@/types/api";
+
+/** Which sign-in methods the server offers (e.g. whether redirect SSO is set up). */
+export async function getLoginConfig(): Promise<LoginConfig> {
+  const { data } = await apiClient.get<LoginConfig>("/login/config");
+  return data;
+}
+
+/**
+ * Begin the redirect (Authorization Code) sign-in.
+ *
+ * Returns the Microsoft URL to send the browser to. After the user signs in,
+ * Microsoft redirects to `redirectUri` (a route this app serves) with a code,
+ * which {@link completeAuthCodeLogin} exchanges server-side. The token never
+ * reaches the browser.
+ */
+export async function startAuthCodeLogin(redirectUri: string): Promise<AuthorizeResponse> {
+  const { data } = await apiClient.post<AuthorizeResponse>("/login/authorize", {
+    redirect_uri: redirectUri,
+  });
+  return data;
+}
+
+/** Complete the redirect sign-in by handing the callback's query params to the server. */
+export async function completeAuthCodeLogin(
+  authResponse: Record<string, string>,
+): Promise<SessionResponse> {
+  const { data } = await apiClient.post<SessionResponse>("/login/callback", {
+    auth_response: authResponse,
+  });
+  return data;
+}
 
 export async function startInteractiveLogin(params: {
   email?: string;
@@ -23,6 +60,26 @@ export async function startInteractiveLogin(params: {
 
 export async function loginWithAzureCli(): Promise<SessionResponse> {
   const { data } = await apiClient.post<SessionResponse>("/login/azure-cli");
+  return data;
+}
+
+/**
+ * Start a device-code sign-in — the browser-based flow for a hosted/remote app.
+ *
+ * Returns a short `user_code` and a `verification_uri`; the user opens that URI
+ * in their **own** browser and enters the code. The token is acquired and kept
+ * on the server, so the browser still only ever holds the session id. Poll with
+ * {@link waitForSignIn} until it completes.
+ */
+export async function startDeviceCodeLogin(params?: {
+  tenantId?: string;
+  clientId?: string;
+}): Promise<SessionResponse> {
+  const { data } = await apiClient.post<SessionResponse>("/login/device-code", {
+    tenant_id: params?.tenantId ?? null,
+    client_id: params?.clientId ?? null,
+    scopes: [],
+  });
   return data;
 }
 

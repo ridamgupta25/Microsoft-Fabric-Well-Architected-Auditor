@@ -75,6 +75,24 @@ class Settings(BaseSettings):
         description="Origins permitted to call the API.",
     )
 
+    # -- redirect sign-in (Authorization Code flow) ---------------------------
+    # A hosted deployment signs remote users in with the standard browser
+    # redirect ("Sign in with Microsoft"): the user authenticates on Microsoft's
+    # page in *their own* browser and is redirected back. This needs an Entra app
+    # registration (the built-in Azure CLI client cannot own a custom redirect
+    # URI). Set the client/tenant id to enable it; leave unset to keep only the
+    # device-code / local flows. The token is still acquired and kept server-side.
+    auth_client_id: str | None = Field(
+        default=None, description="Entra app (client) id for redirect sign-in."
+    )
+    auth_tenant_id: str | None = Field(
+        default=None, description="Entra tenant id (a GUID, or 'organizations')."
+    )
+    auth_client_secret: str | None = Field(
+        default=None,
+        description="Client secret for the app. Server-side only; never sent to the browser.",
+    )
+
     # -- logging --------------------------------------------------------------
     log_level: str = "INFO"
     log_json: bool = Field(
@@ -96,6 +114,11 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.environment.lower() in {"prod", "production"}
+
+    @property
+    def redirect_sign_in_enabled(self) -> bool:
+        """True when the redirect Authorization Code flow is configured."""
+        return bool(self.auth_client_id and self.auth_tenant_id)
 
     def resolve(self, value: str) -> Path:
         """Resolve a configured relative path against the backend root."""
