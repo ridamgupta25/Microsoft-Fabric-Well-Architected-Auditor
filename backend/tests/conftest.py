@@ -91,7 +91,7 @@ def client(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     def fake_token_for(session_id: str | None) -> str | None:
         return FAKE_TOKEN if session_id == AUTHENTICATED_SESSION else None
 
-    def fake_build_provider(config, token=None, *, refresh=False):
+    def fake_build_provider(config, token=None, *, refresh=False, token_refresher=None):
         return RecordedProvider(FIXTURE_FILE)
 
     monkeypatch.setattr(auth_service, "token_for", fake_token_for)

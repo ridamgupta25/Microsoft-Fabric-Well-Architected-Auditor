@@ -60,6 +60,7 @@ class AuditRunner:
         out_dir: str | None = None,
         token: str | None = None,
         organization_id: str | None = None,
+        auth_session: str | None = None,
     ) -> AuditJob:
         """Accept an audit and start it in the background."""
         job = AuditJob(
@@ -83,6 +84,7 @@ class AuditRunner:
                 workspaces=workspaces,
                 out_dir=out_dir,
                 token=token,
+                auth_session=auth_session,
                 parent_correlation_id=correlation_id.get(),
             )
         )
@@ -99,12 +101,15 @@ class AuditRunner:
         workspaces: list[dict] | None,
         out_dir: str | None,
         token: str | None,
+        auth_session: str | None = None,
         parent_correlation_id: str = "-",
     ) -> None:
         """Run one audit to completion, recording success or failure."""
         # Background tasks get a fresh context, so carry the request's id across
         # to keep the audit's log lines traceable to whoever asked for it.
         correlation_id.set(parent_correlation_id)
+        from . import auth_service
+        token_refresher = auth_service.make_token_refresher(auth_session)
 
         async with self._semaphore:
             job.mark_running()
@@ -127,6 +132,7 @@ class AuditRunner:
                     out_dir,
                     token,
                     on_progress=_on_progress,
+                    token_refresher=token_refresher,
                 )
                 report: dict[str, Any] = audit_service.to_json(run)
                 report["audit_id"] = job.id
@@ -158,6 +164,7 @@ class AuditRunner:
                     workspaces=workspaces,
                     out_dir=out_dir,
                     token=token,
+                    auth_session=auth_session,
                     parent_correlation_id=parent_correlation_id,
                 )
             )
@@ -173,6 +180,7 @@ class AuditRunner:
         workspaces: list[dict] | None,
         out_dir: str | None,
         token: str | None,
+        auth_session: str | None = None,
         parent_correlation_id: str = "-",
     ) -> None:
         """Re-crawl the tenant live, rebuild the KB, and update the report.
@@ -182,6 +190,8 @@ class AuditRunner:
         report sees the freshened numbers.
         """
         correlation_id.set(parent_correlation_id)
+        from . import auth_service
+        token_refresher = auth_service.make_token_refresher(auth_session)
         async with self._semaphore:
             try:
                 run = await asyncio.to_thread(
@@ -193,6 +203,7 @@ class AuditRunner:
                         out_dir,
                         token,
                         refresh=True,
+                        token_refresher=token_refresher,
                     )
                 )
                 report = audit_service.to_json(run)

@@ -92,6 +92,66 @@ def token_for(session_id: str | None) -> str | None:
     return sess["result"] if sess else None
 
 
+def make_token_refresher(session_id: str | None):
+    """Return a callable that silently refreshes the token, or None.
+
+    The returned function, when called, attempts to acquire a fresh token using
+    MSAL's cached refresh token. On success it updates the session and returns
+    the new access token; on failure it returns None.
+    """
+    sess = _SESSIONS.get(session_id or "")
+    if not sess:
+        return None
+    app = sess.get("_msal_app")
+    account = sess.get("_msal_account")
+    scopes = sess.get("_msal_scopes")
+    if not app or not account or not scopes:
+        # az-cli sessions: re-invoke az to get a fresh token
+        if sess.get("_azcli"):
+            return _make_azcli_refresher(sess)
+        return None
+
+    def _refresh() -> str | None:
+        try:
+            res = app.acquire_token_silent(scopes, account=account)
+            if res and "access_token" in res:
+                sess["result"] = res["access_token"]
+                return res["access_token"]
+        except Exception:
+            pass
+        return None
+
+    return _refresh
+
+
+def _make_azcli_refresher(sess: dict):
+    """Refresher for az-cli sessions — re-invokes az to get a fresh token."""
+    import shutil
+    import subprocess
+
+    def _refresh() -> str | None:
+        if not shutil.which("az"):
+            return None
+        try:
+            out = subprocess.run(
+                ["az", "account", "get-access-token", "--resource",
+                 "https://api.fabric.microsoft.com", "--output", "json"],
+                capture_output=True, text=True, timeout=90)
+        except Exception:
+            return None
+        if out.returncode != 0:
+            return None
+        try:
+            token = json.loads(out.stdout).get("accessToken")
+        except Exception:
+            return None
+        if token:
+            sess["result"] = token
+        return token
+
+    return _refresh
+
+
 def logout(session_id: str | None) -> bool:
     """Discard a session's token. Returns whether there was one to discard.
 
@@ -154,7 +214,8 @@ def login_interactive(email: str, tenant_id, client_id, auth_cfg: dict) -> dict:
         raise AuthError(f"could not initialize sign-in: {exc}", 400) from exc
 
     sid = uuid.uuid4().hex
-    sess = {"result": None, "error": None, "done": False, "user": None}
+    sess = {"result": None, "error": None, "done": False, "user": None,
+            "_msal_app": app, "_msal_account": None, "_msal_scopes": scopes}
     _SESSIONS[sid] = sess
 
     def worker():
@@ -163,6 +224,9 @@ def login_interactive(email: str, tenant_id, client_id, auth_cfg: dict) -> dict:
             if "access_token" in res:
                 sess["result"] = res["access_token"]
                 sess["user"] = _profile_from_claims(res.get("id_token_claims"))
+                accounts = app.get_accounts()
+                if accounts:
+                    sess["_msal_account"] = accounts[0]
             else:
                 sess["error"] = res.get("error_description", "authentication failed")
         except Exception as exc:  # pragma: no cover
@@ -208,7 +272,8 @@ def login_azcli() -> dict:
 
     sid = uuid.uuid4().hex
     _SESSIONS[sid] = {"result": token, "error": None, "done": True,
-                      "user": _profile_from_claims(_decode_jwt_claims(token))}
+                      "user": _profile_from_claims(_decode_jwt_claims(token)),
+                      "_azcli": True}
     return {"session": sid, "status": "done", "message": "Signed in via Azure CLI."}
 
 
@@ -251,7 +316,8 @@ def start_device_flow(tenant_id, client_id, scopes) -> dict:
         raise AuthError(flow.get("error_description", "device flow failed"), 400)
 
     sid = uuid.uuid4().hex
-    sess = {"result": None, "error": None, "done": False, "user": None}
+    sess = {"result": None, "error": None, "done": False, "user": None,
+            "_msal_app": app, "_msal_account": None, "_msal_scopes": scopes}
     _SESSIONS[sid] = sess
 
     def worker():
@@ -260,6 +326,9 @@ def start_device_flow(tenant_id, client_id, scopes) -> dict:
             if "access_token" in res:
                 sess["result"] = res["access_token"]
                 sess["user"] = _profile_from_claims(res.get("id_token_claims"))
+                accounts = app.get_accounts()
+                if accounts:
+                    sess["_msal_account"] = accounts[0]
             else:
                 sess["error"] = res.get("error_description", "authentication failed")
         except Exception as exc:  # pragma: no cover
