@@ -81,7 +81,7 @@ results: one implementation, three front doors.
 | [`core/engine.py`](../backend/src/auditfast/core/engine.py) | Generic scope-driven dispatch |
 | [`core/check/registry.py`](../backend/src/auditfast/core/check/registry.py) | The single registry (`REGISTRY`), the `@check` decorator, and `questionnaire_check` for interactive points |
 | [`core/check/helpers.py`](../backend/src/auditfast/core/check/helpers.py) | `Verdict` and the builders |
-| [`core/check/<pillar>/<layer>/`](../backend/src/auditfast/core/check/) | 164 checks — `automated`, `questionnaire` (interactive), `manual`, and generated `roadmap` modules per pillar × layer |
+| [`core/check/<pillar>/<layer>/`](../backend/src/auditfast/core/check/) | 148 checks — `automated`, `questionnaire` (interactive), `manual`, and generated `roadmap` modules per pillar × layer |
 | [`clients/`](../backend/src/auditfast/clients/) | `LiveFabricProvider` (the only shipped provider) and the `Provider` protocol |
 | [`services/audit_service.py`](../backend/src/auditfast/services/audit_service.py) | The one audit path; builds the caching provider |
 | [`services/context_store.py`](../backend/src/auditfast/services/context_store.py) | The KB: `ContextStore` (disk cache) + `CachingProvider` + `KBArchive` + `ArchivingProvider` (permanent timestamped archive) |

@@ -122,7 +122,7 @@ what keeps guarantee #5 true by construction.
 | [`core/models.py`](backend/src/auditfast/core/models.py) | `WorkspaceContext`, `CheckContext`, `CheckSpec`, `CheckResult` |
 | [`core/engine.py`](backend/src/auditfast/core/engine.py) | Generic, scope-driven dispatch |
 | [`core/scoring.py`](backend/src/auditfast/core/scoring.py) | 0–3 bands → weighted roll-up → pillar × layer matrix |
-| [`core/check/`](backend/src/auditfast/core/check/) | The 164-check library + registry + verdict helpers |
+| [`core/check/`](backend/src/auditfast/core/check/) | The 148-check library + registry + verdict helpers |
 | [`clients/`](backend/src/auditfast/clients/) | `LiveFabricProvider` (the only shipped provider) + the `Provider` protocol |
 | [`services/`](backend/src/auditfast/services/) | The one audit path, the KB cache, the checklist intake + batch runner, auth, catalog |
 | [`ai/`](backend/src/auditfast/ai/) | Deterministic dedup + proposal drafting; optional advisory (off by default) |
@@ -231,16 +231,16 @@ rather than silent.
 
 ### Current coverage
 
-**164 checks — 64 `automated`, 16 `interactive` (self-assessed), 84 `roadmap`, 0 `manual`.**
+**148 checks — 64 `automated`, 84 `roadmap`, 0 `interactive`, 0 `manual`.**
 
 | Pillar | Checks | | By scope | Checks |
 |--------|-------:|-|----------|-------:|
-| Data Management & Quality | 56 | | workspace | 123 |
-| Operations & Reliability | 36 | | notebook | 29 |
-| Performance & Capacity | 25 | | pipeline | 12 |
-| Security | 19 | | | |
-| Cost & Resource Optimization | 17 | | | |
-| Governance & Compliance | 10 | | | |
+| Data Management & Quality | 53 | | workspace | 107 |
+| Operations & Reliability | 33 | | notebook | 29 |
+| Performance & Capacity | 23 | | pipeline | 12 |
+| Security | 16 | | | |
+| Cost & Resource Optimization | 15 | | | |
+| Governance & Compliance | 7 | | | |
 | Foundation (unscored) | 1 | | | |
 
 `roadmap` checks are honest placeholders: automatable *in principle*, but needing
@@ -250,7 +250,9 @@ point is silently missing — and are promoted to `automated` as data becomes re
 
 `interactive` checks are the **Azure Well-Architected Review** model: points a
 machine cannot read from a workspace (a tested DR plan, a documented cost review)
-but a reviewer *can* attest. During a run the reviewer picks a scored option; the
+but a reviewer *can* attest. **None are registered today — the 16 original
+questionnaire points were removed; the machinery remains, so re-adding a
+`questionnaire_check` re-enables it.** During a run the reviewer picks a scored option; the
 engine skips them and [`services/questionnaire_service.py`](backend/src/auditfast/services/questionnaire_service.py)
 scores the answer 0–3 and merges it per applicable workspace. **Skipping records
 N/A, never a low score** — so a self-assessment left blank can't drag the number down.
@@ -411,10 +413,11 @@ the payoff of the pure-core + generic-engine design.
 
 ## 13. Quality & determinism in practice
 
-- **192 tests, fully offline.** The suite runs against a recorded-tenant fixture —
+- **189 passing tests (7 skipped), fully offline.** The suite runs against a recorded-tenant fixture —
   no live Fabric call — so determinism is *tested*, not merely intended. Pinned
-  values (`checks_registered`, the overall score, scored-check and result-row
-  counts) fail loudly if any check, band, or roll-up drifts.
+  values (the overall score, scored-check and result-row counts) fail loudly if
+  any check, band, or roll-up drifts; `checks_registered` is asserted against the
+  live registry, so it self-adjusts.
 - **`ruff` lint** on the whole backend.
 - **The N/A-not-FAIL rule is enforced** by the harness on every new check, so
   extending coverage is guaranteed additive.
@@ -432,7 +435,7 @@ the payoff of the pure-core + generic-engine design.
 | Agents / tooling | Model Context Protocol (FastMCP) · GitHub Copilot authoring layer |
 | Reports | Markdown · Excel (openpyxl) |
 | Persistence | On-disk knowledge base (JSON) + permanent timestamped archive |
-| Tests | pytest + FastAPI TestClient — 192, fully offline |
+| Tests | pytest + FastAPI TestClient — 189 passing (7 skipped), fully offline |
 
 ---
 

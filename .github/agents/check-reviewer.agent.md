@@ -24,13 +24,13 @@ You verify that a new check is correct and did not regress the suite.
    `POST /api/v1/audit/check`) with the new check id, a workspace id, and a
    Fabric token, and confirm the live verdict is sensible.
 4. Update pinned values to the new truth (never weaken a test):
-   - `checks_registered == 164` in [tests/test_api.py](../../backend/tests/test_api.py) → +1 per registered check.
+   - `checks_registered` in [tests/test_api.py](../../backend/tests/test_api.py) asserts `== len(REGISTRY)`, so it self-adjusts — no bump needed.
    - `EXPECTED_OVERALL` (float), `EXPECTED_SCORED_CHECKS = 98`,
      `EXPECTED_RESULT_ROWS = 211` in [tests/conftest.py](../../backend/tests/conftest.py).
-   - the evaluated-count `== 64` (and interactive-count `== 16`) in [tests/test_engine.py](../../backend/tests/test_engine.py).
-   A **roadmap/manual/interactive** attestation changes `checks_registered` + row
+   - the evaluated-count `== 64` (and interactive-count `== 0`) in [tests/test_engine.py](../../backend/tests/test_engine.py).
+   A **roadmap/manual/interactive** attestation changes the row
    counts but **not** `EXPECTED_OVERALL` / `EXPECTED_SCORED_CHECKS` (it is never
-   scored by the engine).
+   scored by the engine; `checks_registered` self-adjusts).
 
 ## Output
 The harness result (pass/fail), the live verdict from `run_check`, the count

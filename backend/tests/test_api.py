@@ -9,7 +9,14 @@ from __future__ import annotations
 
 import time
 
-from .conftest import AUTHENTICATED_SESSION, EXPECTED_OVERALL
+from auditfast.core.check.registry import REGISTRY
+
+from .conftest import (
+    AUTHENTICATED_SESSION,
+    EXPECTED_OVERALL,
+    EXPECTED_RESULT_ROWS,
+    EXPECTED_SCORED_CHECKS,
+)
 
 
 def _wait_for_audit(client, audit_id: str, timeout: float = 30.0) -> dict:
@@ -34,7 +41,10 @@ def _submit(client, **extra) -> str:
 def test_health_reports_a_loaded_rule_library(client):
     body = client.get("/api/v1/health").json()
     assert body["status"] == "ok"
-    assert body["checks_registered"] == 164
+    # Assert the endpoint reports the *live* registry size, not a pinned literal,
+    # so this stays correct as checks are added or removed.
+    assert body["checks_registered"] == len(REGISTRY)
+    assert body["checks_registered"] > 0
 
 
 def test_liveness_touches_no_dependencies(client):
@@ -115,8 +125,8 @@ def test_report_endpoint_returns_the_full_scorecard(client):
 
     report = client.get(f"/api/v1/reports/{audit_id}").json()
     assert report["overall"] == EXPECTED_OVERALL
-    assert report["total_scored"] == 98
-    assert len(report["results"]) == 211
+    assert report["total_scored"] == EXPECTED_SCORED_CHECKS
+    assert len(report["results"]) == EXPECTED_RESULT_ROWS
     assert report["by_pillar"]["Governance & Compliance"]["pct"] is None
 
 

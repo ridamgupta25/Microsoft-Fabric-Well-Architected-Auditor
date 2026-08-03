@@ -62,7 +62,7 @@ py -m venv .venv
 .\.venv\Scripts\python.exe -c "from auditfast.core.check.registry import REGISTRY; print(len(REGISTRY), 'checks loaded')"
 ```
 
-Expected: `164 checks loaded`. If this prints `0`, the check modules failed to
+Expected: `148 checks loaded`. If this prints `0`, the check modules failed to
 import and every audit would silently score nothing.
 
 ### Run the tests
@@ -72,7 +72,7 @@ cd backend
 ..\.venv\Scripts\python.exe -m pytest
 ```
 
-Expected: **192 passed**. The suite is fully offline and deterministic — it runs
+Expected: **189 passed, 7 skipped**. The suite is fully offline and deterministic — it runs
 against a recorded tenant fixture under `tests/fixtures/`, not a real Fabric
 tenant, so it needs no credentials and never makes a network call. See
 [migration.md](migration.md#test-strategy) for why that fixture is test

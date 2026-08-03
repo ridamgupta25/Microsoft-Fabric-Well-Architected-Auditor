@@ -56,7 +56,8 @@ reproducible.
 - New artifact type → add a `Scope` member + a provider that yields it; the
   engine does not change.
 
-**Always run the tests after a change** (§9). Expected: **192 passed**, offline.
+**Always run the tests after a change** (§9). Expected: **189 passed, 7 skipped**,
+offline (the questionnaire tests skip while no interactive checks are registered).
 
 ---
 
@@ -200,19 +201,19 @@ for workspace_id, layer in targets:
 
 ## 6. The check system
 
-**Current coverage: 164 checks** — 64 `automated`, 16 `interactive` (self-assessed), 84 `roadmap`, 0 `manual`.
+**Current coverage: 148 checks** — 64 `automated`, 84 `roadmap`, 0 `interactive`, 0 `manual`.
 
 | Pillar | Checks |
 |--------|-------:|
-| Data Management & Quality | 56 |
-| Operations & Reliability | 36 |
-| Performance & Capacity | 25 |
-| Security | 19 |
-| Cost & Resource Optimization | 17 |
-| Governance & Compliance | 10 |
+| Data Management & Quality | 53 |
+| Operations & Reliability | 33 |
+| Performance & Capacity | 23 |
+| Security | 16 |
+| Cost & Resource Optimization | 15 |
+| Governance & Compliance | 7 |
 | Foundation (unscored) | 1 |
 
-By scope: workspace 123, pipeline 12, notebook 29. Browse the live catalog with
+By scope: workspace 107, pipeline 12, notebook 29. Browse the live catalog with
 `GET /api/v1/catalog/checks` or `auditfast checks --pillar Security` — that is the
 source of truth, not a hand-maintained list.
 
@@ -252,6 +253,10 @@ def delta_optimize(ctx: CheckContext) -> Verdict:
   5. update the pinned counts in `tests/` (registry totals, score, row counts).
 
 ### 6a. Interactive (self-assessed) checks
+
+> **None are registered today.** The 16 original questionnaire points were
+> removed; the machinery described here remains, so re-adding a
+> `questionnaire_check` re-enables it (the interactive count climbs back above 0).
 
 Some Well-Architected points can't be read from Fabric but *can* be scored by
 asking the reviewer — the **Azure Well-Architected Review** model. These are
@@ -334,14 +339,14 @@ cd backend
 # Run the frontend (separate terminal, from auditfast-core/frontend)
 npm install ; npm run dev                                       # http://localhost:5173
 
-# Tests — expected: 192 passed, fully offline
+# Tests — expected: 189 passed, 7 skipped, fully offline
 cd backend
 ..\.venv\Scripts\python.exe -m pytest -q
 
 # Lint
 ..\.venv\Scripts\python.exe -m ruff check src
 
-# Sanity: how many checks registered (expected 164)
+# Sanity: how many checks registered (expected 148)
 ..\.venv\Scripts\python.exe -c "from auditfast.core.check.registry import REGISTRY; print(len(REGISTRY), 'checks')"
 ```
 
@@ -356,7 +361,7 @@ cd backend
 | Area | State |
 |------|-------|
 | Automated checks | 64 today (workspace + pipeline + Spark/Delta notebook checks). 84 more are `roadmap`. |
-| Interactive checks | 16 self-assessed (Azure WAF-style) questionnaire points, scored 0–3 from the reviewer's answer and merged per workspace; *skipped* ⇒ N/A. |
+| Interactive checks | None registered today — the 16 original self-assessed (Azure WAF-style) questionnaire points were removed. The machinery remains; re-adding a `questionnaire_check` re-enables it. *Skipped* ⇒ N/A. |
 | Foundation pillar | Informational only — never scored (inventory, access errors, `WS-READ-INCOMPLETE` warnings). |
 | Crawl completeness | `getDefinition`/table failures are tracked (`read_failures`, forbidden vs transient), surfaced as `WS-READ-INCOMPLETE` + a report section, and an incomplete snapshot is never cached (§5). |
 | Crawl performance | `getDefinition` is read one item at a time (60s timeout) — a 1000+ item workspace can take many minutes on first crawl. Parallelisation is the open scalability item. |
