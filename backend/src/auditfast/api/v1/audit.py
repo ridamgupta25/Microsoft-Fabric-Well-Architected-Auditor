@@ -54,6 +54,7 @@ async def submit_audit(
         out_dir=str(settings.output_path),
         token=token,
         organization_id=organization_id,
+        auth_session=request.auth_session,
     )
     return AuditAccepted(
         audit_id=job.id, status=job.status, submitted_at=job.submitted_at

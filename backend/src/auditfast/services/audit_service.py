@@ -49,7 +49,8 @@ class AuditRun:
 
 # -- provider construction ----------------------------------------------------
 
-def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: bool = False):
+def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: bool = False,
+                   token_refresher=None):
     """Create the provider for a run.
 
     Every run reads the live tenant, but through the on-disk **knowledge base**:
@@ -61,7 +62,7 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
     """
     if not token:
         raise AuditError("A sign-in token is required to run an audit.")
-    live = LiveFabricProvider(token)
+    live = LiveFabricProvider(token, token_refresher=token_refresher)
     settings = get_settings()
     provider = live
     if settings.cache_enabled:
@@ -190,6 +191,7 @@ def run_audit(
     token: str | None = None,
     on_progress: Callable[[dict], None] | None = None,
     refresh: bool = False,
+    token_refresher=None,
 ) -> AuditRun:
     """Run an audit and, when ``out_dir`` is given, write the report files.
 
@@ -200,7 +202,7 @@ def run_audit(
     force a fresh live crawl and rebuild the KB.
     """
     config = load_project(project_path)
-    provider = build_provider(config, token, refresh=refresh)
+    provider = build_provider(config, token, refresh=refresh, token_refresher=token_refresher)
     remediation: RemediationBook = load_remediation(config)
 
     def _progress(partial: list[CheckResult]) -> None:

@@ -36,12 +36,13 @@ class LiveFabricProvider:
 
     BASE = "https://api.fabric.microsoft.com/v1"
 
-    def __init__(self, token: str, timeout: int = 60):
+    def __init__(self, token: str, timeout: int = 60, token_refresher=None):
         import requests  # imported lazily so offline mode needs no HTTP stack
 
         self._session = requests.Session()
         self._session.headers.update({"Authorization": f"Bearer {token}"})
         self._timeout = timeout
+        self._token_refresher = token_refresher
 
     # -- transport -------------------------------------------------------------
     def _get(self, path: str) -> tuple[int | None, Any]:
@@ -101,8 +102,20 @@ class LiveFabricProvider:
         except ValueError:
             return None
 
-    #: getDefinition statuses worth retrying — transient throttling / 5xx. A
-    #: 401/403 is a permission verdict, not a blip, so it is never retried.
+    def _try_refresh_token(self) -> bool:
+        """Attempt a silent token refresh. Returns True if a new token was set."""
+        if not self._token_refresher:
+            return False
+        log.info("access token expired, attempting silent refresh")
+        new_token = self._token_refresher()
+        if new_token:
+            self._session.headers.update({"Authorization": f"Bearer {new_token}"})
+            log.info("token refreshed, resuming crawl")
+            return True
+        log.warning("token refresh failed, could not acquire new token")
+        return False
+
+    #: getDefinition statuses worth retrying — transient throttling / 5xx.
     _RETRYABLE = frozenset({429, 500, 502, 503, 504})
 
     def _definition_parts(
@@ -114,15 +127,15 @@ class LiveFabricProvider:
 
         * ``""`` — the read completed (``parts`` may still be empty for a
           genuinely empty item);
-        * ``"forbidden"`` — a 401/403 permission denial (Fabric gates
+        * ``"forbidden"`` — a 403 permission denial (Fabric gates
           getDefinition behind the Item.ReadWrite scope). It will not recover
           without a different token, so the caller records a known gap;
         * ``"transient"`` — a throttling/5xx/timeout/transport error that
           survived retries. It *may* recover, so a partial crawl carrying one
           must be re-fetched rather than cached.
 
-        Distinguishing the two is what lets the knowledge base avoid freezing a
-        temporary throttle into a permanent-looking gap.
+        A 401 (token expired) is distinguished from 403 (permission denied):
+        on 401 the provider attempts a silent token refresh and retries the call.
 
         getDefinition is a long-running operation: 200 with the body inline for
         small items, or 202 with a ``Location`` to poll until it completes.
@@ -146,8 +159,14 @@ class LiveFabricProvider:
                 body = self._await_operation(response)
                 if body is None:
                     return [], "transient"  # the LRO failed or timed out
-            elif status in (401, 403):
-                log.warning("item %s getDefinition -> HTTP %s (forbidden)", item_id, status)
+            elif status == 401:
+                # Token expired — attempt silent refresh and retry this item
+                if self._try_refresh_token():
+                    continue
+                log.warning("item %s getDefinition -> HTTP 401 (token expired, refresh failed)", item_id)
+                return [], "forbidden"
+            elif status == 403:
+                log.warning("item %s getDefinition -> HTTP 403 (permission denied)", item_id)
                 return [], "forbidden"
             elif status in self._RETRYABLE and attempt < 2:
                 time.sleep(min(2.0 * (attempt + 1), 5.0))
@@ -242,8 +261,16 @@ class LiveFabricProvider:
         status, body = self._get(
             f"/workspaces/{workspace_id}/lakehouses/{item_id}/tables"
         )
-        if status in (401, 403):
-            log.warning("lakehouse %s list-tables -> HTTP %s (forbidden)", item_id, status)
+        if status == 401:
+            if self._try_refresh_token():
+                status, body = self._get(
+                    f"/workspaces/{workspace_id}/lakehouses/{item_id}/tables"
+                )
+            else:
+                log.warning("lakehouse %s list-tables -> HTTP 401 (token expired, refresh failed)", item_id)
+                return [], "forbidden"
+        if status == 403:
+            log.warning("lakehouse %s list-tables -> HTTP 403 (permission denied)", item_id)
             return [], "forbidden"
         if status is None or status == 429 or (isinstance(status, int) and status >= 500):
             log.warning("lakehouse %s list-tables -> HTTP %s (transient)", item_id, status)
@@ -315,6 +342,8 @@ class LiveFabricProvider:
         # The workspace itself is always read: it establishes both identity and
         # access, and its status is how we detect an unreadable workspace.
         status, workspace = self._get(f"/workspaces/{workspace_id}")
+        if status == 401 and self._try_refresh_token():
+            status, workspace = self._get(f"/workspaces/{workspace_id}")
         if status != 200 or not isinstance(workspace, dict):
             raise WorkspaceAccessError(workspace_id, status)
 

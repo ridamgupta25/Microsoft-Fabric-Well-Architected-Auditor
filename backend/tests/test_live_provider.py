@@ -71,3 +71,129 @@ def test_values_first_call_failure_is_unknown_not_empty():
     rows, known = provider._values("/workspaces/w/git/connection")
     assert rows == []
     assert known is False
+
+
+# -- token refresh tests -------------------------------------------------------
+
+class _CountingFakeSession:
+    """Tracks calls and returns different responses per call count."""
+
+    def __init__(self):
+        self.post_calls: list[str] = []
+        self.get_calls: list[str] = []
+        self.headers: dict = {}
+        self._post_responses: list[_FakeResponse] = []
+        self._get_responses: dict[str, list[_FakeResponse]] = {}
+
+    def queue_post(self, response: _FakeResponse):
+        self._post_responses.append(response)
+
+    def queue_get(self, url: str, response: _FakeResponse):
+        self._get_responses.setdefault(url, []).append(response)
+
+    def post(self, url, timeout=None):
+        self.post_calls.append(url)
+        return self._post_responses.pop(0)
+
+    def get(self, url, timeout=None):
+        self.get_calls.append(url)
+        responses = self._get_responses.get(url)
+        if responses:
+            return responses.pop(0)
+        return _FakeResponse(404, {})
+
+    def update(self, headers):
+        self.headers.update(headers)
+
+
+def test_definition_parts_refreshes_token_on_401_and_retries():
+    """On HTTP 401 the provider refreshes the token and retries the same item."""
+    refreshed = []
+
+    def fake_refresher():
+        refreshed.append(True)
+        return "new-token"
+
+    provider = LiveFabricProvider("old-token", token_refresher=fake_refresher)
+    session = _CountingFakeSession()
+    # First call returns 401 (expired), second call after refresh returns 200
+    session.queue_post(_FakeResponse(401, {}))
+    import base64, json
+    payload = base64.b64encode(json.dumps({"activities": []}).encode()).decode()
+    session.queue_post(_FakeResponse(200, {
+        "definition": {"parts": [{"path": "pipeline-content.json", "payload": payload}]}
+    }))
+    provider._session = session
+    provider._session.headers = {}
+
+    parts, failure = provider._definition_parts("ws-1", "item-1")
+
+    assert failure == ""
+    assert parts == [{"path": "pipeline-content.json", "payload": payload}]
+    assert len(refreshed) == 1  # refresher was called once
+    assert len(session.post_calls) == 2  # original + retry
+    assert provider._session.headers.get("Authorization") == "Bearer new-token"
+
+
+def test_definition_parts_reports_forbidden_on_403_without_refresh():
+    """HTTP 403 (permission denied) is not retried — reported as forbidden."""
+    refreshed = []
+
+    def fake_refresher():
+        refreshed.append(True)
+        return "new-token"
+
+    provider = LiveFabricProvider("token", token_refresher=fake_refresher)
+    session = _CountingFakeSession()
+    session.queue_post(_FakeResponse(403, {}))
+    provider._session = session
+    provider._session.headers = {}
+
+    parts, failure = provider._definition_parts("ws-1", "item-1")
+
+    assert failure == "forbidden"
+    assert parts == []
+    assert len(refreshed) == 0  # refresher NOT called for 403
+
+
+def test_definition_parts_401_without_refresher_reports_forbidden():
+    """Without a refresher, 401 falls through to forbidden."""
+    provider = LiveFabricProvider("token", token_refresher=None)
+    session = _CountingFakeSession()
+    session.queue_post(_FakeResponse(401, {}))
+    provider._session = session
+    provider._session.headers = {}
+
+    parts, failure = provider._definition_parts("ws-1", "item-1")
+
+    assert failure == "forbidden"
+    assert parts == []
+
+
+def test_workspace_read_retries_on_401_after_refresh():
+    """The initial workspace GET retries after a successful token refresh."""
+    refreshed = []
+
+    def fake_refresher():
+        refreshed.append(True)
+        return "new-token"
+
+    provider = LiveFabricProvider("old-token", token_refresher=fake_refresher)
+    base = provider.BASE
+    session = _CountingFakeSession()
+    # First workspace read returns 401, second returns 200
+    ws_url = f"{base}/workspaces/ws-1"
+    session.queue_get(ws_url, _FakeResponse(401, {}))
+    session.queue_get(ws_url, _FakeResponse(200, {"displayName": "MyWS", "capacityId": "cap1"}))
+    # Items endpoint (needed by fetch)
+    items_url = f"{base}/workspaces/ws-1/items"
+    session.queue_get(items_url, _FakeResponse(200, {"value": []}))
+    provider._session = session
+    provider._session.headers = {}
+
+    from auditfast.core.enums import Resource
+    ctx = provider.fetch("ws-1", resources=[Resource.ITEMS])
+
+    assert ctx.display_name == "MyWS"
+    assert len(refreshed) == 1
+    assert len(session.get_calls) == 3  # ws(401) + ws(200) + items
