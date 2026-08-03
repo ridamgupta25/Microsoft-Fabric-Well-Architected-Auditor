@@ -9,6 +9,8 @@ background refresh cannot double-count.
 """
 from __future__ import annotations
 
+import pytest
+
 from auditfast.core.check.registry import REGISTRY
 from auditfast.core.enums import Automation, Status
 from auditfast.services.questionnaire_service import (
@@ -19,6 +21,15 @@ from auditfast.services.questionnaire_service import (
 )
 
 from .conftest import FIXTURE_SETTINGS, FIXTURE_TARGETS
+
+#: This module exercises the interactive (self-assessed) questionnaire. When no
+#: interactive checks are registered there is nothing to score, so the whole
+#: module skips instead of failing. Re-adding a ``questionnaire_check`` re-enables
+#: these tests automatically.
+pytestmark = pytest.mark.skipif(
+    not interactive_specs(),
+    reason="no interactive (self-assessed) checks are registered",
+)
 
 
 def _run(provider, **kwargs):

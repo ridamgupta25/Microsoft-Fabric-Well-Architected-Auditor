@@ -83,7 +83,7 @@ Risk Register).
 
 ```powershell
 cd backend
-..\.venv\Scripts\python.exe -m pytest      # 192 passed, fully offline against a recorded test fixture
+..\.venv\Scripts\python.exe -m pytest      # 189 passed, 7 skipped, fully offline against a recorded test fixture
 ```
 
 ---
@@ -116,24 +116,24 @@ the work runs in the background, because a tenant-wide run can take minutes.
 
 ## What it checks
 
-**164 checks** across seven pillars — 64 verified today (`automated`), 16
-self-assessed (`interactive`, Azure Well-Architected Review style), and 84
-automatable-but-pending (`roadmap`).
+**148 checks** across seven pillars — 64 verified today (`automated`) and 84
+automatable-but-pending (`roadmap`). The self-assessed (`interactive`) questionnaire
+machinery remains, but no interactive points are registered today.
 
 | Scope | Checks | Examples |
 |-------|-------:|----------|
-| **Workspace** | 123 | naming, roles via security groups, least-privilege admins, guest access, sensitivity labels, Git, deployment pipeline, capacity, orphaned items, layer content / separation, inventory, self-assessed governance/DR/cost points |
+| **Workspace** | 107 | naming, roles via security groups, least-privilege admins, guest access, sensitivity labels, Git, deployment pipeline, capacity, orphaned items, layer content / separation, inventory |
 | **Pipeline** | 12 | naming, descriptions, parameterization, retry, on-failure path, failure notification, timeouts, no hardcoded secrets |
 | **Notebook** | 29 | Delta MERGE / OPTIMIZE / VACUUM / Z-ORDER / V-ORDER, table properties, retention, Spark env & pinned libraries, shuffle / cache / repartition, `SELECT *` |
 
 | Pillar | Checks |
 |--------|-------:|
-| Data Management & Quality | 56 |
-| Operations & Reliability | 36 |
-| Performance & Capacity | 25 |
-| Security | 19 |
-| Cost & Resource Optimization | 17 |
-| Governance & Compliance | 10 |
+| Data Management & Quality | 53 |
+| Operations & Reliability | 33 |
+| Performance & Capacity | 23 |
+| Security | 16 |
+| Cost & Resource Optimization | 15 |
+| Governance & Compliance | 7 |
 | Foundation (informational, unscored) | 1 |
 
 Lakehouse / Delta storage, semantic models, and Eventhouse are not yet

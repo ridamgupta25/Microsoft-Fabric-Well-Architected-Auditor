@@ -5,8 +5,8 @@ the working audit logic** — this was a restructure, not a rewrite.
 
 > **Historical record.** This page describes the original Flask → FastAPI
 > migration, when the tool had **20 checks** under `core/checks/`. The codebase
-> has since grown to **164 checks** under `core/check/<pillar>/<layer>/` across
-> seven pillars (including 16 interactive, self-assessed points), plus an on-disk
+> has since grown to **148 checks** under `core/check/<pillar>/<layer>/` across
+> seven pillars, plus an on-disk
 > knowledge-base cache. Figures and paths below are preserved as they were at
 > migration time; see [architecture.md](architecture.md) and
 > [checks.md](checks.md) for the current state.

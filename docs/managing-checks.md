@@ -237,9 +237,9 @@ To review coverage without running anything:
 
    | You changed | Update in |
    |---|---|
-   | **Any** check added/removed | `checks_registered == …` in `backend/tests/test_api.py` |
+   | **Any** check added/removed | Nothing for `checks_registered` — `backend/tests/test_api.py` asserts `== len(REGISTRY)`, which self-adjusts |
    | An **automated** check | the automated count `== 64` in `backend/tests/test_engine.py`; `EXPECTED_OVERALL`, `EXPECTED_SCORED_CHECKS`, `EXPECTED_RESULT_ROWS` in `backend/tests/conftest.py` (the score/row counts shift) |
-   | An **interactive** check | the interactive count `== 16` in `backend/tests/test_engine.py` (the automated score is **unchanged** — the engine skips it) |
+   | An **interactive** check | the interactive count `== 0` in `backend/tests/test_engine.py` (the automated score is **unchanged** — the engine skips it) |
 
    Then lint: `..\.venv\Scripts\python.exe -m ruff check src`.
 

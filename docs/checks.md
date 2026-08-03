@@ -32,13 +32,13 @@ name, object name, and the remediation lookup — comes from the registered
 
 ## Catalog
 
-**164 checks** live under [`core/check/<pillar>/<layer>/`](../backend/src/auditfast/core/check/),
+**148 checks** live under [`core/check/<pillar>/<layer>/`](../backend/src/auditfast/core/check/),
 split into four module kinds per pillar × layer:
 
 | Module | Automation | Meaning |
 |--------|-----------|---------|
 | `automated.py` | `automated` | Verified now from data the provider fetches — **64** checks |
-| `questionnaire.py` | `interactive` | **Self-assessed** — the reviewer answers a scored question during the audit (Azure Well-Architected Review style); registered with `questionnaire_check(...)` — **16** checks |
+| `questionnaire.py` | `interactive` | **Self-assessed** — the reviewer answers a scored question during the audit (Azure Well-Architected Review style); registered with `questionnaire_check(...)` — **0** checks today (machinery intact; the 16 original points were removed) |
 | `roadmap.py` | `roadmap` | Automatable, but needs a Fabric API not yet called — reported as an attestation and **generated** (**84** checks; see *Promoting* below) |
 | `manual.py` | `manual` | Never machine-verifiable — a legal / process / judgement attestation (**0** today) |
 
@@ -46,19 +46,19 @@ split into four module kinds per pillar × layer:
 
 | Pillar | Checks |
 |--------|-------:|
-| Data Management & Quality | 56 |
-| Operations & Reliability | 36 |
-| Performance & Capacity | 25 |
-| Security | 19 |
-| Cost & Resource Optimization | 17 |
-| Governance & Compliance | 10 |
+| Data Management & Quality | 53 |
+| Operations & Reliability | 33 |
+| Performance & Capacity | 23 |
+| Security | 16 |
+| Cost & Resource Optimization | 15 |
+| Governance & Compliance | 7 |
 | Foundation (informational, unscored) | 1 |
 
 ### By scope
 
 | Scope | Checks | Examples |
 |-------|-------:|----------|
-| `workspace` | 123 | naming, roles via security groups, least-privilege admins, sensitivity labels, capacity assigned, Git enabled, deployment pipeline, orphaned items, layer content / separation, inventory, the 16 self-assessed governance / DR / cost / data-quality points |
+| `workspace` | 107 | naming, roles via security groups, least-privilege admins, sensitivity labels, capacity assigned, Git enabled, deployment pipeline, orphaned items, layer content / separation, inventory |
 | `pipeline` | 12 | naming, descriptions, parameterization, retry policy, on-failure path, failure notification, timeouts, no hardcoded secrets |
 | `notebook` | 29 | Delta MERGE / OPTIMIZE / VACUUM / Z-ORDER / V-ORDER, table properties, retention, Spark env & pinned libraries, shuffle / cache / repartition, `SELECT *` |
 
@@ -122,6 +122,10 @@ same as *"this is not configured"*.
 ---
 
 ## Interactive (self-assessed) checks
+
+> **None are registered today.** The 16 original questionnaire points were
+> removed; the machinery below remains, so re-adding a `questionnaire_check`
+> brings them back.
 
 Some Well-Architected points can't be read from a workspace — whether a
 disaster-recovery plan has actually been restore-tested, whether a cost review

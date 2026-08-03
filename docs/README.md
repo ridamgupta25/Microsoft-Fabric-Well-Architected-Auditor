@@ -57,7 +57,7 @@ flowchart LR
 | Domain | Pure Python — no framework dependency |
 | Auth | MSAL, read-only delegated Entra scopes |
 | Reports | openpyxl (Excel), Markdown |
-| Tests | pytest + FastAPI TestClient — 192, fully offline |
+| Tests | pytest + FastAPI TestClient — 189 passing (7 skipped), fully offline |
 
 Three adapters sit over one service layer: the **REST API**, the **CLI**, and an
 **MCP server**. They cannot disagree, because there is one implementation with
@@ -67,18 +67,18 @@ three front doors.
 
 ## Current coverage
 
-**164 checks** — 64 verified today (`automated`), 16 self-assessed (`interactive`,
-Azure Well-Architected Review style), 84 automatable-but-not-yet (`roadmap`),
-across seven pillars.
+**148 checks** — 64 verified today (`automated`), 84 automatable-but-not-yet (`roadmap`),
+across seven pillars. The self-assessed (`interactive`) questionnaire machinery
+remains, but no interactive points are registered today.
 
 | Pillar | Checks |
 |--------|-------:|
-| Data Management & Quality | 56 |
-| Operations & Reliability | 36 |
-| Performance & Capacity | 25 |
-| Security | 19 |
-| Cost & Resource Optimization | 17 |
-| Governance & Compliance | 10 |
+| Data Management & Quality | 53 |
+| Operations & Reliability | 33 |
+| Performance & Capacity | 23 |
+| Security | 16 |
+| Cost & Resource Optimization | 15 |
+| Governance & Compliance | 7 |
 | Foundation (informational, unscored) | 1 |
 
 Automated today: workspace-level, Data Pipeline, and Spark/Delta **notebook**
