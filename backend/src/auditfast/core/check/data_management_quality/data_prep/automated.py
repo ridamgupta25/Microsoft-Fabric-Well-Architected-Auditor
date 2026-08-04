@@ -88,7 +88,9 @@ _NB_SECRETS = [
     re.compile(r"\.database\.windows\.net", re.IGNORECASE),
 ]
 _WILDCARD_IMPORT = re.compile(r"^\s*from\s+[\w.]+\s+import\s+\*", re.MULTILINE)
-_DISPLAY_CALL = re.compile(r"(?:^|\W)(?:display|\w+\.show)\s*\(")
+# A standalone ``display(...)`` or a ``.show(...)``/``.display(...)`` chained on any
+# receiver — including ``spark.sql(\"...\").show()`` where a ``)`` precedes ``.show``.
+_DISPLAY_CALL = re.compile(r"(?:^|[^\w.])display\s*\(|\.(?:show|display)\s*\(")
 _WIDE_CALL = re.compile(r"\.(?:collect|toPandas)\s*\(|\.count\s*\(\s*\)")
 
 
@@ -157,16 +159,54 @@ def nb_no_wide_calls(ctx: CheckContext) -> Verdict:
 _IMPORT_STMT = re.compile(r"^\s*(?:import|from)\s+[\w.]", re.MULTILINE)
 _FUNC_DEF = re.compile(r"^\s*def\s+\w+\s*\(", re.MULTILINE)
 _RDD_API = re.compile(r"\.rdd\b|sc\.parallelize\s*\(|\.mapPartitions\s*\(")
-_UDF_DEF = re.compile(r"@udf\b|\budf\s*\(|\.udf\s*\(", re.IGNORECASE)
+# A Python UDF definition/registration: the ``@udf`` / ``@F.udf`` / ``@pandas_udf``
+# decorator, an ``udf(...)`` / ``pandas_udf(...)`` construction, ``F.udf(...)``, or a
+# ``spark.udf.register(...)`` / ``sqlContext.udf.register(...)`` registration.
+_UDF_DEF = re.compile(
+    r"@(?:\w+\.)?(?:pandas_)?udf\b"
+    r"|\b(?:pandas_)?udf\s*\("
+    r"|\.udf\s*\("
+    r"|\budf\.register\s*\(",
+    re.IGNORECASE,
+)
 _SPARK_SQL = re.compile(r"spark\.sql\s*\(|%%?sql\b", re.IGNORECASE)
 _DATAFRAME_OP = re.compile(r"spark\.(?:read|table)\b|\.groupBy\s*\(|\.withColumn\s*\(|createDataFrame\s*\(")
 _EXTERNAL_READ = re.compile(r"\.read\b[^\n]*(?:csv|json|format\s*\(\s*[\"'](?:csv|json))", re.IGNORECASE)
 _SCHEMA_DEFINED = re.compile(r"\.schema\s*\(|StructType\s*\(|inferSchema", re.IGNORECASE)
 _JOIN_CALL = re.compile(r"\.join\s*\(")
 _BROADCAST = re.compile(r"broadcast\s*\(", re.IGNORECASE)
-_TIMEOUT_HINT = re.compile(r"timeout|max_?runtime|session\.?timeout", re.IGNORECASE)
 _NB_NAME_OK = re.compile(r"^[A-Za-z][A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)+$")
 _NB_NAME_BAD = re.compile(r"^(?:notebook|untitled|test|temp|copy of)\b", re.IGNORECASE)
+
+
+def _timeout_value_is_positive(value: object) -> bool:
+    """A timeout value that actually bounds a run: a positive number or a non-zero
+    duration string. ``0`` / ``False`` / ``""`` / an all-zero duration mean "unset"."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return value > 0
+    if isinstance(value, str):
+        return any(ch.isdigit() and ch != "0" for ch in value)
+    return False
+
+
+def _has_positive_timeout(node: object) -> bool:
+    """True when any nested metadata key naming a timeout carries a positive value.
+
+    Only dict *keys* named like a timeout are inspected (not free-text values), so
+    the word "timeout" appearing in a cell's output or a traceback cannot satisfy it.
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if (isinstance(key, str) and "timeout" in key.lower()
+                    and _timeout_value_is_positive(value)):
+                return True
+            if _has_positive_timeout(value):
+                return True
+    elif isinstance(node, list):
+        return any(_has_positive_timeout(item) for item in node)
+    return False
 
 
 @check(
@@ -236,10 +276,20 @@ def nb_name(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_timeout(ctx: CheckContext) -> Verdict:
-    """A timeout / max-runtime guards against runaway Spark sessions."""
-    ok = bool(_TIMEOUT_HINT.search(json.dumps(ctx.obj)))
-    return binary(ok, "Timeout / max-runtime setting present" if ok
-                  else "No execution timeout configured (runaway-session risk)")
+    """An explicit, positive execution/session timeout guards runaway Spark sessions.
+
+    Fabric always emits ``sessionKeepAliveTimeout`` in notebook metadata and
+    applies a *default* session timeout that the definition does not expose, so a
+    missing or ``0`` value is neither demonstrably compliant nor a failure — it is
+    reported N/A. Only an explicit positive timeout in the metadata is a PASS.
+    """
+    metadata = (ctx.obj or {}).get("metadata") or {}
+    if _has_positive_timeout(metadata):
+        return binary(True, "Explicit positive execution/session timeout configured")
+    return not_applicable(
+        "No explicit positive execution timeout in the notebook definition; "
+        "Fabric's default session timeout applies and cannot be verified from code"
+    )
 
 
 @check(

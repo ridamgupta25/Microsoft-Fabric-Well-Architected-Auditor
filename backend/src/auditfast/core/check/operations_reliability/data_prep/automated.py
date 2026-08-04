@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 
-from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities
+from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities, walk_activities
 from auditfast.core.check.helpers import Verdict, binary, covered, not_applicable
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Pillar, Resource, Scope, Severity
@@ -16,7 +16,12 @@ from auditfast.core.models import CheckContext
 #: Timeout values Fabric/ADF apply by default — i.e. "nobody set this".
 DEFAULT_TIMEOUTS = frozenset({"7.00:00:00", "0.12:00:00", "7.00:00", ""})
 
-NOTIFY_TYPES = frozenset({"Teams", "Office365Outlook", "SendEmail", "WebHook"})
+#: Activity types that ARE a notification (Teams / email / webhook / Data Activator).
+NOTIFY_TYPES = frozenset({"Teams", "Office365Outlook", "Outlook365", "SendEmail", "WebHook"})
+#: Generic call activities that only count as a notifier when their *name* says so —
+#: a Web/Function activity named "Send_Teams_Alert" posts to a webhook, but a Copy or
+#: Lookup that merely contains "email" in its name does not.
+NOTIFY_CALL_TYPES = frozenset({"Web", "WebActivity", "AzureFunctionActivity", "Function"})
 NOTIFY_NAME_RE = re.compile(r"notif|alert|email|teams", re.IGNORECASE)
 
 
@@ -55,11 +60,22 @@ def failure_path(ctx: CheckContext) -> Verdict:
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def failure_notification(ctx: CheckContext) -> Verdict:
-    """Someone is told when the pipeline fails — Teams, email, or Data Activator."""
-    has_notify = any(
-        a.get("type") in NOTIFY_TYPES or NOTIFY_NAME_RE.search(a.get("name", ""))
-        for a in activities(ctx.obj)
-    )
+    """Someone is told when the pipeline fails — Teams, email, or Data Activator.
+
+    A notifier is a Teams/Outlook/email/webhook activity, or a generic Web/Function
+    call whose own name marks it as one. Container activities (If Condition,
+    ForEach, Switch, Until) are searched too, so a notifier nested inside an
+    ``If Condition`` still counts. A Copy/Lookup that merely has "email" in its
+    name is not treated as a notifier.
+    """
+    def is_notifier(activity: dict) -> bool:
+        activity_type = activity.get("type")
+        if activity_type in NOTIFY_TYPES:
+            return True
+        return (activity_type in NOTIFY_CALL_TYPES
+                and bool(NOTIFY_NAME_RE.search(activity.get("name", ""))))
+
+    has_notify = any(is_notifier(a) for a in walk_activities(ctx.obj))
     return binary(has_notify, "A notification activity is present" if has_notify
                   else "No notification activity found")
 

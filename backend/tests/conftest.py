@@ -43,9 +43,10 @@ FIXTURE_SETTINGS = {
 
 #: The overall score the recorded tenant must produce. Pinned to the value the
 #: engine returns for the fixture, so any change to a check, a band, or the
-#: roll-up fails loudly here.
-EXPECTED_OVERALL = 52.33333333333333
-EXPECTED_SCORED_CHECKS = 100
+#: roll-up fails loudly here. The fixture notebook sets no explicit timeout, so
+#: NB-TIMEOUT is N/A (not a false FAIL) — hence 99 scored checks, not 100.
+EXPECTED_OVERALL = 52.861952861952865
+EXPECTED_SCORED_CHECKS = 99
 EXPECTED_RESULT_ROWS = 212
 
 #: A session id the auth-service patch below always resolves to a token.
