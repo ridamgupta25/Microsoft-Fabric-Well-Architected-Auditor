@@ -95,6 +95,22 @@ def test_no_installs_is_na():
     assert v.status is Status.NA
 
 
+def test_bare_pip_install_is_scored_not_na():
+    """A bare `pip install` (no magic) must be evaluated for pinning, not skipped as N/A."""
+    v = spark_libpin(_ctx(_nb("pip install azure-kusto-data azure-identity")))
+    assert v.score == 0  # both unpinned
+
+
+def test_wheel_url_install_is_flagged_unpinned():
+    v = spark_libpin(_ctx(_nb("%pip install https://aka.ms/chat_magics-0.0.0-py3-none-any.whl")))
+    assert v.score == 0
+
+
+def test_subprocess_pip_install_is_flagged():
+    v = spark_libpin(_ctx(_nb('subprocess.run(["-m", "pip", "install", "build"])')))
+    assert v.score == 0
+
+
 # -- SPARK-ENV -----------------------------------------------------------------
 
 def test_inline_pip_is_flagged():

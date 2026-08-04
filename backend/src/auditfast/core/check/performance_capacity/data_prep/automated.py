@@ -167,6 +167,15 @@ def spark_libpin(ctx: CheckContext) -> Verdict:
     code = notebook_code(ctx.obj)
     targets = pip_targets(code)
     if not targets:
+        # An install is present but no package spec could be parsed — a wheel/VCS
+        # URL, a bare-shell/subprocess pip call. None of those pin a reproducible
+        # version, so flag rather than skip (SPARK-ENV sees the same installs).
+        if _spark.has_inline_install(code):
+            return graded(
+                0, "Installs libraries inline but not via a pinned '==' version "
+                "(wheel URL / VCS / bare-shell or subprocess pip) — pin an explicit "
+                "version for reproducible builds"
+            )
         return not_applicable("Notebook installs no libraries inline")
     unpinned = unpinned_targets(code)
     return covered(
