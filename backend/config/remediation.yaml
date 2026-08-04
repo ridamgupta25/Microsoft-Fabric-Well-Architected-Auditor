@@ -4,7 +4,7 @@
 # A missing key is not an error: the finding simply renders with an empty
 # recommendation column. Every ref used by a check should therefore appear here.
 "1.1.2": "Align the workspace with its layer role: move items that belong to another layer into that layer's workspace, and make sure this one holds the item types its role calls for."
-"1.1.7": "Rename the workspace to follow the org convention <Domain>-<Env>-<Project> (e.g., Sales-Prod-DataPrep)."
+"1.1.7": "Name promotable workspaces with an environment tier — Dev, UAT, or Prod (only the tiers you use; a lone UAT is fine). Workspaces without a tier should read as their purpose instead: include 'Reporting' in the name of a reporting-only workspace, while a shared data / lakehouse workspace needs no tier. Keep the name internally consistent too: use one separator style (don't mix spaces with underscores) and clean per-word casing (avoid garbled casing like 'aRIGFHG')."
 "6.1.2": "Assign workspace roles to Microsoft Entra security groups instead of named individuals; move the listed users into an appropriate group."
 "6.1.8": "Reduce the number of Admin grants to the minimum required; prefer Contributor/Viewer and use security groups."
 "6.1.3": "Run automation (pipelines, deployments) under a service principal or managed identity granted a workspace role, rather than personal accounts."
