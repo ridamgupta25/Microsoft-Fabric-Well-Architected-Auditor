@@ -44,7 +44,7 @@ def test_parse_tmsl_extracts_measures_and_relationships():
 
 
 def test_parse_tmsl_tolerates_bare_model_and_garbage():
-    assert parse_tmsl({}) == {"tables": [], "measures": [], "relationships": []}
+    assert parse_tmsl({}) == {"tables": [], "measures": [], "relationships": [], "roles": []}
     # A bare model object (no "model" envelope) still parses.
     assert parse_tmsl({"tables": [{"name": "T", "measures": []}]})["tables"] == ["T"]
     # Non-dict input degrades to empty rather than raising.

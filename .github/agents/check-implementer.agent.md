@@ -162,16 +162,118 @@ DO NOT access any field not listed here.
 ### Pipeline definition (`ctx.obj` when `Scope.PIPELINE`)
 A dict with `properties.activities` (list of activity dicts). Each activity has:
 - `name`, `type`, `description`, `dependsOn` (list), `policy` (dict with `retry`, `retryIntervalInSeconds`, `timeout`)
+- `typeProperties` (dict — varies by activity type, see full schema below)
 Use the shared helper: `activities(ctx.obj) -> list[dict]`
+
+**Full pipeline activity structure** (from `getDefinition` → `pipeline-content.json`):
+```
+properties:
+  description: str
+  parameters: dict[str, {type, defaultValue}]
+  activities: list of:
+    name: str
+    type: str  (TridentNotebook | Copy | Lookup | GetMetadata | ForEach |
+                IfCondition | Switch | Until | Wait | Fail | SetVariable |
+                AppendVariable | ExecutePipeline | SparkJobDefinition |
+                Script | WebActivity | PBISemanticModelRefresh | Delete |
+                Filter | InvokePipeline | Teams | Web)
+    description: str
+    dependsOn: [{activity, dependencyConditions: [Succeeded|Failed|Completed|Skipped]}]
+    policy: {retry, retryIntervalInSeconds, timeout, secureInput, secureOutput}
+    typeProperties: (varies by type — e.g. source/sink for Copy, notebookId for TridentNotebook,
+                     scripts[].text for Script, url/method/body for WebActivity)
+```
 
 ### Notebook definition (`ctx.obj` when `Scope.NOTEBOOK`)
 An ipynb-style dict with `cells` (list). Each cell has:
-- `cell_type` (`"code"` or `"markdown"`), `source` (str or list[str]), `metadata.tags` (list)
+- `cell_type` (`"code"` or `"markdown"`), `source` (str or list[str]), `metadata` (dict)
+- `metadata.tags` (list — e.g. `["parameters"]`)
+- `metadata.language` (str — per-cell language override if any)
 Use shared helpers: `notebook_code(ctx.obj) -> str`, `has_parameters_cell(ctx.obj) -> bool`, `markdown_sources(ctx.obj) -> list[str]`
+
+**Full notebook structure** (from `getDefinition?format=ipynb` → `notebook-content.ipynb`):
+```
+nbformat: 4
+nbformat_minor: 5
+metadata:
+  language_info: {name: "python"|"scala"|"r"|"sql"}
+  kernel_info: {name: str}
+  trident: {lakehouse: {known_lakehouses: [...]}}
+cells: list of:
+  cell_type: "code" | "markdown"
+  source: str | list[str]  (cell content — code or markdown text)
+  metadata:
+    tags: list[str]  (e.g. ["parameters"] for parameterized cells)
+  outputs: list  (execution outputs, usually empty in definitions)
+  execution_count: int | null
+```
+
+**What you can detect from notebook code** (via `notebook_code(ctx.obj)` → concatenated source):
+- Magic commands: `%%sql`, `%%spark`, `%%pyspark`, `%%sparkr`, `%%configure`
+- Spark operations: `spark.read`, `spark.table`, `spark.sql`, `.write`, `.saveAsTable`
+- Delta operations: `MERGE INTO`, `OPTIMIZE`, `VACUUM`, `ZORDER`, `DESCRIBE HISTORY`
+- Package installs: `%pip install`, `!pip install`, `%%configure` with jars
+- Secrets/credentials: hardcoded keys, connection strings, tokens
+- notebookutils: `notebookutils.credentials`, `notebookutils.notebook.run`, `mssparkutils`
+- DataFrame operations: `collect()`, `toPandas()`, `display()`, `show()`, `broadcast()`
+- Imports: `from x import *`, specific library imports
+- Configuration: `spark.conf.set(...)`, `spark.sql.shuffle.partitions`
+
+### Semantic model definition (`ctx.workspace.semantic_models[name]`)
+A dict parsed from TMSL (`model.bim`) by `parse_tmsl()`:
+```
+tables: list[str]  (table names in the model)
+measures: list of:
+  name: str
+  table: str  (parent table)
+  expression: str  (DAX expression)
+  description: str
+  is_hidden: bool
+  format_string: str
+relationships: list of:
+  name: str
+  from_table: str, from_column: str
+  to_table: str, to_column: str
+  cross_filter: str  ("oneDirection" | "bothDirections" | "")
+  is_active: bool
+roles: list of:  (RLS/OLS definitions)
+  name: str  (role name)
+  model_permission: str  ("read" | "")
+  table_permissions: list of:
+    table: str  (table the filter applies to)
+    filter: str  (DAX filter expression)
+    column_permissions: list of:
+      column: str
+      permission: str  ("none" | "read" | "")
+```
 
 ### Table schema (`ctx.workspace.tables[name]`)
 A dict with `type` (`"Managed"` or `"External"`), `format` (`"Delta"` etc.), `columns` (list of `{"name": ..., "type": ...}`)
 Use shared helpers: `columns(t)`, `col_names(t)`, `is_snake_case(n)`, `is_fact(n)`, `is_dimension(n)`
+
+### Shortcuts (`ctx.workspace.shortcuts[lakehouse_name]`)
+A list of dicts, each with:
+- `name: str` — shortcut name
+- `path: str` — mount path (e.g. `/Tables/dbo`)
+- `target_type: str` — where it points (`OneLake`, `AdlsGen2`, `AmazonS3`, etc.)
+
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 4b — FABRIC SKILLS REFERENCE (domain knowledge for research)
+# ═══════════════════════════════════════════════════════════════════
+
+When you need to understand what Fabric supports or what a definition contains beyond what's listed above, consult these files in `fabric-skills/common/`:
+
+| File | Use when |
+|------|----------|
+| `ITEM-DEFINITIONS-CORE.md` | Understanding raw definition envelope, part paths, format options for any item type |
+| `SPARK-NOTEBOOK-AUTHORING-CORE.md` | Notebook languages, magic commands, notebookutils API, Spark patterns, lakehouse paths |
+| `SPARK-AUTHORING-CORE.md` | Spark SQL syntax, Delta Lake operations, table management, optimization |
+| `SPARK-CONSUMPTION-CORE.md` | Reading/querying Spark data, performance patterns |
+| `SPARK-MONITORING-CORE.md` | Spark job monitoring, metrics, session management |
+| `COMMON-CORE.md` | Workspace operations, item CRUD, capacity, deployment pipelines |
+| `COMMON-CLI.md` | CLI patterns for Fabric REST calls |
+
+**When to read these:** If the user asks for a check about something not yet in PHASE 4 (e.g. a new artifact field, an API surface you haven't seen), read the relevant fabric-skills file FIRST to confirm the data actually exists in the definition before telling the user it's unavailable. The data may already be fetched but not yet surfaced in `parse_tmsl` or similar parsers — in that case, extend the parser.
 
 # ═══════════════════════════════════════════════════════════════════
 # PHASE 5 — SHARED DETECTORS (import these, never re-implement)
@@ -396,7 +498,7 @@ USER GIVES: "Notebooks should not use SELECT *"
 # ANTI-HALLUCINATION RULES
 # ═══════════════════════════════════════════════════════════════════
 
-1. **NEVER invent a `ctx.workspace` field** not listed in PHASE 4. If you need data not there, tell the user it's not available and suggest a `roadmap` attestation.
+1. **NEVER invent a `ctx.workspace` field** not listed in PHASE 4. If you need data not there, check `fabric-skills/common/ITEM-DEFINITIONS-CORE.md` to see if the raw definition contains it. If it does, extend the parser (e.g. `parse_tmsl` in `clients/tmsl.py`). If it truly doesn't exist in any Fabric API, tell the user and suggest a `roadmap` attestation.
 2. **NEVER invent a `Resource` enum value.** Only the 9 values in PHASE 2 exist.
 3. **NEVER invent Item/RoleAssignment fields.** Only the fields listed in PHASE 4 exist.
 4. **ALWAYS read the target file before editing** — check what imports already exist.
@@ -404,3 +506,4 @@ USER GIVES: "Notebooks should not use SELECT *"
 6. **ALWAYS read the test files before updating counts** — get the current values.
 7. **ALWAYS run the validation commands** — do not skip or assume they pass.
 8. **If unsure about anything, read the actual source file** rather than guessing.
+9. **If the data is in the raw definition but not parsed** — extend the relevant parser (`tmsl.py`, notebook/pipeline `_definition` methods in `clients/live.py`) and add the field to the fixture. Do NOT tell the user it's impossible.

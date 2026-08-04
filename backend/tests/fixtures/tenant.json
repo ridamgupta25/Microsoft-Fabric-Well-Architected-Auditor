@@ -123,6 +123,10 @@
         "dim_customer": { "type": "Managed", "format": "Delta", "columns": [ { "name": "customer_sk", "type": "bigint" }, { "name": "customer_id", "type": "string" }, { "name": "name", "type": "string" }, { "name": "valid_from", "type": "timestamp" }, { "name": "valid_to", "type": "timestamp" }, { "name": "is_current", "type": "boolean" }, { "name": "created_date", "type": "timestamp" } ] },
         "dim_date": { "type": "Managed", "format": "Delta", "columns": [ { "name": "date_sk", "type": "int" }, { "name": "full_date", "type": "date" }, { "name": "fiscal_year", "type": "int" }, { "name": "quarter", "type": "int" } ] },
         "StagingTemp": { "type": "External", "format": "Parquet", "columns": [ { "name": "col1", "type": "string" }, { "name": "load_dt", "type": "string" } ] }
+      },
+      "semanticModels": {
+        "SM_Sales": { "tables": ["Sales", "Date"], "measures": [], "relationships": [], "roles": [{ "name": "US Sales", "model_permission": "read", "table_permissions": [{ "table": "Geography", "filter": "[Country] = \"US\"", "column_permissions": [{"column": "SSN", "permission": "none"}] }] }] },
+        "SM_Finance": { "tables": ["Finance"], "measures": [], "relationships": [], "roles": [] }
       }
     },
     {
