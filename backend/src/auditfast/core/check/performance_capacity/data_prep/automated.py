@@ -147,10 +147,11 @@ def delta_retention(ctx: CheckContext) -> Verdict:
 def spark_env(ctx: CheckContext) -> Verdict:
     """Dependencies come from a Fabric Environment, not inline ``%pip`` installs."""
     code = notebook_code(ctx.obj)
-    installs = pip_targets(code)
-    if installs:
+    if _spark.has_inline_install(code):
+        count = len(pip_targets(code))
+        what = f"{count} package(s)" if count else "package(s)"
         return graded(
-            1, f"Installs {len(installs)} package(s) inline (%pip/!pip); prefer a "
+            1, f"Installs {what} inline (%pip/!pip/pip install/wheel URL); prefer a "
             "Fabric Environment for shared, reproducible dependencies"
         )
     return binary(True, "No inline library installs; consistent with Environment-managed dependencies")

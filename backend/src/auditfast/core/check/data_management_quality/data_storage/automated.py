@@ -99,8 +99,11 @@ def table_date_dimension(ctx: CheckContext) -> Verdict:
     tables = ctx.workspace.tables
     if not tables:
         return not_applicable(_NO_TABLES)
-    found = any(is_dimension(n) and ("date" in n.lower() or "calendar" in n.lower())
-                for n in tables)
+    found = any(
+        ("date" in n.lower() or "calendar" in n.lower())
+        and (is_dimension(n) or "dim" in n.lower() or "calendar" in n.lower())
+        for n in tables
+    )
     return binary(found, "A date/time dimension table exists" if found
                   else "No date/time dimension table found")
 

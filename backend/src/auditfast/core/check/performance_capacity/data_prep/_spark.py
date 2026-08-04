@@ -33,7 +33,11 @@ SEQ_DELETE = re.compile(r"\bDELETE\s+FROM\b", re.IGNORECASE)
 SEQ_INSERT = re.compile(r"\bINSERT\s+(?:INTO|OVERWRITE)\b|insertInto", re.IGNORECASE)
 
 # -- Delta maintenance ---------------------------------------------------------
-OPTIMIZE = re.compile(r"\bOPTIMIZE\b|\.optimize\s*\(", re.IGNORECASE)
+# The Delta ``OPTIMIZE`` SQL command (``OPTIMIZE <table>`` — a table token must
+# follow the keyword) or the ``deltaTable.optimize()`` Python API. Requiring a
+# table token after ``OPTIMIZE`` stops the English word "Optimize" in a string or
+# comment (e.g. the MCEM level "Manage and Optimize") from matching.
+OPTIMIZE = re.compile(r'\bOPTIMIZE\s+[`\w]|\.optimize\s*\(', re.IGNORECASE)
 VACUUM = re.compile(r"\bVACUUM\b|\.vacuum\s*\(", re.IGNORECASE)
 ZORDER = re.compile(r"ZORDER\s+BY|\.zorderBy\s*\(|executeZOrderBy", re.IGNORECASE)
 VORDER = re.compile(
@@ -50,6 +54,16 @@ RETENTION = re.compile(
 
 # -- Spark tuning / hygiene ----------------------------------------------------
 PIP_INSTALL = re.compile(r"(?:%pip|!pip|%conda|!conda)\s+install\s+([^\n#]+)", re.IGNORECASE)
+# ANY inline dependency install — broader than PIP_INSTALL (which only yields
+# parseable package specs for SPARK-LIBPIN). Also catches wheel-URL / VCS installs
+# and bare-shell / ``subprocess`` / ``-m pip`` invocations that carry no package name.
+INLINE_INSTALL = re.compile(
+    r"(?:%pip|!pip|%conda|!conda)\s+install\b"
+    r"|(?<![.\w])pip\s+install\b"
+    r"|-m\s+pip\s+install\b"
+    r"|(?:subprocess\.\w+|os\.system)\s*\([^)]*\bpip\b[^)]*\binstall\b",
+    re.IGNORECASE,
+)
 SPARK_CONF = re.compile(
     r"spark\.conf\.set\s*\(|\.config\s*\(\s*[\"']spark\.|SparkConf\s*\(", re.IGNORECASE
 )
@@ -69,6 +83,12 @@ _PACKAGE = re.compile(r"^[A-Za-z0-9_.\-]+(\[[^\]]+\])?([=<>!~].+)?$")
 def writes_delta(code: str) -> bool:
     """True when the notebook writes to a managed/Delta table."""
     return bool(WRITE.search(code))
+
+
+def has_inline_install(code: str) -> bool:
+    """True when the notebook installs any dependency inline (magic, shell, or
+    programmatic) — including wheel-URL / VCS targets that carry no package name."""
+    return bool(INLINE_INSTALL.search(code))
 
 
 def pip_targets(code: str) -> list[str]:
