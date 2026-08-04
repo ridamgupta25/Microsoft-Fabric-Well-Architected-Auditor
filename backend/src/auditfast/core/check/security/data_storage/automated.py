@@ -6,6 +6,10 @@ from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
 
+import re
+
+from auditfast.core.check._tables import TABLE_LAYERS, columns
+
 
 @check(
     id="WS-LABELS", ref="6.2.4", title="Sensitivity labels applied to items",
@@ -65,3 +69,60 @@ def ols_on_semantic_models(ctx: CheckContext) -> Verdict:
     ]
     return covered(len(with_ols), len(models),
                    f"{len(with_ols)} of {len(models)} semantic models define OLS/CLS column permissions")
+
+
+
+# ---------------------------------------------------------------------------
+# Dynamic Data Masking
+# ---------------------------------------------------------------------------
+
+#: Column name patterns that suggest sensitive/PII data warranting DDM.
+_SENSITIVE_PATTERNS = re.compile(
+    r"(email|phone|ssn|social_security|credit_card|card_number|account_number"
+    r"|passport|salary|wage|compensation|dob|date_of_birth|birth_date"
+    r"|national_id|tax_id|iban|bank_account|address|zip_code|postal_code)",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="WS-DDM", ref="6.2.3",
+    title="Dynamic Data Masking applied in the Warehouse for sensitive columns",
+    pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+)
+def dynamic_data_masking(ctx: CheckContext) -> Verdict:
+    """Warehouse tables apply Dynamic Data Masking on columns that hold sensitive data."""
+    if not ctx.workspace.has(Resource.TABLE_SCHEMAS):
+        return not_applicable(
+            "No lakehouse/warehouse tables were read for this workspace"
+        )
+    tables = ctx.workspace.tables
+    if not tables:
+        return not_applicable(
+            "No lakehouse/warehouse tables were read for this workspace"
+        )
+
+    sensitive_cols: list[str] = []
+    masked_cols: list[str] = []
+
+    for table_name, table in tables.items():
+        for col in columns(table):
+            col_name = (col.get("name") or "").lower()
+            if not _SENSITIVE_PATTERNS.search(col_name):
+                continue
+            qualified = f"{table_name}.{col.get('name', '')}"
+            sensitive_cols.append(qualified)
+            # DDM metadata: provider exposes masking_function when a mask is defined.
+            masking = col.get("masking_function") or col.get("data_mask")
+            if masking:
+                masked_cols.append(qualified)
+
+    if not sensitive_cols:
+        return not_applicable("No table column metadata available")
+
+    return covered(
+        len(masked_cols), len(sensitive_cols),
+        f"{len(masked_cols)} of {len(sensitive_cols)} sensitive columns "
+        f"have Dynamic Data Masking applied",
+    )
