@@ -424,3 +424,123 @@ def pl_load_mode(ctx: CheckContext) -> Verdict:
     ok = param_mode or branch
     return binary(ok, "Load mode is parameterized / branched (initial vs incremental)" if ok
                   else "No initial-vs-incremental separation (load-mode parameter or branch) found")
+
+
+# -- data quality framework checks (3.6.x) ------------------------------------
+_WRITE_PATTERN = re.compile(
+    r"\.saveAsTable\s*\(|\.write\b|INSERT\s+INTO|INSERT\s+OVERWRITE",
+    re.IGNORECASE,
+)
+_COUNT_RECONCILE = re.compile(
+    r"assert.*\.count\s*\(|\.count\s*\(\s*\)\s*[!=<>]|"
+    r"row_count|record_count|source_count|target_count|"
+    r"reconcil|recon_count|count_check|validate.*count",
+    re.IGNORECASE,
+)
+_JOIN_PATTERN = re.compile(r"(?<!['\",])\s*\.join\s*\(\s*(?![\[\]'\"])", re.IGNORECASE)
+_FK_INTEGRITY = re.compile(
+    r"left_anti|leftanti|anti.*join|"
+    r"referential|fk_check|integrity_check|"
+    r"\.isNull\s*\(\s*\).*join|join.*\.isNull\s*\(",
+    re.IGNORECASE,
+)
+_MULTI_SOURCE = re.compile(
+    r"(?:spark\.table\s*\(|spark\.read\b|\.load\s*\()", re.IGNORECASE,
+)
+_ORPHAN_DETECT = re.compile(
+    r"left_anti|leftanti|orphan|unmatched|no_parent|missing_parent|"
+    r"anti.*join.*parent|parent.*anti.*join",
+    re.IGNORECASE,
+)
+_MERGE_PATTERN = re.compile(
+    r"MERGE\s+INTO|deltaTable\s*\.\s*merge\s*\(|DeltaTable\s*\.\s*merge\s*\(",
+    re.IGNORECASE,
+)
+_MERGE_VALIDATE = re.compile(
+    r"operationMetrics|DESCRIBE\s+HISTORY|merge.*count|"
+    r"rows_inserted|rows_updated|rows_deleted|"
+    r"num_inserted|num_updated|num_deleted|"
+    r"merge_result|merge_valid|post.?merge.*count",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-RECON-COUNT", ref="3.6.1",
+    title="Record count reconciliation after writes",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_recon_count(ctx: CheckContext) -> Verdict:
+    """Notebooks that write data validate row counts against source expectations."""
+    code = notebook_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write data to a table")
+    ok = bool(_COUNT_RECONCILE.search(code))
+    return binary(ok, "Record count reconciliation present" if ok
+                  else "Writes data without record count validation")
+
+
+@check(
+    id="NB-FK-INTEGRITY", ref="3.6.2",
+    title="Referential integrity: FK values validated against lookup tables",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_fk_integrity(ctx: CheckContext) -> Verdict:
+    """Notebooks that join tables verify FK values exist in dimension/lookup tables."""
+    code = notebook_code(ctx.obj)
+    if not _JOIN_PATTERN.search(code):
+        return not_applicable("Notebook does not perform joins")
+    ok = bool(_FK_INTEGRITY.search(code))
+    return binary(ok, "Referential integrity check present" if ok
+                  else "Joins tables without FK/referential integrity validation")
+
+
+@check(
+    id="NB-CROSS-RECON", ref="3.6.3",
+    title="Cross-source reconciliation for multi-source loads",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_cross_recon(ctx: CheckContext) -> Verdict:
+    """Notebooks reading multiple sources reconcile records across them."""
+    code = notebook_code(ctx.obj)
+    sources = _MULTI_SOURCE.findall(code)
+    if len(sources) < 2:
+        return not_applicable("Notebook reads from fewer than 2 sources")
+    ok = bool(_COUNT_RECONCILE.search(code))
+    return binary(ok, "Cross-source reconciliation present" if ok
+                  else f"Reads {len(sources)} sources without cross-source reconciliation")
+
+
+@check(
+    id="NB-ORPHAN-DETECT", ref="3.6.4",
+    title="Orphan detection: child records without parents identified",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_orphan_detect(ctx: CheckContext) -> Verdict:
+    """Notebooks with joins detect orphan/unmatched child records."""
+    code = notebook_code(ctx.obj)
+    if not _JOIN_PATTERN.search(code):
+        return not_applicable("Notebook does not perform joins")
+    ok = bool(_ORPHAN_DETECT.search(code))
+    return binary(ok, "Orphan/unmatched record detection present" if ok
+                  else "Joins tables without orphan record detection")
+
+
+@check(
+    id="NB-MERGE-VALID", ref="3.6.5",
+    title="Merge result validation: post-merge counts reconciled",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_merge_valid(ctx: CheckContext) -> Verdict:
+    """Notebooks performing MERGE validate post-merge counts against I/U/D expectations."""
+    code = notebook_code(ctx.obj)
+    if not _MERGE_PATTERN.search(code):
+        return not_applicable("Notebook does not perform MERGE operations")
+    ok = bool(_MERGE_VALIDATE.search(code))
+    return binary(ok, "Post-merge result validation present" if ok
+                  else "MERGE without post-merge count/result validation")
