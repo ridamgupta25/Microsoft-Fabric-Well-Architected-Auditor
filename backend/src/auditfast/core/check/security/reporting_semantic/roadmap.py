@@ -10,12 +10,10 @@ Do not edit by hand — regenerate with build-manual-checks.py.
 """
 from auditfast.core.check._gated import Requirement, gated
 from auditfast.core.check.registry import check
-from auditfast.core.enums import Automation, Layer, Pillar, Resource, Scope
+from auditfast.core.enums import Automation, Pillar, Resource, Scope
 
 # (id, ref, title, layers, required, requirement)
 _CHECKS: list[tuple[str, str, str, tuple[str, ...], bool, str]] = [
-
-    ("R-6-2-1", "6.2.1", "Row-Level Security (RLS) implemented on Gold / Power BI semantic models", (Layer.REPORTING,), True, "ADMIN_SCANNER"),
 ]
 
 for _id, _ref, _title, _layers, _required, _requirement in _CHECKS:
