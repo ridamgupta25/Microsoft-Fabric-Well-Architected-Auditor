@@ -144,7 +144,11 @@ def test_pillar_selection_narrows_the_report(client):
     _wait_for_audit(client, audit_id)
 
     report = client.get(f"/api/v1/reports/{audit_id}").json()
-    assert {r["pillar"] for r in report["results"]} == {"Security"}
+    # Scored pillars narrow to the selection; Foundation is always-on context
+    # (item inventory) so the report's inventory section is never empty.
+    scored_pillars = {r["pillar"] for r in report["results"] if r["pillar"] != "Foundation"}
+    assert scored_pillars == {"Security"}
+    assert any(r["pillar"] == "Foundation" for r in report["results"])
 
 
 def test_unreadable_workspace_is_an_error_not_a_failing_check(client):
