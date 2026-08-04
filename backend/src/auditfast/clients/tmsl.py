@@ -65,4 +65,25 @@ def parse_tmsl(document: dict) -> dict:
             "is_active": bool(rel.get("isActive", True)),
         })
 
-    return {"tables": table_names, "measures": measures, "relationships": relationships}
+    roles: list[dict] = []
+    for role in model.get("roles") or []:
+        if not isinstance(role, dict):
+            continue
+        perms = role.get("tablePermissions") or []
+        roles.append({
+            "name": role.get("name", ""),
+            "model_permission": role.get("modelPermission", "") or "",
+            "table_permissions": [
+                {
+                    "table": p.get("name", ""),
+                    "filter": _expression(p.get("filterExpression")),
+                    "column_permissions": [
+                        {"column": cp.get("name", ""), "permission": cp.get("metadataPermission", "")}
+                        for cp in (p.get("columnPermissions") or []) if isinstance(cp, dict)
+                    ],
+                }
+                for p in perms if isinstance(p, dict)
+            ],
+        })
+
+    return {"tables": table_names, "measures": measures, "relationships": relationships, "roles": roles}

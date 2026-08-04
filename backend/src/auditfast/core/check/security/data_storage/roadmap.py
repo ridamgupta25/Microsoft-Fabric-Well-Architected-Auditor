@@ -15,7 +15,6 @@ from auditfast.core.enums import Automation, Layer, Pillar, Resource, Scope
 # (id, ref, title, layers, required, requirement)
 _CHECKS: list[tuple[str, str, str, tuple[str, ...], bool, str]] = [
 
-    ("R-6-2-2", "6.2.2", "Column-Level Security / Object-Level Security applied for sensitive fields", (Layer.STORAGE, Layer.REPORTING), True, "ADMIN_SCANNER"),
     ("R-6-2-5", "6.2.5", "OneLake data access controlled via workspace roles (not open access)", (Layer.STORAGE,), True, "ADMIN_SCANNER"),
     ("R-6-2-6", "6.2.6", "Data exfiltration controls configured (copy/export/download restrictions on sensitive workspaces)", (Layer.STORAGE,), True, "ADMIN_SCANNER"),
 ]
