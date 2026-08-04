@@ -7,6 +7,11 @@ working, so a future rewrite cannot silently reintroduce the false PASS/FAIL.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
+from auditfast.core.check.cost_resource_optimization.data_operations.automated import (
+    no_orphaned_items,
+)
 from auditfast.core.check.data_management_quality.data_prep.automated import (
     nb_no_display,
     nb_no_udf,
@@ -23,7 +28,7 @@ from auditfast.core.check.performance_capacity.data_prep.automated import (
     spark_env,
 )
 from auditfast.core.enums import Status
-from auditfast.core.models import CheckContext, WorkspaceContext
+from auditfast.core.models import CheckContext, Item, WorkspaceContext
 
 
 def _nb(code: str = "", metadata: dict | None = None) -> dict:
@@ -205,3 +210,42 @@ def test_missing_timeout_metadata_is_na():
 def test_positive_timeout_passes():
     nb = _nb(metadata={"sessionKeepAliveTimeout": 1800})
     assert nb_timeout(_ctx(nb)).score == _PASS
+
+
+# -- WS-ORPHAN -----------------------------------------------------------------
+
+def _ws_items_ctx(*items: Item) -> CheckContext:
+    ws = WorkspaceContext(id="w", items=list(items))
+    return CheckContext(workspace=ws, settings={"orphan_days": 90}, obj_name="w", obj=None)
+
+
+def test_orphan_all_missing_timestamps_is_na_not_fail():
+    """No item exposes a run/refresh timestamp -> N/A, not a 0% FAIL of every item."""
+    ctx = _ws_items_ctx(
+        Item(id="1", type="Notebook", display_name="A"),
+        Item(id="2", type="DataPipeline", display_name="B"),
+    )
+    assert no_orphaned_items(ctx).status is Status.NA
+
+
+def test_orphan_recent_items_pass():
+    now_iso = datetime.now(timezone.utc).isoformat()
+    ctx = _ws_items_ctx(Item(id="1", type="Notebook", display_name="A", last_run_utc=now_iso))
+    assert no_orphaned_items(ctx).score == _PASS
+
+
+def test_orphan_stale_item_is_flagged():
+    ctx = _ws_items_ctx(
+        Item(id="1", type="Notebook", display_name="A", last_run_utc="2000-01-01T00:00:00Z")
+    )
+    assert no_orphaned_items(ctx).score == _FAIL  # 0 of 1 fresh
+
+
+def test_orphan_scores_only_items_with_a_timestamp():
+    """An item with no timestamp is excluded, not counted as stale."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    ctx = _ws_items_ctx(
+        Item(id="1", type="Notebook", display_name="A", last_run_utc=now_iso),
+        Item(id="2", type="Notebook", display_name="B"),  # no timestamp -> excluded
+    )
+    assert no_orphaned_items(ctx).coverage == 1.0  # 1 dated item, and it is fresh

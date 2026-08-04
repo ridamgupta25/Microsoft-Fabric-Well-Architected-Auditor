@@ -53,7 +53,13 @@ RETENTION = re.compile(
 )
 
 # -- Spark tuning / hygiene ----------------------------------------------------
-PIP_INSTALL = re.compile(r"(?:%pip|!pip|%conda|!conda)\s+install\s+([^\n#]+)", re.IGNORECASE)
+# Package specs from an install command, for SPARK-LIBPIN. Matches the pip/conda
+# magics AND a bare ``pip``/``pip3`` install (which also covers ``python -m pip
+# install``, whose "pip install …" substring the bare-pip branch catches).
+PIP_INSTALL = re.compile(
+    r"(?:%pip|!pip|%conda|!conda|(?<![.\w])pip3?)\s+install\s+([^\n#]+)",
+    re.IGNORECASE,
+)
 # ANY inline dependency install — broader than PIP_INSTALL (which only yields
 # parseable package specs for SPARK-LIBPIN). Also catches wheel-URL / VCS installs
 # and bare-shell / ``subprocess`` / ``-m pip`` invocations that carry no package name.

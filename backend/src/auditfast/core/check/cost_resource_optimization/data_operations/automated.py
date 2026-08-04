@@ -22,10 +22,11 @@ def capacity_assigned(ctx: CheckContext) -> Verdict:
 
 
 def _is_stale(item: Item, *, cutoff_days: int, now: datetime) -> bool:
-    """An item is stale when it has no parseable recent run/refresh timestamp.
+    """True when the item's last run/refresh is older than the staleness window.
 
-    A missing or unreadable timestamp counts as stale: we cannot show the item is
-    in use, and unused items are the cost problem this check exists to surface.
+    Only called for items that carry a timestamp; a present-but-unparseable stamp
+    is treated as stale (a value we cannot read is suspect). A *missing* timestamp
+    is handled by the caller as N/A, not stale — unknown is not the same as unused.
     """
     stamp = item.last_run_utc
     if not stamp:
@@ -45,14 +46,28 @@ def _is_stale(item: Item, *, cutoff_days: int, now: datetime) -> bool:
     requires=[Resource.ITEMS], required=False,
 )
 def no_orphaned_items(ctx: CheckContext) -> Verdict:
-    """Every item has run or refreshed within the project's staleness window."""
+    """Items with a known run/refresh have run within the staleness window.
+
+    The Fabric List Items API does not expose a last-run/refresh timestamp, so
+    when *no* item carries one the data needed to judge staleness is unavailable
+    and the check is N/A — never a blanket FAIL of every item. "We could not read
+    when the item last ran" is not the same finding as "the item is orphaned".
+    """
     if not ctx.workspace.has(Resource.ITEMS):
         return not_applicable("Workspace items could not be read from Fabric")
+    items = ctx.workspace.items
+    dated = [i for i in items if i.last_run_utc]
+    if not dated:
+        return not_applicable(
+            f"No run/refresh timestamp is available for any of the {len(items)} "
+            "item(s) — the Fabric List Items API does not expose last-run/refresh, "
+            "so staleness cannot be assessed (needs per-item run/refresh history)"
+        )
     cutoff_days = int(ctx.setting("orphan_days", 90))
     now = datetime.now(timezone.utc)
-    items = ctx.workspace.items
-    stale = [i for i in items if _is_stale(i, cutoff_days=cutoff_days, now=now)]
+    stale = [i for i in dated if _is_stale(i, cutoff_days=cutoff_days, now=now)]
     return covered(
-        len(items) - len(stale), len(items),
-        f"{len(stale)} of {len(items)} items have no run/refresh in {cutoff_days} days",
+        len(dated) - len(stale), len(dated),
+        f"{len(stale)} of {len(dated)} item(s) with a known run/refresh are stale "
+        f"(> {cutoff_days} days)",
     )
