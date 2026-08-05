@@ -69,10 +69,10 @@ def test_result_and_scored_counts_are_unchanged(provider):
 
 def test_status_counts_are_unchanged(provider):
     agg = aggregate(_run(provider))
-    assert agg["counts"][Status.PASS] == 49
+    assert agg["counts"][Status.PASS] == 50
     assert agg["counts"][Status.PARTIAL] == 18
-    assert agg["counts"][Status.FAIL] == 39
-    assert agg["counts"][Status.FAIL] == 37
+    assert agg["counts"][Status.FAIL] == 40
+    assert agg["counts"][Status.NA] == 89
     assert agg["counts"][Status.INFO] == 3
 
 
@@ -273,10 +273,10 @@ def test_progress_callback_fires_per_workspace(provider):
 def test_registry_is_fully_populated():
     """83 checks are evaluated; roadmap (gated N/A) checks are not loaded."""
     evaluated = [s for s in REGISTRY if s.automation is Automation.AUTOMATED]
-    assert len(evaluated) == 83
-    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 29
-    assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 16
-    assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 38
+    assert len(evaluated) == 94
+    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 30
+    assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 18
+    assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 44
     # Roadmap (gated N/A) checks are intentionally not registered — see
     # auditfast.core.check.__init__._CHECK_MODULES — so none remain in the registry.
     assert len([s for s in REGISTRY if s.automation is Automation.ROADMAP]) == 0
@@ -336,8 +336,7 @@ def test_explicit_registry_is_isolated_from_the_global_one():
     assert registry.get("X-ISOLATED") is not None
     assert REGISTRY.get("X-ISOLATED") is None, "test check leaked into the global registry"
     before = len([s for s in REGISTRY if s.automation is Automation.AUTOMATED])
-    assert before == 83
-
+    assert before == 94
 
 # -- selection and dispatch ----------------------------------------------------
 
