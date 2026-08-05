@@ -591,7 +591,7 @@ _PLAIN_INSERT = re.compile(r"\bINSERT\s+INTO\b", re.IGNORECASE)
 
 
 @check(
-    id="PL-IDEMPOTENT", ref="3.6.4",
+    id="PL-IDEMPOTENT-LOAD", ref="3.6.4",
     title="Warehouse load procedures are idempotent and re-runnable",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,

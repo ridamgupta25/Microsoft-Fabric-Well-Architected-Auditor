@@ -88,11 +88,6 @@
 # Remediation is keyed by ref, so this text has to serve both — they are both
 # load-safety advice, so it reads coherently either way.
 "3.6.4": "Make the load safe to re-run and orphan-aware: write with MERGE INTO (or TRUNCATE / DELETE-by-batch followed by INSERT) so re-running cannot duplicate rows, and detect orphan child records with an anti-join, routing unmatched keys to an error table or quarantine before loading."
-# Ref 3.6.4 is claimed by two checks from two different source checklists:
-# NB-ORPHAN-DETECT (orphan child records) and PL-IDEMPOTENT (re-runnable loads).
-# Remediation is keyed by ref, so this text has to serve both — they are both
-# load-safety advice, so it reads coherently either way.
-"3.6.4": "Make the load safe to re-run and orphan-aware: write with MERGE INTO (or TRUNCATE / DELETE-by-batch followed by INSERT) so re-running cannot duplicate rows, and detect orphan child records with an anti-join, routing unmatched keys to an error table or quarantine before loading."
 "3.6.5": "After a MERGE INTO, validate the result by checking operationMetrics or DESCRIBE HISTORY to confirm inserted/updated/deleted counts match expectations."
 # -- MLC Cat-1 checklist points ------------------------------------------------
 "9.1.3": "Enable Copy activity fault tolerance (skip incompatible rows and/or skip error files) and set redirect/log settings so the skipped rows are written somewhere, or route failures to a quarantine activity. One malformed record must not fail the whole run, and skipped records must never be discarded silently."
