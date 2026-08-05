@@ -144,14 +144,15 @@ def test_progress_callback_fires_per_workspace(provider):
 
 
 def test_registry_is_fully_populated():
-    """64 checks are evaluated; every other check still runs as a gated N/A."""
+    """All 74 registered checks are automated; roadmap checks are not loaded."""
     evaluated = [s for s in REGISTRY if s.automation is Automation.AUTOMATED]
     assert len(evaluated) == 74
     assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 28
     assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 12
     assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 34
-    # The rest run as gated N/A that names the access they need — never skipped.
-    assert len([s for s in REGISTRY if s.automation is Automation.ROADMAP]) == 82
+    # Roadmap (gated N/A) checks are intentionally not registered — see
+    # auditfast.core.check.__init__._CHECK_MODULES — so none remain in the registry.
+    assert len([s for s in REGISTRY if s.automation is Automation.ROADMAP]) == 0
     # Interactive (self-assessed) checks have been removed; none remain registered.
     assert len([s for s in REGISTRY if s.automation is Automation.INTERACTIVE]) == 0
     assert all(

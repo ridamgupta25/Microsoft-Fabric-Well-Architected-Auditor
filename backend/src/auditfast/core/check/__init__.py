@@ -42,7 +42,11 @@ from .registry import (
 Option = CheckOption
 
 #: Leaf module names that carry check registrations.
-_CHECK_MODULES = {"automated", "manual", "questionnaire", "roadmap"}
+#: "roadmap" is intentionally excluded: those gated checks only ever attest N/A
+#: ("more data needed"), which is noise in the catalog and audit reports. Leaving
+#: them unloaded removes them from every surface (website, API, CLI, MCP) at once.
+#: Re-add "roadmap" here to restore them — the generated roadmap.py files remain.
+_CHECK_MODULES = {"automated", "manual", "questionnaire"}
 
 
 def _discover() -> tuple[str, ...]:
