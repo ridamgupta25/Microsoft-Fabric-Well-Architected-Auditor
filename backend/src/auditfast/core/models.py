@@ -103,6 +103,10 @@ class WorkspaceContext:
     tables: dict[str, dict] = field(default_factory=dict)
     shortcuts: dict[str, list] = field(default_factory=dict)
     semantic_models: dict[str, dict] = field(default_factory=dict)
+    #: Tenant-level Fabric connection metadata. Credentials and secrets are
+    #: never stored; TLS version and health remain unknown unless a provider
+    #: supplies explicit evidence for them.
+    connections: list[dict] = field(default_factory=list)
     #: The Git provider connection details (provider, org, repo, branch, dir) when
     #: the workspace is Git-connected — the authoritative source for item code.
     git_details: dict = field(default_factory=dict)
@@ -183,6 +187,7 @@ class WorkspaceContext:
             "tables": self.tables,
             "shortcuts": self.shortcuts,
             "semantic_models": self.semantic_models,
+            "connections": self.connections,
             "git_details": self.git_details,
             "unavailable": sorted(r.value for r in self.unavailable),
             "read_failures": self.read_failures,
@@ -205,6 +210,7 @@ class WorkspaceContext:
             tables=dict(data.get("tables", {})),
             shortcuts=dict(data.get("shortcuts", {})),
             semantic_models=dict(data.get("semantic_models", {})),
+            connections=list(data.get("connections", [])),
             git_details=dict(data.get("git_details", {})),
             unavailable={Resource(v) for v in data.get("unavailable", [])},
             read_failures=dict(data.get("read_failures", {})),
