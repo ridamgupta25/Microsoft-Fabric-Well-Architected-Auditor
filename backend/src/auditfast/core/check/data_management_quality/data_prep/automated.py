@@ -361,6 +361,27 @@ def nb_schema(ctx: CheckContext) -> Verdict:
                   else "External CSV/JSON read without an explicit schema")
 
 
+@check(
+    id="NB-LATE-ARRIVAL", ref="3.1.10",
+    title="Late-arriving changes handled without corruption",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_late_arrival(ctx: CheckContext) -> Verdict:
+    """Late or out-of-order changes use version-aware deduplication or MERGE logic."""
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = notebook_code(ctx.obj)
+    late_signal = bool(_LATE_ARRIVAL.search(code))
+    safe_write = bool(_LATE_SAFE_WRITE.search(code))
+    if not late_signal:
+        return not_applicable("No late-arrival or out-of-order handling signal found")
+    return binary(
+        safe_write,
+        "Late/out-of-order handling uses version-aware deduplication or MERGE"
+        if safe_write else
+        "Late/out-of-order handling is indicated but no version-aware duplicate-safe write was found",
+    )
 # -- pipeline load-pattern checks (2.1.3 orchestration, 2.2.x incremental) -----
 _INVOKE_TYPES = {"ExecutePipeline", "InvokePipeline"}
 _DATA_MOVE_TYPES = {"Copy", "Script", "TridentNotebook", "SqlServerStoredProcedure", "Lookup"}
@@ -370,6 +391,16 @@ _INCREMENTAL = re.compile(
     re.IGNORECASE,
 )
 _LOAD_MODE = re.compile(r"load_?type|load_?mode|is_?initial|full_?load|incremental", re.IGNORECASE)
+_LATE_ARRIVAL = re.compile(
+    r"late[_ -]?arriv|out[_ -]?of[_ -]?order|event[_ -]?time|watermark|lookback|"
+    r"sequence[_ -]?(?:number|no|id)|version[_ -]?(?:number|no|id)|effective[_ -]?date",
+    re.IGNORECASE,
+)
+_LATE_SAFE_WRITE = re.compile(
+    r"merge|upsert|dropduplicates|drop_duplicates|row_number|dedup|"
+    r"latest[_ -]?version|newer[_ -]?version|sequence|version|when[_ -]?matched",
+    re.IGNORECASE,
+)
 
 
 @check(
@@ -544,3 +575,30 @@ def nb_merge_valid(ctx: CheckContext) -> Verdict:
     ok = bool(_MERGE_VALIDATE.search(code))
     return binary(ok, "Post-merge result validation present" if ok
                   else "MERGE without post-merge count/result validation")
+
+
+@check(
+    id="PL-LATE-ARRIVAL", ref="2.2.3",
+    title="Late-arriving changes handled without corruption",
+    pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
+)
+def pl_late_arrival(ctx: CheckContext) -> Verdict:
+    """Late or out-of-order changes use a version-aware, duplicate-safe write path."""
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+    acts = activities(ctx.obj)
+    data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
+    if not data_acts:
+        return not_applicable("No data-movement activity to assess for late changes")
+    blob = json.dumps(ctx.obj)
+    late_signal = bool(_LATE_ARRIVAL.search(blob))
+    safe_write = bool(_LATE_SAFE_WRITE.search(blob))
+    if not late_signal:
+        return not_applicable("No late-arrival or out-of-order handling signal found")
+    return binary(
+        safe_write,
+        "Late/out-of-order handling uses a version-aware or duplicate-safe write pattern"
+        if safe_write else
+        "Late/out-of-order handling is indicated but no version-aware duplicate-safe write was found",
+    )

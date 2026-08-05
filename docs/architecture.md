@@ -102,6 +102,12 @@ results: one implementation, three front doors.
 | [`ai/orchestrator/`](../backend/src/auditfast/ai/orchestrator/) | Optional Azure OpenAI advisory — off unless `ai_enabled`; never in the scoring path |
 | [`mcp/server.py`](../backend/src/auditfast/mcp/server.py) | MCP tools over the same services (catalog, audit, FabricIQ) |
 
+Connection security evidence is documented in
+[TLS Evidence for Source Connections](tls-evidence.md). Fabric connection
+metadata is fetched read-only by the provider; minimum TLS evidence must come
+from the underlying source configuration or an approved probe and is never
+inferred by `core/`.
+
 ---
 
 ## 4. What happens during an audit

@@ -8,6 +8,7 @@ from __future__ import annotations
 from auditfast.core.check.registry import REGISTRY
 from auditfast.core.engine import run_audit
 from auditfast.core.enums import Automation, Layer, Pillar, Scope, Status
+from auditfast.core.models import CheckContext, WorkspaceContext
 from auditfast.core.scoring import aggregate, band_from_coverage, rating
 
 from .conftest import (
@@ -68,9 +69,9 @@ def test_result_and_scored_counts_are_unchanged(provider):
 
 def test_status_counts_are_unchanged(provider):
     agg = aggregate(_run(provider))
-    assert agg["counts"][Status.PASS] == 46
+    assert agg["counts"][Status.PASS] == 49
     assert agg["counts"][Status.PARTIAL] == 18
-    assert agg["counts"][Status.FAIL] == 36
+    assert agg["counts"][Status.FAIL] == 37
     assert agg["counts"][Status.INFO] == 3
 
 
@@ -130,6 +131,131 @@ def test_pipeline_load_checks_run(provider):
     assert orch  # ws-prep-01 has two pipelines but none orchestrates the others
 
 
+def test_tls_check_requires_explicit_version_evidence():
+    from auditfast.core.check.security.data_operations.automated import connections_use_tls12
+
+    def verdict(version):
+        ctx = WorkspaceContext(id="ws", connections=[{
+            "id": "c1", "minimum_tls_version": version,
+        }])
+        return connections_use_tls12(CheckContext(workspace=ctx, settings={}))
+
+    assert verdict("TLS1.2").score == 3
+    assert verdict("1.1").score == 0
+    assert verdict(None).status is Status.NA
+
+
+def test_deadletter_checks_require_explicit_record_routing():
+    from auditfast.core.check.operations_reliability.data_prep.automated import (
+        nb_deadletter,
+        pl_deadletter,
+    )
+
+    pipeline = {
+        "properties": {"activities": [{
+            "name": "Quarantine_Invalid_Records",
+            "type": "Copy",
+            "typeProperties": {"sink": {"dataset": "dead_letter_records"}},
+        }]}
+    }
+    notebook = {"cells": [{
+        "cell_type": "code",
+        "source": "invalid = df.filter('is_valid = false')\ninvalid.write.saveAsTable('quarantine.records')",
+    }]}
+    pipeline_ctx = WorkspaceContext(id="ws", pipelines={"p": pipeline})
+    notebook_ctx = WorkspaceContext(id="ws", notebooks={"n": notebook})
+
+    assert pl_deadletter(CheckContext(pipeline_ctx, {}, "p", pipeline)).score == 3
+    assert nb_deadletter(CheckContext(notebook_ctx, {}, "n", notebook)).score == 3
+
+
+def test_pipeline_idempotency_check_scores_rerun_safety_patterns():
+    from auditfast.core.check.operations_reliability.data_prep.automated import pipeline_idempotent
+
+    def verdict(text):
+        definition = {"properties": {"activities": [{
+            "name": text, "type": "Copy",
+        }]}}
+        workspace = WorkspaceContext(id="ws")
+        return pipeline_idempotent(CheckContext(workspace, {}, "pipeline", definition))
+
+    assert verdict("MERGE by batch_id").score == 3
+    assert verdict("Append raw records").score == 0
+
+
+def test_pipeline_idempotency_accepts_ordered_cleanup_before_copy():
+    from auditfast.core.check.operations_reliability.data_prep.automated import pipeline_idempotent
+
+    definition = {"properties": {"activities": [
+        {"name": "Delete old files", "type": "Delete", "dependsOn": []},
+        {"name": "Copy sales.csv", "type": "Copy", "dependsOn": [{
+            "activity": "Delete old files",
+            "dependencyConditions": ["Succeeded"],
+        }]},
+    ]}}
+    context = CheckContext(
+        WorkspaceContext(id="ws"), {}, "pipeline", definition,
+    )
+    assert pipeline_idempotent(context).score == 3
+
+
+def test_notebook_idempotency_check_scores_rerun_safety_patterns():
+    from auditfast.core.check.operations_reliability.data_prep.automated import notebook_idempotent
+
+    def verdict(text):
+        definition = {"cells": [{
+            "cell_type": "code",
+            "source": text,
+        }]}
+        workspace = WorkspaceContext(id="ws")
+        return notebook_idempotent(CheckContext(workspace, {}, "notebook", definition))
+
+    assert verdict("df.dropDuplicates(['id']); df.write.mode('append').saveAsTable('t')").score == 3
+    assert verdict("df.write.mode('append').saveAsTable('t')").score == 0
+
+
+def test_late_arrival_checks_require_safe_versioned_writes():
+    from auditfast.core.check.data_management_quality.data_prep.automated import (
+        nb_late_arrival,
+        pl_late_arrival,
+    )
+
+    pipeline = {"properties": {"activities": [{
+        "name": "MERGE latest version by event_time",
+        "type": "Script",
+    }]}}
+    notebook = {"cells": [{
+        "cell_type": "code",
+        "source": "event_time = df.event_time\nlatest = df.dropDuplicates(['id', 'version'])\nMERGE INTO target",
+    }]}
+    pipeline_context = CheckContext(WorkspaceContext(id="ws"), {}, "p", pipeline)
+    notebook_context = CheckContext(WorkspaceContext(id="ws"), {}, "n", notebook)
+
+    assert pl_late_arrival(pipeline_context).score == 3
+    assert nb_late_arrival(notebook_context).score == 3
+
+
+def test_reconciliation_checks_require_source_target_control_metrics():
+    from auditfast.core.check.governance_compliance.data_prep.automated import (
+        notebook_reconciliation,
+        pipeline_reconciliation,
+    )
+
+    pipeline = {"properties": {"activities": [{
+        "name": "Reconcile source target row_count",
+        "type": "Script",
+    }]}}
+    notebook = {"cells": [{
+        "cell_type": "code",
+        "source": "source_count = source.count()\ntarget_count = target.count()\nreconcile_source_target = source_count == target_count",
+    }]}
+    pipeline_context = CheckContext(WorkspaceContext(id="ws"), {}, "p", pipeline)
+    notebook_context = CheckContext(WorkspaceContext(id="ws"), {}, "n", notebook)
+
+    assert pipeline_reconciliation(pipeline_context).score == 3
+    assert notebook_reconciliation(notebook_context).score == 3
+
+
 def test_progress_callback_fires_per_workspace(provider):
     """on_progress is called once per audited workspace, with cumulative results.
 
@@ -144,14 +270,14 @@ def test_progress_callback_fires_per_workspace(provider):
 
 
 def test_registry_is_fully_populated():
-    """64 checks are evaluated; every other check still runs as a gated N/A."""
+    """83 checks are evaluated; every other check still runs as a gated N/A."""
     evaluated = [s for s in REGISTRY if s.automation is Automation.AUTOMATED]
-    assert len(evaluated) == 74
-    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 28
-    assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 12
-    assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 34
+    assert len(evaluated) == 83
+    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 29
+    assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 16
+    assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 38
     # The rest run as gated N/A that names the access they need — never skipped.
-    assert len([s for s in REGISTRY if s.automation is Automation.ROADMAP]) == 82
+    assert len([s for s in REGISTRY if s.automation is Automation.ROADMAP]) == 81
     # Interactive (self-assessed) checks have been removed; none remain registered.
     assert len([s for s in REGISTRY if s.automation is Automation.INTERACTIVE]) == 0
     assert all(
@@ -208,7 +334,7 @@ def test_explicit_registry_is_isolated_from_the_global_one():
     assert registry.get("X-ISOLATED") is not None
     assert REGISTRY.get("X-ISOLATED") is None, "test check leaked into the global registry"
     before = len([s for s in REGISTRY if s.automation is Automation.AUTOMATED])
-    assert before == 74
+    assert before == 83
 
 
 # -- selection and dispatch ----------------------------------------------------
