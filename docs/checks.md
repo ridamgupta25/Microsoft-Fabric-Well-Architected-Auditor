@@ -74,6 +74,15 @@ await the data needed to judge them.
 The catalog is **not** maintained by hand here — browse the live source of truth:
 `GET /api/v1/catalog/checks`, or `auditfast checks --pillar Security`.
 
+### TLS source-connection evidence
+
+`WS-TLS` (`6.3.4`) is backed by Fabric connection metadata and requires an
+explicit minimum TLS version to produce a scored result. Fabric's
+`connectionEncryption = "Encrypted"` value alone does not prove TLS 1.2+;
+missing minimum-version evidence is reported as N/A. See
+[TLS Evidence for Source Connections](tls-evidence.md) for the provider data
+contract and the source-specific evidence required for live PASS/FAIL results.
+
 ---
 
 ## Which checks run

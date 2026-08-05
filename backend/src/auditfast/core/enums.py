@@ -162,6 +162,7 @@ class Resource(StrEnum):
     TABLE_SCHEMAS = "tableSchemas"
     SHORTCUTS = "shortcuts"
     SEMANTIC_MODEL_DEFINITIONS = "semanticModelDefinitions"
+    CONNECTIONS = "connections"
 
 
 class Status(StrEnum):

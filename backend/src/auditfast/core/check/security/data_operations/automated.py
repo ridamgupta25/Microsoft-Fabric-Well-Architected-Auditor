@@ -10,7 +10,7 @@ import re
 from auditfast.core.check._pipeline import PIPELINE_LAYERS
 from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable
 from auditfast.core.check.registry import check
-from auditfast.core.enums import Pillar, Resource, Scope, Severity
+from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
 
 _ROLES_UNREADABLE = "Workspace role assignments could not be read from Fabric"
@@ -117,4 +117,44 @@ def no_hardcoded_secrets(ctx: CheckContext) -> Verdict:
         not hits,
         "No hardcoded secret patterns detected" if not hits
         else f"Potential hardcoded secret(s) detected ({len(hits)} pattern match)",
+    )
+
+
+def _tls_version(value: object) -> tuple[int, int] | None:
+    """Parse explicit TLS version values without treating encryption as TLS proof."""
+    text = str(value or "").strip().upper().replace("TLS", "").replace("V", "")
+    parts = text.split(".")
+    if len(parts) != 2 or not all(part.isdigit() for part in parts):
+        return None
+    return int(parts[0]), int(parts[1])
+
+
+@check(
+    id="WS-TLS", ref="6.3.4", title="API and source connections use TLS 1.2+",
+    pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    layers=(Layer.OPERATIONS,), requires=[Resource.CONNECTIONS], required=True,
+)
+def connections_use_tls12(ctx: CheckContext) -> Verdict:
+    """Every visible API or source connection explicitly requires TLS 1.2 or newer."""
+    if not ctx.workspace.has(Resource.CONNECTIONS):
+        return not_applicable("Fabric connection metadata could not be read")
+    connections = ctx.workspace.connections
+    if not connections:
+        return not_applicable("No Fabric source connections were returned")
+    unknown = [c for c in connections if _tls_version(c.get("minimum_tls_version")) is None]
+    if unknown:
+        return not_applicable(
+            f"TLS minimum version is not exposed for {len(unknown)} of "
+            f"{len(connections)} connection(s); encrypted does not prove TLS 1.2+"
+        )
+    noncompliant = [
+        c for c in connections
+        if _tls_version(c.get("minimum_tls_version")) < (1, 2)
+    ]
+    return binary(
+        not noncompliant,
+        f"{len(connections) - len(noncompliant)} of {len(connections)} connection(s) "
+        "explicitly require TLS 1.2+"
+        if not noncompliant else
+        f"{len(noncompliant)} of {len(connections)} connection(s) explicitly allow TLS below 1.2",
     )

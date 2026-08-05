@@ -73,6 +73,59 @@ def test_values_first_call_failure_is_unknown_not_empty():
     assert known is False
 
 
+def test_fetch_reads_and_persists_connection_metadata_without_tls_claims():
+    provider = LiveFabricProvider("token")
+    base = provider.BASE
+    connection = {
+        "id": "connection-1",
+        "displayName": "Orders API",
+        "gatewayId": "gateway-1",
+        "connectivityType": "ShareableCloud",
+        "connectionDetails": {
+            "type": "Web",
+            "path": "https://api.example.test/orders",
+        },
+        "credentialDetails": {
+            "credentialType": "OAuth2",
+            "singleSignOnType": "MicrosoftEntraID",
+            "connectionEncryption": "Encrypted",
+            "skipTestConnection": False,
+        },
+        "connectionRecency": {
+            "lastCredentialUsedDateTime": "2026-08-04T10:00:00Z",
+        },
+    }
+    session = _FakeSession({
+        f"{base}/workspaces/ws-1": _FakeResponse(200, {"displayName": "Prep"}),
+        f"{base}/connections": _FakeResponse(200, {"value": [connection]}),
+    })
+    provider._session = session
+
+    from auditfast.core.enums import Resource
+
+    ctx = provider.fetch("ws-1", resources=[Resource.CONNECTIONS])
+
+    assert ctx.connections == [{
+        "id": "connection-1",
+        "display_name": "Orders API",
+        "gateway_id": "gateway-1",
+        "connectivity_type": "ShareableCloud",
+        "connection_type": "Web",
+        "endpoint": "https://api.example.test/orders",
+        "credential_type": "OAuth2",
+        "single_sign_on_type": "MicrosoftEntraID",
+        "connection_encryption": "Encrypted",
+        "skip_test_connection": False,
+        "created_date_time": None,
+        "last_bound_date_time": None,
+        "last_credential_used_date_time": "2026-08-04T10:00:00Z",
+        "minimum_tls_version": None,
+        "status": "unknown",
+    }]
+    restored = type(ctx).from_dict(ctx.to_dict())
+    assert restored.connections == ctx.connections
+
+
 # -- token refresh tests -------------------------------------------------------
 
 class _CountingFakeSession:

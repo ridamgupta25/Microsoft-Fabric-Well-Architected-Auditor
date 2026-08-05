@@ -19,7 +19,6 @@ _CHECKS: list[tuple[str, str, str, tuple[str, ...], bool, str]] = [
     ("R-6-1-7", "6.1.7", "Fabric tenant admin settings reviewed and hardened (export restrictions, external sharing, guest access defaults)", (Layer.OPERATIONS,), True, "ADMIN_TENANT"),
     ("R-6-3-1", "6.3.1", "On-Premises Data Gateway uses encrypted connections", (Layer.OPERATIONS,), True, "ADMIN_TENANT"),
     ("R-6-3-2", "6.3.2", "Private endpoints configured for Fabric capacity (if applicable)", (Layer.OPERATIONS,), False, "ADMIN_TENANT"),
-    ("R-6-3-4", "6.3.4", "API source connections use TLS 1.2+", (Layer.OPERATIONS,), True, "ADMIN_TENANT"),
     ("R-6-3-5", "6.3.5", "Conditional Access policies applied to Fabric tenant", (Layer.OPERATIONS,), True, "ADMIN_TENANT"),
 ]
 
