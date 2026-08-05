@@ -279,6 +279,30 @@ class LiveFabricProvider:
             return [], ""  # e.g. 404 — no SQL endpoint / no tables; not a read failure
         return body.get("data") or [], ""
 
+    @staticmethod
+    def _connection_metadata(row: dict) -> dict:
+        """Keep connection metadata useful to checks without persisting secrets."""
+        details = row.get("connectionDetails") or {}
+        credentials = row.get("credentialDetails") or {}
+        recency = row.get("connectionRecency") or {}
+        return {
+            "id": row.get("id", ""),
+            "display_name": row.get("displayName", ""),
+            "gateway_id": row.get("gatewayId"),
+            "connectivity_type": row.get("connectivityType", ""),
+            "connection_type": details.get("type", ""),
+            "endpoint": details.get("path", ""),
+            "credential_type": credentials.get("credentialType", ""),
+            "single_sign_on_type": credentials.get("singleSignOnType", ""),
+            "connection_encryption": credentials.get("connectionEncryption", ""),
+            "skip_test_connection": credentials.get("skipTestConnection"),
+            "created_date_time": recency.get("createdDateTime"),
+            "last_bound_date_time": recency.get("lastBoundDateTime"),
+            "last_credential_used_date_time": recency.get("lastCredentialUsedDateTime"),
+            "minimum_tls_version": None,
+            "status": "unknown",
+        }
+
     def _item_shortcuts(self, workspace_id: str, item_id: str) -> list[dict]:
         """List an item's OneLake shortcuts (name/path/target type), all pages."""
         rows, _known = self._values(
@@ -354,6 +378,17 @@ class LiveFabricProvider:
             capacity_id=workspace.get("capacityId"),
             deployment_pipeline=bool(workspace.get("assignedToDeploymentPipeline")),
         )
+
+        if Resource.CONNECTIONS in wanted:
+            rows, known = self._values("/connections")
+            ctx.connections = [
+                self._connection_metadata(row)
+                for row in rows
+                if isinstance(row, dict) and row.get("id")
+            ]
+            if not known:
+                ctx.unavailable.add(Resource.CONNECTIONS)
+            log.info("fetch %s: %d connection records read", workspace_id, len(ctx.connections))
 
         # Pipeline, notebook, and table reads all walk the item list, so fetch it
         # whenever any item-derived resource was asked for.

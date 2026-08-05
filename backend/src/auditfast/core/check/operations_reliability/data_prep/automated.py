@@ -5,8 +5,10 @@ data comes from or goes to.
 """
 from __future__ import annotations
 
+import json
 import re
 
+from auditfast.core.check._notebook import NOTEBOOK_LAYERS, notebook_code
 from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities, walk_activities
 from auditfast.core.check.helpers import Verdict, binary, covered, not_applicable
 from auditfast.core.check.registry import check
@@ -23,6 +25,32 @@ NOTIFY_TYPES = frozenset({"Teams", "Office365Outlook", "Outlook365", "SendEmail"
 #: Lookup that merely contains "email" in its name does not.
 NOTIFY_CALL_TYPES = frozenset({"Web", "WebActivity", "AzureFunctionActivity", "Function"})
 NOTIFY_NAME_RE = re.compile(r"notif|alert|email|teams", re.IGNORECASE)
+_DATA_MOVE_TYPES = frozenset({"Copy", "Script", "TridentNotebook", "SqlServerStoredProcedure", "Lookup"})
+_RECORD_ERROR = re.compile(
+    r"reject|invalid|quarantine|dead[_ -]?letter|error[_ -]?output|bad[_ -]?records?|"
+    r"failed[_ -]?records?|_corrupt|_rejected|_quarantine",
+    re.IGNORECASE,
+)
+_IDEMPOTENT_PATTERN = re.compile(
+    r"\bmerge\b|\bupsert\b|overwrite|replace|delete[_ -]?then[_ -]?insert|"
+    r"dedup|dropduplicates|drop_duplicates|idempotent|batch[_ -]?id|run[_ -]?id|"
+    r"watermark|checkpoint|load[_ -]?date",
+    re.IGNORECASE,
+)
+_CLEANUP_ACTIVITY = re.compile(
+    r"delete|truncate|purge|cleanup|clean[_ -]?up|remove|clear",
+    re.IGNORECASE,
+)
+_WRITE_SIGNAL = re.compile(
+    r"\.write\b|saveastable\b|insert\s+into|merge\s+into|create\s+or\s+replace|overwrite",
+    re.IGNORECASE,
+)
+_CLEANUP_BEFORE_WRITE = re.compile(
+    r"(?:delete\s+from|truncate\s+table|drop\s+table|"
+    r"mssparkutils\.fs\.rm|notebookutils\.fs\.rm|fs\.rm|rm\s*\().*?"
+    r"(?:\.write\b|saveastable\b|insert\s+into|merge\s+into|overwrite)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 @check(
@@ -126,4 +154,113 @@ def retry_values(ctx: CheckContext) -> Verdict:
         len(good), len(with_retry),
         f"{len(good)} of {len(with_retry)} retrying activities set a bounded count "
         f"(1-10) and a positive interval",
+    )
+
+
+@check(
+    id="PL-IDEMPOTENT", ref="2.4.6",
+    title="Pipeline reruns are idempotent",
+    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
+)
+def pipeline_idempotent(ctx: CheckContext) -> Verdict:
+    """A failed pipeline can be rerun without appending duplicate records."""
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+    acts = activities(ctx.obj)
+    data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
+    if not data_acts:
+        return not_applicable("No data-movement activity to assess for rerun idempotency")
+    blob = json.dumps(ctx.obj)
+    explicit_pattern = bool(_IDEMPOTENT_PATTERN.search(blob))
+    cleanup_before_write = any(
+        _CLEANUP_ACTIVITY.search(activity.get("name", ""))
+        and any(
+            dependency.get("activity") == activity.get("name")
+            and "Succeeded" in (dependency.get("dependencyConditions") or [])
+            for data_activity in data_acts
+            for dependency in (data_activity.get("dependsOn") or [])
+        )
+        for activity in acts
+    )
+    ok = explicit_pattern or cleanup_before_write
+    return binary(
+        ok,
+        "Rerun-safety pattern detected (atomic upsert, overwrite, deduplication, run key, or ordered cleanup)"
+        if ok else
+        "No rerun-safety pattern detected; a failed rerun may append duplicate records",
+    )
+
+
+@check(
+    id="NB-IDEMPOTENT", ref="3.1.11",
+    title="Notebook reruns are idempotent",
+    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def notebook_idempotent(ctx: CheckContext) -> Verdict:
+    """Notebook writes are rerun-safe through merge/upsert, dedup, or ordered cleanup."""
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = notebook_code(ctx.obj)
+    if not _WRITE_SIGNAL.search(code):
+        return not_applicable("Notebook has no write operation to assess for rerun idempotency")
+    explicit_pattern = bool(_IDEMPOTENT_PATTERN.search(code))
+    cleanup_before_write = bool(_CLEANUP_BEFORE_WRITE.search(code))
+    ok = explicit_pattern or cleanup_before_write
+    return binary(
+        ok,
+        "Rerun-safety pattern detected (merge/upsert, overwrite, deduplication, run key, or ordered cleanup)"
+        if ok else
+        "No rerun-safety pattern detected; a failed rerun may append duplicate records",
+    )
+
+
+@check(
+    id="PL-DEADLETTER", ref="2.4.4",
+    title="Failed records captured to dead-letter or quarantine output",
+    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
+)
+def pl_deadletter(ctx: CheckContext) -> Verdict:
+    """Invalid records are routed to a retained dead-letter or quarantine output."""
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+    acts = activities(ctx.obj)
+    data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
+    if not data_acts:
+        return not_applicable("No data-movement activity to assess for failed records")
+    blob = json.dumps(ctx.obj)
+    if not _RECORD_ERROR.search(blob):
+        return not_applicable("No record-validation or error-routing pattern found")
+    ok = any(_RECORD_ERROR.search(json.dumps(a)) for a in acts)
+    return binary(
+        ok,
+        "Failed/invalid records have an explicit error or quarantine route" if ok
+        else "Record errors are mentioned but no activity-level quarantine route was found",
+    )
+
+
+@check(
+    id="NB-DEADLETTER", ref="3.1.9",
+    title="Failed records captured to dead-letter or quarantine output",
+    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_deadletter(ctx: CheckContext) -> Verdict:
+    """Invalid records are retained in a dead-letter or quarantine output."""
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = notebook_code(ctx.obj)
+    if not _RECORD_ERROR.search(code):
+        return not_applicable("Notebook has no record-validation or error-routing pattern")
+    ok = bool(re.search(
+        r"(?:write|save|insert|append|quarantine|dead[_ -]?letter|reject|invalid)",
+        code,
+        re.IGNORECASE,
+    ))
+    return binary(
+        ok,
+        "Notebook routes failed/invalid records to a retained output" if ok
+        else "Notebook detects record errors but does not retain a failed-record output",
     )
