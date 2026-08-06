@@ -100,6 +100,7 @@ class WorkspaceContext:
     items: list[Item] = field(default_factory=list)
     pipelines: dict[str, dict] = field(default_factory=dict)
     notebooks: dict[str, dict] = field(default_factory=dict)
+    environments: dict[str, dict] = field(default_factory=dict)
     tables: dict[str, dict] = field(default_factory=dict)
     shortcuts: dict[str, list] = field(default_factory=dict)
     semantic_models: dict[str, dict] = field(default_factory=dict)
@@ -190,6 +191,7 @@ class WorkspaceContext:
             "items": [asdict(i) for i in self.items],
             "pipelines": self.pipelines,
             "notebooks": self.notebooks,
+            "environments": self.environments,
             "tables": self.tables,
             "shortcuts": self.shortcuts,
             "semantic_models": self.semantic_models,
@@ -213,6 +215,7 @@ class WorkspaceContext:
             items=[Item(**i) for i in data.get("items", [])],
             pipelines=dict(data.get("pipelines", {})),
             notebooks=dict(data.get("notebooks", {})),
+            environments=dict(data.get("environments", {})),
             tables=dict(data.get("tables", {})),
             shortcuts=dict(data.get("shortcuts", {})),
             semantic_models=dict(data.get("semantic_models", {})),

@@ -17,6 +17,30 @@ def activities(definition: dict) -> list[dict]:
     return (definition.get("properties") or {}).get("activities") or []
 
 
+def script_sql(definition: dict) -> str:
+    """Every line of T-SQL a pipeline runs through its Script activities.
+
+    Warehouse load logic frequently lives here rather than in a notebook — a
+    Script activity carries its statements inline, so the SQL *is* readable even
+    though stored procedures inside the Warehouse are not. Statements are joined
+    with newlines so a caller can pattern-match across the whole pipeline.
+
+    Handles both shapes Fabric emits: ``scripts: [{"text": ...}]`` and the older
+    single ``script`` string.
+    """
+    parts: list[str] = []
+    for activity in walk_activities(definition):
+        if activity.get("type") != "Script":
+            continue
+        props = activity.get("typeProperties") or {}
+        for entry in props.get("scripts") or []:
+            if isinstance(entry, dict) and entry.get("text"):
+                parts.append(str(entry["text"]))
+        if isinstance(props.get("script"), str):
+            parts.append(props["script"])
+    return "\n".join(parts)
+
+
 #: Keys (on an activity or its ``typeProperties``) that hold child activity lists.
 _CHILD_ACTIVITY_KEYS = ("activities", "ifTrueActivities", "ifFalseActivities", "defaultActivities")
 
