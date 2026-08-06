@@ -294,7 +294,7 @@ def nb_timeout(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-LANG", ref="3.2.1", title="Consistent language approach (not mixed PySpark / Spark SQL)",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_language(ctx: CheckContext) -> Verdict:
@@ -320,7 +320,7 @@ def nb_dataframe_api(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-BROADCAST", ref="3.2.4", title="Broadcast joins used for small-large joins",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_broadcast(ctx: CheckContext) -> Verdict:
@@ -525,7 +525,7 @@ _MERGE_VALIDATE = re.compile(
 @check(
     id="NB-RECON-COUNT", ref="5.2.5",
     title="Record count reconciliation after writes",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_recon_count(ctx: CheckContext) -> Verdict:
@@ -541,7 +541,7 @@ def nb_recon_count(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-FK-INTEGRITY", ref="5.3.2",
     title="Referential integrity: FK values validated against lookup tables",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_fk_integrity(ctx: CheckContext) -> Verdict:
@@ -557,7 +557,7 @@ def nb_fk_integrity(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-CROSS-RECON", ref="5.3.6",
     title="Cross-source reconciliation for multi-source loads",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_cross_recon(ctx: CheckContext) -> Verdict:
@@ -574,7 +574,7 @@ def nb_cross_recon(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-ORPHAN-DETECT", ref="5.3.7",
     title="Orphan detection: child records without parents identified",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_orphan_detect(ctx: CheckContext) -> Verdict:
@@ -590,7 +590,7 @@ def nb_orphan_detect(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-MERGE-VALID", ref="5.3.9",
     title="Merge result validation: post-merge counts reconciled",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_merge_valid(ctx: CheckContext) -> Verdict:
