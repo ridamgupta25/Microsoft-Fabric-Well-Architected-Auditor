@@ -43,25 +43,34 @@ def _is_stale(item: Item, *, cutoff_days: int, now: datetime) -> bool:
 @check(
     id="WS-ORPHAN", ref="12.3.4", title="No orphaned / stale items",
     pillar=Pillar.COST, scope=Scope.WORKSPACE, severity=Severity.LOW,
-    requires=[Resource.ITEMS], required=False,
+    requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=False,
 )
 def no_orphaned_items(ctx: CheckContext) -> Verdict:
-    """Items with a known run/refresh have run within the staleness window.
+    """Runnable items have run / refreshed within the staleness window.
 
-    The Fabric List Items API does not expose a last-run/refresh timestamp, so
-    when *no* item carries one the data needed to judge staleness is unavailable
-    and the check is N/A — never a blanket FAIL of every item. "We could not read
-    when the item last ran" is not the same finding as "the item is orphaned".
+    The Fabric List Items API carries no last-run/refresh timestamp, so it is
+    read per runnable item from the job-scheduler history (``…/jobs/instances``).
+    Only items that actually run a job (pipelines, notebooks, semantic models,
+    dataflows, Spark jobs) can be stale; reports and dashboards never run and are
+    excluded. When the history is unreadable — or no runnable item has ever run —
+    staleness cannot be judged and the check is N/A, never a blanket FAIL. "We
+    could not read when the item last ran" is not "the item is orphaned".
     """
     if not ctx.workspace.has(Resource.ITEMS):
         return not_applicable("Workspace items could not be read from Fabric")
+    if not ctx.workspace.has(Resource.ITEM_RUN_HISTORY):
+        return not_applicable(
+            "Per-item run/refresh history could not be read from Fabric "
+            "(jobs/instances was forbidden or unavailable)"
+        )
     items = ctx.workspace.items
     dated = [i for i in items if i.last_run_utc]
     if not dated:
         return not_applicable(
-            f"No run/refresh timestamp is available for any of the {len(items)} "
-            "item(s) — the Fabric List Items API does not expose last-run/refresh, "
-            "so staleness cannot be assessed (needs per-item run/refresh history)"
+            f"No run/refresh has been recorded for any of the {len(items)} "
+            "item(s) — none of the runnable items (pipeline / notebook / semantic "
+            "model / dataflow) has a job-run history yet, so staleness cannot be "
+            "assessed"
         )
     cutoff_days = int(ctx.setting("orphan_days", 90))
     now = datetime.now(timezone.utc)
