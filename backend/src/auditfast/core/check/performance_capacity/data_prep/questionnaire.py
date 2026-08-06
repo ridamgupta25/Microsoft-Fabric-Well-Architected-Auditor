@@ -1,1 +1,1 @@
-"""Performance & Capacity · Data Prep — interactive (self-assessed) checks."""
+"""Performance & Capacity · Data Prep — no self-assessed checks."""

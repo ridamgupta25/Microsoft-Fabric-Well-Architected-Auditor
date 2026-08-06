@@ -55,6 +55,7 @@ class RecordedProvider:
             items=[Item.from_api(i) for i in raw.get("items", [])],
             pipelines=dict(raw.get("pipelines") or {}),
             notebooks=dict(raw.get("notebooks") or {}),
+            environments=dict(raw.get("environments") or {}),
             tables=dict(raw.get("tables") or {}),
             shortcuts=dict(raw.get("shortcuts") or {}),
             semantic_models=dict(raw.get("semanticModels") or {}),
