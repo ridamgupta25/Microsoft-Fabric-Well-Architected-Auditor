@@ -81,6 +81,23 @@ SELECT_STAR = re.compile(r"select\s+\*|\.select\s*\(\s*[\"']\*[\"']\s*\)", re.IG
 SELECT = re.compile(r"\bselect\b|\.select\s*\(", re.IGNORECASE)
 WIDE_TRANSFORM = re.compile(r"\.join\s*\(|\bgroupBy\s*\(|\.groupby\s*\(|\bJOIN\b|\bGROUP\s+BY\b", re.IGNORECASE)
 
+# -- Predicate pushdown / shortcut reads (3.5.7) -------------------------------
+# Detects reads from external file formats or OneLake shortcut paths that are
+# candidates for predicate pushdown. Conservative: only flags explicit API calls
+# and well-known path prefixes, never managed spark.table() reads.
+EXTERNAL_READ = re.compile(
+    r"spark\.read\.(parquet|load|format|json|csv|avro|orc)\s*\("
+    r"|abfss://"            # ADLS Gen2 / OneLake shortcut target
+    r"|\/Files\/"           # OneLake Files section (shortcut mount)
+    r"|Files\.load\b",      # notebookutils shortcut read variant
+    re.IGNORECASE,
+)
+# A filter/where predicate applied to the read — makes predicate pushdown possible.
+PUSHDOWN_FILTER = re.compile(
+    r"\.filter\s*\(|\.where\s*\(|(?<!\w)WHERE\b",
+    re.IGNORECASE,
+)
+
 # A token that is not a package spec: a flag, a URL/path, a VCS/requirements ref.
 _NON_PACKAGE = re.compile(r"^-|^git\+|^https?:|^/|\.txt$|^\.")
 _PACKAGE = re.compile(r"^[A-Za-z0-9_.\-]+(\[[^\]]+\])?([=<>!~].+)?$")
