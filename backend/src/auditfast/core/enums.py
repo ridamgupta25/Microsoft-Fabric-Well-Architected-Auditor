@@ -159,6 +159,7 @@ class Resource(StrEnum):
     GIT = "git"
     PIPELINE_DEFINITIONS = "pipelineDefinitions"
     NOTEBOOK_DEFINITIONS = "notebookDefinitions"
+    ENVIRONMENT_DEFINITIONS = "environmentDefinitions"
     TABLE_SCHEMAS = "tableSchemas"
     SHORTCUTS = "shortcuts"
     SEMANTIC_MODEL_DEFINITIONS = "semanticModelDefinitions"

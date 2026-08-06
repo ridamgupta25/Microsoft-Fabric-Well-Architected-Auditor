@@ -12,7 +12,12 @@ from auditfast.core.check.performance_capacity.data_prep.automated import (
     delta_zorder,
     spark_env,
     spark_libpin,
+    spark_partition_pruning,
+    spark_pool,
+    spark_profile,
+    spark_runtime,
     spark_select,
+    spark_ui_review,
 )
 from auditfast.core.enums import Status
 from auditfast.core.models import CheckContext, WorkspaceContext
@@ -23,8 +28,10 @@ def _nb(code: str) -> dict:
     return {"cells": [{"cell_type": "code", "source": code}]}
 
 
-def _ctx(obj) -> CheckContext:
-    return CheckContext(workspace=WorkspaceContext(id="w"), settings={}, obj_name="nb", obj=obj)
+def _ctx(obj, settings=None) -> CheckContext:
+    return CheckContext(
+        workspace=WorkspaceContext(id="w"), settings=settings or {}, obj_name="nb", obj=obj,
+    )
 
 
 # -- DELTA-MERGE ---------------------------------------------------------------
@@ -133,6 +140,176 @@ def test_select_star_fails():
 def test_explicit_projection_passes():
     v = spark_select(_ctx(_nb("spark.sql('SELECT id, name FROM t')")))
     assert v.score == 3
+
+
+# -- New performance evidence checks -----------------------------------------
+
+def test_partition_pruning_passes_with_filter():
+    settings = {"partition_columns": {"sales": ["load_date"]}}
+    v = spark_partition_pruning(_ctx(
+        _nb("spark.sql('SELECT id FROM sales WHERE load_date = \'2026-01-01\'')"), settings,
+    ))
+    assert v.score == 3
+
+
+def test_partition_pruning_fails_for_unfiltered_select_star():
+    settings = {"partition_columns": {"sales": ["load_date"]}}
+    v = spark_partition_pruning(_ctx(_nb("spark.sql('SELECT * FROM sales')"), settings))
+    assert v.score == 0
+
+
+def test_partition_pruning_is_na_without_partition_metadata():
+    v = spark_partition_pruning(_ctx(_nb("print('hello')")))
+    assert v.status is Status.NA
+
+
+def test_partition_pruning_checks_each_query_independently():
+    settings = {"partition_columns": {"sales": ["load_date"]}}
+    code = """
+spark.sql('SELECT id FROM sales WHERE load_date = \'2026-01-01\'')
+spark.sql('SELECT * FROM sales')
+"""
+    v = spark_partition_pruning(_ctx(_nb(code), settings))
+    assert v.score == 0
+
+
+def _nb_with_runtime(version: str) -> dict:
+    notebook = _nb("print('runtime')")
+    notebook["cells"][0]["outputs"] = [{"text": f"Apache-Spark/{version} Delta-Lake/3.2"}]
+    return notebook
+
+
+def _nb_with_printed_spark_version(version: str) -> dict:
+    notebook = _nb("print(spark.version)")
+    notebook["cells"][0]["outputs"] = [{"text": f"{version}\n"}]
+    return notebook
+
+
+def test_current_runtime_passes():
+    assert spark_runtime(_ctx(_nb_with_runtime("3.5.5"))).score == 3
+
+
+def test_printed_spark_version_passes():
+    assert spark_runtime(_ctx(_nb_with_printed_spark_version("3.5.5.5.4.20260403.6"))).score == 3
+
+
+def test_printed_spark_version_takes_precedence_over_delta_history():
+    notebook = _nb_with_printed_spark_version("3.5.5.5.4.20260403.6")
+    notebook["cells"].append({
+        "cell_type": "code",
+        "source": "spark.sql('DESCRIBE HISTORY t')",
+        "outputs": [{"text": "Apache-Spark/3.4.1 Delta-Lake/3.2"}],
+    })
+    v = spark_runtime(_ctx(notebook))
+    assert v.score == 3
+    assert "3.5.5" in v.evidence
+
+
+def test_unsupported_runtime_fails():
+    assert spark_runtime(_ctx(_nb_with_runtime("3.4.1"))).score == 0
+
+
+def test_runtime_is_na_without_captured_version():
+    assert spark_runtime(_ctx(_nb("print(spark.version)"))).status is Status.NA
+
+
+def test_bound_environment_runtime_is_primary_evidence():
+    notebook = _nb_with_runtime("3.4.1")
+    notebook["_auditfast_environment"] = {
+        "name": "Validation Environment",
+        "runtime_version": "1.3",
+    }
+    verdict = spark_runtime(_ctx(notebook))
+    assert verdict.score == 3
+    assert "Validation Environment" in verdict.evidence
+    assert "Spark 3.5.0" in verdict.evidence
+
+
+def test_bound_old_environment_runtime_fails():
+    notebook = _nb("print('runtime')")
+    notebook["_auditfast_environment"] = {"runtime_version": "1.2"}
+    assert spark_runtime(_ctx(notebook)).score == 0
+
+
+def test_unknown_bound_environment_runtime_is_na():
+    notebook = _nb("print('runtime')")
+    notebook["_auditfast_environment"] = {"runtime_version": "9.9"}
+    assert spark_runtime(_ctx(notebook)).status is Status.NA
+
+
+def _monitored_nb(*, usage=None, advice=None, stages=None) -> dict:
+    notebook = _nb("df = spark.table('sales')")
+    monitoring = {}
+    if usage is not None:
+        monitoring["resource_usage"] = usage
+    if advice is not None:
+        monitoring["advice"] = advice
+    if stages is not None:
+        monitoring["stages"] = stages
+    notebook["_auditfast_monitoring"] = monitoring
+    return notebook
+
+
+def test_pool_sizing_passes_for_healthy_utilization():
+    v = spark_pool(_ctx(_monitored_nb(usage={
+        "duration": 600_000, "idleTime": 60_000,
+        "coreEfficiency": 0.75, "capacityExceeded": False,
+    })))
+    assert v.score == 3
+
+
+def test_pool_sizing_fails_for_underutilization():
+    v = spark_pool(_ctx(_monitored_nb(usage={
+        "duration": 600_000, "idleTime": 300_000,
+        "coreEfficiency": 0.2, "capacityExceeded": False,
+    })))
+    assert v.score == 0
+
+
+def test_pool_sizing_is_na_without_metrics():
+    assert spark_pool(_ctx(_nb("print('hello')"))).status is Status.NA
+
+
+def test_spark_ui_passes_without_detected_issues():
+    v = spark_ui_review(_ctx(_monitored_nb(advice=[], stages=[{
+        "diskBytesSpilled": 0, "shuffleWriteBytes": 10_000,
+    }])))
+    assert v.score == 3
+
+
+def test_spark_ui_fails_on_skew_or_spill():
+    v = spark_ui_review(_ctx(_monitored_nb(
+        advice=[{"name": "Data skew detected"}],
+        stages=[{"diskBytesSpilled": 1, "shuffleWriteBytes": 0}],
+    )))
+    assert v.score == 0
+    assert "skew" in v.evidence and "spill" in v.evidence
+
+
+def test_spark_ui_is_na_without_monitoring():
+    assert spark_ui_review(_ctx(_nb("df.explain()"))).status is Status.NA
+
+
+def test_profile_passes_for_healthy_long_running_application():
+    v = spark_profile(_ctx(_monitored_nb(
+        usage={"duration": 600_000}, advice=[], stages=[],
+    )))
+    assert v.score == 3
+
+
+def test_profile_fails_for_long_running_application_with_open_issue():
+    v = spark_profile(_ctx(_monitored_nb(
+        usage={"duration": 600_000},
+        advice=[{"description": "Shuffle skew requires optimization"}], stages=[],
+    )))
+    assert v.score == 0
+
+
+def test_profile_is_na_for_short_application():
+    v = spark_profile(_ctx(_monitored_nb(
+        usage={"duration": 10_000}, advice=[], stages=[],
+    )))
+    assert v.status is Status.NA
 
 
 # -- PL-COPY-PARALLEL (pipeline) ----------------------------------------------
