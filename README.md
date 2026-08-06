@@ -31,27 +31,18 @@ easiest path needs only `az login` and no app registration; see
 [docs/getting-started.md § Signing in](docs/getting-started.md#8-signing-in).
 
 ```powershell
-# 1. Backend (from the repository root)
+# Terminal 1
 py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e "backend[dev]"
-
-# 2. Frontend
-cd frontend
-npm install
-cd ..
-```
-
-Then run both, in two terminals:
-
-```powershell
-# Terminal 1 — API
 cd backend
 ..\.venv\Scripts\python.exe -m auditfast serve --port 8000
 
-# Terminal 2 — web app
+# Terminal 2
 cd frontend
+npm install
 npm run dev
 ```
+
 
 Open **http://localhost:5173**, click **Connect to Fabric** and sign in, then go
 to **Run audit** and click **Run audit**.
