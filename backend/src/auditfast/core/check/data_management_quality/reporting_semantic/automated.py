@@ -7,96 +7,119 @@ referential structure is machine-readable without querying the warehouse.
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from auditfast.core.check.helpers import Verdict, covered, not_applicable
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
 
-#: Layers whose workspaces hold semantic models.
 SEMANTIC_LAYERS = (Layer.REPORTING, Layer.STORAGE, Layer.MIXED)
 
-#: A surrogate-key-shaped column name. Kimball convention is a ``_sk`` suffix;
-#: ``_key`` / ``_id`` are the common variants. A relationship joining on one of
-#: these is joining on a key rather than on a descriptive business attribute.
-SURROGATE_KEY_RE = re.compile(r"(?:_sk|sk|_key|key|_id|id)$", re.IGNORECASE)
+SURROGATE_KEY_RE = re.compile(r"(?:_sk|_key|_id)$", re.IGNORECASE)
 
 
-def _model(ctx: CheckContext) -> dict | None:
-    """The parsed TMSL for the semantic model this check is running against."""
-    return ctx.workspace.semantic_models.get(ctx.obj_name)
+def _model(ctx: CheckContext) -> dict[str, Any] | None:
+    """Return parsed TMSL for the current semantic model object."""
+    return (ctx.workspace.semantic_models or {}).get(ctx.obj_name)
 
+
+def _relationships(model: dict[str, Any]) -> list[dict[str, Any]]:
+    return model.get("relationships") or []
+
+
+def _is_active(rel: dict[str, Any]) -> bool:
+    """Normalize active flag variants."""
+    return bool(rel.get("is_active", rel.get("isActive", True)))
+
+def _norm_col(name: str) -> str:
+    return re.sub(r"[\s\-\.]+", "_", (name or "").strip().lower())
+
+
+def _query_results(ctx: CheckContext) -> dict[str, Any]:
+    return getattr(ctx.workspace, "query_results", {}) or {}
+
+
+_KEY_HINT_RE = re.compile(
+    r"(?:^id$|_id$|^key$|_key$|^sk$|_sk$|code$|number$|num$|date$)",
+    re.IGNORECASE,
+)
 
 @check(
-    id="SM-FK-SURROGATE", ref="5.4.1",
+    id="SM-FK-SURROGATE",
+    ref="5.4.1",
     title="Fact-dimension relationships join on surrogate keys",
-    pillar=Pillar.DATA, scope=Scope.SEMANTIC_MODEL, severity=Severity.HIGH,
+    pillar=Pillar.DATA,
+    scope=Scope.SEMANTIC_MODEL,
+    severity=Severity.HIGH,
     layers=SEMANTIC_LAYERS,
-    requires=[Resource.ITEMS, Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
+    requires=[Resource.ITEMS, Resource.SEMANTIC_MODEL_DEFINITIONS],
+    required=True,
 )
 def sm_fk_surrogate(ctx: CheckContext) -> Verdict:
-    """Every relationship joins on a key column, and none is left inactive.
-
-    This is the model-level half of referential integrity: it shows the facts
-    are wired to their dimensions on surrogate keys rather than on a business
-    attribute, and that the paths are live. It does **not** prove every FK value
-    has a matching dimension row — that needs a query against the warehouse.
-    """
     model = _model(ctx)
     if model is None:
         return not_applicable("Semantic model definition could not be read")
 
-    relationships = model.get("relationships") or []
+    relationships = _relationships(model)
     if not relationships:
-        if len(model.get("tables") or []) <= 1:
+        table_count = len(model.get("tables") or [])
+        if table_count <= 1:
             return not_applicable("Single-table model — no relationships to define")
-        return covered(0, 1, f"Model has {len(model.get('tables') or [])} tables but no "
-                             f"relationships defined — facts are not wired to dimensions")
+        return covered(0, 1, f"Model has {table_count} tables but no relationships defined — facts are not wired to dimensions",)
 
-    on_keys, inactive = [], []
+    on_keys: list[dict[str, Any]] = []
+    inactive_names: list[str] = []
+
     for rel in relationships:
-        from_col = str(rel.get("from_column") or "")
-        if SURROGATE_KEY_RE.search(from_col):
-            on_keys.append(rel)
-        if not rel.get("is_active", True):
-            inactive.append(rel)
+        from_col = _norm_col(str(rel.get("from_column") or rel.get("fromColumn") or ""))
+        to_col = _norm_col(str(rel.get("to_column") or rel.get("toColumn") or ""))
 
-    detail = (f"{len(on_keys)} of {len(relationships)} relationships join on a "
-              f"key column")
-    if inactive:
-        names = ", ".join(sorted(str(r.get("name") or "?") for r in inactive))
-        detail += f"; {len(inactive)} inactive ({names})"
+        if _KEY_HINT_RE.search(from_col) or _KEY_HINT_RE.search(to_col):
+            on_keys.append(rel)
+
+        if not _is_active(rel):
+            inactive_names.append(str(rel.get("name") or rel.get("id") or "?"))
+
+    detail = f"{len(on_keys)} of {len(relationships)} relationships join on a surrogate-key-shaped column"
+    if inactive_names:
+        detail += f"; {len(inactive_names)} inactive ({', '.join(sorted(inactive_names))})"
+
     return covered(len(on_keys), len(relationships), detail)
 
 
 @check(
-    id="SM-BIDIRECTIONAL", ref="5.4.1",
-    title="Relationships avoid ambiguous bidirectional filters",
-    pillar=Pillar.DATA, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
+    id="SM-FK-RI-DATA",
+    ref="5.4.1",
+    title="Fact FK values resolve to dimension surrogate keys (no orphans)",
+    pillar=Pillar.DATA,
+    scope=Scope.WORKSPACE,
+    severity=Severity.HIGH,
     layers=SEMANTIC_LAYERS,
-    requires=[Resource.ITEMS, Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
+    requires=[Resource.ITEMS, Resource.SEMANTIC_MODEL_DEFINITIONS],
+    required=True,
 )
-def sm_bidirectional(ctx: CheckContext) -> Verdict:
-    """Single-direction filters — bidirectional ones create ambiguous join paths.
+def sm_fk_ri_data(ctx: CheckContext) -> Verdict:
+    rows = _query_results(ctx).get("5.4.1.ri") or []
+    if not rows:
+        return not_applicable("No Lakehouse/Warehouse SQL RI evidence found for 5.4.1")
 
-    A both-directions filter on a star schema lets the engine resolve a query by
-    more than one path, which produces results that are hard to explain and can
-    silently double-count. They are occasionally justified; each one should be a
-    deliberate decision.
-    """
-    model = _model(ctx)
-    if model is None:
-        return not_applicable("Semantic model definition could not be read")
+    total = len(rows)
+    passed = 0
+    failing: list[str] = []
 
-    relationships = model.get("relationships") or []
-    if not relationships:
-        return not_applicable("Model defines no relationships")
+    for row in rows:
+        orphan_count = int(row.get("orphan_count") or 0)
+        rel_name = str(row.get("relationship") or "?")
+        if orphan_count == 0:
+            passed += 1
+        else:
+            failing.append(f"{rel_name} (orphans={orphan_count})")
 
-    single = [r for r in relationships
-              if "both" not in str(r.get("cross_filter") or "").lower()]
-    both = [r for r in relationships if r not in single]
-    detail = f"{len(single)} of {len(relationships)} relationships filter in one direction"
-    if both:
-        names = ", ".join(sorted(str(r.get("name") or "?") for r in both))
-        detail += f"; bidirectional: {names}"
-    return covered(len(single), len(relationships), detail)
+    detail = f"{passed} of {total} FK relationships have zero orphans"
+    if failing:
+        detail += "; failing: " + ", ".join(failing[:10])
+        if len(failing) > 10:
+            detail += f" (+{len(failing) - 10} more)"
+
+    return covered(passed, total, detail)

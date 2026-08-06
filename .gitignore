@@ -8,6 +8,7 @@ __pycache__/
 *.egg-info/
 build/
 backend/src/*.egg-info/
+backend/validation
 
 # Node / frontend
 node_modules/
