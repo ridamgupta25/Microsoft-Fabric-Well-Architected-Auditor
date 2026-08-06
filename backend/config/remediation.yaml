@@ -107,12 +107,12 @@
 "3.5.3": "Release cached/persisted DataFrames with unpersist() once they are no longer needed so executor memory is not held unnecessarily."
 "3.5.4": "Use coalesce (to reduce) or repartition (to redistribute) before writes so output file sizes and partition counts are appropriate."
 "3.5.5": "Filter on the table's partition columns before reading so Spark can prune partitions instead of scanning the full table."
-"3.5.1": "Review Spark UI for key jobs and address skewed partitions, excessive spill, and inefficient shuffle stages."
-"3.5.6": "Profile long-running notebooks with execution plans and Spark metrics, then optimize the slowest stages and rerun the measurement."
-"3.5.8": "Project explicit columns instead of SELECT * so only the data you need is read and column pruning applies."
-"3.6.1": "Add a record count reconciliation step after writing data — compare source and target row counts and raise an alert on mismatch."
-"3.6.2": "Validate referential integrity by running an anti-join of FK values against the dimension/lookup table and handling any unmatched keys before loading."
-"3.6.3": "When loading from multiple sources, reconcile record counts or hash totals across sources to detect missing or duplicated records."
+"3.5.6": "Review Spark UI for key jobs and address skewed partitions, excessive spill, and inefficient shuffle stages."
+"3.5.7": "Apply filter predicates immediately after spark.read on shortcut or external sources (e.g. .filter(), .where(), or a SQL WHERE clause) so the Spark Catalyst optimizer can push the predicate down to the data source and avoid a full table scan."
+"3.5.9": "Project explicit columns instead of SELECT * so only the data you need is read and column pruning applies."
+"3.6.1": "Define and enforce a consistent Warehouse load pattern for every Gold-layer pipeline: use COPY INTO for file-to-table bulk loads, CTAS for transformation-heavy one-time loads, a Copy activity for pipeline-orchestrated moves, or a stored procedure for complex multi-step loads. Mixed patterns without a documented rationale indicate a missing load-strategy decision."
+"3.6.2": "Replace T-SQL cursors (DECLARE CURSOR / FETCH NEXT / WHILE @@FETCH_STATUS) and pandas row iterators (.iterrows() / .itertuples()) with set-based SQL operations (INSERT INTO ... SELECT, MERGE INTO, CTAS) or PySpark DataFrame transformations so the Spark/SQL engine can parallelize and optimize the operation."
+"3.6.3": "Define and enforce a consistent Warehouse load pattern for every Gold-layer pipeline: use COPY INTO for file-to-table bulk loads, CTAS for transformation-heavy one-time loads, a Copy activity for pipeline-orchestrated moves, or a stored procedure for complex multi-step loads. Mixed patterns without a documented rationale indicate a missing load-strategy decision."
 # Ref 3.6.4 is claimed by two checks from two different source checklists:
 # NB-ORPHAN-DETECT (orphan child records) and PL-IDEMPOTENT (re-runnable loads).
 # Remediation is keyed by ref, so this text has to serve both — they are both
