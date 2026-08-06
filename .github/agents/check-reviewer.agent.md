@@ -10,6 +10,7 @@ You verify whether the findings in an audit report are supported by the captured
 - Review every finding in the audit report against the source-of-truth workspace snapshot.
 - Resolve the correct workspace snapshot automatically before validating evidence.
 - Produce a validation report with PASS, FAIL, and NOT VERIFIABLE verdicts for each row, along with evidence and notes.
+- Verify that the knowledge base contains the referenced artifact and enough definition metadata to support the finding; if not, mark the row NOT VERIFIABLE and record the KB gap.
 - When the task is specifically about a newly-added deterministic check, review that check as one row in the broader audit report context rather than treating the task as a harness-only validation.
 
 ## Constraints
@@ -54,6 +55,7 @@ You verify whether the findings in an audit report are supported by the captured
    - Write backend/validation/validation-report.md.
    - Overwrite any existing report at that path.
    - Use the report structure expected by the repository: summary table plus a findings table covering every audit row.
+   - Include a KB gaps section for rows that could not be fully validated because the snapshot lacked artifact or metadata coverage.
 4. Run extra verification only when explicitly needed.
    - For general audit-report validation, the main deliverable is the validation report itself.
    - If the task specifically concerns a newly-added check implementation, then run the harness and suite as supporting validation:
