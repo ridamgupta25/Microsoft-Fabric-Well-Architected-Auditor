@@ -73,6 +73,60 @@ def test_values_first_call_failure_is_unknown_not_empty():
     assert known is False
 
 
+def test_notebook_monitoring_reads_latest_session_metrics():
+    provider = LiveFabricProvider("token")
+    base = provider.BASE
+    root = f"{base}/workspaces/w/notebooks/n/livySessions"
+    app = f"{root}/livy-1/applications/app-1"
+    session = _FakeSession({
+        root: _FakeResponse(200, {"value": [{"livyId": "livy-1", "appId": "app-1"}]}),
+        f"{root}/livy-1": _FakeResponse(200, {
+            "livyId": "livy-1", "appId": "app-1", "executorCores": 4,
+        }),
+        f"{app}/advice": _FakeResponse(200, {"value": []}),
+        f"{app}/resourceUsage": _FakeResponse(200, {
+            "duration": 600_000, "idleTime": 60_000, "coreEfficiency": 0.8,
+        }),
+        f"{app}/stages": _FakeResponse(200, [{"stageId": 1}]),
+    })
+    provider._session = session
+
+    monitoring = provider._notebook_monitoring("w", "n")
+
+    assert monitoring["livy_id"] == "livy-1"
+    assert monitoring["app_id"] == "app-1"
+    assert monitoring["resource_usage"]["coreEfficiency"] == 0.8
+    assert monitoring["stages"] == [{"stageId": 1}]
+    assert len(session.calls) == 5
+
+
+def test_notebook_monitoring_returns_empty_when_sessions_are_unavailable():
+    provider = LiveFabricProvider("token")
+    base = provider.BASE
+    provider._session = _FakeSession({
+        f"{base}/workspaces/w/notebooks/n/livySessions": _FakeResponse(403, {}),
+    })
+
+    assert provider._notebook_monitoring("w", "n") == {}
+
+
+def test_environment_definition_reads_spark_runtime():
+    provider = LiveFabricProvider("token")
+    import base64
+
+    payload = base64.b64encode(
+        b"runtime_version: '1.3'\ndriver_cores: 4\n"
+    ).decode()
+    provider._definition_parts = lambda workspace_id, item_id, fmt=None: ([
+        {"path": "Setting/Sparkcompute.yml", "payload": payload}
+    ], "")
+
+    definition, failure = provider._environment_definition("w", "env")
+
+    assert failure == ""
+    assert definition == {"runtime_version": "1.3", "driver_cores": 4}
+
+
 def test_fetch_reads_and_persists_connection_metadata_without_tls_claims():
     provider = LiveFabricProvider("token")
     base = provider.BASE
@@ -171,7 +225,8 @@ def test_definition_parts_refreshes_token_on_401_and_retries():
     session = _CountingFakeSession()
     # First call returns 401 (expired), second call after refresh returns 200
     session.queue_post(_FakeResponse(401, {}))
-    import base64, json
+    import base64
+    import json
     payload = base64.b64encode(json.dumps({"activities": []}).encode()).decode()
     session.queue_post(_FakeResponse(200, {
         "definition": {"parts": [{"path": "pipeline-content.json", "payload": payload}]}

@@ -261,6 +261,144 @@ def spark_select(ctx: CheckContext) -> Verdict:
     return binary(True, "Projects explicit columns (no SELECT *)")
 
 
+# -- Workload evidence (3.4.x / 3.5.x) ----------------------------------------
+
+@check(
+    id="SPARK-RUNTIME", ref="3.4.5", title="Python/Spark runtime is current and supported",
+    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS, Resource.ENVIRONMENT_DEFINITIONS], required=True,
+)
+def spark_runtime(ctx: CheckContext) -> Verdict:
+    """Compare the bound Environment runtime with the configured minimum."""
+    environment = ctx.obj.get("_auditfast_environment") if isinstance(ctx.obj, dict) else None
+    configured = environment.get("runtime_version") if isinstance(environment, dict) else None
+    if configured:
+        runtime = _spark.fabric_runtime_to_spark(str(configured))
+        minimum = _spark.parse_version(ctx.setting("minimum_spark_version", "3.5"))
+        if runtime is None:
+            return not_applicable(f"Bound Environment runtime {configured!r} is not recognized")
+        if minimum is None:
+            return not_applicable("Project minimum_spark_version is invalid; expected major.minor[.patch]")
+        actual = ".".join(map(str, runtime))
+        required = ".".join(map(str, minimum))
+        name = environment.get("name", "bound Environment")
+        return binary(
+            runtime >= minimum,
+            f"Environment {name} uses Fabric runtime {configured} (Spark {actual}); required minimum is {required}",
+        )
+    versions = _spark.captured_spark_versions(ctx.obj)
+    if not versions:
+        return not_applicable("No bound Environment runtime or captured Spark runtime version")
+    minimum = _spark.parse_version(ctx.setting("minimum_spark_version", "3.5"))
+    if minimum is None:
+        return not_applicable("Project minimum_spark_version is invalid; expected major.minor[.patch]")
+    runtime = versions[-1]
+    actual = ".".join(map(str, runtime))
+    required = ".".join(map(str, minimum))
+    return binary(
+        runtime >= minimum,
+        f"Captured Spark runtime {actual}; required minimum is {required}",
+    )
+
+
+@check(
+    id="SPARK-POOL", ref="3.4.6", title="Spark pool size appropriate for workload",
+    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def spark_pool(ctx: CheckContext) -> Verdict:
+    """Recent Spark resource usage stays within deterministic utilization limits."""
+    usage = _spark.monitoring(ctx.obj).get("resource_usage")
+    if not isinstance(usage, dict):
+        return not_applicable("Spark resource-usage metrics are unavailable for this notebook")
+    duration = _spark.number(usage.get("duration"))
+    efficiency = _spark.number(usage.get("coreEfficiency"), -1)
+    idle_ratio = _spark.number(usage.get("idleTime")) / duration if duration > 0 else -1
+    if efficiency < 0 or idle_ratio < 0:
+        return not_applicable("Spark resource-usage metrics lack efficiency or duration data")
+    minimum_efficiency = _spark.number(ctx.setting("minimum_spark_core_efficiency", 0.5), -1)
+    maximum_idle = _spark.number(ctx.setting("maximum_spark_idle_ratio", 0.3), -1)
+    if minimum_efficiency < 0 or maximum_idle < 0:
+        return not_applicable("Spark pool utilization thresholds are invalid")
+    exceeded = bool(usage.get("capacityExceeded"))
+    ok = efficiency >= minimum_efficiency and idle_ratio <= maximum_idle and not exceeded
+    return binary(
+        ok,
+        f"coreEfficiency={efficiency:.2f}, idleRatio={idle_ratio:.2f}, capacityExceeded={exceeded}",
+    )
+
+
+@check(
+    id="SPARK-UI", ref="3.5.6", title="Spark UI has no skew, spill, or excessive shuffle issues",
+    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def spark_ui_review(ctx: CheckContext) -> Verdict:
+    """Recent Spark Advisor and stage metrics show no material performance issue."""
+    evidence = _spark.monitoring(ctx.obj)
+    if "advice" not in evidence and "stages" not in evidence:
+        return not_applicable("Spark Advisor and stage metrics are unavailable for this notebook")
+    threshold = int(_spark.number(ctx.setting("heavy_shuffle_bytes", 1_073_741_824), -1))
+    if threshold < 0:
+        return not_applicable("Project heavy_shuffle_bytes threshold is invalid")
+    issues = _spark.performance_issues(ctx.obj, threshold)
+    return binary(not issues, "No skew, spill, or heavy-shuffle issue detected" if not issues
+                  else f"Detected: {', '.join(issues)}")
+
+
+@check(
+    id="SPARK-PARTITION", ref="3.5.5", title="No full-table scans when partition pruning is possible",
+    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def spark_partition_pruning(ctx: CheckContext) -> Verdict:
+    """Every SQL read of a configured partitioned table filters a partition column."""
+    code = notebook_code(ctx.obj)
+    configured = ctx.setting("partition_columns", {})
+    if not isinstance(configured, dict) or not configured:
+        return not_applicable("No partition-column metadata configured for this project")
+    reads = _spark.partitioned_sql_reads(code, configured)
+    if not reads:
+        return not_applicable("Notebook has no SQL reads of configured partitioned tables")
+    unfiltered = sorted({table for table, filtered in reads if not filtered})
+    if unfiltered:
+        return binary(False, f"Partition predicate missing for: {', '.join(unfiltered)}")
+    return binary(True, f"All {len(reads)} configured partitioned-table read(s) filter a partition column")
+
+
+@check(
+    id="SPARK-PROFILE", ref="3.5.10", title="Long-running notebooks profiled and optimized",
+    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def spark_profile(ctx: CheckContext) -> Verdict:
+    """Long-running applications have monitoring evidence and no open issue."""
+    evidence = _spark.monitoring(ctx.obj)
+    usage = evidence.get("resource_usage")
+    if not isinstance(usage, dict):
+        return not_applicable("Spark application duration and profiling metrics are unavailable")
+    duration = _spark.number(usage.get("duration"))
+    if duration <= 0:
+        return not_applicable("Spark application duration is unavailable")
+    threshold = int(_spark.number(ctx.setting("long_running_notebook_ms", 300_000), -1))
+    if threshold < 0:
+        return not_applicable("Project long_running_notebook_ms threshold is invalid")
+    if duration < threshold:
+        return not_applicable(
+            f"Latest Spark application ran for {int(duration)} ms; below {threshold} ms threshold"
+        )
+    if "advice" not in evidence and "stages" not in evidence:
+        return not_applicable("Long-running application has no Advisor or stage profiling metrics")
+    shuffle_threshold = int(
+        _spark.number(ctx.setting("heavy_shuffle_bytes", 1_073_741_824), -1)
+    )
+    if shuffle_threshold < 0:
+        return not_applicable("Project heavy_shuffle_bytes threshold is invalid")
+    issues = _spark.performance_issues(ctx.obj, shuffle_threshold)
+    return binary(not issues, f"Profiled {int(duration)} ms application; no open performance issue"
+                  if not issues else f"Profiled {int(duration)} ms application; open issues: {', '.join(issues)}")
+
+
 # -- Copy activity parallelism (2.6.2) ----------------------------------------
 
 @check(
