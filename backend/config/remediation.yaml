@@ -165,6 +165,7 @@
 "4.5.12": "Validate fact foreign keys against the dimension before loading — an anti-join (left_anti) or a null check after a left join — and route unmatched keys to an error table. Fabric Warehouse allows FK constraints to be declared but does not enforce them, so nothing else prevents an orphan key being written."
 "4.3.4": "Implement a scheduled archiving/purging routine for the Lakehouse Files section: delete or move files past the agreed retention window (mssparkutils.fs.rm, or an ADLS lifecycle policy). Note this is separate from VACUUM, which only reclaims Delta table files."
 "5.4.1": "Use active fact-dimension surrogate-key relationships, and verify with SQL that non-null fact FKs have matching dimension keys (zero orphans)."
+"5.4.1": "Use active fact-dimension surrogate-key relationships, and verify with SQL that non-null fact FKs have matching dimension keys (zero orphans)."
 "5.2.5": "Add a record count reconciliation step after writing data — compare source and target row counts and raise an alert on mismatch."
 "5.3.2": "Validate referential integrity by running an anti-join of FK values against the dimension/lookup table and handling any unmatched keys before loading."
 "5.3.6": "When loading from multiple sources, reconcile record counts or hash totals across sources to detect missing or duplicated records."
