@@ -29,7 +29,7 @@ def sensitivity_labels(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="WS-RLS", ref="6.2.3", title="Row-Level Security (RLS) defined on semantic models",
+    id="WS-RLS", ref="6.2.1", title="Row-Level Security (RLS) defined on semantic models",
     pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=[Layer.STORAGE], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
