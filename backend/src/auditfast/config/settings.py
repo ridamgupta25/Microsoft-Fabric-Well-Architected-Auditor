@@ -67,6 +67,18 @@ class Settings(BaseSettings):
         description="Root folder for the permanent, per-run KB archive.",
     )
 
+    # -- Fabric read behaviour ------------------------------------------------
+    # Per-item run/refresh recency (semantic-model /refreshes + notebook/pipeline
+    # jobs/instances) costs one extra REST call PER item, and on non-capacity or
+    # never-refreshed workspaces it usually returns nothing. It is OFF by default
+    # so a crawl stays fast; the cheap per-workspace semantic-model created-date
+    # read stays on regardless. Turn it on when auditing capacity-backed
+    # workspaces where the last-run timestamp actually matters.
+    fabric_refresh_history: bool = Field(
+        default=False,
+        description="Read per-item last-run/refresh recency (slow: one call per item).",
+    )
+
     # -- CORS -----------------------------------------------------------------
     # The React dev server runs on a different origin, so the API must allow it
     # explicitly. In production this should be the deployed frontend origin only.
