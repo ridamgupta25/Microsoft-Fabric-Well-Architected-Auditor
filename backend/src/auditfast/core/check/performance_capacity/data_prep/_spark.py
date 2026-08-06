@@ -80,6 +80,10 @@ REPARTITION = re.compile(r"\.repartition\s*\(|\.coalesce\s*\(", re.IGNORECASE)
 SELECT_STAR = re.compile(r"select\s+\*|\.select\s*\(\s*[\"']\*[\"']\s*\)", re.IGNORECASE)
 SELECT = re.compile(r"\bselect\b|\.select\s*\(", re.IGNORECASE)
 WIDE_TRANSFORM = re.compile(r"\.join\s*\(|\bgroupBy\s*\(|\.groupby\s*\(|\bJOIN\b|\bGROUP\s+BY\b", re.IGNORECASE)
+SPARK_RUNTIME = re.compile(r"Apache-Spark/(\d+)\.(\d+)(?:\.(\d+))?", re.IGNORECASE)
+PLAIN_SPARK_VERSION = re.compile(r"(?<![\d.])(\d+)\.(\d+)\.(\d+)(?:\.\d+)*(?![\d.])")
+SQL_SELECT = re.compile(r"\bSELECT\b.*?(?=\bSELECT\b|;|$)", re.IGNORECASE | re.DOTALL)
+SQL_FROM = re.compile(r"\bFROM\s+([`A-Za-z_][`\w.]*)", re.IGNORECASE)
 
 # A token that is not a package spec: a flag, a URL/path, a VCS/requirements ref.
 _NON_PACKAGE = re.compile(r"^-|^git\+|^https?:|^/|\.txt$|^\.")
@@ -112,3 +116,149 @@ def pip_targets(code: str) -> list[str]:
 def unpinned_targets(code: str) -> list[str]:
     """Package specs installed without a pinned ``==`` version."""
     return [t for t in pip_targets(code) if "==" not in t]
+
+
+def captured_spark_versions(definition: dict) -> list[tuple[int, int, int]]:
+    """Spark versions captured in notebook outputs/metadata, excluding source text.
+
+    Prefer the direct output of a cell that asks for ``spark.version``. Notebook
+    outputs can also contain historical Delta ``Apache-Spark/...`` strings from
+    commands like DESCRIBE HISTORY; those are useful fallback evidence, but they
+    are not as authoritative as the current session's printed Spark version.
+    """
+    direct: list[tuple[int, int, int]] = []
+    fallback: list[tuple[int, int, int]] = []
+
+    def version_tuple(match) -> tuple[int, int, int]:
+        return tuple(int(part or 0) for part in match.groups())
+
+    def output_text(value) -> str:
+        if isinstance(value, dict):
+            return "\n".join(output_text(child) for child in value.values())
+        if isinstance(value, list):
+            return "\n".join(output_text(child) for child in value)
+        return value if isinstance(value, str) else ""
+
+    for cell in (definition or {}).get("cells") or []:
+        source = cell.get("source")
+        source_text = "".join(source) if isinstance(source, list) else str(source or "")
+        if "spark.version" not in source_text:
+            continue
+        for match in PLAIN_SPARK_VERSION.finditer(output_text(cell.get("outputs") or [])):
+            direct.append(version_tuple(match))
+        for match in SPARK_RUNTIME.finditer(output_text(cell.get("outputs") or [])):
+            direct.append(version_tuple(match))
+
+    if direct:
+        return direct
+
+    def visit(value) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key != "source":
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+        elif isinstance(value, str):
+            for match in SPARK_RUNTIME.finditer(value):
+                fallback.append(version_tuple(match))
+
+    visit(definition or {})
+    return fallback
+
+
+def parse_version(value: str) -> tuple[int, int, int] | None:
+    """Parse a deterministic ``major.minor[.patch]`` project threshold."""
+    match = re.fullmatch(r"\s*(\d+)\.(\d+)(?:\.(\d+))?\s*", str(value))
+    if not match:
+        return None
+    return tuple(int(part or 0) for part in match.groups())
+
+
+def fabric_runtime_to_spark(value: str) -> tuple[int, int, int] | None:
+    """Map Fabric Environment runtime versions to Spark major versions."""
+    runtime = parse_version(value)
+    if runtime is None:
+        return None
+    mapping = {"1.1": (3, 3, 0), "1.2": (3, 4, 0), "1.3": (3, 5, 0)}
+    return mapping.get(f"{runtime[0]}.{runtime[1]}")
+
+
+def partitioned_sql_reads(
+    code: str, partition_columns: dict[str, list[str]],
+) -> list[tuple[str, bool]]:
+    """Return configured partitioned-table SQL reads and predicate compliance.
+
+    Each SELECT is evaluated independently, preventing an unrelated WHERE in a
+    different query from making an unfiltered read look compliant.
+    """
+    configured = {
+        str(table).strip("`").lower(): [str(column).lower() for column in columns]
+        for table, columns in partition_columns.items()
+        if isinstance(columns, list) and columns
+    }
+    reads: list[tuple[str, bool]] = []
+    for query_match in SQL_SELECT.finditer(code):
+        query = query_match.group(0)
+        table_match = SQL_FROM.search(query)
+        if not table_match:
+            continue
+        table = table_match.group(1).strip("`").lower()
+        columns = configured.get(table) or configured.get(table.rsplit(".", 1)[-1])
+        if not columns:
+            continue
+        where = re.search(r"\bWHERE\b(.*)$", query, re.IGNORECASE | re.DOTALL)
+        predicate = where.group(1) if where else ""
+        filtered = any(re.search(rf"\b{re.escape(column)}\b", predicate, re.IGNORECASE)
+                       for column in columns)
+        reads.append((table, filtered))
+    return reads
+
+
+def monitoring(definition: dict) -> dict:
+    """Provider-enriched Spark monitoring evidence for this notebook."""
+    value = (definition or {}).get("_auditfast_monitoring")
+    return value if isinstance(value, dict) else {}
+
+
+def collection(value) -> list[dict]:
+    """Normalize Fabric collection responses that use value/data or a raw list."""
+    if isinstance(value, list):
+        return [row for row in value if isinstance(row, dict)]
+    if isinstance(value, dict):
+        rows = value.get("value") or value.get("data") or []
+        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+    return []
+
+
+def number(value, default: float = 0.0) -> float:
+    """Convert a monitoring metric to float without raising in a check."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def performance_issues(definition: dict, heavy_shuffle_bytes: int) -> list[str]:
+    """Deterministic skew, spill, and heavy-shuffle issues in monitoring data."""
+    evidence = monitoring(definition)
+    issues: set[str] = set()
+    for advice in collection(evidence.get("advice")):
+        text = " ".join(str(advice.get(key) or "") for key in ("name", "description"))
+        if re.search(r"skew", text, re.IGNORECASE):
+            issues.add("skew advice")
+        if re.search(r"spill", text, re.IGNORECASE):
+            issues.add("spill advice")
+        if re.search(r"shuffle", text, re.IGNORECASE):
+            issues.add("shuffle advice")
+    for stage in collection(evidence.get("stages")):
+        if number(stage.get("diskBytesSpilled")) > 0 or number(stage.get("memoryBytesSpilled")) > 0:
+            issues.add("stage spill")
+        shuffle = max(
+            number(stage.get("shuffleWriteBytes")),
+            number(stage.get("shuffleReadBytes")),
+        )
+        if shuffle > heavy_shuffle_bytes:
+            issues.add("heavy shuffle")
+    return sorted(issues)

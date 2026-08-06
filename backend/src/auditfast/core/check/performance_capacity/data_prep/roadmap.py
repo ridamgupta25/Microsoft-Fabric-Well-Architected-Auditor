@@ -15,8 +15,6 @@ from auditfast.core.enums import Automation, Layer, Pillar, Resource, Scope
 # (id, ref, title, layers, required, requirement)
 _CHECKS: list[tuple[str, str, str, tuple[str, ...], bool, str]] = [
 
-    ("R-3-4-5", "3.4.5", "Python/Spark version is current and supported", (Layer.PREP,), True, "ITEM_DEFINITION"),
-    ("R-3-5-5", "3.5.5", "No full-table scans when partition pruning is possible", (Layer.PREP,), True, "ITEM_DEFINITION"),
     ("R-3-5-7", "3.5.7", "Gold-layer tables optimized for common query patterns (Z-ORDER on filter columns)", (Layer.PREP,), True, "ITEM_DEFINITION"),
     ("R-3-5-8", "3.5.8", "Predicate pushdown verified for shortcut/external reads", (Layer.PREP,), True, "ITEM_DEFINITION"),
 ]
