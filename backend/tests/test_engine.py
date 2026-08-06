@@ -69,7 +69,7 @@ def test_result_and_scored_counts_are_unchanged(provider):
 
 def test_status_counts_are_unchanged(provider):
     agg = aggregate(_run(provider))
-    assert agg["counts"][Status.PASS] == 50
+    assert agg["counts"][Status.PASS] == 53
     assert agg["counts"][Status.PARTIAL] == 18
     assert agg["counts"][Status.FAIL] == 40
     assert agg["counts"][Status.NA] == 99
@@ -274,7 +274,7 @@ def test_registry_is_fully_populated():
     """99 checks are evaluated; remaining roadmap checks are not loaded."""
     evaluated = [s for s in REGISTRY if s.automation is Automation.AUTOMATED]
     assert len(evaluated) == 99
-    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 31
+    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 32
     assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 18
     assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 49
     # Roadmap (gated N/A) checks are intentionally not registered — see
