@@ -17,7 +17,7 @@ from auditfast.core.check._tables import (
     is_fact,
     is_snake_case,
 )
-from auditfast.core.check.helpers import Verdict, binary, covered, not_applicable
+from auditfast.core.check.helpers import Verdict, binary, covered, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
@@ -198,6 +198,39 @@ def _too_wide(column_type: str) -> bool | None:
         return None
     width = match.group(1).lower()
     return True if width == "max" else int(width) > _MAX_TEXT_WIDTH
+
+
+@check(
+    id="WS-SHORTCUT-SCOPE", ref="4.1.2", title="OneLake used as the single data lake",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS], required=False,
+)
+def shortcut_scope(ctx: CheckContext) -> Verdict:
+    """Where the workspace's shortcuts point — OneLake versus external storage.
+
+    A shortcut to Dataverse or ADLS is a legitimate governed pattern, so the count
+    is reported for review rather than scored as a failure.
+    """
+    if not ctx.workspace.has(Resource.SHORTCUTS):
+        return not_applicable("Shortcuts could not be read from Fabric")
+    all_shortcuts = [s for entries in ctx.workspace.shortcuts.values() for s in entries]
+    if not all_shortcuts:
+        return not_applicable("No OneLake shortcuts in this workspace")
+
+    external_types = sorted({
+        (s.get("target_type") or "unknown")
+        for s in all_shortcuts
+        if (s.get("target_type") or "").strip().lower() != "onelake"
+    })
+    onelake = sum(1 for s in all_shortcuts
+                  if (s.get("target_type") or "").strip().lower() == "onelake")
+    external = len(all_shortcuts) - onelake
+    return note(
+        f"{len(all_shortcuts)} shortcut(s): {onelake} target OneLake, "
+        f"{external} target external sources ({', '.join(external_types) or 'none'}). "
+        f"External shortcuts are legitimate when governed - confirm each is intended."
+    )
+
 
 
 @check(

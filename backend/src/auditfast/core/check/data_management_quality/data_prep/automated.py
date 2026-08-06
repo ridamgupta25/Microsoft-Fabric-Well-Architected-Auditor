@@ -520,6 +520,45 @@ _MERGE_VALIDATE = re.compile(
     r"merge_result|merge_valid|post.?merge.*count",
     re.IGNORECASE,
 )
+_DEDUP_PATTERN = re.compile(
+    # Real dedup calls only. A bare ``row_number()`` ranks rows without removing
+    # any, so it counts only when a later filter keeps rank 1. The word "dedup"
+    # must be a call: "Error during deduplication" is a message, not a control.
+    r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.duplicated\s*\(|"
+    r"\.distinct\s*\(|"
+    r"row_number\s*\(\s*\)[\s\S]{0,120}?\bover\b[\s\S]{0,400}?(?:==|=)\s*1\b|"
+    r"\bdedup\w*\s*\(|"
+    # The group-by-then-keep-count-above-one idiom, the SQL/PySpark way of
+    # surfacing duplicate keys without calling any dedup API.
+    r"groupBy[^\n]*\.count\s*\(\s*\)[^\n]*?count[^\n]*?>\s*1",
+    re.IGNORECASE,
+)
+_TYPE_CAST = re.compile(
+    # An explicit cast, an explicit schema, or typed DDL. A bare ``IntegerType()``
+    # is excluded: it appears in type *introspection* as often as in a schema.
+    r"\.cast\s*\(|to_date\s*\(|to_timestamp\s*\(|\.astype\s*\(|"
+    r"StructField\s*\(|"
+    # SQL casting, written in selectExpr / spark.sql / a %%sql cell.
+    r"\bCAST\s*\(\s*[\w.`\"\[\]]+\s+AS\s+\w+|"
+    # Typed DDL. The type must sit inside the column-definition parentheses, so a
+    # CREATE TABLE ... AS SELECT that merely mentions DATE later does not count.
+    r"CREATE\s+(?:OR\s+REPLACE\s+)?TABLE[^\n(]*\([^)]{0,400}?"
+    r"\b\w+\s+(?:INT|BIGINT|SMALLINT|STRING|VARCHAR|CHAR|DECIMAL|NUMERIC|TIMESTAMP|DATE|"
+    r"BOOLEAN|DOUBLE|FLOAT)\b",
+    re.IGNORECASE,
+)
+# Case matters here: ``Id``/``ID``/``_id`` are key suffixes, but a case-insensitive
+# ``id`` also matches the tail of ordinary words such as "valid", and a lower-case
+# ``key`` matches "monkey". Each alternative therefore carries its own boundary.
+_KEY_NAME = r"(?:\bkey\b|\w*_(?:key|KEY|id|ID)\b|\w+(?:Key|KEY|Id|ID)\b)"
+_KEY_QUALITY = re.compile(
+    # A null test on a key-named column, either way round, or a dedup keyed on one.
+    rf"{_KEY_NAME}[^\n]{{0,40}}\.is(?:Not)?Null\s*\(|"
+    rf"\.is(?:Not)?Null\s*\([^\n]{{0,60}}{_KEY_NAME}|"
+    r"drop[Dd]uplicates\s*\(\s*(?:subset\s*=\s*)?\[|"
+    r"drop_duplicates\s*\(\s*(?:subset\s*=\s*)?\[|"
+    r"dropna\s*\([^\n]*subset",
+)
 
 
 @check(
@@ -628,3 +667,52 @@ def pl_late_arrival(ctx: CheckContext) -> Verdict:
         if safe_write else
         "Late/out-of-order handling is indicated but no version-aware duplicate-safe write was found",
     )
+
+
+@check(
+    id="NB-DEDUP", ref="5.2.6",
+    title="Duplicate detection across batches",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_dedup(ctx: CheckContext) -> Verdict:
+    """Notebooks that write data de-duplicate, so a re-run cannot double-load rows."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write data to a table")
+    ok = bool(_DEDUP_PATTERN.search(code))
+    return binary(ok, "Duplicate detection present" if ok
+                  else "Writes data without duplicate detection")
+
+
+@check(
+    id="NB-TYPE-CAST", ref="5.3.1",
+    title="Data type conformance: columns cast to standard types",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_type_cast(ctx: CheckContext) -> Verdict:
+    """Notebooks that write data cast columns explicitly instead of trusting inference."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write data to a table")
+    ok = bool(_TYPE_CAST.search(code))
+    return binary(ok, "Explicit type conformance present" if ok
+                  else "Writes data without explicit type casting")
+
+
+@check(
+    id="NB-KEY-QUALITY", ref="5.5.6",
+    title="Identifiers and keys: uniqueness verified, no nulls in key columns",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_key_quality(ctx: CheckContext) -> Verdict:
+    """Notebooks that write data validate key columns for nulls and duplicates."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write data to a table")
+    ok = bool(_KEY_QUALITY.search(code))
+    return binary(ok, "Key uniqueness / null validation present" if ok
+                  else "Writes data without key uniqueness or null validation")
+
