@@ -467,6 +467,161 @@ def nb_no_cursor(ctx: CheckContext) -> Verdict:
         else "No T-SQL cursors or row-by-row iteration patterns — set-based transformations",
     )
 
+# T-SQL cursor and pandas row-by-row iteration anti-patterns (3.6.7).
+# Note: .collect()/.toPandas() are separately caught by NB-COLLECT; this
+# targets explicit SQL cursor syntax and pandas row iterators that are
+# semantically cursor-equivalent.
+_CURSOR = re.compile(
+    r"\bDECLARE\s+\w+\s+CURSOR\b"    # T-SQL cursor declaration
+    r"|\bFETCH\s+NEXT\b"               # T-SQL cursor fetch
+    r"|\bWHILE\s+@@FETCH_STATUS\b"     # T-SQL cursor loop
+    r"|\.iterrows\s*\(\s*\)"           # pandas row-by-row iteration
+    r"|\.itertuples\s*\(\s*\)",        # pandas tuple-by-tuple iteration
+    re.IGNORECASE,
+)
+
+#: Table/schema name patterns that indicate a staging area.
+#: Keys in ctx.workspace.tables are either plain lakehouse names ("StagingTemp")
+#: or "WarehouseName.schema.table" for warehouse tables.  The pattern must
+#: match the schema segment that follows the first dot, so it correctly detects
+#: "DataflowsStagingWarehouse.stg.sales" (schema = stg) and
+#: "AnyWarehouse.staging.orders" (schema = staging), but NOT
+#: "DataflowsStagingWarehouse.dbo.customers" where only the warehouse name
+#: contains "Staging" while the actual schema is dbo.
+_STAGING_NAME = re.compile(
+    # Lakehouse: plain name contains staging (e.g. StagingTemp)
+    r"(?:^|[_.\-])staging(?:[_.\-]|$)"
+    r"|^stg[_.]|[_.]stg$"
+    r"|^stage[_.]|[_.]stage$"
+    # Warehouse: schema segment (after the first dot) is stg/staging/stage
+    r"|\.[_]?(?:stg|staging|stage)[_.]",
+    re.IGNORECASE,
+)
+
+@check(
+    id="WS-WH-LOAD", ref="3.6.1",
+    title="Gold Warehouse load pattern is defined and consistent",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
+    required=True,
+)
+def wh_load_pattern(ctx: CheckContext) -> Verdict:
+    """Warehouse tables are populated via a defined pattern: COPY INTO, CTAS, Copy activity, or stored procedure."""
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
+
+    warehouses = [i for i in ctx.workspace.items if i.type == "Warehouse"]
+    if not warehouses:
+        return not_applicable("No Warehouse items found in this workspace")
+
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    pipelines = ctx.workspace.pipelines
+    if not pipelines:
+        return graded(
+            1,
+            f"{len(warehouses)} Warehouse item(s) found but no pipelines defined — "
+            "a load pattern (COPY INTO / CTAS / Copy activity / stored procedure) should be established",
+        )
+
+    def _to_text(v) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v
+        if isinstance(v, dict):
+            parts: list[str] = []
+            for k in ("text", "query", "commandText", "sqlText", "value"):
+                x = v.get(k)
+                if isinstance(x, str):
+                    parts.append(x)
+            if parts:
+                return " ".join(parts)
+            return str(v)
+        if isinstance(v, list):
+            return " ".join(_to_text(x) for x in v)
+        return str(v)
+
+    load_acts: list[str] = []
+
+    for pl_name, pl_def in pipelines.items():
+        for act in pipeline_activities(pl_def):
+            act_type = str(act.get("type", "") or "")
+            props = act.get("typeProperties") or {}
+            act_name = act.get("name", act_type) or act_type
+
+            # Copy activity
+            if act_type == "Copy":
+                load_acts.append(f"{pl_name}/{act_name}")
+                continue
+
+            if act_type == "Script":
+                scripts = props.get("scripts") or []
+                text = _to_text(scripts).upper()
+                if any(kw in text for kw in ("COPY INTO", "CREATE TABLE", "INSERT INTO", "CTAS")):
+                    load_acts.append(f"{pl_name}/{act_name}")
+                    continue
+
+            if act_type in ("SqlServerStoredProcedure", "StoredProcedure"):
+                load_acts.append(f"{pl_name}/{act_name}")
+                continue
+
+    if not load_acts:
+        return graded(
+            1,
+            f"{len(warehouses)} Warehouse item(s) found across {len(pipelines)} pipeline(s) "
+            "but no activity uses a defined load pattern (COPY INTO / CTAS / Copy / stored procedure)",
+        )
+
+    return binary(
+        True,
+        f"{len(load_acts)} load-pattern activity/activities across {len(pipelines)} pipeline(s): "
+        + ", ".join(load_acts[:5]),
+    )
+
+@check(
+    id="NB-NO-CURSOR", ref="3.6.2",
+    title="Silver-to-Gold transformations are set-based (no row-by-row cursors)",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_no_cursor(ctx: CheckContext) -> Verdict:
+    """Set-based SQL and DataFrame operations rather than T-SQL cursors or pandas row iteration."""
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = notebook_code(ctx.obj)
+    hits = _CURSOR.findall(code)
+    return binary(
+        not hits,
+        f"{len(hits)} cursor/row-iteration pattern(s) detected "
+        "(T-SQL CURSOR / .iterrows() / .itertuples())" if hits
+        else "No T-SQL cursors or row-by-row iteration patterns — set-based transformations",
+    )
+
+
+@check(
+    id="WS-STAGING", ref="3.6.3
+    title="Staging tables/schema used for Warehouse loads before merge into final tables",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+)
+def wh_staging_pattern(ctx: CheckContext) -> Verdict:
+    """A staging layer (stg_*/staging_* tables or schema) buffers loads before the final merge."""
+    tables = ctx.workspace.tables
+    if not tables:
+        return not_applicable(_NO_TABLES)
+    staging = [n for n in tables if _STAGING_NAME.search(n)]
+    if staging:
+        return binary(
+            True,
+            f"{len(staging)} staging table(s) found: {', '.join(staging[:5])}",
+        )
+    return graded(
+        1,
+        f"{len(tables)} table(s) found but none follow a staging naming pattern "
+        "(stg_* / staging_* / stage_*) — a staging schema buffers loads before the final merge",
+    )
 
 @check(
     id="WS-STAGING", ref="3.6.3",
