@@ -24,6 +24,7 @@ from auditfast.core.models import CheckContext
 from . import _spark
 from ._spark import NOTEBOOK_LAYERS, pip_targets, unpinned_targets, writes_delta
 import re
+import re
 
 # -- Delta table maintenance (3.3.x) ------------------------------------------
 
