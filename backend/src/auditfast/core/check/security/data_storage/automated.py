@@ -31,7 +31,7 @@ def sensitivity_labels(ctx: CheckContext) -> Verdict:
 
 @check(
     id="WS-RLS", ref="6.2.1", title="Row-Level Security (RLS) defined on semantic models",
-    pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.CRITICAL,
     layers=[Layer.STORAGE], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
 def rls_on_semantic_models(ctx: CheckContext) -> Verdict:
@@ -51,7 +51,7 @@ def rls_on_semantic_models(ctx: CheckContext) -> Verdict:
 
 @check(
     id="WS-OLS", ref="6.2.2", title="Column-Level Security / Object-Level Security applied for sensitive fields",
-    pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.CRITICAL,
     layers=[Layer.STORAGE], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
 def ols_on_semantic_models(ctx: CheckContext) -> Verdict:
