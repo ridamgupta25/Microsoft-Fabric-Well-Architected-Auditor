@@ -17,7 +17,7 @@ from auditfast.core.check._tables import (
     is_fact,
     is_snake_case,
 )
-from auditfast.core.check.helpers import Verdict, binary, covered, not_applicable
+from auditfast.core.check.helpers import Verdict, binary, covered, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
@@ -26,6 +26,12 @@ _NO_TABLES = "No lakehouse/warehouse tables were read for this workspace"
 
 #: Column names implying a date/time value, for the data-type check.
 _DATE_NAME = re.compile(r"(date|timestamp|_dt$|_time$)", re.IGNORECASE)
+
+#: A text type carrying a declared width, e.g. ``varchar(4000)`` or ``nvarchar(max)``.
+_DECLARED_WIDTH = re.compile(r"^n?(?:varchar|char)\s*\(\s*(max|\d+)\s*\)", re.IGNORECASE)
+
+#: Widths above this are treated as oversized — they defeat statistics and inflate row size.
+_MAX_TEXT_WIDTH = 4000
 
 
 @check(
@@ -139,23 +145,92 @@ def table_column_naming(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="TB-DATATYPES", ref="4.2.4", title="Date/time columns use a temporal type (not string)",
+    id="TB-DATATYPES", ref="4.2.4", title="Data types are appropriate (temporal dates, no oversized text)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
 )
 def table_data_types(ctx: CheckContext) -> Verdict:
-    """Columns whose name implies a date/time are typed as temporal, not string."""
+    """Date-named columns are typed temporally, and declared text widths are sane.
+
+    Only columns that can actually be judged are counted: a date-named column, or a
+    text column that declares a width. A bare ``string`` has no width to assess.
+    """
     tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
     if not tables:
         return not_applicable("No table column metadata available")
-    date_cols = [(c.get("name", ""), (c.get("type", "") or "").lower())
-                 for t in tables.values() for c in columns(t)
-                 if _DATE_NAME.search(c.get("name", ""))]
-    if not date_cols:
-        return not_applicable("No date/time-named columns to type-check")
-    ok = [n for n, ty in date_cols if ty and not ty.startswith(("string", "varchar", "char"))]
-    return covered(len(ok), len(date_cols),
-                   f"{len(ok)} of {len(date_cols)} date/time columns use a temporal type")
+
+    assessed = compliant = stringly_dates = oversized = 0
+    for table in tables.values():
+        for col in columns(table):
+            name = col.get("name", "")
+            ctype = (col.get("type", "") or "").lower()
+            if not ctype:
+                continue
+            if _DATE_NAME.search(name):
+                assessed += 1
+                if ctype.startswith(("string", "varchar", "char", "nvarchar", "nchar")):
+                    stringly_dates += 1
+                else:
+                    compliant += 1
+            elif _too_wide(ctype) is not None:
+                assessed += 1
+                if _too_wide(ctype):
+                    oversized += 1
+                else:
+                    compliant += 1
+
+    if not assessed:
+        return not_applicable(
+            "No date/time-named columns and no text columns with a declared width"
+        )
+    return covered(
+        compliant, assessed,
+        f"{compliant} of {assessed} assessable columns are appropriately typed — "
+        f"{stringly_dates} date column(s) typed as text, "
+        f"{oversized} text column(s) wider than {_MAX_TEXT_WIDTH}",
+    )
+
+
+def _too_wide(column_type: str) -> bool | None:
+    """True/False for a text type with a declared width, None when not assessable."""
+    match = _DECLARED_WIDTH.match(column_type)
+    if not match:
+        return None
+    width = match.group(1).lower()
+    return True if width == "max" else int(width) > _MAX_TEXT_WIDTH
+
+
+@check(
+    id="WS-SHORTCUT-SCOPE", ref="4.1.2", title="OneLake used as the single data lake",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS], required=False,
+)
+def shortcut_scope(ctx: CheckContext) -> Verdict:
+    """Where the workspace's shortcuts point — OneLake versus external storage.
+
+    A shortcut to Dataverse or ADLS is a legitimate governed pattern, so the count
+    is reported for review rather than scored as a failure.
+    """
+    if not ctx.workspace.has(Resource.SHORTCUTS):
+        return not_applicable("Shortcuts could not be read from Fabric")
+    all_shortcuts = [s for entries in ctx.workspace.shortcuts.values() for s in entries]
+    if not all_shortcuts:
+        return not_applicable("No OneLake shortcuts in this workspace")
+
+    external_types = sorted({
+        (s.get("target_type") or "unknown")
+        for s in all_shortcuts
+        if (s.get("target_type") or "").strip().lower() != "onelake"
+    })
+    onelake = sum(1 for s in all_shortcuts
+                  if (s.get("target_type") or "").strip().lower() == "onelake")
+    external = len(all_shortcuts) - onelake
+    return note(
+        f"{len(all_shortcuts)} shortcut(s): {onelake} target OneLake, "
+        f"{external} target external sources ({', '.join(external_types) or 'none'}). "
+        f"External shortcuts are legitimate when governed - confirm each is intended."
+    )
+
 
 
 @check(

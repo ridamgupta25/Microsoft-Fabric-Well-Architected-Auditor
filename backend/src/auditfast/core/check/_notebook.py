@@ -6,10 +6,22 @@ the notebook checks import.
 """
 from __future__ import annotations
 
+import re
+
 from auditfast.core.enums import Layer
 
 #: Layers whose workspaces are expected to hold transformation notebooks.
 NOTEBOOK_LAYERS = (Layer.PREP, Layer.OPERATIONS, Layer.MIXED)
+
+#: A string literal or a comment. Matching literals first means a ``#`` inside a
+#: string is never mistaken for the start of a comment.
+_STRING_OR_COMMENT = re.compile(
+    r"'''[\s\S]*?'''"
+    r'|"""[\s\S]*?"""'
+    r"|'(?:\\.|[^'\\\n])*'"
+    r'|"(?:\\.|[^"\\\n])*"'
+    r"|#[^\n]*"
+)
 
 
 def notebook_code(definition: dict) -> str:
@@ -21,6 +33,19 @@ def notebook_code(definition: dict) -> str:
         src = cell.get("source")
         parts.append("".join(src) if isinstance(src, list) else (src or ""))
     return "\n".join(parts)
+
+
+def executable_code(definition: dict) -> str:
+    """Code cells with ``#`` comments removed.
+
+    A detector that looks for a *technique* must not be satisfied by a comment
+    describing it, nor by code that was commented out — both mean the technique
+    is absent.
+    """
+    return _STRING_OR_COMMENT.sub(
+        lambda m: "" if m.group(0).startswith("#") else m.group(0),
+        notebook_code(definition),
+    )
 
 
 def has_parameters_cell(definition: dict) -> bool:
