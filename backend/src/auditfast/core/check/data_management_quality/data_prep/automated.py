@@ -647,18 +647,13 @@ _COUNT_RECONCILE = re.compile(
     r"reconcil|\bcount_check\b|validate[^\n]*count|expect_table_row_count",
     re.IGNORECASE,
 )
-_RI_PATTERN = re.compile(
-    r"""(?isx)
-    (?:\.join\s*\(.*?["']left_anti["'])
-    |
-    (?:\.join\s*\(.*?["']left["'].*?\.(?:where|filter)\s*\(.*?isNull\s*\()
-    |
-    (?:\bleft\s+join\b.*?\bwhere\b.*?\bis\s+null\b)
-    |
-    \b(?:referential|integrity|fk_check|integrity_check|orphan|unmatched|missing_parent|no_parent)\b
-    """
+# A DataFrame ``.join(`` or a SQL ``JOIN <table>``. ``path.join`` and ``"x".join``
+# are not table joins.
+_JOIN_PATTERN = re.compile(
+    r"(?<!['\",])(?<!path)\.join\s*\(\s*(?![\[\]'\"])"
+    r"|\bjoin\s+[\w`\"\[]",
+    re.IGNORECASE,
 )
-_JOIN_PATTERN = re.compile(r"(?is)\.join\s*\(|\bleft\s+join\b|\binner\s+join\b|\bright\s+join\b|\bfull\s+join\b", re.IGNORECASE)
 _RI_PATTERN = re.compile(
     r"""(?isx)
     (?:\.join\s*\(.*?["']left_anti["'])
@@ -1306,6 +1301,7 @@ def nb_fact_dim_ri(ctx: CheckContext) -> Verdict:
         return not_applicable("Notebook does not load or join dimensional tables")
     if not _JOIN_PATTERN.search(code):
         return not_applicable("Notebook performs no fact-to-dimension join")
+    ok = bool(_RI_PATTERN.search(code))
     ok = bool(_RI_PATTERN.search(code))
     return binary(ok, "Fact FKs are validated against the dimension (anti-join / "
                       "null check)" if ok

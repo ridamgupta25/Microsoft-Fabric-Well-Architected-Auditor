@@ -106,6 +106,8 @@ def _measure_detail(names: list[str], verb: str) -> str:
     layers=SEMANTIC_LAYERS,
     requires=[Resource.ITEMS, Resource.SEMANTIC_MODEL_DEFINITIONS],
     required=True,
+    requires=[Resource.ITEMS, Resource.SEMANTIC_MODEL_DEFINITIONS],
+    required=True,
 )
 def sm_fk_surrogate(ctx: CheckContext) -> Verdict:
     model = _model(ctx)
@@ -113,17 +115,26 @@ def sm_fk_surrogate(ctx: CheckContext) -> Verdict:
         return not_applicable("Semantic model definition could not be read")
 
     relationships = _relationships(model)
+    relationships = _relationships(model)
     if not relationships:
         table_count = len(model.get("tables") or [])
         if table_count <= 1:
+        table_count = len(model.get("tables") or [])
+        if table_count <= 1:
             return not_applicable("Single-table model — no relationships to define")
-        return covered(0, 1, f"Model has {table_count} tables but no relationships defined — facts are not wired to dimensions",)
         return covered(0, 1, f"Model has {table_count} tables but no relationships defined — facts are not wired to dimensions",)
 
     on_keys: list[dict[str, Any]] = []
     inactive_names: list[str] = []
 
+    on_keys: list[dict[str, Any]] = []
+    inactive_names: list[str] = []
+
     for rel in relationships:
+        from_col = _norm_col(str(rel.get("from_column") or rel.get("fromColumn") or ""))
+        to_col = _norm_col(str(rel.get("to_column") or rel.get("toColumn") or ""))
+
+        if _KEY_HINT_RE.search(from_col) or _KEY_HINT_RE.search(to_col):
         from_col = _norm_col(str(rel.get("from_column") or rel.get("fromColumn") or ""))
         to_col = _norm_col(str(rel.get("to_column") or rel.get("toColumn") or ""))
 
