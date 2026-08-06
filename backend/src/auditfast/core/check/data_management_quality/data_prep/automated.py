@@ -10,6 +10,7 @@ import re
 
 from auditfast.core.check._notebook import (
     NOTEBOOK_LAYERS,
+    executable_code,
     has_parameters_cell,
     markdown_sources,
     notebook_code,
@@ -173,7 +174,6 @@ _SPARK_SQL = re.compile(r"spark\.sql\s*\(|%%?sql\b", re.IGNORECASE)
 _DATAFRAME_OP = re.compile(r"spark\.(?:read|table)\b|\.groupBy\s*\(|\.withColumn\s*\(|createDataFrame\s*\(")
 _EXTERNAL_READ = re.compile(r"\.read\b[^\n]*(?:csv|json|format\s*\(\s*[\"'](?:csv|json))", re.IGNORECASE)
 _SCHEMA_DEFINED = re.compile(r"\.schema\s*\(|StructType\s*\(|inferSchema", re.IGNORECASE)
-_JOIN_CALL = re.compile(r"\.join\s*\(")
 _BROADCAST = re.compile(r"broadcast\s*\(", re.IGNORECASE)
 _NB_NAME_OK = re.compile(r"^[A-Za-z][A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)+$")
 _NB_NAME_BAD = re.compile(r"^(?:notebook|untitled|test|temp|copy of)\b", re.IGNORECASE)
@@ -299,7 +299,7 @@ def nb_timeout(ctx: CheckContext) -> Verdict:
 )
 def nb_language(ctx: CheckContext) -> Verdict:
     """One primary language rather than a mix of PySpark and Spark SQL."""
-    code = notebook_code(ctx.obj)
+    code = executable_code(ctx.obj)
     mixed = bool(_SPARK_SQL.search(code)) and bool(_DATAFRAME_OP.search(code))
     if mixed:
         return graded(1, "Mixes PySpark and Spark SQL — pick one primary approach")
@@ -325,10 +325,10 @@ def nb_dataframe_api(ctx: CheckContext) -> Verdict:
 )
 def nb_broadcast(ctx: CheckContext) -> Verdict:
     """Joins carry a broadcast() hint where a small dimension meets a large fact."""
-    code = notebook_code(ctx.obj)
-    joins = _JOIN_CALL.findall(code)
+    code = executable_code(ctx.obj)
+    joins = _JOIN_PATTERN.findall(code)
     if not joins:
-        return not_applicable("No DataFrame joins present to evaluate for broadcast hints")
+        return not_applicable("No joins present to evaluate for broadcast hints")
     ok = bool(_BROADCAST.search(code))
     return binary(ok, "broadcast() hint present on join(s)" if ok
                   else f"{len(joins)} join(s) without a broadcast() hint")
@@ -463,32 +463,58 @@ _WRITE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _COUNT_RECONCILE = re.compile(
-    r"assert.*\.count\s*\(|\.count\s*\(\s*\)\s*[!=<>]|"
-    r"row_count|record_count|source_count|target_count|"
-    r"reconcil|recon_count|count_check|validate.*count",
+    # A count that is actually asserted or compared against an expectation. A count
+    # merely assigned, used as a column alias, or compared to 0 (an emptiness guard)
+    # reconciles nothing.
+    r"assert[^\n]*\.count\s*\(|"
+    r"\.count\s*\(\s*\)\s*(?:==|!=|<=|>=|<|>)(?!\s*0\b)|"
+    r"(?:row|record|source|target|actual|expected|recon)_count\b\s*(?:==|!=|<=|>=|<|>)(?!\s*0\b)|"
+    r"(?:==|!=|<=|>=|<|>)\s*(?:row|record|source|target|actual|expected|recon)_count\b|"
+    # Explicitly named reconciliation / row-count validation.
+    r"reconcil|\bcount_check\b|validate[^\n]*count|expect_table_row_count",
     re.IGNORECASE,
 )
-_JOIN_PATTERN = re.compile(r"(?<!['\",])\s*\.join\s*\(\s*(?![\[\]'\"])", re.IGNORECASE)
+# A DataFrame ``.join(`` or a SQL ``JOIN <table>``. ``path.join`` and ``"x".join``
+# are not table joins.
+_JOIN_PATTERN = re.compile(
+    r"(?<!['\",])(?<!path)\.join\s*\(\s*(?![\[\]'\"])"
+    r"|\bjoin\s+[\w`\"\[]",
+    re.IGNORECASE,
+)
 _FK_INTEGRITY = re.compile(
     r"left_anti|leftanti|anti.*join|"
     r"referential|fk_check|integrity_check|"
     r"\.isNull\s*\(\s*\).*join|join.*\.isNull\s*\(",
     re.IGNORECASE,
 )
+# One physical read. The chained ``spark.read...load(...)`` form is listed first so it
+# is consumed whole rather than counted as both a ``spark.read`` and a ``.load(``. The
+# chain may be split by line continuations and may nest one level of parentheses.
 _MULTI_SOURCE = re.compile(
-    r"(?:spark\.table\s*\(|spark\.read\b|\.load\s*\()", re.IGNORECASE,
+    r"spark\.read\b(?:[\s\\]*\.\s*\w+\s*\((?:[^()]|\([^()]*\))*\))*?[\s\\]*\.\s*load\s*\(|"
+    r"spark\.read\b|"
+    r"spark\.table\s*\(|"
+    r"\.load\s*\(",
+    re.IGNORECASE,
 )
 _ORPHAN_DETECT = re.compile(
     r"left_anti|leftanti|orphan|unmatched|no_parent|missing_parent|"
     r"anti.*join.*parent|parent.*anti.*join",
     re.IGNORECASE,
 )
+# A Delta merge is often issued through a variable bound to DeltaTable.forName/forPath,
+# so the ``.merge(`` call site alone does not carry the DeltaTable name.
 _MERGE_PATTERN = re.compile(
-    r"MERGE\s+INTO|deltaTable\s*\.\s*merge\s*\(|DeltaTable\s*\.\s*merge\s*\(",
+    r"MERGE\s+INTO|"
+    r"DeltaTable\s*\.\s*merge\s*\(|"
+    r"DeltaTable\s*\.\s*(?:forName|forPath)\s*\([\s\S]*?\.\s*merge\s*\(|"
+    r"\.\s*merge\s*\([\s\S]{0,400}?\.\s*whenMatched",
     re.IGNORECASE,
 )
 _MERGE_VALIDATE = re.compile(
-    r"operationMetrics|DESCRIBE\s+HISTORY|merge.*count|"
+    # ``merge[_ ]count`` must be a real token: a bare ``merge.*count`` also matches
+    # the target name in "MERGE INTO gold_customer_country".
+    r"operationMetrics|DESCRIBE\s+HISTORY|merge[_\s]*count\b|"
     r"rows_inserted|rows_updated|rows_deleted|"
     r"num_inserted|num_updated|num_deleted|"
     r"merge_result|merge_valid|post.?merge.*count",
@@ -504,7 +530,7 @@ _MERGE_VALIDATE = re.compile(
 )
 def nb_recon_count(ctx: CheckContext) -> Verdict:
     """Notebooks that write data validate row counts against source expectations."""
-    code = notebook_code(ctx.obj)
+    code = executable_code(ctx.obj)
     if not _WRITE_PATTERN.search(code):
         return not_applicable("Notebook does not write data to a table")
     ok = bool(_COUNT_RECONCILE.search(code))
@@ -520,7 +546,7 @@ def nb_recon_count(ctx: CheckContext) -> Verdict:
 )
 def nb_fk_integrity(ctx: CheckContext) -> Verdict:
     """Notebooks that join tables verify FK values exist in dimension/lookup tables."""
-    code = notebook_code(ctx.obj)
+    code = executable_code(ctx.obj)
     if not _JOIN_PATTERN.search(code):
         return not_applicable("Notebook does not perform joins")
     ok = bool(_FK_INTEGRITY.search(code))
@@ -536,7 +562,7 @@ def nb_fk_integrity(ctx: CheckContext) -> Verdict:
 )
 def nb_cross_recon(ctx: CheckContext) -> Verdict:
     """Notebooks reading multiple sources reconcile records across them."""
-    code = notebook_code(ctx.obj)
+    code = executable_code(ctx.obj)
     sources = _MULTI_SOURCE.findall(code)
     if len(sources) < 2:
         return not_applicable("Notebook reads from fewer than 2 sources")
@@ -553,7 +579,7 @@ def nb_cross_recon(ctx: CheckContext) -> Verdict:
 )
 def nb_orphan_detect(ctx: CheckContext) -> Verdict:
     """Notebooks with joins detect orphan/unmatched child records."""
-    code = notebook_code(ctx.obj)
+    code = executable_code(ctx.obj)
     if not _JOIN_PATTERN.search(code):
         return not_applicable("Notebook does not perform joins")
     ok = bool(_ORPHAN_DETECT.search(code))
@@ -569,7 +595,7 @@ def nb_orphan_detect(ctx: CheckContext) -> Verdict:
 )
 def nb_merge_valid(ctx: CheckContext) -> Verdict:
     """Notebooks performing MERGE validate post-merge counts against I/U/D expectations."""
-    code = notebook_code(ctx.obj)
+    code = executable_code(ctx.obj)
     if not _MERGE_PATTERN.search(code):
         return not_applicable("Notebook does not perform MERGE operations")
     ok = bool(_MERGE_VALIDATE.search(code))

@@ -1,6 +1,7 @@
 """Security · Data Storage — how the data at rest is classified and protected."""
 from __future__ import annotations
 
+from auditfast.core.check._semantic import hidden_columns, rls_roles
 from auditfast.core.check.helpers import Verdict, covered, not_applicable
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
@@ -29,7 +30,7 @@ def sensitivity_labels(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="WS-RLS", ref="6.2.3", title="Row-Level Security (RLS) defined on semantic models",
+    id="WS-RLS", ref="6.2.1", title="Row-Level Security (RLS) defined on semantic models",
     pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=[Layer.STORAGE], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
@@ -40,10 +41,12 @@ def rls_on_semantic_models(ctx: CheckContext) -> Verdict:
     models = ctx.workspace.semantic_models
     if not models:
         return not_applicable("No semantic models in this workspace")
-    with_rls = [name for name, defn in models.items()
-                if any(r.get("table_permissions") for r in defn.get("roles", []))]
+    with_rls = [name for name, defn in models.items() if rls_roles(defn)[0]]
+    warehouses = sum(1 for i in ctx.workspace.items if i.type == "Warehouse")
+    caveat = (f"; the {warehouses} Warehouse(s) were not assessed — Warehouse RLS policies "
+              f"are not readable through the Fabric REST API") if warehouses else ""
     return covered(len(with_rls), len(models),
-                   f"{len(with_rls)} of {len(models)} semantic models define RLS roles")
+                   f"{len(with_rls)} of {len(models)} semantic models define RLS roles{caveat}")
 
 
 @check(
@@ -52,23 +55,23 @@ def rls_on_semantic_models(ctx: CheckContext) -> Verdict:
     layers=[Layer.STORAGE], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
 def ols_on_semantic_models(ctx: CheckContext) -> Verdict:
-    """Semantic models restrict sensitive columns via OLS/CLS column permissions."""
+    """A column permission denies a column, so column-level security is in force.
+
+    Which fields count as sensitive is a business classification, so this reports
+    whether the control exists — not whether it covers the right columns.
+    """
     if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
         return not_applicable("Semantic model definitions could not be read from Fabric")
     models = ctx.workspace.semantic_models
     if not models:
         return not_applicable("No semantic models in this workspace")
-    with_ols = [
-        name for name, defn in models.items()
-        if any(
-            cp
-            for r in defn.get("roles", [])
-            for tp in r.get("table_permissions", [])
-            for cp in tp.get("column_permissions", [])
-        )
-    ]
-    return covered(len(with_ols), len(models),
-                   f"{len(with_ols)} of {len(models)} semantic models define OLS/CLS column permissions")
+    restricted = [name for name, defn in models.items() if hidden_columns(defn)]
+    return covered(
+        len(restricted), len(models),
+        f"{len(restricted)} of {len(models)} semantic models deny at least one column "
+        f"through a column-level security permission; which fields need protecting is a "
+        f"business judgement this check does not make",
+    )
 
 
 
@@ -119,7 +122,15 @@ def dynamic_data_masking(ctx: CheckContext) -> Verdict:
                 masked_cols.append(qualified)
 
     if not sensitive_cols:
-        return not_applicable("No table column metadata available")
+        # Two very different reasons produce an empty list; say which one it was.
+        if not any(columns(t) for t in tables.values()):
+            return not_applicable(
+                f"No column metadata available for the {len(tables)} table(s) read "
+                f"— Fabric's table listing does not return columns"
+            )
+        return not_applicable(
+            f"No sensitive-looking column names found across {len(tables)} table(s)"
+        )
 
     return covered(
         len(masked_cols), len(sensitive_cols),

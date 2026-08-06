@@ -127,16 +127,22 @@ class WorkspaceContext:
 
     @property
     def is_complete(self) -> bool:
-        """True when the crawl read everything it attempted.
+        """True when the crawl read everything a re-crawl could still recover.
 
-        Incomplete when a per-item definition/table read failed (tracked in
-        :attr:`read_failures`) or a core list read — items or role assignments —
-        was unavailable. Such a snapshot must not be cached and served as if
-        whole: it would freeze a permission/throttle gap into a believable-looking
-        low score. A lone GIT read failure is tolerated (cheap, rarely blocking).
+        Incomplete when a per-item definition/table read was *blocked* — forbidden
+        or throttled (tracked in :attr:`read_failures`) — or a core list read,
+        items or role assignments, was unavailable. Such a snapshot must not be
+        cached and served as if whole: it would freeze a permission/throttle gap
+        into a believable-looking low score. A lone GIT read failure is tolerated
+        (cheap, rarely blocking), and so is an ``empty`` count — a definition that
+        came back unusable is reported, but re-crawling will not change it.
         """
         blocking = {Resource.ITEMS, Resource.ROLE_ASSIGNMENTS}
-        return not self.read_failures and not (self.unavailable & blocking)
+        recoverable = any(
+            stat.get("forbidden") or stat.get("transient")
+            for stat in self.read_failures.values()
+        )
+        return not recoverable and not (self.unavailable & blocking)
 
     @property
     def name(self) -> str:

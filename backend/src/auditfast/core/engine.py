@@ -124,11 +124,14 @@ def read_incomplete_result(workspace: WorkspaceContext, resource_value: str, sta
     failed = stat.get("failed", 0)
     forbidden = stat.get("forbidden", 0)
     transient = stat.get("transient", 0)
+    empty = stat.get("empty", 0)
     kinds = []
     if forbidden:
         kinds.append(f"{forbidden} forbidden (HTTP 401/403)")
     if transient:
         kinds.append(f"{transient} throttled/timed out (HTTP 429/5xx/timeout)")
+    if empty:
+        kinds.append(f"{empty} returned no usable definition")
     evidence = (
         f"{failed} of {attempted} {label} could not be read — {', '.join(kinds)}. "
         f"Re-sign-in with Item.ReadWrite.All and a workspace role that can read item "
