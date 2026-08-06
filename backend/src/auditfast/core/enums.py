@@ -164,6 +164,10 @@ class Resource(StrEnum):
     SHORTCUTS = "shortcuts"
     SEMANTIC_MODEL_DEFINITIONS = "semanticModelDefinitions"
     CONNECTIONS = "connections"
+    #: Per-item run/refresh recency, read from the job-scheduler history
+    #: (``…/items/{id}/jobs/instances``) — the List Items API carries no
+    #: timestamp, so this is a one-call-per-runnable-item enrichment.
+    ITEM_RUN_HISTORY = "itemRunHistory"
 
 
 class Status(StrEnum):

@@ -21,6 +21,7 @@ import logging
 import time
 from collections import Counter
 from collections.abc import Iterable
+from dataclasses import replace
 from typing import Any
 
 import yaml
@@ -39,13 +40,21 @@ class LiveFabricProvider:
 
     BASE = "https://api.fabric.microsoft.com/v1"
 
-    def __init__(self, token: str, timeout: int = 60, token_refresher=None):
+    def __init__(self, token: str, timeout: int = 60, token_refresher=None,
+                 powerbi_token: str | None = None):
         import requests  # imported lazily so offline mode needs no HTTP stack
 
         self._session = requests.Session()
         self._session.headers.update({"Authorization": f"Bearer {token}"})
         self._timeout = timeout
         self._token_refresher = token_refresher
+        #: A Power BI-audience token (``https://analysis.windows.net/powerbi/api``)
+        #: — a *different* audience from the Fabric token above. It is optional and
+        #: used only to read semantic-model refresh recency, which lives on the
+        #: Power BI Datasets API, not the Fabric surface. Absent ⇒ that one signal
+        #: is left unknown, never guessed.
+        self._powerbi_token = powerbi_token
+        self._powerbi_client = None
 
     # -- transport -------------------------------------------------------------
     def _get(self, path: str) -> tuple[int | None, Any]:
@@ -120,6 +129,16 @@ class LiveFabricProvider:
 
     #: getDefinition statuses worth retrying — transient throttling / 5xx.
     _RETRYABLE = frozenset({429, 500, 502, 503, 504})
+
+    #: Item types that expose a run/refresh history: pipelines, notebooks,
+    #: dataflows and Spark jobs via the Fabric job scheduler, and semantic models
+    #: via the Power BI refresh history (a different API). Types that never run
+    #: (reports, dashboards, lakehouses, warehouses, …) are skipped rather than
+    #: probed for nothing.
+    _JOB_ITEM_TYPES = frozenset({
+        "Notebook", "DataPipeline", "SparkJobDefinition", "SemanticModel",
+        "Dataflow",
+    })
 
     def _definition_parts(
         self, workspace_id: str, item_id: str, fmt: str | None = None
@@ -496,6 +515,147 @@ class LiveFabricProvider:
             if read == 0:
                 ctx.unavailable.add(resource)
 
+    def _latest_run(self, workspace_id: str, item_id: str) -> tuple[str | None, str]:
+        """Return one item's most recent job-run time and a failure classifier.
+
+        Reads a single page of the item's job-instance history and returns
+        ``(timestamp, failure)`` where ``timestamp`` is the latest ``endTimeUtc``
+        (falling back to ``startTimeUtc`` for a run still in flight) or ``None``
+        when the item has never run. ``failure`` follows the
+        :meth:`_definition_parts` convention: ``""`` read, ``"forbidden"`` a
+        permission/expired-token denial, ``"transient"`` a throttling/5xx/network
+        error. A 400/404 (the item type keeps no job history) is *not* a failure —
+        it simply yields no timestamp.
+
+        ISO-8601 UTC (``…Z``) stamps sort lexicographically, so ``max`` over the
+        page is the chronologically latest run without any date parsing.
+        """
+        path = f"/workspaces/{workspace_id}/items/{item_id}/jobs/instances"
+        status, body = self._get(path)
+        if status == 401 and self._try_refresh_token():
+            status, body = self._get(path)
+        if status in (401, 403):
+            log.warning("item %s jobs/instances -> HTTP %s (permission denied)", item_id, status)
+            return None, "forbidden"
+        if status is None or status == 429 or (isinstance(status, int) and status >= 500):
+            log.warning("item %s jobs/instances -> HTTP %s (transient)", item_id, status)
+            return None, "transient"
+        if status != 200 or not isinstance(body, dict):
+            return None, ""  # 400/404 — no job history for this item type
+        stamps = [
+            row.get("endTimeUtc") or row.get("startTimeUtc")
+            for row in (body.get("value") or [])
+            if isinstance(row, dict) and (row.get("endTimeUtc") or row.get("startTimeUtc"))
+        ]
+        return (max(stamps) if stamps else None), ""
+
+    def _powerbi(self):
+        """Return a lazily-built Power BI client, or ``None`` without a PBI token.
+
+        Semantic-model refresh history is served only by the Power BI Datasets
+        API, whose audience differs from the Fabric crawl token — so it needs a
+        separately-minted token. A test may pre-set ``_powerbi_client``.
+        """
+        if self._powerbi_client is not None:
+            return self._powerbi_client
+        if not self._powerbi_token:
+            return None
+        from .powerbi import PowerBIClient
+        self._powerbi_client = PowerBIClient(self._powerbi_token, timeout=self._timeout)
+        return self._powerbi_client
+
+    def _semantic_model_last_refresh(self, workspace_id: str, item_id: str) -> tuple[str | None, str]:
+        """Return a semantic model's last-refresh time and a failure classifier.
+
+        Reads the Power BI refresh history (latest first) for the model. Without
+        a Power BI token the recency is *unknown* (``"forbidden"``) rather than
+        "never refreshed", so it is excluded from staleness instead of counted
+        as stale. A ``None`` timestamp with no failure means the model has no
+        refresh history yet.
+        """
+        pbi = self._powerbi()
+        if pbi is None:
+            return None, "forbidden"
+        try:
+            return pbi.dataset_last_refresh(item_id, group_id=workspace_id)
+        except Exception as exc:
+            log.warning("semantic model %s refresh history error: %s", item_id, exc)
+            return None, "transient"
+
+    def _enrich_run_history(self, ctx: WorkspaceContext, workspace_id: str) -> None:
+        """Fill ``Item.last_run_utc`` from each runnable item's run/refresh history.
+
+        One call per runnable item: semantic models are read from the Power BI
+        refresh history (a different API audience); pipelines, notebooks,
+        dataflows and Spark jobs from the Fabric job scheduler. Other types are
+        skipped. ``Item`` is frozen, so a dated item is rebuilt with
+        :func:`dataclasses.replace`.
+
+        Recency is an optional, LOW-severity signal: when every runnable item's
+        history is unreadable the resource is marked *unavailable* (so the
+        staleness check reports N/A), but it is deliberately **not** added to
+        ``read_failures`` — a run-history gap must never force a re-crawl or block
+        the workspace from being cached.
+        """
+        attempted = read = failed = 0
+        enriched: list[Item] = []
+        semantic_models = sum(1 for i in ctx.items if i.type == "SemanticModel")
+        if semantic_models and not self._powerbi_token:
+            log.warning(
+                "fetch %s: %d semantic model(s) present but no Power BI token — refresh "
+                "recency will be N/A (sign-in did not yield a Power BI-audience token)",
+                workspace_id, semantic_models,
+            )
+        for item in ctx.items:
+            if item.type not in self._JOB_ITEM_TYPES or not item.id:
+                enriched.append(item)
+                continue
+            attempted += 1
+            if item.type == "SemanticModel":
+                stamp, failure = self._semantic_model_last_refresh(workspace_id, item.id)
+            else:
+                stamp, failure = self._latest_run(workspace_id, item.id)
+            if failure:
+                failed += 1
+                enriched.append(item)
+            else:
+                read += 1
+                enriched.append(replace(item, last_run_utc=stamp) if stamp else item)
+        ctx.items = enriched
+        if attempted and read == 0 and failed:
+            ctx.unavailable.add(Resource.ITEM_RUN_HISTORY)
+        log.info("fetch %s: run history read for %d of %d runnable item(s)",
+                 workspace_id, read, attempted)
+
+    def _enrich_created_dates(self, ctx: WorkspaceContext, workspace_id: str) -> None:
+        """Set ``Item.created_date`` on semantic models from the Power BI datasets API.
+
+        ``GET /groups/{ws}/datasets`` exposes each model's ``createdDate`` in one
+        call (no admin or capacity), so this is the reliable "when was it created"
+        signal even for models with no refresh history. Needs a Power BI token;
+        without one it is a silent no-op. Only semantic models carry a dataset
+        created date, so other item types are left untouched.
+        """
+        pbi = self._powerbi()
+        if pbi is None:
+            return
+        try:
+            created = pbi.dataset_created_dates(group_id=workspace_id)
+        except Exception as exc:
+            log.warning("fetch %s: dataset created-dates read error: %s", workspace_id, exc)
+            return
+        if not created:
+            return
+        ctx.items = [
+            replace(item, created_date=created[item.id])
+            if item.type == "SemanticModel" and not item.created_date and item.id in created
+            else item
+            for item in ctx.items
+        ]
+        log.info("fetch %s: created date set for %d of %d semantic model(s)", workspace_id,
+                 sum(1 for i in ctx.items if i.type == "SemanticModel" and i.created_date),
+                 sum(1 for i in ctx.items if i.type == "SemanticModel"))
+
     # -- the provider contract -------------------------------------------------
     def fetch(
         self,
@@ -542,6 +702,7 @@ class LiveFabricProvider:
             Resource.TABLE_SCHEMAS,
             Resource.SHORTCUTS,
             Resource.SEMANTIC_MODEL_DEFINITIONS,
+            Resource.ITEM_RUN_HISTORY,
         }:
             rows, known = self._values(f"/workspaces/{workspace_id}/items")
             ctx.items = [Item.from_api(row) for row in rows]
@@ -549,6 +710,13 @@ class LiveFabricProvider:
                 ctx.unavailable.add(Resource.ITEMS)
             log.info("fetch %s: %d items by type %s", workspace_id,
                      len(ctx.items), dict(Counter(i.type for i in ctx.items)))
+
+        # Per-item run/refresh recency (last_run_utc) plus the per-workspace
+        # semantic-model created date. Fetched whenever a recency-needing resource
+        # is selected — the KB crawl requests it for every workspace.
+        if Resource.ITEM_RUN_HISTORY in wanted and ctx.items:
+            self._enrich_run_history(ctx, workspace_id)
+            self._enrich_created_dates(ctx, workspace_id)
 
         if Resource.ROLE_ASSIGNMENTS in wanted:
             rows, known = self._values(f"/workspaces/{workspace_id}/roleAssignments")

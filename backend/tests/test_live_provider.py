@@ -32,6 +32,22 @@ def _provider_with(session: _FakeSession) -> LiveFabricProvider:
     return provider
 
 
+class _FakePowerBI:
+    """A stand-in for PowerBIClient: canned refresh times and created dates."""
+
+    def __init__(self, by_dataset: dict, created: dict | None = None):
+        self.by_dataset = by_dataset
+        self.created = created or {}
+        self.calls: list[tuple] = []
+
+    def dataset_last_refresh(self, dataset_id, group_id=None):
+        self.calls.append((dataset_id, group_id))
+        return self.by_dataset.get(dataset_id), ""
+
+    def dataset_created_dates(self, group_id=None):
+        return dict(self.created)
+
+
 def test_values_follows_continuation_to_the_last_page():
     provider = LiveFabricProvider("token")
     base = provider.BASE
@@ -178,6 +194,178 @@ def test_fetch_reads_and_persists_connection_metadata_without_tls_claims():
     }]
     restored = type(ctx).from_dict(ctx.to_dict())
     assert restored.connections == ctx.connections
+
+
+def test_fetch_enriches_last_run_from_job_history():
+    """A runnable item's last_run_utc is its latest run/refresh time.
+
+    Fabric-native items (notebook) come from jobs/instances; semantic models
+    from the Power BI refresh history. Non-runnable types (reports, dashboards)
+    are skipped, so no wasted call is made for them.
+    """
+    provider = LiveFabricProvider("token", powerbi_token="pbi")
+    base = provider.BASE
+    items = {"value": [
+        {"id": "nb-1", "type": "Notebook", "displayName": "Nightly"},
+        {"id": "sm-1", "type": "SemanticModel", "displayName": "Sales"},
+        {"id": "rp-1", "type": "Report", "displayName": "Dashboard"},
+    ]}
+    nb_jobs = {"value": [
+        {"status": "Completed", "startTimeUtc": "2026-01-01T00:00:00Z",
+         "endTimeUtc": "2026-01-01T00:05:00Z"},
+        {"status": "Completed", "startTimeUtc": "2026-03-02T09:00:00Z",
+         "endTimeUtc": "2026-03-02T09:30:00Z"},
+    ]}
+    session = _FakeSession({
+        f"{base}/workspaces/ws-1": _FakeResponse(200, {"displayName": "Prep"}),
+        f"{base}/workspaces/ws-1/items": _FakeResponse(200, items),
+        f"{base}/workspaces/ws-1/items/nb-1/jobs/instances": _FakeResponse(200, nb_jobs),
+    })
+    provider._session = session
+    provider._powerbi_client = _FakePowerBI(
+        {"sm-1": "2024-07-27T16:28:52Z"},
+        created={"sm-1": "2024-01-05T00:00:00Z"},
+    )
+
+    from auditfast.core.enums import Resource
+
+    ctx = provider.fetch("ws-1", resources=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY])
+
+    by_id = {i.id: i for i in ctx.items}
+    assert by_id["nb-1"].last_run_utc == "2026-03-02T09:30:00Z"  # latest of two runs
+    assert by_id["sm-1"].last_run_utc == "2024-07-27T16:28:52Z"  # from PBI refresh history
+    assert by_id["sm-1"].created_date == "2024-01-05T00:00:00Z"  # from PBI datasets API
+    assert by_id["rp-1"].last_run_utc is None  # non-runnable type
+    # The semantic model is read via Power BI with the Fabric workspace id as group.
+    assert provider._powerbi_client.calls == [("sm-1", "ws-1")]
+    # A report never runs a job, so its history endpoint is never queried.
+    assert f"{base}/workspaces/ws-1/items/rp-1/jobs/instances" not in session.calls
+    assert Resource.ITEM_RUN_HISTORY not in ctx.unavailable
+
+
+def test_fetch_semantic_models_without_powerbi_token_is_na():
+    """No Power BI token -> semantic-model recency is unknown (N/A), never stale.
+
+    This is the "My workspace" case: only semantic models, no PBI token, so the
+    resource is unavailable and the staleness check reports N/A rather than a
+    blanket FAIL — and caching is never blocked.
+    """
+    provider = LiveFabricProvider("token")  # no powerbi_token
+    base = provider.BASE
+    items = {"value": [
+        {"id": "sm-1", "type": "SemanticModel", "displayName": "A"},
+        {"id": "sm-2", "type": "SemanticModel", "displayName": "B"},
+    ]}
+    session = _FakeSession({
+        f"{base}/workspaces/ws-1": _FakeResponse(200, {"displayName": "My workspace"}),
+        f"{base}/workspaces/ws-1/items": _FakeResponse(200, items),
+    })
+    provider._session = session
+
+    from auditfast.core.enums import Resource
+
+    ctx = provider.fetch("ws-1", resources=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY])
+
+    assert all(i.last_run_utc is None for i in ctx.items)
+    assert Resource.ITEM_RUN_HISTORY in ctx.unavailable
+    assert ctx.read_failures == {}
+
+
+def test_fetch_run_history_all_forbidden_marks_resource_unavailable():
+    """When every runnable item's history is 403, the resource is N/A, not stale."""
+    provider = LiveFabricProvider("token")
+    base = provider.BASE
+    items = {"value": [{"id": "nb-1", "type": "Notebook", "displayName": "N"}]}
+    session = _FakeSession({
+        f"{base}/workspaces/ws-1": _FakeResponse(200, {"displayName": "Prep"}),
+        f"{base}/workspaces/ws-1/items": _FakeResponse(200, items),
+        f"{base}/workspaces/ws-1/items/nb-1/jobs/instances": _FakeResponse(403, {}),
+    })
+    provider._session = session
+
+    from auditfast.core.enums import Resource
+
+    ctx = provider.fetch("ws-1", resources=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY])
+
+    assert ctx.items[0].last_run_utc is None
+    assert Resource.ITEM_RUN_HISTORY in ctx.unavailable
+    # A forbidden run-history read must not block caching via read_failures.
+    assert ctx.read_failures == {}
+
+
+def test_powerbi_dataset_last_refresh_falls_back_to_personal_workspace():
+    """My-workspace models 404 on the group form, so the no-group form is used."""
+    from auditfast.clients.powerbi import PowerBIClient
+
+    client = PowerBIClient("pbi")
+    base = client.BASE
+    history = {"value": [
+        {"status": "Completed", "startTime": "2024-04-20T18:11:00Z",
+         "endTime": "2024-04-20T18:11:44Z"},
+    ]}
+    session = _FakeSession({
+        f"{base}/groups/ws/datasets/d1/refreshes?$top=1": _FakeResponse(404, {}),
+        f"{base}/datasets/d1/refreshes?$top=1": _FakeResponse(200, history),
+    })
+    client._session = session
+
+    assert client.dataset_last_refresh("d1", group_id="ws") == ("2024-04-20T18:11:44Z", "")
+
+
+def test_powerbi_dataset_last_refresh_401_is_forbidden_not_never_refreshed():
+    """A rejected token must classify as 'forbidden' (N/A), not '200-empty' (never ran)."""
+    from auditfast.clients.powerbi import PowerBIClient
+
+    client = PowerBIClient("pbi")
+    base = client.BASE
+    session = _FakeSession({
+        f"{base}/groups/ws/datasets/d1/refreshes?$top=1": _FakeResponse(401, {}),
+        f"{base}/datasets/d1/refreshes?$top=1": _FakeResponse(401, {}),
+    })
+    client._session = session
+
+    assert client.dataset_last_refresh("d1", group_id="ws") == (None, "forbidden")
+
+
+def test_fetch_sets_created_date_even_when_refresh_history_empty():
+    """The real-world case: no refresh history, but createdDate is still available."""
+    provider = LiveFabricProvider("token", powerbi_token="pbi")
+    base = provider.BASE
+    items = {"value": [{"id": "sm-1", "type": "SemanticModel", "displayName": "M"}]}
+    session = _FakeSession({
+        f"{base}/workspaces/ws-1": _FakeResponse(200, {"displayName": "Workshop"}),
+        f"{base}/workspaces/ws-1/items": _FakeResponse(200, items),
+    })
+    provider._session = session
+    provider._powerbi_client = _FakePowerBI(
+        {},  # dataset_last_refresh -> (None, "") : never refreshed
+        created={"sm-1": "2023-07-10T09:11:22Z"},
+    )
+
+    from auditfast.core.enums import Resource
+
+    ctx = provider.fetch("ws-1", resources=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY])
+
+    assert ctx.items[0].last_run_utc is None                     # genuinely never refreshed
+    assert ctx.items[0].created_date == "2023-07-10T09:11:22Z"   # but createdDate is known
+
+
+def test_powerbi_dataset_created_dates_falls_back_to_personal_workspace():
+    """My-workspace models 401 on the group datasets form, so /datasets is used."""
+    from auditfast.clients.powerbi import PowerBIClient
+
+    client = PowerBIClient("pbi")
+    base = client.BASE
+    session = _FakeSession({
+        f"{base}/groups/ws/datasets": _FakeResponse(401, {}),
+        f"{base}/datasets": _FakeResponse(200, {"value": [
+            {"id": "d1", "createdDate": "2024-04-20T18:11:44Z"},
+            {"id": "d2"},  # no createdDate -> excluded
+        ]}),
+    })
+    client._session = session
+
+    assert client.dataset_created_dates(group_id="ws") == {"d1": "2024-04-20T18:11:44Z"}
 
 
 # -- token refresh tests -------------------------------------------------------

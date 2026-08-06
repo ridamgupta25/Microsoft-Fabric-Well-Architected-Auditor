@@ -50,7 +50,7 @@ class AuditRun:
 # -- provider construction ----------------------------------------------------
 
 def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: bool = False,
-                   token_refresher=None):
+                   token_refresher=None, powerbi_token: str | None = None):
     """Create the provider for a run.
 
     Every run reads the live tenant, but through the on-disk **knowledge base**:
@@ -59,11 +59,15 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
     its TTL. ``refresh=True`` forces a fresh live crawl (rebuilding the KB).
     Caching can be turned off entirely with ``AUDITFAST_CACHE_ENABLED=false``, in
     which case the raw live provider is returned.
+
+    ``powerbi_token`` is an optional Power BI-audience token used only to read
+    semantic-model refresh recency; without it that one signal stays unknown.
     """
     if not token:
         raise AuditError("A sign-in token is required to run an audit.")
-    live = LiveFabricProvider(token, token_refresher=token_refresher)
     settings = get_settings()
+    live = LiveFabricProvider(token, token_refresher=token_refresher,
+                              powerbi_token=powerbi_token)
     provider = live
     if settings.cache_enabled:
         from .context_store import CachingProvider, ContextStore
@@ -201,6 +205,7 @@ def run_audit(
     on_progress: Callable[[dict], None] | None = None,
     refresh: bool = False,
     token_refresher=None,
+    powerbi_token: str | None = None,
 ) -> AuditRun:
     """Run an audit and, when ``out_dir`` is given, write the report files.
 
@@ -211,7 +216,8 @@ def run_audit(
     force a fresh live crawl and rebuild the KB.
     """
     config = load_project(project_path)
-    provider = build_provider(config, token, refresh=refresh, token_refresher=token_refresher)
+    provider = build_provider(config, token, refresh=refresh, token_refresher=token_refresher,
+                              powerbi_token=powerbi_token)
     remediation: RemediationBook = load_remediation(config)
 
     def _progress(partial: list[CheckResult]) -> None:
