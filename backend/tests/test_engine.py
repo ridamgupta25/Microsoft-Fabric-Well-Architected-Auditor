@@ -274,7 +274,7 @@ def test_registry_is_fully_populated():
     """83 checks are evaluated; roadmap (gated N/A) checks are not loaded."""
     evaluated = [s for s in REGISTRY if s.automation is Automation.AUTOMATED]
     assert len(evaluated) == 104
-    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 32
+    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 33
     assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 23
     assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 47
     # Roadmap (gated N/A) checks are intentionally not registered — see
