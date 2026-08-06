@@ -659,6 +659,18 @@ _RI_PATTERN = re.compile(
     """
 )
 _JOIN_PATTERN = re.compile(r"(?is)\.join\s*\(|\bleft\s+join\b|\binner\s+join\b|\bright\s+join\b|\bfull\s+join\b", re.IGNORECASE)
+_RI_PATTERN = re.compile(
+    r"""(?isx)
+    (?:\.join\s*\(.*?["']left_anti["'])
+    |
+    (?:\.join\s*\(.*?["']left["'].*?\.(?:where|filter)\s*\(.*?isNull\s*\()
+    |
+    (?:\bleft\s+join\b.*?\bwhere\b.*?\bis\s+null\b)
+    |
+    \b(?:referential|integrity|fk_check|integrity_check|orphan|unmatched|missing_parent|no_parent)\b
+    """
+)
+_JOIN_PATTERN = re.compile(r"(?is)\.join\s*\(|\bleft\s+join\b|\binner\s+join\b|\bright\s+join\b|\bfull\s+join\b", re.IGNORECASE)
 _FK_INTEGRITY = re.compile(
     # An anti-join - the standard way to isolate FK values with no parent row.
     # ``"anti"`` is quoted so the join-type argument matches but the English word
@@ -1294,7 +1306,6 @@ def nb_fact_dim_ri(ctx: CheckContext) -> Verdict:
         return not_applicable("Notebook does not load or join dimensional tables")
     if not _JOIN_PATTERN.search(code):
         return not_applicable("Notebook performs no fact-to-dimension join")
-    ok = bool(_RI_PATTERN.search(code))
     ok = bool(_RI_PATTERN.search(code))
     return binary(ok, "Fact FKs are validated against the dimension (anti-join / "
                       "null check)" if ok
