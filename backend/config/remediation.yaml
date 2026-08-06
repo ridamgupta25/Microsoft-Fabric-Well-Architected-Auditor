@@ -62,7 +62,7 @@
 "4.4.8": "Build a date/calendar dimension with the attributes reporting needs (fiscal year, quarter, holidays)."
 "4.4.7": "Give each dimension a surrogate key (e.g. <dim>_sk) instead of using the business key as the fact FK."
 "4.2.3": "Rename table columns to a consistent snake_case convention so they are self-documenting."
-"4.2.4": "Type date/time columns as date/timestamp (not string) so comparisons and partition pruning work."
+"4.2.4": "Type date/time columns as date/timestamp (not string), and size text columns to the data instead of varchar(max), so comparisons, statistics and partition pruning work."
 "4.4.10": "For SCD Type 2 dimensions, include valid_from, valid_to and is_current and maintain them on each load."
 # -- Spark / Delta notebook + Copy-parallelism (promoted from roadmap) --------
 "2.6.2": "Set parallelCopies and/or dataIntegrationUnits on Copy activities so large transfers use appropriate parallelism instead of the conservative defaults."

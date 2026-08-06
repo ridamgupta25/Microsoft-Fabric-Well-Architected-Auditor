@@ -77,6 +77,8 @@ def parse_tmsl(document: dict) -> dict:
                 {
                     "table": p.get("name", ""),
                     "filter": _expression(p.get("filterExpression")),
+                    # "None" here hides the whole table — table-level OLS.
+                    "metadata_permission": p.get("metadataPermission", "") or "",
                     "column_permissions": [
                         {"column": cp.get("name", ""), "permission": cp.get("metadataPermission", "")}
                         for cp in (p.get("columnPermissions") or []) if isinstance(cp, dict)
