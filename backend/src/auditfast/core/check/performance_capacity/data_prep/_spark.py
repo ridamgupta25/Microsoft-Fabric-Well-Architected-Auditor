@@ -102,7 +102,6 @@ PUSHDOWN_FILTER = re.compile(
     re.IGNORECASE,
 )
 
-
 # A token that is not a package spec: a flag, a URL/path, a VCS/requirements ref.
 _NON_PACKAGE = re.compile(r"^-|^git\+|^https?:|^/|\.txt$|^\.")
 _PACKAGE = re.compile(r"^[A-Za-z0-9_.\-]+(\[[^\]]+\])?([=<>!~].+)?$")
