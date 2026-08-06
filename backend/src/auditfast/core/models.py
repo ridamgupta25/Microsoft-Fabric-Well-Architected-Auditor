@@ -32,6 +32,11 @@ class Item:
     display_name: str = ""
     sensitivity_label: str | None = None
     last_run_utc: str | None = None
+    #: ISO-8601 creation timestamp. For semantic models this comes from the Power
+    #: BI datasets API (``createdDate``) — available without admin or capacity, so
+    #: it is the reliable "when created" signal even when there is no refresh
+    #: history. Other item types leave it ``None`` (the List Items API omits it).
+    created_date: str | None = None
 
     @classmethod
     def from_api(cls, raw: dict) -> Item:
@@ -44,6 +49,7 @@ class Item:
             display_name=raw.get("displayName") or "",
             sensitivity_label=label,
             last_run_utc=raw.get("lastRunUtc") or raw.get("lastUpdatedDate"),
+            created_date=raw.get("createdDate"),
         )
 
 
