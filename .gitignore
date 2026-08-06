@@ -8,6 +8,7 @@ __pycache__/
 *.egg-info/
 build/
 backend/src/*.egg-info/
+backend/validation
 
 # Node / frontend
 node_modules/
@@ -21,6 +22,10 @@ frontend/dist/
 
 # Generated audit output
 output/
+
+# Check Reviewer verdicts — regenerated (overwritten) on every validation run,
+# and the evidence notes quote tenant metadata from the workspace snapshot
+validation/
 
 # Knowledge base — crawled tenant metadata (workspace GUIDs, item names); never commit
 kb-cache/

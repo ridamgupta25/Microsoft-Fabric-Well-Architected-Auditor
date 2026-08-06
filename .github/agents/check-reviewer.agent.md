@@ -10,6 +10,7 @@ You verify whether the findings in an audit report are supported by the captured
 - Review every finding in the audit report against the source-of-truth workspace snapshot.
 - Resolve the correct workspace snapshot automatically before validating evidence.
 - Produce a validation report with PASS, FAIL, and NOT VERIFIABLE verdicts for each row, along with evidence and notes.
+- Verify that the knowledge base contains the referenced artifact and enough definition metadata to support the finding; if not, mark the row NOT VERIFIABLE and record the KB gap.
 - When the task is specifically about a newly-added deterministic check, review that check as one row in the broader audit report context rather than treating the task as a harness-only validation.
 
 ## Constraints
@@ -80,6 +81,8 @@ You verify whether the findings in an audit report are supported by the captured
    - Write Local/validation-report.md, creating the folder if needed. Local/ is gitignored: the report is a working artifact about one run, not shipped documentation, and must never land in the tracked tree.
    - Overwrite any existing report at that path.
    - Structure it as: (a) the resolved snapshot path per workspace; (b) a summary table of PASS / FAIL / NOT VERIFIABLE counts, plus a verdict-by-report-status cross-tab; (c) a detail section for every non-PASS row; (d) one findings table per workspace covering every row, with columns Row, Object, Check ID, Ref, Report Status, Verdict, Reason Code, Evidence; (e) a closing observations section for cross-row contradictions and scope gaps.
+   - Use the report structure expected by the repository: summary table plus a findings table covering every audit row.
+   - Include a KB gaps section for rows that could not be fully validated because the snapshot lacked artifact or metadata coverage.
 4. Run extra verification only when explicitly needed.
    - For general audit-report validation, the main deliverable is the validation report itself.
    - If the task specifically concerns a newly-added check implementation, then run the harness and suite as supporting validation, from backend/ with the venv interpreter:

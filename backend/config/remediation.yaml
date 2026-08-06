@@ -80,10 +80,33 @@
 "3.4.1": "Manage Spark dependencies through a Fabric Environment instead of inline %pip/!pip installs, so libraries are shared, versioned, and reproducible."
 "3.4.2": "Pin every installed library to an explicit ==version so runs are reproducible and not broken by a floating latest release."
 "3.4.4": "Where the defaults do not fit the workload, tune Spark configuration (e.g. spark.conf.set(...)) and document why."
+"3.4.5": "Select a current supported Fabric runtime and record the runtime version used by the notebook."
+"3.4.6": "Size the Spark pool from observed workload and capacity metrics; reduce idle capacity or increase resources when jobs are constrained."
 "3.5.2": "Set spark.sql.shuffle.partitions to suit the data volume instead of leaving the 200 default, which is wasteful for small/medium data."
 "3.5.3": "Release cached/persisted DataFrames with unpersist() once they are no longer needed so executor memory is not held unnecessarily."
 "3.5.4": "Use coalesce (to reduce) or repartition (to redistribute) before writes so output file sizes and partition counts are appropriate."
+"3.5.5": "Filter on the table's partition columns before reading so Spark can prune partitions instead of scanning the full table."
+"3.5.6": "Review Spark UI for key jobs and address skewed partitions, excessive spill, and inefficient shuffle stages."
 "3.5.9": "Project explicit columns instead of SELECT * so only the data you need is read and column pruning applies."
+"3.6.1": "Add a record count reconciliation step after writing data — compare source and target row counts and raise an alert on mismatch."
+"3.6.2": "Validate referential integrity by running an anti-join of FK values against the dimension/lookup table and handling any unmatched keys before loading."
+"3.6.3": "When loading from multiple sources, reconcile record counts or hash totals across sources to detect missing or duplicated records."
+# Ref 3.6.4 is claimed by two checks from two different source checklists:
+# NB-ORPHAN-DETECT (orphan child records) and PL-IDEMPOTENT (re-runnable loads).
+# Remediation is keyed by ref, so this text has to serve both — they are both
+# load-safety advice, so it reads coherently either way.
+"3.6.4": "Make the load safe to re-run and orphan-aware: write with MERGE INTO (or TRUNCATE / DELETE-by-batch followed by INSERT) so re-running cannot duplicate rows, and detect orphan child records with an anti-join, routing unmatched keys to an error table or quarantine before loading."
+"3.6.5": "After a MERGE INTO, validate the result by checking operationMetrics or DESCRIBE HISTORY to confirm inserted/updated/deleted counts match expectations."
+# -- MLC Cat-1 checklist points ------------------------------------------------
+"9.1.3": "Enable Copy activity fault tolerance (skip incompatible rows and/or skip error files) and set redirect/log settings so the skipped rows are written somewhere, or route failures to a quarantine activity. One malformed record must not fail the whole run, and skipped records must never be discarded silently."
+"4.5.10": "Handle late-arriving data with the inferred-member pattern: when a fact's dimension key is not yet present, insert a stub dimension row (or substitute the conventional -1 unknown member) and backfill it when the real record arrives, rather than dropping the fact or failing the load."
+"5.4.4": "Count how many rows land on the unknown/inferred member on each run and write that number to the audit tables, so a source feed that starts producing unmatched keys is detected instead of quietly inflating the unknown member."
+"5.4.6": "Reconcile record counts across the Silver-to-Gold hop: capture the Silver source count, compare it against the Gold result (allowing for documented aggregation), and raise an alert when the two do not tie out."
+"5.4.9": "Enforce the fact table's declared grain on load: deduplicate on the grain columns (dropDuplicates / ROW_NUMBER() = 1), or assert that a GROUP BY on the grain returns no group with COUNT(*) > 1, and fail the load when it does."
+"4.5.12": "Validate fact foreign keys against the dimension before loading — an anti-join (left_anti) or a null check after a left join — and route unmatched keys to an error table. Fabric Warehouse allows FK constraints to be declared but does not enforce them, so nothing else prevents an orphan key being written."
+"4.3.4": "Implement a scheduled archiving/purging routine for the Lakehouse Files section: delete or move files past the agreed retention window (mssparkutils.fs.rm, or an ADLS lifecycle policy). Note this is separate from VACUUM, which only reclaims Delta table files."
+"5.4.1": "Use active fact-dimension surrogate-key relationships, and verify with SQL that non-null fact FKs have matching dimension keys (zero orphans)."
+"3.5.10": "Profile long-running notebooks with execution plans and Spark metrics, then optimize the slowest stages and rerun the measurement."
 "5.2.5": "Add a record count reconciliation step after writing data — compare source and target row counts and raise an alert on mismatch."
 "5.3.2": "Validate referential integrity by running an anti-join of FK values against the dimension/lookup table and handling any unmatched keys before loading."
 "5.3.6": "When loading from multiple sources, reconcile record counts or hash totals across sources to detect missing or duplicated records."

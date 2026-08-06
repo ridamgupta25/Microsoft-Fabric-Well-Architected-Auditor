@@ -15,10 +15,10 @@ from auditfast.core.check._notebook import (
     markdown_sources,
     notebook_code,
 )
-from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities
+from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities, script_sql, walk_activities
 from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable
 from auditfast.core.check.registry import check
-from auditfast.core.enums import Pillar, Resource, Scope, Severity
+from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
 
 #: Connection/endpoint literals that belong in a parameter or managed connection.
@@ -481,6 +481,18 @@ _JOIN_PATTERN = re.compile(
     r"|\bjoin\s+[\w`\"\[]",
     re.IGNORECASE,
 )
+_RI_PATTERN = re.compile(
+    r"""(?isx)
+    (?:\.join\s*\(.*?["']left_anti["'])
+    |
+    (?:\.join\s*\(.*?["']left["'].*?\.(?:where|filter)\s*\(.*?isNull\s*\()
+    |
+    (?:\bleft\s+join\b.*?\bwhere\b.*?\bis\s+null\b)
+    |
+    \b(?:referential|integrity|fk_check|integrity_check|orphan|unmatched|missing_parent|no_parent)\b
+    """
+)
+_JOIN_PATTERN = re.compile(r"(?is)\.join\s*\(|\bleft\s+join\b|\binner\s+join\b|\bright\s+join\b|\bfull\s+join\b", re.IGNORECASE)
 _FK_INTEGRITY = re.compile(
     r"left_anti|leftanti|anti.*join|"
     r"referential|fk_check|integrity_check|"
@@ -640,6 +652,282 @@ def nb_merge_valid(ctx: CheckContext) -> Verdict:
     ok = bool(_MERGE_VALIDATE.search(code))
     return binary(ok, "Post-merge result validation present" if ok
                   else "MERGE without post-merge count/result validation")
+
+
+# -- MLC Cat-1: warehouse load idempotency (3.6.4) ----------------------------
+#: Re-runnable write patterns. MERGE upserts on a key; TRUNCATE/DELETE-then-INSERT
+#: clears the target slice first. All three leave the same rows after a re-run.
+_IDEMPOTENT_SQL = (
+    (re.compile(r"\bMERGE\s+INTO\b", re.IGNORECASE), "MERGE INTO"),
+    (re.compile(r"\bTRUNCATE\s+TABLE\b", re.IGNORECASE), "TRUNCATE then INSERT"),
+    (re.compile(r"\bDELETE\s+FROM\b[\s\S]{0,400}?\bWHERE\b", re.IGNORECASE),
+     "DELETE ... WHERE then INSERT"),
+)
+#: A bare append. Run it twice and the target has the rows twice.
+_PLAIN_INSERT = re.compile(r"\bINSERT\s+INTO\b", re.IGNORECASE)
+
+
+@check(
+    id="PL-IDEMPOTENT-LOAD", ref="3.6.4",
+    title="Warehouse load procedures are idempotent and re-runnable",
+    pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
+)
+def pl_idempotent_load(ctx: CheckContext) -> Verdict:
+    """Re-running the load leaves the same rows — no duplicates, no double counting.
+
+    Reads the T-SQL a pipeline runs through its Script activities, which is where
+    warehouse loads usually live. A load is re-runnable when it MERGEs on a key,
+    or clears the target slice (TRUNCATE, or DELETE ... WHERE) before inserting.
+    A bare ``INSERT INTO`` is the failing case: run it twice, get the rows twice.
+
+    A Copy activity whose sink upserts counts too. Stored procedures defined
+    inside the Warehouse are not readable, so a pipeline that only calls one is
+    reported as N/A rather than guessed at.
+    """
+    sql = script_sql(ctx.obj)
+    upserting_copy = [
+        a for a in walk_activities(ctx.obj)
+        if a.get("type") == "Copy"
+        and "upsert" in str(((a.get("typeProperties") or {}).get("sink") or {})
+                            .get("writeBehavior", "")).lower()
+    ]
+    if upserting_copy:
+        names = ", ".join(sorted(a.get("name", "?") for a in upserting_copy))
+        return binary(True, f"Copy activity writes with upsert behaviour: {names}")
+
+    if not sql:
+        proc_calls = [a for a in walk_activities(ctx.obj)
+                      if a.get("type") in ("SqlServerStoredProcedure", "StoredProcedure")]
+        if proc_calls:
+            names = ", ".join(sorted(a.get("name", "?") for a in proc_calls))
+            return not_applicable(
+                f"Load runs a stored procedure ({names}); its body lives in the "
+                f"Warehouse and cannot be read")
+        return not_applicable("Pipeline runs no SQL load logic")
+
+    found = [label for pattern, label in _IDEMPOTENT_SQL if pattern.search(sql)]
+    if found:
+        return binary(True, f"Load is re-runnable — uses {', '.join(found)}")
+    if _PLAIN_INSERT.search(sql):
+        return binary(False, "Load uses a bare INSERT INTO with no MERGE, TRUNCATE or "
+                             "DELETE guard — re-running duplicates rows")
+    return not_applicable("Script activities run no INSERT/MERGE load statement")
+
+
+# -- MLC Cat-1: dimensional load quality (4.5.10, 5.4.4, 5.4.6) ---------------
+#: The notebook is doing dimensional work at all — otherwise these checks have
+#: nothing to judge and must report N/A rather than fail a Bronze ingest.
+_DIM_CONTEXT = re.compile(r"\bdim[_\s.]|\bdimension\b|\bfact[_\s.]|\bfct[_\s.]", re.IGNORECASE)
+
+#: A late-arriving fact is given an inferred / unknown member instead of being
+#: dropped: a stub dimension row, or the conventional -1 surrogate key.
+#: The -1 forms all allow a nested call — ``coalesce(col("x"), lit(-1))`` is the
+#: common Spark idiom — so match "-1 appears shortly after the call", not a
+#: bracket-exact shape.
+_LATE_ARRIVING = re.compile(
+    r"inferred[_\s]?member|late[_\s]?arriv|unknown[_\s]?member|is_inferred|"
+    r"coalesce\s*\([^\n]{0,80}?-1|"
+    r"fillna\s*\([^\n]{0,60}?-1|"
+    r"\.na\.fill\s*\([^\n]{0,60}?-1|"
+    r"otherwise\s*\([^\n]{0,40}?-1|"
+    r"when\s*\([^\n]{0,80}?-1|"
+    r"['\"]unknown['\"]",
+    re.IGNORECASE,
+)
+#: Unknown/orphan member usage is counted or logged, not just silently allowed.
+_UNKNOWN_MONITORED = re.compile(
+    r"unknown[_\s]?(?:count|rate|pct|percent|usage)|orphan[_\s]?(?:count|rate|pct)|"
+    r"(?:count|sum)\s*\([^)]{0,60}\)[^\n]{0,100}?(?:unknown|inferred|orphan|-1)|"
+    r"(?:log|insert\s+into|write)[^\n]{0,80}?(?:unknown|orphan|inferred)[^\n]{0,40}?(?:count|log|audit)",
+    re.IGNORECASE,
+)
+#: Names of the medallion layers, to spot a notebook that spans two of them.
+_SILVER_REF = re.compile(r"\bsilver\b", re.IGNORECASE)
+_GOLD_REF = re.compile(r"\bgold\b", re.IGNORECASE)
+
+
+@check(
+    id="NB-LATE-ARRIVING", ref="4.5.10",
+    title="Late-arriving dimensions and facts handled (inferred member pattern)",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_late_arriving(ctx: CheckContext) -> Verdict:
+    """A fact arriving before its dimension gets an inferred member, not dropped.
+
+    Without the pattern the load either discards the fact — silent data loss —
+    or fails outright. The evidence is a stub/unknown member: an ``is_inferred``
+    flag, an explicit "unknown" member, or the conventional ``-1`` surrogate key
+    substituted when the lookup misses.
+    """
+    code = notebook_code(ctx.obj)
+    if not _DIM_CONTEXT.search(code):
+        return not_applicable("Notebook does not load or join dimensional tables")
+    if not _JOIN_PATTERN.search(code):
+        return not_applicable("Notebook performs no fact-to-dimension lookup")
+    ok = bool(_LATE_ARRIVING.search(code))
+    return binary(ok, "Late-arriving rows get an inferred/unknown member" if ok
+                  else "Joins dimensions with no inferred/unknown member fallback — "
+                       "late-arriving facts are dropped or fail the load")
+
+
+@check(
+    id="NB-UNKNOWN-MONITOR", ref="5.4.4",
+    title="Completeness: unknown / orphan member usage is monitored",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_unknown_monitored(ctx: CheckContext) -> Verdict:
+    """Rows landing on the unknown member are counted, not silently accepted.
+
+    Routing unmatched keys to an unknown member keeps the load running, but if
+    nobody counts them a broken feed looks healthy for months. Only notebooks
+    that actually use an unknown/inferred member are judged — creating one is
+    NB-LATE-ARRIVING's job.
+    """
+    code = notebook_code(ctx.obj)
+    if not _LATE_ARRIVING.search(code):
+        return not_applicable("Notebook uses no unknown/inferred member to monitor")
+    ok = bool(_UNKNOWN_MONITORED.search(code))
+    return binary(ok, "Unknown/orphan member usage is counted or logged" if ok
+                  else "Uses an unknown member but never counts how many rows land "
+                       "on it — a broken feed would go unnoticed")
+
+
+@check(
+    id="NB-LAYER-RECON", ref="5.4.6",
+    title="Cross-layer reconciliation: Gold counts reconcile with Silver",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_layer_recon(ctx: CheckContext) -> Verdict:
+    """A notebook promoting Silver to Gold reconciles the row counts across the hop.
+
+    Distinct from NB-CROSS-RECON (ref 3.6.3), which reconciles several *sources*
+    in one load. This one is about the medallion hop: rows that entered Silver
+    should be accounted for in Gold, allowing for aggregation.
+    """
+    code = notebook_code(ctx.obj)
+    if not (_SILVER_REF.search(code) and _GOLD_REF.search(code)):
+        return not_applicable("Notebook does not span the Silver and Gold layers")
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook reads both layers but writes neither")
+    ok = bool(_COUNT_RECONCILE.search(code))
+    return binary(ok, "Cross-layer row counts are reconciled" if ok
+                  else "Promotes Silver to Gold without reconciling row counts "
+                       "across the hop")
+
+
+# -- MLC Cat-1: grain uniqueness (5.4.9) --------------------------------------
+#: The load asserts one row per grain: an explicit dedup, or a duplicate probe.
+_GRAIN_GUARD = re.compile(
+    r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.distinct\s*\(|"
+    r"row_number\s*\(\s*\)[^\n]{0,120}?(?:==|=)\s*1|"
+    r"groupBy\s*\([^\n]{0,80}?\)[^\n]{0,60}?count\s*\(\s*\)[^\n]{0,60}?(?:>|filter|where)|"
+    r"having\s+count\s*\(\s*\*?\s*\)\s*>\s*1|duplicate[_\s]?(?:check|count|test)",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-GRAIN-UNIQUE", ref="5.4.9",
+    title="No duplicate grain: fact loads enforce one row per grain",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_grain_unique(ctx: CheckContext) -> Verdict:
+    """A notebook writing a fact table dedupes it, or proves it has no duplicates.
+
+    The grain itself is not declared anywhere machine-readable, so this judges
+    whether the load *enforces* uniqueness at all — a dedup, a row-number filter,
+    or a duplicate probe. It cannot confirm the surviving rows are unique; that
+    needs a GROUP BY against the warehouse.
+    """
+    code = notebook_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook writes no table")
+    if not _DIM_CONTEXT.search(code):
+        return not_applicable("Notebook does not write a fact or dimension table")
+    ok = bool(_GRAIN_GUARD.search(code))
+    return binary(ok, "Load enforces grain uniqueness (dedup / duplicate check)" if ok
+                  else "Writes a fact/dimension table with no dedup or duplicate "
+                       "check — re-runs and late replays can duplicate the grain")
+
+
+# -- MLC Cat-1: fact-to-dimension referential integrity (4.5.12) --------------
+@check(
+    id="NB-FACT-DIM-RI", ref="4.5.12",
+    title="Referential integrity: fact FKs validated against dimension records",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_fact_dim_ri(ctx: CheckContext) -> Verdict:
+    """A fact load proves its FKs resolve to real dimension rows.
+
+    Narrower than NB-FK-INTEGRITY (ref 3.6.2), which accepts any lookup
+    validation on any join. This one only judges notebooks doing *dimensional*
+    work, because Fabric Warehouse declares foreign keys but does not enforce
+    them — nothing stops an unmatched key being written except this validation.
+
+    Detects the anti-join idiom (``left_anti``), an explicit null-check after a
+    left join, or a named referential/integrity check.
+    """
+    code = notebook_code(ctx.obj)
+    if not _DIM_CONTEXT.search(code):
+        return not_applicable("Notebook does not load or join dimensional tables")
+    if not _JOIN_PATTERN.search(code):
+        return not_applicable("Notebook performs no fact-to-dimension join")
+    ok = bool(_RI_PATTERN.search(code))
+    return binary(ok, "Fact FKs are validated against the dimension (anti-join / "
+                      "null check)" if ok
+                  else "Joins facts to dimensions without validating that every FK "
+                       "resolves — Fabric Warehouse does not enforce FK constraints")
+
+
+# -- MLC Cat-1: orphaned file cleanup (4.3.4) ---------------------------------
+#: A deliberate purge / archive routine over the Files section. Distinct from
+#: VACUUM, which only reclaims Delta table files (that is DELTA-VACUUM's job).
+_FILE_PURGE = re.compile(
+    r"(?:mssparkutils|notebookutils)\s*\.\s*fs\s*\.\s*rm\s*\(|"
+    r"\bshutil\s*\.\s*rmtree\s*\(|\bos\s*\.\s*remove\s*\(|"
+    r"archive[_\s]?(?:old|file|policy)|purge[_\s]?(?:old|file)|"
+    r"retention[_\s]?(?:policy|days|cutoff)|cleanup[_\s]?(?:old|file)",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="WS-FILE-PURGE", ref="4.3.4",
+    title="Orphaned files cleaned up periodically (archiving / purging policy)",
+    pillar=Pillar.PERFORMANCE, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    layers=(Layer.STORAGE, Layer.PREP, Layer.MIXED),
+    requires=[Resource.ITEMS, Resource.NOTEBOOK_DEFINITIONS], required=False,
+)
+def ws_file_purge(ctx: CheckContext) -> Verdict:
+    """Somewhere in the solution, stale Files-section data is archived or purged.
+
+    Scoped to the workspace rather than to each notebook: a purge routine is a
+    housekeeping job that exists once, so failing every notebook that is not it
+    would be noise. Asks only whether the routine exists at all.
+
+    The Files listing itself is not readable through the Fabric REST API, so
+    this cannot confirm files were actually removed — only that a routine is
+    implemented.
+    """
+    lakehouses = [i for i in ctx.workspace.items if i.type in ("Lakehouse", "Warehouse")]
+    if not lakehouses:
+        return not_applicable("Workspace holds no lakehouse or warehouse")
+    if not ctx.workspace.notebooks:
+        return not_applicable("No notebook definitions available to inspect for a "
+                              "purge routine")
+    purging = [name for name, nb in ctx.workspace.notebooks.items()
+               if _FILE_PURGE.search(notebook_code(nb))]
+    if purging:
+        return binary(True, f"File archive/purge routine found in: {', '.join(sorted(purging))}")
+    return binary(False, f"{len(lakehouses)} lakehouse/warehouse item(s) but no notebook "
+                         f"implements a file archive or purge routine — stale Files "
+                         f"data accumulates indefinitely")
 
 
 @check(

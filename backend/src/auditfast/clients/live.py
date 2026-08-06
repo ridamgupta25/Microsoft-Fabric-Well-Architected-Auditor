@@ -15,12 +15,15 @@ Two behaviours matter and are easy to get wrong:
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import logging
 import time
 from collections import Counter
 from collections.abc import Iterable
 from typing import Any
+
+import yaml
 
 from ..core.enums import Layer, Resource
 from ..core.models import Item, RoleAssignment, WorkspaceContext
@@ -187,10 +190,8 @@ class LiveFabricProvider:
             log.warning("getDefinition 202 without a Location header")
             return None
         delay = 1.0
-        try:
+        with contextlib.suppress(ValueError):
             delay = min(float(response.headers.get("Retry-After") or 1.0), 10.0)
-        except ValueError:
-            pass
         deadline = time.monotonic() + self._timeout
         while time.monotonic() < deadline:
             time.sleep(min(delay, 5.0))
@@ -250,6 +251,99 @@ class LiveFabricProvider:
             # A .py export: wrap the raw source as a single code cell.
             return {"cells": [{"cell_type": "code", "source": payload}]}, ""
         return None, failure
+
+    def _environment_definition(self, workspace_id: str, item_id: str) -> tuple[dict | None, str]:
+        """Read an Environment's Sparkcompute settings from its definition."""
+        parts, failure = self._definition_parts(workspace_id, item_id)
+        result: dict[str, Any] = {}
+        for part in parts:
+            if not str(part.get("path") or "").lower().endswith("sparkcompute.yml"):
+                continue
+            try:
+                payload = base64.b64decode(part["payload"]).decode("utf-8")
+                document = yaml.safe_load(payload) or {}
+            except (KeyError, ValueError, yaml.YAMLError):
+                return None, ""
+            if isinstance(document, dict):
+                result.update(document)
+        return (result or None), failure
+
+    @staticmethod
+    def _environment_binding(definition: dict) -> str:
+        """Find an Environment binding across known notebook metadata shapes."""
+        found: list[str] = []
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if (
+                        str(key).lower() in {"environmentartifactid", "environmentid", "environment_id"}
+                        and isinstance(child, str)
+                        and child.strip()
+                    ):
+                        found.append(child.strip())
+                    visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        visit(definition or {})
+        return found[0] if found else ""
+
+    @staticmethod
+    def _first_identifier(row: dict, *names: str) -> str:
+        """Return the first non-empty identifier across Fabric response variants."""
+        for name in names:
+            value = row.get(name)
+            if value is not None and str(value).strip():
+                return str(value)
+        return ""
+
+    def _notebook_monitoring(self, workspace_id: str, item_id: str) -> dict:
+        """Read latest Spark session metrics for a notebook, or return no evidence.
+
+        Monitoring is best-effort enrichment of ``NOTEBOOK_DEFINITIONS``. A
+        missing session, unsupported endpoint, or permission denial remains an
+        empty dict so checks report N/A rather than turning an observability gap
+        into a configuration failure.
+        """
+        base = f"/workspaces/{workspace_id}/notebooks/{item_id}/livySessions"
+        status, body = self._get(base)
+        if status != 200 or not isinstance(body, dict):
+            return {}
+        sessions = body.get("value") or body.get("data") or []
+        if not isinstance(sessions, list) or not sessions:
+            return {}
+        session = sessions[0] if isinstance(sessions[0], dict) else {}
+        livy_id = self._first_identifier(session, "livyId", "id", "sessionId")
+        if not livy_id:
+            return {}
+
+        detail_status, detail = self._get(f"{base}/{livy_id}")
+        if detail_status != 200 or not isinstance(detail, dict):
+            detail = session
+        app_id = self._first_identifier(
+            detail, "appId", "applicationId", "sparkApplicationId"
+        ) or self._first_identifier(session, "appId", "applicationId", "sparkApplicationId")
+
+        monitoring: dict[str, Any] = {
+            "livy_id": livy_id,
+            "app_id": app_id,
+            "session": detail,
+        }
+        if not app_id:
+            return monitoring
+
+        app_base = f"{base}/{livy_id}/applications/{app_id}"
+        for key, suffix in (
+            ("advice", "advice"),
+            ("resource_usage", "resourceUsage"),
+            ("stages", "stages"),
+        ):
+            metric_status, metric = self._get(f"{app_base}/{suffix}")
+            if metric_status == 200 and metric is not None:
+                monitoring[key] = metric
+        return monitoring
 
     def _lakehouse_tables(self, workspace_id: str, item_id: str) -> tuple[list[dict], str]:
         """List a lakehouse's tables via REST (name/type/format; no columns).
@@ -444,6 +538,7 @@ class LiveFabricProvider:
             Resource.ITEMS,
             Resource.PIPELINE_DEFINITIONS,
             Resource.NOTEBOOK_DEFINITIONS,
+            Resource.ENVIRONMENT_DEFINITIONS,
             Resource.TABLE_SCHEMAS,
             Resource.SHORTCUTS,
             Resource.SEMANTIC_MODEL_DEFINITIONS,
@@ -471,6 +566,27 @@ class LiveFabricProvider:
             else:
                 # 401/403/500/transport failure: we could not determine it.
                 ctx.unavailable.add(Resource.GIT)
+
+        if Resource.ENVIRONMENT_DEFINITIONS in wanted:
+            environments = [i for i in ctx.items if i.type == "Environment"]
+            attempted = read = forbidden = transient = 0
+            for item in environments:
+                attempted += 1
+                definition, failure = self._environment_definition(workspace_id, item.id)
+                if failure == "forbidden":
+                    forbidden += 1
+                elif failure == "transient":
+                    transient += 1
+                else:
+                    read += 1
+                    if definition:
+                        record = dict(definition)
+                        record["id"] = item.id
+                        record["display_name"] = item.display_name
+                        ctx.environments[item.id] = record
+                        ctx.environments[item.display_name] = record
+            self._record_failures(ctx, Resource.ENVIRONMENT_DEFINITIONS,
+                                  attempted, read, forbidden, transient)
 
         # The expensive one — one call per pipeline. Only paid for when a
         # selected check actually reads a pipeline definition.
@@ -507,10 +623,19 @@ class LiveFabricProvider:
                     transient += 1
                 elif definition:
                     read += 1
-                    key = self._unique_key(ctx.notebooks, item.display_name or item.id, item.id)
-                    ctx.notebooks[key] = definition
-                else:
-                    empty += 1
+                    if definition:
+                        binding = self._environment_binding(definition)
+                        environment = ctx.environments.get(binding)
+                        if environment:
+                            definition["_auditfast_environment"] = {
+                                "id": environment.get("id", binding),
+                                "name": environment.get("display_name", binding),
+                                "runtime_version": environment.get("runtime_version"),
+                            }
+                        monitoring = self._notebook_monitoring(workspace_id, item.id)
+                        if monitoring:
+                            definition["_auditfast_monitoring"] = monitoring
+                        ctx.notebooks[item.display_name or item.id] = definition
             self._record_failures(ctx, Resource.NOTEBOOK_DEFINITIONS,
                                   attempted, read, forbidden, transient, empty)
             log.info("fetch %s: %d notebooks found, %d definitions read",
