@@ -131,6 +131,58 @@ class PowerBIClient:
         status, body = self._get(path)
         return body if status == 200 and isinstance(body, dict) else None
 
+    def dataset_last_refresh(
+        self, dataset_id: str, group_id: str | None = None
+    ) -> tuple[str | None, str]:
+        """Return a semantic model's last refresh time and a failure classifier.
+
+        Reads the Power BI refresh history (returned latest-first) and yields
+        ``(timestamp, failure)`` where ``timestamp`` is the top entry's
+        ``endTime`` (or ``startTime`` while a refresh is running). ``failure``
+        follows the crawl convention: ``""`` read (``timestamp`` may still be
+        ``None`` for a model that has genuinely never been refreshed);
+        ``"forbidden"`` a 401/403 (wrong-audience or unlicensed token);
+        ``"transient"`` a 404-on-every-form / throttling / 5xx / transport error.
+
+        The workspace-scoped form is tried first; a personal ("My workspace")
+        model 404s there, so the no-group form is used as a fallback. Keeping
+        "could not read" distinct from "never refreshed" is what lets the caller
+        report N/A instead of silently dropping the model.
+        """
+        paths = []
+        if group_id:
+            paths.append(f"/groups/{group_id}/datasets/{dataset_id}/refreshes?$top=1")
+        paths.append(f"/datasets/{dataset_id}/refreshes?$top=1")
+        failure = "transient"
+        for path in paths:
+            status, body = self._get(path)
+            if status == 200 and isinstance(body, dict):
+                rows = body.get("value") or []
+                if rows and isinstance(rows[0], dict):
+                    return rows[0].get("endTime") or rows[0].get("startTime"), ""
+                return None, ""  # 200-empty: never refreshed — a real, readable answer
+            if status in (401, 403):
+                failure = "forbidden"  # token rejected; the other form will fare no better
+        return None, failure
+
+    def dataset_created_dates(self, group_id: str | None = None) -> dict[str, str]:
+        """Map ``dataset id -> createdDate`` for a workspace's semantic models.
+
+        ``GET /groups/{id}/datasets`` returns every model's ISO-8601
+        ``createdDate`` in a single call — no admin or capacity needed, and it is
+        present even for models that have never been refreshed. A personal
+        ("My workspace") id 401s on the group form, so the no-group ``/datasets``
+        form is used as a fallback. Returns ``{}`` when nothing could be read.
+        """
+        rows = self._values(f"/groups/{group_id}/datasets") if group_id else []
+        if not rows:
+            rows = self._values("/datasets")
+        return {
+            row["id"]: row["createdDate"]
+            for row in rows
+            if isinstance(row, dict) and row.get("id") and row.get("createdDate")
+        }
+
     def execute_queries(
         self, dataset_id: str, dax_queries: list[str], group_id: str | None = None
     ) -> dict:

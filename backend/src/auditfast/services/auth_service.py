@@ -92,6 +92,56 @@ def token_for(session_id: str | None) -> str | None:
     return sess["result"] if sess else None
 
 
+def powerbi_token_for(session_id: str | None) -> str | None:
+    """Mint a Power BI-audience token for a signed-in session, or ``None``.
+
+    Semantic-model refresh history lives only on the Power BI Datasets API
+    (audience ``https://analysis.windows.net/powerbi/api``) — a different
+    audience from the Fabric token the crawl uses. This acquires that token
+    *silently* from the session's existing MSAL cache, or, for an az-cli
+    session, by re-invoking ``az`` for the Power BI resource. It never prompts;
+    on any failure it returns ``None`` and the crawl simply leaves semantic-model
+    recency unknown rather than guessing.
+    """
+    sess = _SESSIONS.get(session_id or "")
+    if not sess:
+        return None
+    app = sess.get("_msal_app")
+    account = sess.get("_msal_account")
+    if app and account:
+        try:
+            res = app.acquire_token_silent(_POWERBI_DEFAULT_SCOPE, account=account)
+            if res and "access_token" in res:
+                return res["access_token"]
+        except Exception:
+            pass
+    if sess.get("_azcli"):
+        return _azcli_powerbi_token()
+    return None
+
+
+def _azcli_powerbi_token() -> str | None:
+    """Get a Power BI-audience token from an existing ``az login``, or ``None``."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("az"):
+        return None
+    try:
+        out = subprocess.run(
+            ["az", "account", "get-access-token", "--resource",
+             "https://analysis.windows.net/powerbi/api", "--output", "json"],
+            capture_output=True, text=True, timeout=90)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        return json.loads(out.stdout).get("accessToken")
+    except Exception:
+        return None
+
+
 def make_token_refresher(session_id: str | None):
     """Return a callable that silently refreshes the token, or None.
 
