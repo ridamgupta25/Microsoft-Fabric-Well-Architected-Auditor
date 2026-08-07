@@ -9,7 +9,6 @@ from __future__ import annotations
 import re
 
 from auditfast.core.check._pipeline import activities as pipeline_activities
-from auditfast.core.check._pipeline import activities as pipeline_activities
 from auditfast.core.check._tables import (
     TABLE_LAYERS,
     col_names,
@@ -149,6 +148,46 @@ _INCREMENTAL_SQL = re.compile(
     r"change[_\s]?tracking|change[_\s]?data|last_?modified|high_?water|"
     r"incremental",
     re.IGNORECASE,
+)
+_TRY_CATCH_SQL = re.compile(
+    r"\bBEGIN\s+TRY\b.*?\bEND\s+TRY\b.*?\bBEGIN\s+CATCH\b.*?\bEND\s+CATCH\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_TXN_SQL = re.compile(
+    r"\bBEGIN\s+TRAN(?:SACTION)?\b|\bCOMMIT\s+TRAN(?:SACTION)?\b|\bROLLBACK\s+TRAN(?:SACTION)?\b",
+    re.IGNORECASE,
+)
+_STATS_UPDATE_SQL = re.compile(
+    r"\bUPDATE\s+STATISTICS\b|\bsp_updatestats\b|\bANALYZE\s+TABLE\b.*\bCOMPUTE\s+STATISTICS\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_TABLES_PATH = re.compile(r"(?:^|/)tables(?:/|$)", re.IGNORECASE)
+_SHORTCUTS_PATH = re.compile(r"(?:^|/)shortcuts(?:/|$)", re.IGNORECASE)
+_BRONZE_TOKEN = re.compile(r"(?:^|[/_\-.])bronze(?:[/_\-.]|$)", re.IGNORECASE)
+_SILVER_TOKEN = re.compile(r"(?:^|[/_\-.])silver(?:[/_\-.]|$)", re.IGNORECASE)
+
+_PARTITION_HINT_COLUMNS = (
+    "event_date", "business_date", "partition_date", "load_date",
+    "event_dt", "load_dt", "year", "month", "day",
+)
+_STRATEGY_METADATA_KEYS = (
+    "partitionBy", "partitionColumns", "partition_keys",
+    "clusterBy", "clusteredBy", "clusteringColumns", "zOrderBy",
+)
+_DECIMAL_TYPE = re.compile(r"^decimal\s*\((\d+)\s*,\s*(\d+)\)$", re.IGNORECASE)
+_OVERSIZED_VARCHAR = re.compile(r"^varchar\s*\((\d+)\)$", re.IGNORECASE)
+_SURROGATE_KEY_NAME = re.compile(r"(?:^|_)(?:sk|surrogate|hash(?:_?key)?)(?:$|_)", re.IGNORECASE)
+_PK_FK_NAME_HINT = re.compile(r"(?:^|_)(?:pk|fk|primary|foreign)(?:$|_)", re.IGNORECASE)
+_VIEW_PROC_HINT = re.compile(r"(?:^|_)(?:vw|view|sp|proc|procedure)(?:$|_)", re.IGNORECASE)
+_LOGIC_HINT = re.compile(r"(?:merge|join|window|row_number|dedup|rule|calc|business|transform)", re.IGNORECASE)
+
+_SQL_PERMISSION_HINT = (
+    "Request workspace Viewer role (CONNECT + ReadData on Warehouse/SQL analytics endpoint and Metadata/Audit DBs) "
+    "plus client approval for schema/catalog and row-level verification queries; this consumes capacity CU"
+)
+_ONELAKE_PERMISSION_HINT = (
+    "Request Workspace.Read.All + OneLake.Read.All (delegated, read-only). "
+    "Reads lakehouse table/column structure, Files hierarchy and shortcuts (structure only, never row data)"
 )
 _TRY_CATCH_SQL = re.compile(
     r"\bBEGIN\s+TRY\b.*?\bEND\s+TRY\b.*?\bBEGIN\s+CATCH\b.*?\bEND\s+CATCH\b",
@@ -613,7 +652,7 @@ def nb_no_cursor(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="WS-STAGING", ref="3.6.3
+    id="WS-STAGING", ref="3.6.3",
     title="Staging tables/schema used for Warehouse loads before merge into final tables",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
