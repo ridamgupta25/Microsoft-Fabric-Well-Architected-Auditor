@@ -17,7 +17,7 @@ from auditfast.core.check._tables import (
     is_fact,
     is_snake_case,
 )
-from auditfast.core.check.helpers import Verdict, binary, covered, not_applicable, note
+from auditfast.core.check.helpers import Verdict, binary, covered, not_applicable
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
@@ -200,35 +200,116 @@ def _too_wide(column_type: str) -> bool | None:
     return True if width == "max" else int(width) > _MAX_TEXT_WIDTH
 
 
+#: Connection types that stay inside OneLake's governance boundary.
+_ONELAKE_NATIVE = {
+    "lakehouse", "warehouse", "onelake", "datamart", "kustodatabase",
+    "kqldatabase", "eventhouse", "powerbisemanticmodel", "fabricsql",
+}
+
+#: A local or UNC filesystem path — ``C:\Users\...`` or ``\\server\share``.
+_LOCAL_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+
+#: A personal cloud drive rather than a governed team site.
+_PERSONAL_CLOUD = re.compile(r"-my\.sharepoint\.com|/personal/|onedrive", re.IGNORECASE)
+
+#: An endpoint that is a single data file, not a managed store.
+_FILE_ENDPOINT = re.compile(r"\.(?:csv|tsv|xlsx?|xlsb|json|txt|parquet|xml)(?:\?|$)", re.IGNORECASE)
+
+
+def _shadow_reason(conn: dict) -> str | None:
+    """Why this connection is ungoverned shadow storage, or None when it is governed.
+
+    Deliberately conservative: an enterprise object store reached through a
+    shareable cloud connection (ADLS, S3, GCS, a SQL source) is *not* shadow
+    storage — it is a governed external source, which the point allows. What it
+    flags is data living outside any shared, managed store: a file on a person's
+    machine, a personal cloud drive, or an ad-hoc file pulled over HTTP.
+    """
+    connectivity = (conn.get("connectivity_type") or "").strip().lower()
+    conn_type = (conn.get("connection_type") or "").strip().lower()
+    endpoint = (conn.get("endpoint") or "").strip()
+
+    if "personal" in connectivity:
+        return "personal gateway"
+    if conn_type == "file" or _LOCAL_PATH.search(endpoint):
+        return "local file path"
+    if _PERSONAL_CLOUD.search(endpoint):
+        return "personal cloud drive"
+    if conn_type in ("web", "httpserver") and _FILE_ENDPOINT.search(endpoint):
+        return "ad-hoc file over HTTP"
+    return None
+
+
 @check(
-    id="WS-SHORTCUT-SCOPE", ref="4.1.2", title="OneLake used as the single data lake",
+    id="WS-SHORTCUT-SCOPE", ref="4.1.2",
+    title="OneLake used as the single data lake — no ungoverned shadow storage",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS], required=False,
+    layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS, Resource.CONNECTIONS], required=False,
 )
 def shortcut_scope(ctx: CheckContext) -> Verdict:
-    """Where the workspace's shortcuts point — OneLake versus external storage.
+    """Data reaches the workspace through OneLake or a governed source, not a side door.
 
-    A shortcut to Dataverse or ADLS is a legitimate governed pattern, so the count
-    is reported for review rather than scored as a failure.
+    Two populations answer this. **Shortcuts** show where OneLake itself points;
+    a shortcut to Dataverse or ADLS is a legitimate governed pattern, so it is
+    reported for review rather than failed. **Connections** are where shadow
+    storage actually shows up — a spreadsheet on someone's laptop reached through
+    a personal gateway is exactly the "ungoverned shadow storage" the point
+    forbids, and that is what this check scores.
     """
-    if not ctx.workspace.has(Resource.SHORTCUTS):
-        return not_applicable("Shortcuts could not be read from Fabric")
-    all_shortcuts = [s for entries in ctx.workspace.shortcuts.values() for s in entries]
-    if not all_shortcuts:
-        return not_applicable("No OneLake shortcuts in this workspace")
+    has_shortcuts = ctx.workspace.has(Resource.SHORTCUTS)
+    has_connections = ctx.workspace.has(Resource.CONNECTIONS)
+    if not has_shortcuts and not has_connections:
+        return not_applicable("Neither shortcuts nor connections could be read from Fabric")
 
+    shortcuts = [s for entries in (ctx.workspace.shortcuts or {}).values() for s in entries]
+    onelake = sum(1 for s in shortcuts
+                  if (s.get("target_type") or "").strip().lower() == "onelake")
     external_types = sorted({
         (s.get("target_type") or "unknown")
-        for s in all_shortcuts
+        for s in shortcuts
         if (s.get("target_type") or "").strip().lower() != "onelake"
     })
-    onelake = sum(1 for s in all_shortcuts
-                  if (s.get("target_type") or "").strip().lower() == "onelake")
-    external = len(all_shortcuts) - onelake
-    return note(
-        f"{len(all_shortcuts)} shortcut(s): {onelake} target OneLake, "
-        f"{external} target external sources ({', '.join(external_types) or 'none'}). "
-        f"External shortcuts are legitimate when governed - confirm each is intended."
+    if shortcuts:
+        shortcut_note = (
+            f"{len(shortcuts)} shortcut(s): {onelake} target OneLake, "
+            f"{len(shortcuts) - onelake} target external sources "
+            f"({', '.join(external_types) or 'none'})"
+        )
+    elif has_shortcuts:
+        shortcut_note = "no OneLake shortcuts"
+    else:
+        shortcut_note = "shortcuts could not be read"
+
+    if not has_connections:
+        return not_applicable(
+            f"Connections could not be read from Fabric, so shadow storage cannot be "
+            f"judged — {shortcut_note}"
+        )
+    connections = ctx.workspace.connections or []
+    if not connections:
+        return not_applicable(f"No Fabric source connections were returned — {shortcut_note}")
+
+    reasons: dict[str, int] = {}
+    native = governed = 0
+    for conn in connections:
+        reason = _shadow_reason(conn)
+        if reason:
+            reasons[reason] = reasons.get(reason, 0) + 1
+        elif (conn.get("connection_type") or "").strip().lower() in _ONELAKE_NATIVE:
+            native += 1
+        else:
+            governed += 1
+
+    shadow = sum(reasons.values())
+    breakdown = ", ".join(f"{count} {reason}" for reason, count in sorted(reasons.items()))
+    return covered(
+        len(connections) - shadow, len(connections),
+        f"{len(connections) - shadow} of {len(connections)} source connection(s) are "
+        f"governed ({native} OneLake-native, {governed} governed external); "
+        f"{shadow} are ungoverned shadow storage"
+        f"{' — ' + breakdown if breakdown else ''}. {shortcut_note}. "
+        f"External shortcuts and external sources are legitimate when governed — "
+        f"confirm each is intended.",
     )
 
 
