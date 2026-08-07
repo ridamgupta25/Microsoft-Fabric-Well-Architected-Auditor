@@ -10,11 +10,13 @@ import re
 
 from auditfast.core.check._notebook import (
     NOTEBOOK_LAYERS,
+    executable_code,
     has_parameters_cell,
     markdown_sources,
     notebook_code,
 )
 from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities, script_sql, walk_activities
+from auditfast.core.check._tables import is_dimension, is_fact
 from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
@@ -173,7 +175,6 @@ _SPARK_SQL = re.compile(r"spark\.sql\s*\(|%%?sql\b", re.IGNORECASE)
 _DATAFRAME_OP = re.compile(r"spark\.(?:read|table)\b|\.groupBy\s*\(|\.withColumn\s*\(|createDataFrame\s*\(")
 _EXTERNAL_READ = re.compile(r"\.read\b[^\n]*(?:csv|json|format\s*\(\s*[\"'](?:csv|json))", re.IGNORECASE)
 _SCHEMA_DEFINED = re.compile(r"\.schema\s*\(|StructType\s*\(|inferSchema", re.IGNORECASE)
-_JOIN_CALL = re.compile(r"\.join\s*\(")
 _BROADCAST = re.compile(r"broadcast\s*\(", re.IGNORECASE)
 _NB_NAME_OK = re.compile(r"^[A-Za-z][A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)+$")
 _NB_NAME_BAD = re.compile(r"^(?:notebook|untitled|test|temp|copy of)\b", re.IGNORECASE)
@@ -294,12 +295,12 @@ def nb_timeout(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-LANG", ref="3.2.1", title="Consistent language approach (not mixed PySpark / Spark SQL)",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_language(ctx: CheckContext) -> Verdict:
     """One primary language rather than a mix of PySpark and Spark SQL."""
-    code = notebook_code(ctx.obj)
+    code = executable_code(ctx.obj)
     mixed = bool(_SPARK_SQL.search(code)) and bool(_DATAFRAME_OP.search(code))
     if mixed:
         return graded(1, "Mixes PySpark and Spark SQL — pick one primary approach")
@@ -320,15 +321,15 @@ def nb_dataframe_api(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-BROADCAST", ref="3.2.4", title="Broadcast joins used for small-large joins",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_broadcast(ctx: CheckContext) -> Verdict:
     """Joins carry a broadcast() hint where a small dimension meets a large fact."""
-    code = notebook_code(ctx.obj)
-    joins = _JOIN_CALL.findall(code)
+    code = executable_code(ctx.obj)
+    joins = _JOIN_PATTERN.findall(code)
     if not joins:
-        return not_applicable("No DataFrame joins present to evaluate for broadcast hints")
+        return not_applicable("No joins present to evaluate for broadcast hints")
     ok = bool(_BROADCAST.search(code))
     return binary(ok, "broadcast() hint present on join(s)" if ok
                   else f"{len(joins)} join(s) without a broadcast() hint")
@@ -396,9 +397,14 @@ _LATE_ARRIVAL = re.compile(
     r"sequence[_ -]?(?:number|no|id)|version[_ -]?(?:number|no|id)|effective[_ -]?date",
     re.IGNORECASE,
 )
+# Deliberately excludes bare ``version`` / ``sequence``: those are also how
+# ``_LATE_ARRIVAL`` trips (``version_id``, ``sequence_number``), so accepting them
+# here made the verdict a tautology — any pipeline that entered the gate via a
+# version/sequence token satisfied the safe-write test by the same token and could
+# never FAIL. Only an actual duplicate-safe *write* counts.
 _LATE_SAFE_WRITE = re.compile(
     r"merge|upsert|dropduplicates|drop_duplicates|row_number|dedup|"
-    r"latest[_ -]?version|newer[_ -]?version|sequence|version|when[_ -]?matched",
+    r"latest[_ -]?version|newer[_ -]?version|when[_ -]?matched",
     re.IGNORECASE,
 )
 
@@ -439,19 +445,27 @@ def pl_incremental(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-LOADMODE", ref="2.2.4", title="Initial vs incremental load separated or parameterized",
+    id="PL-LOADMODE", ref="2.2.5", title="Initial vs incremental load separated or parameterized",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def pl_load_mode(ctx: CheckContext) -> Verdict:
     """A load-mode parameter or a branch keeps first-load and incremental logic apart."""
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
     props = ctx.obj.get("properties") or {}
-    acts = activities(ctx.obj)
+    acts = walk_activities(ctx.obj)
     data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
     if not data_acts:
         return not_applicable("No data-movement activity to assess for load-mode separation")
     param_mode = any(_LOAD_MODE.search(p) for p in (props.get("parameters") or {}))
-    branch = any((a.get("type") or "") in {"Switch", "IfCondition"} for a in acts)
+    # A bare Switch/If proves nothing — a condition on file existence or row count
+    # is not load-mode separation. The branch must itself mention the load mode.
+    branch = any(
+        (a.get("type") or "") in {"Switch", "IfCondition"}
+        and _LOAD_MODE.search(json.dumps(a))
+        for a in acts
+    )
     ok = param_mode or branch
     return binary(ok, "Load mode is parameterized / branched (initial vs incremental)" if ok
                   else "No initial-vs-incremental separation (load-mode parameter or branch) found")
@@ -463,9 +477,22 @@ _WRITE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _COUNT_RECONCILE = re.compile(
-    r"assert.*\.count\s*\(|\.count\s*\(\s*\)\s*[!=<>]|"
-    r"row_count|record_count|source_count|target_count|"
-    r"reconcil|recon_count|count_check|validate.*count",
+    # A count that is actually asserted or compared against an expectation. A count
+    # merely assigned, used as a column alias, or compared to 0 (an emptiness guard)
+    # reconciles nothing.
+    r"assert[^\n]*\.count\s*\(|"
+    r"\.count\s*\(\s*\)\s*(?:==|!=|<=|>=|<|>)(?!\s*0\b)|"
+    r"(?:row|record|source|target|actual|expected|recon)_count\b\s*(?:==|!=|<=|>=|<|>)(?!\s*0\b)|"
+    r"(?:==|!=|<=|>=|<|>)\s*(?:row|record|source|target|actual|expected|recon)_count\b|"
+    # Explicitly named reconciliation / row-count validation.
+    r"reconcil|\bcount_check\b|validate[^\n]*count|expect_table_row_count",
+    re.IGNORECASE,
+)
+# A DataFrame ``.join(`` or a SQL ``JOIN <table>``. ``path.join`` and ``"x".join``
+# are not table joins.
+_JOIN_PATTERN = re.compile(
+    r"(?<!['\",])(?<!path)\.join\s*\(\s*(?![\[\]'\"])"
+    r"|\bjoin\s+[\w`\"\[]",
     re.IGNORECASE,
 )
 _RI_PATTERN = re.compile(
@@ -486,36 +513,89 @@ _FK_INTEGRITY = re.compile(
     r"\.isNull\s*\(\s*\).*join|join.*\.isNull\s*\(",
     re.IGNORECASE,
 )
+# One physical read. The chained ``spark.read...load(...)`` form is listed first so it
+# is consumed whole rather than counted as both a ``spark.read`` and a ``.load(``. The
+# chain may be split by line continuations and may nest one level of parentheses.
 _MULTI_SOURCE = re.compile(
-    r"(?:spark\.table\s*\(|spark\.read\b|\.load\s*\()", re.IGNORECASE,
+    r"spark\.read\b(?:[\s\\]*\.\s*\w+\s*\((?:[^()]|\([^()]*\))*\))*?[\s\\]*\.\s*load\s*\(|"
+    r"spark\.read\b|"
+    r"spark\.table\s*\(|"
+    r"\.load\s*\(",
+    re.IGNORECASE,
 )
 _ORPHAN_DETECT = re.compile(
     r"left_anti|leftanti|orphan|unmatched|no_parent|missing_parent|"
     r"anti.*join.*parent|parent.*anti.*join",
     re.IGNORECASE,
 )
+# A Delta merge is often issued through a variable bound to DeltaTable.forName/forPath,
+# so the ``.merge(`` call site alone does not carry the DeltaTable name.
 _MERGE_PATTERN = re.compile(
-    r"MERGE\s+INTO|deltaTable\s*\.\s*merge\s*\(|DeltaTable\s*\.\s*merge\s*\(",
+    r"MERGE\s+INTO|"
+    r"DeltaTable\s*\.\s*merge\s*\(|"
+    r"DeltaTable\s*\.\s*(?:forName|forPath)\s*\([\s\S]*?\.\s*merge\s*\(|"
+    r"\.\s*merge\s*\([\s\S]{0,400}?\.\s*whenMatched",
     re.IGNORECASE,
 )
 _MERGE_VALIDATE = re.compile(
-    r"operationMetrics|DESCRIBE\s+HISTORY|merge.*count|"
+    # ``merge[_ ]count`` must be a real token: a bare ``merge.*count`` also matches
+    # the target name in "MERGE INTO gold_customer_country".
+    r"operationMetrics|DESCRIBE\s+HISTORY|merge[_\s]*count\b|"
     r"rows_inserted|rows_updated|rows_deleted|"
     r"num_inserted|num_updated|num_deleted|"
     r"merge_result|merge_valid|post.?merge.*count",
     re.IGNORECASE,
+)
+_DEDUP_PATTERN = re.compile(
+    # Real dedup calls only. A bare ``row_number()`` ranks rows without removing
+    # any, so it counts only when a later filter keeps rank 1. The word "dedup"
+    # must be a call: "Error during deduplication" is a message, not a control.
+    r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.duplicated\s*\(|"
+    r"\.distinct\s*\(|"
+    r"row_number\s*\(\s*\)[\s\S]{0,120}?\bover\b[\s\S]{0,400}?(?:==|=)\s*1\b|"
+    r"\bdedup\w*\s*\(|"
+    # The group-by-then-keep-count-above-one idiom, the SQL/PySpark way of
+    # surfacing duplicate keys without calling any dedup API.
+    r"groupBy[^\n]*\.count\s*\(\s*\)[^\n]*?count[^\n]*?>\s*1",
+    re.IGNORECASE,
+)
+_TYPE_CAST = re.compile(
+    # An explicit cast, an explicit schema, or typed DDL. A bare ``IntegerType()``
+    # is excluded: it appears in type *introspection* as often as in a schema.
+    r"\.cast\s*\(|to_date\s*\(|to_timestamp\s*\(|\.astype\s*\(|"
+    r"StructField\s*\(|"
+    # SQL casting, written in selectExpr / spark.sql / a %%sql cell.
+    r"\bCAST\s*\(\s*[\w.`\"\[\]]+\s+AS\s+\w+|"
+    # Typed DDL. The type must sit inside the column-definition parentheses, so a
+    # CREATE TABLE ... AS SELECT that merely mentions DATE later does not count.
+    r"CREATE\s+(?:OR\s+REPLACE\s+)?TABLE[^\n(]*\([^)]{0,400}?"
+    r"\b\w+\s+(?:INT|BIGINT|SMALLINT|STRING|VARCHAR|CHAR|DECIMAL|NUMERIC|TIMESTAMP|DATE|"
+    r"BOOLEAN|DOUBLE|FLOAT)\b",
+    re.IGNORECASE,
+)
+# Case matters here: ``Id``/``ID``/``_id`` are key suffixes, but a case-insensitive
+# ``id`` also matches the tail of ordinary words such as "valid", and a lower-case
+# ``key`` matches "monkey". Each alternative therefore carries its own boundary.
+_KEY_NAME = r"(?:\bkey\b|\w*_(?:key|KEY|id|ID)\b|\w+(?:Key|KEY|Id|ID)\b)"
+_KEY_QUALITY = re.compile(
+    # A null test on a key-named column, either way round, or a dedup keyed on one.
+    rf"{_KEY_NAME}[^\n]{{0,40}}\.is(?:Not)?Null\s*\(|"
+    rf"\.is(?:Not)?Null\s*\([^\n]{{0,60}}{_KEY_NAME}|"
+    r"drop[Dd]uplicates\s*\(\s*(?:subset\s*=\s*)?\[|"
+    r"drop_duplicates\s*\(\s*(?:subset\s*=\s*)?\[|"
+    r"dropna\s*\([^\n]*subset",
 )
 
 
 @check(
     id="NB-RECON-COUNT", ref="5.2.5",
     title="Record count reconciliation after writes",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_recon_count(ctx: CheckContext) -> Verdict:
     """Notebooks that write data validate row counts against source expectations."""
-    code = notebook_code(ctx.obj)
+    code = executable_code(ctx.obj)
     if not _WRITE_PATTERN.search(code):
         return not_applicable("Notebook does not write data to a table")
     ok = bool(_COUNT_RECONCILE.search(code))
@@ -526,12 +606,12 @@ def nb_recon_count(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-FK-INTEGRITY", ref="5.3.2",
     title="Referential integrity: FK values validated against lookup tables",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_fk_integrity(ctx: CheckContext) -> Verdict:
     """Notebooks that join tables verify FK values exist in dimension/lookup tables."""
-    code = notebook_code(ctx.obj)
+    code = executable_code(ctx.obj)
     if not _JOIN_PATTERN.search(code):
         return not_applicable("Notebook does not perform joins")
     ok = bool(_FK_INTEGRITY.search(code))
@@ -542,12 +622,12 @@ def nb_fk_integrity(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-CROSS-RECON", ref="5.3.6",
     title="Cross-source reconciliation for multi-source loads",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_cross_recon(ctx: CheckContext) -> Verdict:
     """Notebooks reading multiple sources reconcile records across them."""
-    code = notebook_code(ctx.obj)
+    code = executable_code(ctx.obj)
     sources = _MULTI_SOURCE.findall(code)
     if len(sources) < 2:
         return not_applicable("Notebook reads from fewer than 2 sources")
@@ -559,12 +639,12 @@ def nb_cross_recon(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-ORPHAN-DETECT", ref="5.3.7",
     title="Orphan detection: child records without parents identified",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_orphan_detect(ctx: CheckContext) -> Verdict:
     """Notebooks with joins detect orphan/unmatched child records."""
-    code = notebook_code(ctx.obj)
+    code = executable_code(ctx.obj)
     if not _JOIN_PATTERN.search(code):
         return not_applicable("Notebook does not perform joins")
     ok = bool(_ORPHAN_DETECT.search(code))
@@ -575,12 +655,12 @@ def nb_orphan_detect(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-MERGE-VALID", ref="5.3.9",
     title="Merge result validation: post-merge counts reconciled",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_merge_valid(ctx: CheckContext) -> Verdict:
     """Notebooks performing MERGE validate post-merge counts against I/U/D expectations."""
-    code = notebook_code(ctx.obj)
+    code = executable_code(ctx.obj)
     if not _MERGE_PATTERN.search(code):
         return not_applicable("Notebook does not perform MERGE operations")
     ok = bool(_MERGE_VALIDATE.search(code))
@@ -865,7 +945,7 @@ def ws_file_purge(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-LATE-ARRIVAL", ref="2.2.3",
+    id="PL-LATE-ARRIVAL", ref="2.3.8",
     title="Late-arriving changes handled without corruption",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
@@ -874,7 +954,7 @@ def pl_late_arrival(ctx: CheckContext) -> Verdict:
     """Late or out-of-order changes use a version-aware, duplicate-safe write path."""
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
-    acts = activities(ctx.obj)
+    acts = walk_activities(ctx.obj)
     data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
     if not data_acts:
         return not_applicable("No data-movement activity to assess for late changes")
@@ -889,3 +969,582 @@ def pl_late_arrival(ctx: CheckContext) -> Verdict:
         if safe_write else
         "Late/out-of-order handling is indicated but no version-aware duplicate-safe write was found",
     )
+
+
+@check(
+    id="NB-DEDUP", ref="5.2.6",
+    title="Duplicate detection across batches",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_dedup(ctx: CheckContext) -> Verdict:
+    """Notebooks that write data de-duplicate, so a re-run cannot double-load rows."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write data to a table")
+    ok = bool(_DEDUP_PATTERN.search(code))
+    return binary(ok, "Duplicate detection present" if ok
+                  else "Writes data without duplicate detection")
+
+
+@check(
+    id="NB-TYPE-CAST", ref="5.3.1",
+    title="Data type conformance: columns cast to standard types",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_type_cast(ctx: CheckContext) -> Verdict:
+    """Notebooks that write data cast columns explicitly instead of trusting inference."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write data to a table")
+    ok = bool(_TYPE_CAST.search(code))
+    return binary(ok, "Explicit type conformance present" if ok
+                  else "Writes data without explicit type casting")
+
+
+@check(
+    id="NB-KEY-QUALITY", ref="5.5.6",
+    title="Identifiers and keys: uniqueness verified, no nulls in key columns",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_key_quality(ctx: CheckContext) -> Verdict:
+    """Notebooks that write data validate key columns for nulls and duplicates."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write data to a table")
+    ok = bool(_KEY_QUALITY.search(code))
+    return binary(ok, "Key uniqueness / null validation present" if ok
+                  else "Writes data without key uniqueness or null validation")
+
+
+
+# =============================================================================
+# MLC Cat-1 · ingestion framework (2.1.5, 2.2.2-2.2.4, 2.3.2-2.3.4, 2.5.1, 2.5.3)
+# =============================================================================
+
+# -- 2.1.5 parallel execution -------------------------------------------------
+_FOREACH = "ForEach"
+
+
+@check(
+    id="PL-PARALLEL", ref="2.1.5",
+    title="Parallel execution used where possible",
+    pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
+)
+def pl_parallel(ctx: CheckContext) -> Verdict:
+    """Independent work fans out instead of running one item at a time."""
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+    acts = walk_activities(ctx.obj)
+    loops = [a for a in acts if (a.get("type") or "") == _FOREACH]
+
+    if loops:
+        # ``isSequential`` forces one iteration at a time — the single most common
+        # cause of an ingestion pipeline running far longer than it needs to.
+        serial = sorted((a.get("name") or "?") for a in loops
+                        if (a.get("typeProperties") or {}).get("isSequential"))
+        parallel_count = len(loops) - len(serial)
+        evidence = f"{parallel_count} of {len(loops)} ForEach loop(s) iterate in parallel"
+        if serial:
+            evidence += f" — forced sequential: {', '.join(serial)}"
+        return covered(parallel_count, len(loops), evidence)
+
+    data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
+    if len(data_acts) < 2:
+        return not_applicable("Fewer than two data activities and no ForEach — "
+                              "nothing to parallelize")
+    # More than one activity with no upstream dependency means at least two
+    # branches start together; a single root is a strict serial chain.
+    roots = [a for a in data_acts if not a.get("dependsOn")]
+    ok = len(roots) > 1
+    return binary(ok, f"{len(roots)} of {len(data_acts)} data activities start "
+                      f"independently (work fans out)" if ok
+                  else f"All {len(data_acts)} data activities run in a single "
+                       f"serial chain with no parallel branch")
+
+
+# -- 2.2.2 full load reserved for small reference/dimension tables -------------
+#: A statement that replaces a table wholesale, capturing the target it hits.
+_FULL_LOAD_TARGETS = (
+    re.compile(r"TRUNCATE\s+TABLE\s+([\w.\[\]\"]+)", re.IGNORECASE),
+    re.compile(r"INSERT\s+OVERWRITE\s+(?:TABLE\s+)?([\w.\[\]\"]+)", re.IGNORECASE),
+    re.compile(r"DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?([\w.\[\]\"]+)", re.IGNORECASE),
+)
+#: Copy-activity sinks that overwrite rather than append/upsert.
+_OVERWRITE_BEHAVIOUR = re.compile(
+    r"\"(?:writeBehavior|tableOption)\"\s*:\s*\"(?:overwrite|autoCreate)\"|"
+    r"\"preCopyScript\"\s*:\s*\"[^\"]*TRUNCATE",
+    re.IGNORECASE,
+)
+
+
+def _bare_table(name: str) -> str:
+    """The table name without schema qualifier, brackets, or quotes."""
+    return (name or "").replace("[", "").replace("]", "").replace('"', "").split(".")[-1]
+
+
+@check(
+    id="PL-FULLLOAD", ref="2.2.2",
+    title="Full load reserved for small reference/dimension tables",
+    pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
+)
+def pl_full_load(ctx: CheckContext) -> Verdict:
+    """Wholesale reloads target lookup/dimension tables, never fact tables."""
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+    sql = script_sql(ctx.obj)
+    blob = json.dumps(ctx.obj)
+
+    targets: list[str] = []
+    for pattern in _FULL_LOAD_TARGETS:
+        targets.extend(_bare_table(m) for m in pattern.findall(sql))
+    overwrite_copy = bool(_OVERWRITE_BEHAVIOUR.search(blob))
+
+    if not targets and not overwrite_copy:
+        return not_applicable("Pipeline runs no full-reload statement "
+                              "(TRUNCATE / INSERT OVERWRITE / overwrite sink)")
+    if not targets:
+        return graded(1, "A Copy activity overwrites its sink, but the target table "
+                         "is not named in the definition — cannot confirm it is a "
+                         "small reference/dimension table")
+
+    facts = sorted({t for t in targets if is_fact(t)})
+    safe = sorted({t for t in targets if not is_fact(t)})
+    if facts:
+        return binary(False, f"Full reload targets fact table(s): {', '.join(facts)} — "
+                             f"facts should load incrementally, not be replaced wholesale")
+    kind = "dimension/reference" if any(is_dimension(t) for t in safe) else "reference"
+    return binary(True, f"Full reload targets only {kind} table(s): {', '.join(safe)}")
+
+
+# -- 2.2.3 historical (Adage) load separated from ongoing incremental ----------
+_HISTORICAL = re.compile(
+    r"historical|back[_ -]?fill|backfill|full[_ -]?history|one[_ -]?time[_ -]?load|"
+    r"initial[_ -]?load|adage|reload[_ -]?history",
+    re.IGNORECASE,
+)
+_ONGOING = re.compile(
+    r"incremental|daily|hourly|delta[_ -]?load|watermark|cdc|ongoing|scheduled",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="PL-HIST-SEPARATION", ref="2.2.3",
+    title="Historical load separated from ongoing incremental pattern",
+    pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
+)
+def pl_historical_separation(ctx: CheckContext) -> Verdict:
+    """A one-off historical backfill cannot be triggered by the routine daily run.
+
+    Narrower than ``PL-LOADMODE`` (2.2.5), which asks whether *any* initial /
+    incremental separation exists. This fires only when a historical or backfill
+    load is actually present, and asks whether it is kept off the routine path.
+    """
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+    blob = json.dumps(ctx.obj)
+    if not _HISTORICAL.search(blob) and not _HISTORICAL.search(ctx.obj_name):
+        return not_applicable("No historical / backfill load present in this pipeline")
+
+    # A pipeline whose own name marks it as the historical load is separated by
+    # construction — it is a different artifact from the incremental one.
+    if _HISTORICAL.search(ctx.obj_name):
+        return binary(True, f"'{ctx.obj_name}' is a dedicated historical/backfill "
+                            f"pipeline, separate from the ongoing incremental load")
+
+    acts = walk_activities(ctx.obj)
+    gated_by_branch = any(
+        (a.get("type") or "") in {"Switch", "IfCondition"}
+        and (_HISTORICAL.search(json.dumps(a)) or _LOAD_MODE.search(json.dumps(a)))
+        for a in acts
+    )
+    param_gated = any(
+        _HISTORICAL.search(p) or _LOAD_MODE.search(p)
+        for p in ((ctx.obj.get("properties") or {}).get("parameters") or {})
+    )
+    if gated_by_branch or param_gated:
+        return binary(True, "Historical load is gated behind a parameter or branch, "
+                            "so the routine run does not replay history")
+    if _ONGOING.search(blob):
+        return binary(False, "Historical/backfill logic sits inline with the ongoing "
+                             "incremental logic with no parameter or branch separating "
+                             "them — a routine run can replay the full history")
+    return graded(1, "Historical/backfill logic present but no ongoing incremental "
+                     "path found to separate it from")
+
+
+# -- 2.2.4 watermark / control values persisted durably -----------------------
+_WATERMARK = re.compile(r"watermark|high[_ -]?water|last[_ -]?(?:load|run|modified|extract)",
+                        re.IGNORECASE)
+#: The watermark is written back to a durable store.
+_WATERMARK_DURABLE = re.compile(
+    r"(?:UPDATE|INSERT\s+INTO|MERGE\s+INTO)\s+[\w.\[\]\"]*"
+    r"(?:watermark|control|metadata|etl_?config|load_?log)|"
+    r"EXEC(?:UTE)?\s+[\w.\[\]]*(?:set|update|save)_?watermark",
+    re.IGNORECASE,
+)
+_WATERMARK_TABLE_READ = re.compile(
+    r"(?:FROM|JOIN)\s+[\w.\[\]\"]*(?:watermark|control|metadata|etl_?config|load_?log)",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="PL-WATERMARK-STORE", ref="2.2.4",
+    title="Watermark / control values persisted reliably",
+    pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
+)
+def pl_watermark_store(ctx: CheckContext) -> Verdict:
+    """The incremental watermark survives a failure because it lives in a table.
+
+    A watermark held only in a pipeline variable is lost the moment the run ends,
+    so the next run either reprocesses everything or silently skips rows.
+    """
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+    blob = json.dumps(ctx.obj)
+    if not _WATERMARK.search(blob):
+        return not_applicable("Pipeline uses no watermark / control value")
+
+    sql = script_sql(ctx.obj)
+    acts = walk_activities(ctx.obj)
+    lookup_sql = json.dumps([a for a in acts if (a.get("type") or "") == "Lookup"])
+    proc = any((a.get("type") or "") == "SqlServerStoredProcedure"
+               and _WATERMARK.search(json.dumps(a)) for a in acts)
+
+    persists = bool(_WATERMARK_DURABLE.search(sql)) or proc
+    reads_table = bool(_WATERMARK_TABLE_READ.search(sql)
+                       or _WATERMARK_TABLE_READ.search(lookup_sql))
+
+    if persists and reads_table:
+        return binary(True, "Watermark is read from and written back to a durable "
+                            "control/metadata table")
+    if persists:
+        return graded(2, "Watermark is written back to a durable table, but no read "
+                         "of it was found — confirm the next run picks it up")
+    if reads_table:
+        return graded(1, "Watermark is read from a control/metadata table but never "
+                         "written back — the stored value goes stale")
+    return binary(False, "Watermark exists only in pipeline variables/expressions, not "
+                         "in a durable control table — it is lost when the run ends")
+
+
+# -- 2.3.2 operation type flag preserved in Bronze ----------------------------
+_BRONZE = re.compile(r"\bbronze\b|\braw\b|\blanding\b|pre[_ -]?bronze", re.IGNORECASE)
+_OP_TYPE_COLUMN = re.compile(
+    r"operation[_ -]?type|op[_ -]?type|change[_ -]?type|_change_type|__\$operation|"
+    r"cdc[_ -]?operation|dml[_ -]?action|record[_ -]?type|\bopcode\b|"
+    r"sys[_ -]?change[_ -]?operation",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-OPTYPE", ref="2.3.2",
+    title="Operation type column/flag preserved in Bronze",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
+)
+def nb_operation_type(ctx: CheckContext) -> Verdict:
+    """Bronze keeps the source's I/U/D flag so downstream layers can replay it.
+
+    Read from the notebook that writes Bronze rather than from table columns:
+    the Fabric REST API returns table metadata without columns, so a
+    column-based test would be N/A on every live run.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = notebook_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code) or not _BRONZE.search(code):
+        return not_applicable("Notebook does not write a Bronze/raw table")
+    ok = bool(_OP_TYPE_COLUMN.search(code))
+    return binary(ok, "Bronze write carries the source operation type / change flag"
+                  if ok else
+                  "Bronze write drops the source operation type — an update cannot "
+                  "be told from an insert, and deletes are unrecoverable")
+
+
+# -- 2.3.3 all applicable operation types (I/U/D) handled in the merge --------
+_MERGE_STMT = re.compile(r"MERGE\s+INTO|\.merge\s*\(|DeltaTable\s*\.", re.IGNORECASE)
+_MERGE_UPDATE = re.compile(
+    r"whenMatchedUpdate|WHEN\s+MATCHED[\s\S]{0,120}?THEN\s+UPDATE", re.IGNORECASE)
+_MERGE_INSERT = re.compile(
+    r"whenNotMatchedInsert|WHEN\s+NOT\s+MATCHED[\s\S]{0,120}?THEN\s+INSERT", re.IGNORECASE)
+_MERGE_DELETE = re.compile(
+    r"whenMatchedDelete|WHEN\s+MATCHED[\s\S]{0,120}?THEN\s+DELETE|"
+    r"WHEN\s+NOT\s+MATCHED\s+BY\s+SOURCE[\s\S]{0,120}?THEN\s+DELETE|"
+    r"is_?deleted|soft[_ -]?delete", re.IGNORECASE)
+
+
+@check(
+    id="NB-IUD-MERGE", ref="2.3.3",
+    title="All applicable operation types (I/U/D) handled in the merge",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
+)
+def nb_iud_merge(ctx: CheckContext) -> Verdict:
+    """The merge covers inserts, updates and deletes, not just the easy two.
+
+    Distinct from ``DELTA-MERGE`` (3.3.1), which asks whether the upsert is a
+    single atomic MERGE. This asks whether that MERGE is *complete*.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = notebook_code(ctx.obj)
+    if not _MERGE_STMT.search(code):
+        return not_applicable("Notebook runs no MERGE / upsert to assess")
+
+    handled = {
+        "update": bool(_MERGE_UPDATE.search(code)),
+        "insert": bool(_MERGE_INSERT.search(code)),
+        "delete": bool(_MERGE_DELETE.search(code)),
+    }
+    present = sorted(k for k, v in handled.items() if v)
+    missing = sorted(k for k, v in handled.items() if not v)
+    if not missing:
+        return graded(3, "MERGE handles inserts, updates and deletes")
+    if len(present) == 2:
+        return graded(2, f"MERGE handles {' and '.join(present)} but not "
+                         f"{missing[0]}s — confirm the source never emits them")
+    return graded(0, f"MERGE handles only {', '.join(present) or 'none'} of "
+                     f"insert/update/delete — {', '.join(missing)} are silently lost")
+
+
+# -- 2.3.4 insert records validated for uniqueness before merge ---------------
+_DEDUP_BEFORE_MERGE = re.compile(
+    r"dropDuplicates|drop_duplicates|\.distinct\s*\(|"
+    r"row_number\s*\(\s*\)\s*over[\s\S]{0,160}?(?:=|==)\s*1|"
+    r"rank\s*\(\s*\)\s*over[\s\S]{0,160}?(?:=|==)\s*1|"
+    r"GROUP\s+BY[\s\S]{0,160}?HAVING\s+COUNT\s*\(|"
+    r"duplicate[_ -]?check|unique[_ -]?check|assert[_ -]?unique|business[_ -]?key[_ -]?check",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-INSERT-UNIQUE", ref="2.3.4",
+    title="Insert records validated for uniqueness before merge",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
+)
+def nb_insert_unique(ctx: CheckContext) -> Verdict:
+    """Source rows are deduplicated on the business key before they reach the MERGE.
+
+    A Delta MERGE raises on a duplicate source key rather than picking a winner,
+    so an un-deduplicated batch fails the run outright.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = notebook_code(ctx.obj)
+    if not _MERGE_STMT.search(code):
+        return not_applicable("Notebook runs no MERGE / upsert to assess")
+    ok = bool(_DEDUP_BEFORE_MERGE.search(code))
+    return binary(ok, "Source rows are deduplicated / uniqueness-checked before the merge"
+                  if ok else
+                  "MERGE runs on the source batch with no deduplication or business-key "
+                  "uniqueness check — duplicate source keys abort the merge")
+
+
+# -- 2.5.1 metadata DB drives ingestion ---------------------------------------
+_METADATA_SOURCE = re.compile(
+    r"metadata|etl_?config|control[_ -]?table|source[_ -]?list|ingestion[_ -]?config|"
+    r"load[_ -]?config|table[_ -]?list|\bconfig\b|manifest",
+    re.IGNORECASE,
+)
+_ITERATES_LOOKUP = re.compile(r"activity\s*\(\s*'[^']+'\s*\)\s*\.output",
+                              re.IGNORECASE)
+
+
+@check(
+    id="PL-METADATA-DRIVEN", ref="2.5.1",
+    title="Metadata DB drives ingestion (not hardcoded pipelines)",
+    pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
+)
+def pl_metadata_driven(ctx: CheckContext) -> Verdict:
+    """The source list comes from a metadata table, not from the pipeline body."""
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+    acts = walk_activities(ctx.obj)
+    data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
+    if not data_acts:
+        return not_applicable("Pipeline moves no data — nothing to drive from metadata")
+
+    lookups = [a for a in acts if (a.get("type") or "") == "Lookup"
+               and _METADATA_SOURCE.search(json.dumps(a))]
+    loops = [a for a in acts if (a.get("type") or "") == _FOREACH]
+    driven_loops = [a for a in loops if _ITERATES_LOOKUP.search(
+        json.dumps((a.get("typeProperties") or {}).get("items") or ""))]
+
+    if lookups and driven_loops:
+        return binary(True, f"Ingestion is metadata-driven: Lookup "
+                            f"'{lookups[0].get('name')}' feeds a ForEach over its rows")
+    if lookups:
+        return graded(1, f"A metadata Lookup ('{lookups[0].get('name')}') exists but no "
+                         f"ForEach iterates its output — the source list is still fixed")
+    if driven_loops:
+        return graded(1, "A ForEach iterates another activity's output, but that source "
+                         "is not a metadata/config table")
+    return binary(False, f"{len(data_acts)} data activities with no metadata-driven "
+                         f"Lookup+ForEach — adding a source means editing the pipeline")
+
+
+# -- 2.5.3 run control tables capture batch id, status, counts, timestamps ----
+_RUN_CONTROL_WRITE = re.compile(
+    r"(?:INSERT\s+INTO|MERGE\s+INTO|UPDATE)\s+[\w.\[\]\"]*"
+    r"(?:run[_ -]?(?:control|log|history)|batch[_ -]?(?:control|log)|"
+    r"audit[_ -]?(?:log|table)|etl[_ -]?log|load[_ -]?log|process[_ -]?log)|"
+    r"(?:saveAsTable|\.write)[\s\S]{0,80}?"
+    r"(?:run_?control|run_?log|batch_?log|audit_?log|etl_?log|load_?log)",
+    re.IGNORECASE,
+)
+#: The four things a run-control row has to carry to be useful in an incident.
+_RUN_CONTROL_ELEMENTS = {
+    "batch id": re.compile(r"batch[_ -]?id|run[_ -]?id|load[_ -]?id|execution[_ -]?id",
+                           re.IGNORECASE),
+    "status": re.compile(r"\bstatus\b|\bsucceeded\b|\bfailed\b|run[_ -]?state|outcome",
+                         re.IGNORECASE),
+    "row counts": re.compile(r"row[_ -]?count|record[_ -]?count|rows[_ -]?(?:read|written|"
+                             r"inserted|updated)|affected[_ -]?rows", re.IGNORECASE),
+    "timestamps": re.compile(r"start[_ -]?(?:time|date|utc)|end[_ -]?(?:time|date|utc)|"
+                             r"finish[_ -]?time|duration", re.IGNORECASE),
+}
+
+
+@check(
+    id="WS-RUNCONTROL", ref="2.5.3",
+    title="Run control captures batch ID, status, row counts and timestamps",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=PIPELINE_LAYERS,
+    requires=[Resource.PIPELINE_DEFINITIONS, Resource.NOTEBOOK_DEFINITIONS],
+    required=False,
+)
+def ws_run_control(ctx: CheckContext) -> Verdict:
+    """Every run leaves a row saying which batch ran, whether it worked, and how big.
+
+    Workspace-scoped because run control is written by one framework component,
+    so judging every pipeline against it would be noise. Read from the code that
+    *writes* the control rows: the control table's own columns are not returned
+    by the Fabric REST API.
+    """
+    pipelines = ctx.workspace.pipelines or {}
+    notebooks = ctx.workspace.notebooks or {}
+    if not pipelines and not notebooks:
+        return not_applicable("No pipeline or notebook definitions available to "
+                              "inspect for run-control logging")
+
+    writers: list[str] = []
+    corpus: list[str] = []
+    for name, defn in pipelines.items():
+        text = json.dumps(defn)
+        if _RUN_CONTROL_WRITE.search(text):
+            writers.append(name)
+            corpus.append(text)
+    for name, defn in notebooks.items():
+        text = notebook_code(defn)
+        if _RUN_CONTROL_WRITE.search(text):
+            writers.append(name)
+            corpus.append(text)
+
+    if not writers:
+        return binary(False, f"None of {len(pipelines)} pipeline(s) and "
+                             f"{len(notebooks)} notebook(s) writes a run-control / "
+                             f"batch-log row — a failed load leaves no audit trail")
+
+    blob = "\n".join(corpus)
+    present = sorted(k for k, p in _RUN_CONTROL_ELEMENTS.items() if p.search(blob))
+    missing = sorted(k for k in _RUN_CONTROL_ELEMENTS if k not in present)
+    where = ", ".join(sorted(writers))
+    if not missing:
+        return graded(3, f"Run control in {where} captures batch id, status, "
+                         f"row counts and timestamps")
+    return graded(
+        max(0, len(present) - 1),
+        f"Run control in {where} captures {', '.join(present)} but is missing "
+        f"{', '.join(missing)}",
+    )
+
+
+# -- 2.6.1 pipeline execution times monitored and baselined -------------------
+#: The run's *duration* is measured, not merely its start and end recorded.
+#: Distinct from ``WS-RUNCONTROL`` (2.5.3), which only asks that timestamps land
+#: in the control row — a stored start/end is data, not monitoring.
+_DURATION_CAPTURE = re.compile(
+    r"\bduration\b|\belapsed\b|\bruntime\b|run[_ -]?time[_ -]?(?:sec|ms|min)|"
+    r"execution[_ -]?time|exec[_ -]?time|time[_ -]?taken|"
+    r"DATEDIFF\s*\(\s*(?:second|minute|ms|millisecond)|"
+    r"time\s*\.\s*(?:time|perf_counter|monotonic)\s*\(\s*\)",
+    re.IGNORECASE,
+)
+#: The measured duration is compared with something it is expected to beat.
+_DURATION_BASELINE = re.compile(
+    # ``sla`` must not be followed by a letter (so ``sla_seconds`` counts but
+    # ``slack`` does not); ``duration``/``elapsed`` may carry a unit suffix
+    # before the comparison, as in ``duration_s > sla_seconds``.
+    r"baseline|\bsla(?![a-z])|threshold|expected[_ -]?(?:duration|runtime|time)|"
+    r"avg[_ -]?(?:duration|runtime)|average[_ -]?(?:duration|runtime)|"
+    r"median[_ -]?duration|\bp9[05]\b|percentile|"
+    r"max[_ -]?(?:duration|runtime)|(?:longer|slower|exceed)[a-z_ -]{0,12}than|"
+    r"duration\w*\s*[><]=?|elapsed\w*\s*[><]=?",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="WS-RUNTIME-BASELINE", ref="2.6.1",
+    title="Pipeline execution times monitored and baselined",
+    pillar=Pillar.PERFORMANCE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=PIPELINE_LAYERS,
+    requires=[Resource.PIPELINE_DEFINITIONS, Resource.NOTEBOOK_DEFINITIONS],
+    required=False,
+)
+def ws_runtime_baseline(ctx: CheckContext) -> Verdict:
+    """Run durations are measured and compared against an expected value.
+
+    Reads the *instrumentation*, not the telemetry: Fabric's run history lives
+    behind the Activity / monitoring admin API, which this tool does not call.
+    What is verifiable from the definitions is whether the solution measures its
+    own durations and holds them against a baseline — and a baseline is
+    deliberate work that the portal does not do for you, so its absence is a
+    real finding rather than an unreadable one.
+    """
+    pipelines = ctx.workspace.pipelines or {}
+    notebooks = ctx.workspace.notebooks or {}
+    if not pipelines and not notebooks:
+        return not_applicable("No pipeline or notebook definitions available to "
+                              "inspect for duration monitoring")
+
+    measured: list[str] = []
+    corpus: list[str] = []
+    for name, defn in pipelines.items():
+        text = json.dumps(defn)
+        if _DURATION_CAPTURE.search(text):
+            measured.append(name)
+            corpus.append(text)
+    for name, defn in notebooks.items():
+        text = notebook_code(defn)
+        if _DURATION_CAPTURE.search(text):
+            measured.append(name)
+            corpus.append(text)
+
+    total = len(pipelines) + len(notebooks)
+    if not measured:
+        return graded(0, f"None of {total} pipeline(s)/notebook(s) measures its own run "
+                         f"duration, and no baseline or SLA threshold is defined — a "
+                         f"run that doubles in length passes unnoticed (Fabric's "
+                         f"monitoring hub shows durations but sets no baseline)")
+
+    where = ", ".join(sorted(measured))
+    if any(_DURATION_BASELINE.search(text) for text in corpus):
+        return graded(3, f"Run duration is measured and compared against a "
+                         f"baseline/threshold in: {where}")
+    return graded(2, f"Run duration is measured in {where}, but is never compared "
+                     f"against a baseline, SLA or expected value — the number is "
+                     f"recorded, not monitored")

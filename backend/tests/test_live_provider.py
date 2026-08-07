@@ -89,6 +89,40 @@ def test_values_first_call_failure_is_unknown_not_empty():
     assert known is False
 
 
+def test_git_connection_reads_state_not_status():
+    """A 200 only means the endpoint answered; gitConnectionState decides connected.
+
+    Fabric returns HTTP 200 even for a not-connected workspace (the body carries
+    ``gitConnectionState: NotConnected``), so keying off the status code alone
+    would mark every accessible workspace as Git-connected.
+    """
+    parse = LiveFabricProvider._git_connection
+    # 200 + a connected state -> connected, with provider/repo facts surfaced.
+    ado = parse({
+        "gitConnectionState": "ConnectedAndInitialized",
+        "gitProviderDetails": {
+            "gitProviderType": "AzureDevOps", "organizationName": "Contoso",
+            "projectName": "Fabric", "repositoryName": "Repo", "branchName": "main",
+        },
+        "gitSyncDetails": {"head": "abc123", "lastSyncTime": "2026-01-01T00:00:00"},
+    })
+    assert ado["connected"] is True
+    assert ado["provider"] == "AzureDevOps"
+    assert ado["organization"] == "Contoso"
+    assert ado["branch"] == "main"
+    assert ado["last_sync_time"] == "2026-01-01T00:00:00"
+    # 200 + NotConnected -> not connected (the endpoint still returns 200 here).
+    assert parse({"gitProviderDetails": None, "gitSyncDetails": None,
+                  "gitConnectionState": "NotConnected"})["connected"] is False
+    # GitHub reports ownerName rather than organizationName.
+    gh = parse({"gitConnectionState": "Connected",
+                "gitProviderDetails": {"gitProviderType": "GitHub", "ownerName": "octocat"}})
+    assert gh["connected"] is True
+    assert gh["organization"] == "octocat"
+    # A missing / unparseable body -> empty facts (fetch treats this as not connected).
+    assert parse(None) == {}
+
+
 def test_notebook_monitoring_reads_latest_session_metrics():
     provider = LiveFabricProvider("token")
     base = provider.BASE
