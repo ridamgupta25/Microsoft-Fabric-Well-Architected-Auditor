@@ -9,7 +9,7 @@ from auditfast.core.models import CheckContext
 
 
 @check(
-    id="WS-RLS-RPT", ref="14.4.1", title="Row-Level Security (RLS) defined on reporting semantic models",
+    id="WS-RLS-RPT", ref="14.4.1", title="RLS defined on semantic models and tested per role",
     pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.CRITICAL,
     layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
@@ -54,7 +54,7 @@ def rls_on_reporting_models(ctx: CheckContext) -> list[Verdict]:
 
 
 @check(
-    id="WS-OLS-RPT", ref="14.4.3", title="Object-Level Security (OLS) applied on reporting semantic models",
+    id="WS-OLS-RPT", ref="14.4.3", title="Object-Level Security applied where fields must be hidden from some audiences",
     pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.CRITICAL,
     layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )

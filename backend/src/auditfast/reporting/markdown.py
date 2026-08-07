@@ -5,6 +5,7 @@ from datetime import date
 
 from ..core.enums import SEVERITY_RANK, Pillar, Status
 from ..core.scoring import rating
+from ..core.validation import PENDING_LABEL, VALIDATED_LABEL, is_validated, validation_label
 
 
 def _fmt(pct):
@@ -31,6 +32,17 @@ def build_markdown(project_name: str, agg: dict, results: list, errors: list | N
     lines.append(f"{counts[Status.PASS]} pass · {counts[Status.PARTIAL]} partial · "
                  f"{counts[Status.FAIL]} fail · {na_count} not assessed · "
                  f"{agg['total_scored']} checks scored")
+    lines.append("")
+
+    # Validation coverage — how many of the checks in this report have completed
+    # Phase 1 validation. Reads the single source of truth (core.validation).
+    # Keyed by ref (the checklist ref id).
+    distinct_checks = {(r.check_id, r.ref) for r in results}
+    n_validated = sum(1 for _, ref in distinct_checks if is_validated(ref))
+    n_total = len(distinct_checks)
+    lines.append(f"**Validation:** {n_validated} of {n_total} checks in this report are "
+                 f"**{VALIDATED_LABEL}** (Phase 1); the remaining {n_total - n_validated} are "
+                 f"**{PENDING_LABEL}** for the next phase.")
     lines.append("")
 
     # Crawl completeness — access + partial-read warnings, up top so an
@@ -81,15 +93,15 @@ def build_markdown(project_name: str, agg: dict, results: list, errors: list | N
     if not findings:
         lines.append("_No failing or partial checks — every scored best practice passed._")
     else:
-        lines.append("| Severity | Ref | Check | Pillar | Workspace | Object | Status | Evidence | Recommendation |")
-        lines.append("|----------|-----|-------|--------|-----------|--------|--------|----------|----------------|")
+        lines.append("| Severity | Ref | Check | Validation | Pillar | Workspace | Object | Status | Evidence | Recommendation |")
+        lines.append("|----------|-----|-------|------------|--------|-----------|--------|--------|----------|----------------|")
         for r in findings:
             obj = r.obj or "—"
             rec = (r.recommendation or "").replace("|", "\\|")
             ev = (r.evidence or "").replace("|", "\\|")
             lines.append(
-                f"| {r.severity.value} | {r.ref} | {r.title} | {r.pillar} | "
-                f"{r.workspace} | {obj} | {r.status.value} | {ev} | {rec} |")
+                f"| {r.severity.value} | {r.ref} | {r.title} | {validation_label(r.ref)} | "
+                f"{r.pillar} | {r.workspace} | {obj} | {r.status.value} | {ev} | {rec} |")
     lines.append("")
 
     # Not assessed (N/A): checks whose data could not be read. These are the

@@ -33,7 +33,7 @@ HARDCODED_PATTERNS = [
 
 
 @check(
-    id="PL-NAME", ref="2.1.1", title="Pipeline naming convention",
+    id="PL-NAME", ref="2.1.1", title="Pipelines follow consistent naming conventions (including domain prefix/folder alignment)",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -47,7 +47,7 @@ def naming_convention(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-DESC", ref="2.1.6", title="Descriptions / annotations populated",
+    id="PL-DESC", ref="2.1.6", title="Pipeline annotations/descriptions populated for pipelines and key activities",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -65,7 +65,7 @@ def descriptions(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-PARAM", ref="2.1.2", title="Parameterized — no hardcoded endpoints",
+    id="PL-PARAM", ref="2.1.2", title="Pipelines are parameterized (no hardcoded sources, targets, dates, or environment values)",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -97,7 +97,7 @@ _WIDE_CALL = re.compile(r"\.(?:collect|toPandas)\s*\(|\.count\s*\(\s*\)")
 
 
 @check(
-    id="NB-SECRETS", ref="3.1.3", title="No hardcoded secrets or endpoints in notebooks",
+    id="NB-SECRETS", ref="3.1.3", title="No hardcoded paths, connection strings, secrets, or environment-specific values",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.CRITICAL,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -109,7 +109,7 @@ def nb_no_secrets(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-PARAMS", ref="3.1.2", title="Notebook is parameterized",
+    id="NB-PARAMS", ref="3.1.2", title="Notebooks are parameterized using Fabric notebook parameters or widgets",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -122,7 +122,7 @@ def nb_parameterized(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-IMPORTS", ref="3.2.7", title="Explicit imports (no wildcard)",
+    id="NB-IMPORTS", ref="3.2.7", title="Explicit imports only (no `import *`)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -134,7 +134,7 @@ def nb_explicit_imports(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-DISPLAY", ref="3.1.6", title="No display()/show() in production paths",
+    id="NB-DISPLAY", ref="3.1.6", title="Notebooks avoid `display()` / `show()` in production execution paths",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -146,7 +146,7 @@ def nb_no_display(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-COLLECT", ref="3.2.3", title="No collect()/toPandas()/count() on datasets",
+    id="NB-COLLECT", ref="3.2.3", title="No unnecessary `collect()`, `toPandas()`, or `count()` on large datasets",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -211,7 +211,7 @@ def _has_positive_timeout(node: object) -> bool:
 
 
 @check(
-    id="NB-STRUCTURE", ref="3.1.1", title="Notebook follows a consistent structure",
+    id="NB-STRUCTURE", ref="3.1.1", title="Notebooks follow a consistent structure (parameters → imports → config → logic → output)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -230,7 +230,7 @@ def nb_structure(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-MARKDOWN", ref="3.1.4", title="Cell-level documentation (markdown) explains the logic",
+    id="NB-MARKDOWN", ref="3.1.4", title="Cell-level documentation (markdown cells) explains business logic, not just code",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -242,7 +242,7 @@ def nb_markdown(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-MODULAR", ref="3.1.5", title="Logic is modular (uses functions)",
+    id="NB-MODULAR", ref="3.1.5", title="Functions are modular and reusable — not monolithic single-cell scripts",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -254,7 +254,7 @@ def nb_modular(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-NAME", ref="3.1.7", title="Notebook naming is meaningful and consistent",
+    id="NB-NAME", ref="3.1.7", title="All notebooks have meaningful, consistent names aligned to domain/layer",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -272,7 +272,7 @@ def nb_name(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-TIMEOUT", ref="3.1.8", title="Execution timeout / max runtime configured",
+    id="NB-TIMEOUT", ref="3.1.8", title="Notebook execution timeout / max runtime configured to prevent runaway Spark sessions",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -294,7 +294,7 @@ def nb_timeout(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-LANG", ref="3.2.1", title="Consistent language approach (not mixed PySpark / Spark SQL)",
+    id="NB-LANG", ref="3.2.1", title="Consistent language approach (PySpark vs Spark SQL — one primary, not mixed ad-hoc)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -308,7 +308,7 @@ def nb_language(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-DATAFRAME", ref="3.2.2", title="DataFrame API used over the RDD API",
+    id="NB-DATAFRAME", ref="3.2.2", title="DataFrame API used over RDD API",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -320,7 +320,7 @@ def nb_dataframe_api(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-BROADCAST", ref="3.2.4", title="Broadcast joins used for small-large joins",
+    id="NB-BROADCAST", ref="3.2.4", title="Broadcast joins used for small-large table joins where appropriate",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -336,7 +336,7 @@ def nb_broadcast(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-NO-UDF", ref="3.2.5", title="UDFs avoided where native functions exist",
+    id="NB-NO-UDF", ref="3.2.5", title="UDFs avoided where native Spark functions exist",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -348,7 +348,7 @@ def nb_no_udf(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-SCHEMA", ref="3.2.6", title="Schema explicitly defined for external file reads",
+    id="NB-SCHEMA", ref="3.2.6", title="Schema explicitly defined at read time for external sources (not inferred on CSV/JSON)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -363,8 +363,8 @@ def nb_schema(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-LATE-ARRIVAL", ref="3.1.10",
-    title="Late-arriving changes handled without corruption",
+    id="NB-LATE-ARRIVAL", ref="2.3.8",
+    title="Out-of-order / late-arriving change records handled without data corruption",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -410,7 +410,7 @@ _LATE_SAFE_WRITE = re.compile(
 
 
 @check(
-    id="PL-ORCHESTRATION", ref="2.1.3", title="Orchestration coordinates dependent pipelines",
+    id="PL-ORCHESTRATION", ref="2.1.3", title="Master/orchestrator pipeline pattern used for coordinating dependent domain pipelines",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -429,7 +429,7 @@ def pl_orchestration(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-INCREMENTAL", ref="2.2.1", title="Incremental load pattern used",
+    id="PL-INCREMENTAL", ref="2.2.1", title="Incremental load implemented where applicable (watermark, CDC, delta detection) for IFS/EAM/LIMS",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -445,7 +445,7 @@ def pl_incremental(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-LOADMODE", ref="2.2.5", title="Initial vs incremental load separated or parameterized",
+    id="PL-LOADMODE", ref="2.2.5", title="Initial load vs. incremental load clearly separated or parameterized",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -702,7 +702,7 @@ _KEY_QUALITY = re.compile(
 
 @check(
     id="NB-RECON-COUNT", ref="5.2.5",
-    title="Record count reconciliation after writes",
+    title="Record count reconciliation vs. source system control counts",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -718,7 +718,7 @@ def nb_recon_count(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-FK-INTEGRITY", ref="5.3.2",
-    title="Referential integrity: FK values validated against lookup tables",
+    title="Referential integrity: FK values exist in corresponding dimension/lookup tables",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -734,7 +734,7 @@ def nb_fk_integrity(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-CROSS-RECON", ref="5.3.6",
-    title="Cross-source reconciliation for multi-source loads",
+    title="Cross-source reconciliation: records from multiple sources reconciled correctly",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -751,7 +751,7 @@ def nb_cross_recon(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-ORPHAN-DETECT", ref="5.3.7",
-    title="Orphan detection: child records without parents identified",
+    title="Orphan detection: child records without matching parent records identified and handled",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -780,7 +780,7 @@ def nb_orphan_detect(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-MERGE-VALID", ref="5.3.9",
-    title="Merge result validation: post-merge counts reconciled",
+    title="Merge result validation: post-merge counts reconcile with source I/U/D counts",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -917,7 +917,7 @@ _GOLD_REF = re.compile(r"\bgold\b", re.IGNORECASE)
 
 @check(
     id="NB-LATE-ARRIVING", ref="4.5.10",
-    title="Late-arriving dimensions and facts handled (inferred member pattern)",
+    title="Late-arriving dimensions and facts handled (unknown/inferred member pattern)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -942,7 +942,7 @@ def nb_late_arriving(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-UNKNOWN-MONITOR", ref="5.4.4",
-    title="Completeness: unknown / orphan member usage is monitored",
+    title="Completeness: all expected dimension members present; unknown/orphan member usage monitored",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -965,7 +965,7 @@ def nb_unknown_monitored(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-LAYER-RECON", ref="5.4.6",
-    title="Cross-layer reconciliation: Gold counts reconcile with Silver",
+    title="Cross-layer reconciliation: Gold record counts reconcile with Silver (accounting for aggregation)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -1000,7 +1000,7 @@ _GRAIN_GUARD = re.compile(
 
 @check(
     id="NB-GRAIN-UNIQUE", ref="5.4.9",
-    title="No duplicate grain: fact loads enforce one row per grain",
+    title="No duplicate grain: fact tables contain unique records per defined grain",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -1026,7 +1026,7 @@ def nb_grain_unique(ctx: CheckContext) -> Verdict:
 # -- MLC Cat-1: fact-to-dimension referential integrity (4.5.12) --------------
 @check(
     id="NB-FACT-DIM-RI", ref="4.5.12",
-    title="Referential integrity: fact FKs validated against dimension records",
+    title="Referential integrity validated (every FK in fact tables has a matching dimension record)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -1067,7 +1067,7 @@ _FILE_PURGE = re.compile(
 
 @check(
     id="WS-FILE-PURGE", ref="4.3.4",
-    title="Orphaned files cleaned up periodically (archiving / purging policy)",
+    title="Orphaned files cleaned up periodically (archiving/purging policy)",
     pillar=Pillar.PERFORMANCE, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=(Layer.STORAGE, Layer.PREP, Layer.MIXED),
     requires=[Resource.ITEMS, Resource.NOTEBOOK_DEFINITIONS], required=False,
@@ -1100,7 +1100,7 @@ def ws_file_purge(ctx: CheckContext) -> Verdict:
 
 @check(
     id="PL-LATE-ARRIVAL", ref="2.3.8",
-    title="Late-arriving changes handled without corruption",
+    title="Out-of-order / late-arriving change records handled without data corruption",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -1143,7 +1143,7 @@ def nb_dedup(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-TYPE-CAST", ref="5.3.1",
-    title="Data type conformance: columns cast to standard types",
+    title="Data type conformance: all columns cast to standard types (dates as DATE, correct numeric precision)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -1159,7 +1159,7 @@ def nb_type_cast(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-KEY-QUALITY", ref="5.5.6",
-    title="Identifiers and keys: uniqueness verified, no nulls in key columns",
+    title="**Identifiers / Keys**: Uniqueness verified; format consistent; no nulls in key columns",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -1184,7 +1184,7 @@ _FOREACH = "ForEach"
 
 @check(
     id="PL-PARALLEL", ref="2.1.5",
-    title="Parallel execution used where possible",
+    title="Parallel execution used where possible (no unnecessary sequential execution)",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -1242,7 +1242,7 @@ def _bare_table(name: str) -> str:
 
 @check(
     id="PL-FULLLOAD", ref="2.2.2",
-    title="Full load reserved for small reference/dimension tables",
+    title="Full load reserved only for small reference/dimension tables or initial loads",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -1289,7 +1289,7 @@ _ONGOING = re.compile(
 
 @check(
     id="PL-HIST-SEPARATION", ref="2.2.3",
-    title="Historical load separated from ongoing incremental pattern",
+    title="Adage historical load clearly separated from ongoing incremental patterns",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -1351,7 +1351,7 @@ _WATERMARK_TABLE_READ = re.compile(
 
 @check(
     id="PL-WATERMARK-STORE", ref="2.2.4",
-    title="Watermark / control values persisted reliably",
+    title="Watermark / control values persisted reliably in the Metadata DB (not volatile locations)",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -1402,7 +1402,7 @@ _OP_TYPE_COLUMN = re.compile(
 
 @check(
     id="NB-OPTYPE", ref="2.3.2",
-    title="Operation type column/flag preserved in Bronze",
+    title="Operation type column/flag preserved in Bronze for auditability where the source provides it",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -1439,7 +1439,7 @@ _MERGE_DELETE = re.compile(
 
 @check(
     id="NB-IUD-MERGE", ref="2.3.3",
-    title="All applicable operation types (I/U/D) handled in the merge",
+    title="All applicable operation types (I/U/D) handled correctly in the merge strategy",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -1484,7 +1484,7 @@ _DEDUP_BEFORE_MERGE = re.compile(
 
 @check(
     id="NB-INSERT-UNIQUE", ref="2.3.4",
-    title="Insert records validated for uniqueness before merge",
+    title="Insert records validated for uniqueness / business key before merge into target",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -1518,7 +1518,7 @@ _ITERATES_LOOKUP = re.compile(r"activity\s*\(\s*'[^']+'\s*\)\s*\.output",
 
 @check(
     id="PL-METADATA-DRIVEN", ref="2.5.1",
-    title="Metadata DB drives ingestion (not hardcoded pipelines)",
+    title="Metadata DB drives ingestion (source list, load type, schedule, target mapping) rather than hardcoded pipelines",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -1574,7 +1574,7 @@ _RUN_CONTROL_ELEMENTS = {
 
 @check(
     id="WS-RUNCONTROL", ref="2.5.3",
-    title="Run control captures batch ID, status, row counts and timestamps",
+    title="Run control tables capture batch ID, status, row counts, start/end timestamps",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS,
     requires=[Resource.PIPELINE_DEFINITIONS, Resource.NOTEBOOK_DEFINITIONS],

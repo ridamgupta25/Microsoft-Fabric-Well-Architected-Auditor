@@ -98,7 +98,7 @@ def _measure_detail(names: list[str], verb: str) -> str:
 @check(
     id="SM-FK-SURROGATE",
     ref="5.4.1",
-    title="Fact-dimension relationships join on surrogate keys",
+    title="Fact-dimension referential integrity: all FKs in fact tables match dimension surrogate keys",
     pillar=Pillar.DATA,
     scope=Scope.SEMANTIC_MODEL,
     severity=Severity.HIGH,
@@ -149,7 +149,7 @@ def sm_fk_surrogate(ctx: CheckContext) -> Verdict:
 @check(
     id="SM-FK-RI-DATA",
     ref="5.4.1",
-    title="Fact FK values resolve to dimension surrogate keys (no orphans)",
+    title="Fact-dimension referential integrity: all FKs in fact tables match dimension surrogate keys",
     pillar=Pillar.DATA,
     scope=Scope.WORKSPACE,
     severity=Severity.HIGH,
@@ -189,7 +189,7 @@ def sm_fk_ri_data(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="R-BIDI-REL", ref="14.1.1", title="Star schema: relationships filter in a single direction",
+    id="R-BIDI-REL", ref="14.1.1", title="Star schema followed in the semantic model (single-direction relationships, no unnecessary bidirectional filters)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
@@ -240,7 +240,7 @@ def single_direction_relationships(ctx: CheckContext) -> list[Verdict]:
 
 
 @check(
-    id="R-MEASURE-DUP", ref="14.1.3", title="Measures centralized: no duplicated calculation logic",
+    id="R-MEASURE-DUP", ref="14.1.3", title="Measures centralized (no duplicated calculation logic across reports)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
@@ -291,7 +291,7 @@ def measures_not_duplicated(ctx: CheckContext) -> list[Verdict]:
 
 
 @check(
-    id="R-DAX-VAR", ref="14.1.4", title="DAX follows good practices (variables, no repeated sub-expressions, no avoidable iterators)",
+    id="R-DAX-VAR", ref="14.1.4", title="DAX follows good practices (variables, no repeated sub-expressions, avoids expensive iterators where avoidable)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
