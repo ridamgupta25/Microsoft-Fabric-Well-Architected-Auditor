@@ -90,6 +90,11 @@ _CLEANUP_BEFORE_WRITE = re.compile(
     r"(?:\.write\b|saveastable\b|insert\s+into|merge\s+into|overwrite)",
     re.IGNORECASE | re.DOTALL,
 )
+_RESTART_BOUNDARY = re.compile(
+    r"restart|resume|checkpoint|watermark|batch[_ -]?id|run[_ -]?id|"
+    r"from[_ -]?(?:activity|failure|checkpoint)|start[_ -]?from|control[_ -]?(?:table|store)",
+    re.IGNORECASE,
+)
 
 
 @check(
@@ -145,6 +150,26 @@ def failure_notification(ctx: CheckContext) -> Verdict:
     has_notify = any(is_notifier(a) for a in walk_activities(ctx.obj))
     return binary(has_notify, "A notification activity is present" if has_notify
                   else "No notification activity found")
+
+
+@check(
+    id="PL-RESTART", ref="9.1.1",
+    title="Failed pipelines can be restarted from point of failure (not full re-run)",
+    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
+)
+def restart_from_failure(ctx: CheckContext) -> Verdict:
+    """Pipeline definitions expose a restart boundary or durable progress marker."""
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+    acts = activities(ctx.obj)
+    data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
+    if not data_acts:
+        return not_applicable("Pipeline has no data-movement activity to restart")
+    blob = json.dumps(ctx.obj)
+    ok = bool(_RESTART_BOUNDARY.search(blob))
+    return binary(ok, "Restart boundary/checkpoint or durable progress marker detected" if ok
+                  else "No restart-from-failure boundary; a retry may re-run the full pipeline")
 
 
 @check(

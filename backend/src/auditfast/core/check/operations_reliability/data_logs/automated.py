@@ -1,19 +1,106 @@
-"""Operations & Reliability · Data Logs — the telemetry store and its queries.
+"""Operations & Reliability · Data Logs — the observability layer.
 
-Two points about the observability layer, both readable from the item inventory
-plus the workspace's Git connection: telemetry lands in a store built for it
-(Eventhouse / KQL database) rather than only in a batch store, and the saved KQL
-that operators actually run has a home and a version history.
+Four points about the logging workspace, in two pairs.
 
-No API exposes a KQL queryset's *text*, so these judge the presence and the
-source-control posture of the assets, never the content of a query.
+**What is captured, and who hears about it.** An audit table that records row
+counts, null counts and exceptions is what makes a load reviewable after the
+fact; a failure path that reaches a notification activity is what makes a failure
+noticed at the time.
+
+**Where telemetry lands, and how it is queried.** Telemetry belongs in a store
+built for it (Eventhouse / KQL database) rather than only in a batch store, and
+the saved KQL operators actually run should have a home and a version history.
+
+No API exposes a KQL queryset's *text*, so the query checks judge the presence
+and source-control posture of the assets, never the content of a query.
 """
 from __future__ import annotations
 
+import re
+
+from auditfast.core.check._notebook import executable_code
+from auditfast.core.check._pipeline import walk_activities
 from auditfast.core.check.helpers import Verdict, binary, graded, not_applicable
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
+
+# ---------------------------------------------------------------------------
+# Audit logging and failure alerting
+# ---------------------------------------------------------------------------
+
+_AUDIT_LOG_SIGNAL = re.compile(
+    r"audit[_ -]?(?:table|log)|quality[_ -]?(?:table|log)|dq[_ -]?(?:table|log)|"
+    r"row[_ -]?count|null[_ -]?count|exception[_ -]?count|error[_ -]?count|"
+    r"batch[_ -]?id|run[_ -]?id|failure[_ -]?reason",
+    re.IGNORECASE,
+)
+_WRITE_SIGNAL = re.compile(
+    r"\.write\b|saveAsTable|INSERT\s+INTO|MERGE\s+INTO|audit[_ -]?(?:table|log)|"
+    r"quality[_ -]?(?:table|log)|dq[_ -]?(?:table|log)",
+    re.IGNORECASE,
+)
+_NOTIFY_TYPES = frozenset({"Teams", "Office365Outlook", "Outlook365", "SendEmail", "WebHook"})
+_NOTIFY_CALL_TYPES = frozenset({"Web", "WebActivity", "AzureFunctionActivity", "Function"})
+_NOTIFY_NAME = re.compile(r"notif|alert|email|teams|activator", re.IGNORECASE)
+
+
+@check(
+    id="NB-AUDIT-LOG", ref="4.6.4",
+    title="Audit Tables capture data quality logs, row counts, null checks, and exceptions",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    layers=(Layer.LOGS,), requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def audit_tables_capture_quality_logs(ctx: CheckContext) -> Verdict:
+    """Workspace notebooks write a repeatable audit log with quality metrics."""
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    if not ctx.workspace.notebooks:
+        return not_applicable("No notebook definitions are available for Data Logs")
+    candidates = []
+    for name, definition in ctx.workspace.notebooks.items():
+        code = executable_code(definition)
+        if _WRITE_SIGNAL.search(code) and _AUDIT_LOG_SIGNAL.search(code):
+            candidates.append(name)
+    return binary(bool(candidates),
+                  f"Quality audit-log writer found in: {', '.join(sorted(candidates))}"
+                  if candidates else
+                  "No notebook writes an audit table with row/null/exception quality metrics")
+
+
+@check(
+    id="PL-FAILURE-ALERT", ref="10.1.4",
+    title="Alerting on pipeline failure (Data Activator or equivalent)",
+    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    layers=(Layer.LOGS,), requires=[Resource.PIPELINE_DEFINITIONS], required=True,
+)
+def pipeline_failure_alert(ctx: CheckContext) -> Verdict:
+    """A pipeline failure dependency leads to a recognizable notification activity."""
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+    acts = walk_activities(ctx.obj)
+    if not acts:
+        return not_applicable("Pipeline has no activities to evaluate for failure alerting")
+    failure_names = {
+        a.get("name", "") for a in acts
+        if any("Failed" in (dep.get("dependencyConditions") or [])
+               for dep in (a.get("dependsOn") or []))
+    }
+    notifiers = {
+        a.get("name", "") for a in acts
+        if a.get("type") in _NOTIFY_TYPES
+        or (a.get("type") in _NOTIFY_CALL_TYPES and _NOTIFY_NAME.search(a.get("name", "")))
+    }
+    linked = sorted(failure_names & notifiers)
+    return binary(bool(linked),
+                  f"Failure path is linked to notification activity: {', '.join(linked)}"
+                  if linked else
+                  "No failure-linked Data Activator, email, Teams, or webhook notification found")
+
+
+# ---------------------------------------------------------------------------
+# The telemetry store and its saved queries
+# ---------------------------------------------------------------------------
 
 #: A store designed for high-volume, high-ingest telemetry. An Eventhouse is the
 #: container; a KQLDatabase is what queries actually run against. Either one
