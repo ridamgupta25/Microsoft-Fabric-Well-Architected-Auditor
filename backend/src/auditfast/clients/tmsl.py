@@ -11,7 +11,23 @@ rather than raising, so a partial or future TMSL variant still parses cleanly.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
+
+# Power BI's "Auto date/time" feature silently generates one hidden date table per
+# date/datetime column (``LocalDateTable_<guid>``) plus a single ``DateTableTemplate_<guid>``.
+# These system tables never appear in the Power BI model or report UI, so they are
+# excluded from the captured facts to match what a reviewer actually sees.
+_AUTO_DATE_TABLE = re.compile(
+    r"^(?:LocalDateTable|DateTableTemplate)_"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def _is_auto_date_table(name: str) -> bool:
+    """True for a Power BI "Auto date/time" hidden table (not shown in the model UI)."""
+    return bool(_AUTO_DATE_TABLE.match(name or ""))
 
 
 def _expression(value: Any) -> str:
@@ -38,6 +54,8 @@ def parse_tmsl(document: dict) -> dict:
         if not isinstance(table, dict):
             continue
         table_name = table.get("name", "")
+        if _is_auto_date_table(table_name):
+            continue  # skip Power BI auto date/time hidden tables
         table_names.append(table_name)
         for measure in table.get("measures") or []:
             if not isinstance(measure, dict):
@@ -55,11 +73,15 @@ def parse_tmsl(document: dict) -> dict:
     for rel in model.get("relationships") or []:
         if not isinstance(rel, dict):
             continue
+        from_table = rel.get("fromTable", "")
+        to_table = rel.get("toTable", "")
+        if _is_auto_date_table(from_table) or _is_auto_date_table(to_table):
+            continue  # drop relationships that point at the hidden auto date tables
         relationships.append({
             "name": rel.get("name", ""),
-            "from_table": rel.get("fromTable", ""),
+            "from_table": from_table,
             "from_column": rel.get("fromColumn", ""),
-            "to_table": rel.get("toTable", ""),
+            "to_table": to_table,
             "to_column": rel.get("toColumn", ""),
             "cross_filter": rel.get("crossFilteringBehavior", "") or "",
             "is_active": bool(rel.get("isActive", True)),

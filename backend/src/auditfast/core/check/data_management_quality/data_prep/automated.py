@@ -480,7 +480,16 @@ _COUNT_RECONCILE = re.compile(
     # A count that is actually asserted or compared against an expectation. A count
     # merely assigned, used as a column alias, or compared to 0 (an emptiness guard)
     # reconciles nothing.
-    r"assert[^\n]*\.count\s*\(|"
+    #
+    # The assertion arm carries the same zero-guard as the bare-comparison arm, and
+    # skips a line that probes for nulls. Without both, a key-quality assertion such
+    # as ``assert df.filter(col(k).isNull()).count() == 0`` scores as record-count
+    # reconciliation - it counts rows, but it reconciles nothing against a source.
+    #
+    # The guard must be ``(?!\s*0\b)``, not ``\s*(?!0\b)``: the latter lets ``\s*``
+    # backtrack to zero width so the lookahead tests the space rather than the ``0``,
+    # and ``assert df.count() > 0`` slips through.
+    r"assert(?![^\n]*\.is(?:Not)?Null\s*\()[^\n]*?\.count\s*\([^\n]*?(?:==|!=|<=|>=|<|>)(?!\s*0\b)|"
     r"\.count\s*\(\s*\)\s*(?:==|!=|<=|>=|<|>)(?!\s*0\b)|"
     r"(?:row|record|source|target|actual|expected|recon)_count\b\s*(?:==|!=|<=|>=|<|>)(?!\s*0\b)|"
     r"(?:==|!=|<=|>=|<|>)\s*(?:row|record|source|target|actual|expected|recon)_count\b|"
@@ -506,11 +515,19 @@ _RI_PATTERN = re.compile(
     \b(?:referential|integrity|fk_check|integrity_check|orphan|unmatched|missing_parent|no_parent)\b
     """
 )
-_JOIN_PATTERN = re.compile(r"(?is)\.join\s*\(|\bleft\s+join\b|\binner\s+join\b|\bright\s+join\b|\bfull\s+join\b", re.IGNORECASE)
 _FK_INTEGRITY = re.compile(
-    r"left_anti|leftanti|anti.*join|"
-    r"referential|fk_check|integrity_check|"
-    r"\.isNull\s*\(\s*\).*join|join.*\.isNull\s*\(",
+    # An anti-join - the standard way to isolate FK values with no parent row.
+    # ``"anti"`` is quoted so the join-type argument matches but the English word
+    # in a comment or a table name does not.
+    r"left_anti|leftanti|\bleft\s+anti\s+join\b|['\"]anti['\"]|"
+    # A left join whose unmatched rows are then isolated with a null test, in
+    # either the DataFrame or the SQL spelling.
+    r"\.isNull\s*\(\s*\)[^\n]*\bjoin\b|\bjoin\b[^\n]*\.isNull\s*\(|"
+    r"\bIS\s+NULL\b[^\n]*\bjoin\b|\bjoin\b[^\n]*\bIS\s+NULL\b|"
+    # An explicitly named integrity check. It must be a call or an assignment:
+    # a bare ``referential`` also matches a comment, a column name or a docstring
+    # that merely mentions the idea without performing it.
+    r"\b(?:referential_integrity|referential_check|fk_check|integrity_check|ri_check)\s*[\(=]",
     re.IGNORECASE,
 )
 # One physical read. The chained ``spark.read...load(...)`` form is listed first so it
@@ -524,10 +541,106 @@ _MULTI_SOURCE = re.compile(
     re.IGNORECASE,
 )
 _ORPHAN_DETECT = re.compile(
-    r"left_anti|leftanti|orphan|unmatched|no_parent|missing_parent|"
+    r"left_anti|leftanti|\bleft\s+anti\s+join\b|"
+    r"orphan|unmatched|no_parent|missing_parent|"
     r"anti.*join.*parent|parent.*anti.*join",
     re.IGNORECASE,
 )
+
+# -- 5.3.7: identified is not the same as handled -----------------------------
+#: Turning an identified orphan set into an outcome: persisted, raised on, or
+#: recorded. ``display()``/``show()`` are deliberately absent - showing a
+#: dataframe is identification, which the check already credits separately.
+_ORPHAN_HANDLED = (
+    r"\.write\b|saveAsTable\s*\(|\.save\s*\(|insertInto\s*\(|"
+    r"\braise\b|\bassert\b|sys\s*\.\s*exit\s*\(|notebook\s*\.\s*exit\s*\(|"
+    r"logger\s*\.|logging\s*\."
+)
+#: Names teams give a quarantined/rejected record set. Only meaningful next to a
+#: handling verb - a column called ``rejected_flag`` in unrelated business data
+#: must not read as orphan handling.
+_QUARANTINE_NAME = (
+    r"quarantin|reject|bad[_-]?record|error[_-]?record|error[_-]?table|"
+    r"exception[_-]?record|dead[_-]?letter|\bdlq\b"
+)
+#: ``orphans = <expression containing an anti-join>``. The window spans lines so
+#: a multi-line ``spark.sql(\"\"\"... LEFT ANTI JOIN ...\"\"\")`` still binds to
+#: its variable; it is lazy and bounded so it cannot run on into a later
+#: statement's anti-join.
+_ANTI_JOIN_ASSIGN = re.compile(
+    r"^[ \t]*(\w+)\s*=[\s\S]{0,300}?(?:left_anti|leftanti|\bleft\s+anti\s+join\b)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _orphan_set_is_handled(code: str) -> bool:
+    """True when an identified orphan set is persisted, raised on, or recorded.
+
+    Two ways to satisfy it. A write whose destination is a quarantine/reject
+    target is self-evident wherever it appears. Otherwise each anti-join is bound
+    to the variable it is assigned to, and that variable must be used downstream
+    in a handling verb - a set that is computed and never referenced again was
+    identified but not handled.
+    """
+    for first, second in ((_ORPHAN_HANDLED, _QUARANTINE_NAME),
+                          (_QUARANTINE_NAME, _ORPHAN_HANDLED)):
+        if re.search(rf"(?:{first})[^\n]*(?:{second})", code, re.IGNORECASE):
+            return True
+    for match in _ANTI_JOIN_ASSIGN.finditer(code):
+        name = re.escape(match.group(1))
+        rest = code[match.end():]
+        if re.search(rf"\b{name}\b[^\n]*?(?:{_ORPHAN_HANDLED})", rest, re.IGNORECASE):
+            return True
+        if re.search(rf"(?:{_ORPHAN_HANDLED})[^\n]*?\b{name}\b", rest, re.IGNORECASE):
+            return True
+    return False
+
+
+# -- 5.3.9: the validated table must be the merged table ----------------------
+#: A table identifier, optionally schema-qualified and optionally quoted.
+_TABLE_IDENT = r"[`\"\[]?([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)*)[`\"\]]?"
+
+_MERGE_TARGET = re.compile(rf"MERGE\s+INTO\s+{_TABLE_IDENT}", re.IGNORECASE)
+#: ``tgt = DeltaTable.forName(spark, "gold.sales")`` - binds a variable to a table.
+_DELTA_BINDING = re.compile(
+    r"(\w+)\s*=\s*DeltaTable\s*\.\s*(?:forName|forPath)\s*\([^)]*?['\"]([^'\"]+)['\"]",
+    re.IGNORECASE,
+)
+_HISTORY_TABLE = re.compile(rf"DESCRIBE\s+HISTORY\s+{_TABLE_IDENT}", re.IGNORECASE)
+_HISTORY_VAR = re.compile(r"(\w+)\s*\.\s*history\s*\(")
+#: Validation read off the merge itself. These describe the write that just
+#: happened, so they carry no table name and need no cross-check.
+_MERGE_SELF_VALIDATE = re.compile(
+    r"operationMetrics|rows_(?:inserted|updated|deleted)|num_(?:inserted|updated|deleted)|"
+    r"merge[_\s]*count\b|merge_result|merge_valid|post.?merge.*count",
+    re.IGNORECASE,
+)
+
+
+def _table_leaf(name: str) -> str:
+    """Bare table name from a qualified name, a path, or a quoted identifier."""
+    text = str(name or "").strip().strip("`\"'[]")
+    if "/" in text:
+        text = text.rstrip("/").split("/")[-1]
+    return text.split(".")[-1].strip().lower()
+
+
+def _merge_targets(code: str) -> set[str]:
+    """Tables this notebook merges into."""
+    targets = {_table_leaf(m.group(1)) for m in _MERGE_TARGET.finditer(code)}
+    targets |= {_table_leaf(m.group(2)) for m in _DELTA_BINDING.finditer(code)}
+    return {t for t in targets if t}
+
+
+def _validated_tables(code: str) -> set[str]:
+    """Tables whose history this notebook inspects after the merge."""
+    tables = {_table_leaf(m.group(1)) for m in _HISTORY_TABLE.finditer(code)}
+    bound = {m.group(1): _table_leaf(m.group(2)) for m in _DELTA_BINDING.finditer(code)}
+    for match in _HISTORY_VAR.finditer(code):
+        if match.group(1) in bound:
+            tables.add(bound[match.group(1)])
+    return {t for t in tables if t}
+
 # A Delta merge is often issued through a variable bound to DeltaTable.forName/forPath,
 # so the ``.merge(`` call site alone does not carry the DeltaTable name.
 _MERGE_PATTERN = re.compile(
@@ -708,13 +821,26 @@ def nb_cross_recon(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_orphan_detect(ctx: CheckContext) -> Verdict:
-    """Notebooks with joins detect orphan/unmatched child records."""
+    """Notebooks with joins detect orphan/unmatched child records **and handle them**.
+
+    The point asks for two things. Identification is an anti-join or an equivalent
+    unmatched-row probe. Handling is what happens next: the unmatched set is
+    persisted (a quarantine/error table), raised on, or recorded. A set that is
+    computed and then dropped satisfies half the point, so it scores in the middle
+    rather than passing outright.
+    """
     code = executable_code(ctx.obj)
     if not _JOIN_PATTERN.search(code):
         return not_applicable("Notebook does not perform joins")
-    ok = bool(_ORPHAN_DETECT.search(code))
-    return binary(ok, "Orphan/unmatched record detection present" if ok
-                  else "Joins tables without orphan record detection")
+    if not _ORPHAN_DETECT.search(code):
+        return binary(False, "Joins tables without orphan record detection")
+    if _orphan_set_is_handled(code):
+        return binary(True, "Orphan/unmatched records are detected and handled")
+    return graded(
+        1,
+        "Orphan/unmatched records are detected but not handled - the unmatched set "
+        "is computed and then dropped, never quarantined, raised on or recorded",
+    )
 
 
 @check(
@@ -724,13 +850,41 @@ def nb_orphan_detect(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_merge_valid(ctx: CheckContext) -> Verdict:
-    """Notebooks performing MERGE validate post-merge counts against I/U/D expectations."""
+    """Notebooks performing MERGE validate post-merge counts against I/U/D expectations.
+
+    Where the validation names a table, that table must be one the notebook merged
+    into - reading ``DESCRIBE HISTORY`` on some *other* table proves nothing about
+    the merge. Metrics read off the merge itself (``operationMetrics``, I/U/D row
+    counts) describe the write that just happened and need no cross-check. When
+    neither the target nor the validated table can be resolved from the code, the
+    result is N/A rather than a guess.
+    """
     code = executable_code(ctx.obj)
     if not _MERGE_PATTERN.search(code):
         return not_applicable("Notebook does not perform MERGE operations")
-    ok = bool(_MERGE_VALIDATE.search(code))
-    return binary(ok, "Post-merge result validation present" if ok
-                  else "MERGE without post-merge count/result validation")
+    if not _MERGE_VALIDATE.search(code):
+        return binary(False, "MERGE without post-merge count/result validation")
+
+    if _MERGE_SELF_VALIDATE.search(code):
+        return binary(True, "Post-merge result validation reads the merge's own metrics")
+
+    targets = _merge_targets(code)
+    validated = _validated_tables(code)
+    if not targets or not validated:
+        return not_applicable(
+            "Post-merge validation is present, but the merged table could not be "
+            "resolved from the notebook, so it cannot be confirmed to validate the "
+            "table that was merged"
+        )
+    matched = targets & validated
+    if matched:
+        return binary(True, f"Post-merge validation covers the merged table(s): "
+                            f"{', '.join(sorted(matched))}")
+    return binary(
+        False,
+        f"Post-merge validation inspects {', '.join(sorted(validated))} but the "
+        f"MERGE targets {', '.join(sorted(targets))} - a different table is validated",
+    )
 
 
 # -- MLC Cat-1: warehouse load idempotency (3.6.4) ----------------------------
