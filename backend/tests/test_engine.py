@@ -69,10 +69,10 @@ def test_result_and_scored_counts_are_unchanged(provider):
 
 def test_status_counts_are_unchanged(provider):
     agg = aggregate(_run(provider))
-    assert agg["counts"][Status.PASS] == 50
+    assert agg["counts"][Status.PASS] == 51
     assert agg["counts"][Status.PARTIAL] == 18
-    assert agg["counts"][Status.FAIL] == 51
-    assert agg["counts"][Status.NA] == 123
+    assert agg["counts"][Status.FAIL] == 52
+    assert agg["counts"][Status.NA] == 133
     assert agg["counts"][Status.INFO] == 5
 
 
@@ -271,12 +271,12 @@ def test_progress_callback_fires_per_workspace(provider):
 
 
 def test_registry_is_fully_populated():
-    """119 checks are evaluated; remaining roadmap checks are not loaded."""
+    """131 checks are evaluated; remaining roadmap checks are not loaded."""
     evaluated = [s for s in REGISTRY if s.automation is Automation.AUTOMATED]
-    assert len(evaluated) == 119
-    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 37
-    assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 23
-    assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 58
+    assert len(evaluated) == 131
+    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 47
+    assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 24
+    assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 59
     # Roadmap (gated N/A) checks are intentionally not registered — see
     # auditfast.core.check.__init__._CHECK_MODULES — so none remain in the registry.
     assert len([s for s in REGISTRY if s.automation is Automation.ROADMAP]) == 0
@@ -335,7 +335,7 @@ def test_explicit_registry_is_isolated_from_the_global_one():
     assert registry.get("X-ISOLATED") is not None
     assert REGISTRY.get("X-ISOLATED") is None, "test check leaked into the global registry"
     before = len([s for s in REGISTRY if s.automation is Automation.AUTOMATED])
-    assert before == 119
+    assert before == 131
 
 # -- selection and dispatch ----------------------------------------------------
 

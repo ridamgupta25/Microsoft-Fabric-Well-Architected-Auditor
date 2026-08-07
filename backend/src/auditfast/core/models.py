@@ -111,6 +111,12 @@ class WorkspaceContext:
     tables: dict[str, dict] = field(default_factory=dict)
     shortcuts: dict[str, list] = field(default_factory=dict)
     semantic_models: dict[str, dict] = field(default_factory=dict)
+    #: Warehouse row-level-security policies, keyed by warehouse name. Read over the
+    #: SQL analytics endpoint (``sys.security_policies``) because the Fabric REST
+    #: API does not expose them. An empty list for a warehouse is a real finding
+    #: ("defines no policy"); the warehouse being absent from the map means it could
+    #: not be read, which is N/A.
+    warehouse_security: dict[str, list] = field(default_factory=dict)
     #: Tenant-level Fabric connection metadata. Credentials and secrets are
     #: never stored; TLS version and health remain unknown unless a provider
     #: supplies explicit evidence for them.
@@ -202,6 +208,7 @@ class WorkspaceContext:
             "tables": self.tables,
             "shortcuts": self.shortcuts,
             "semantic_models": self.semantic_models,
+            "warehouse_security": self.warehouse_security,
             "connections": self.connections,
             "git_details": self.git_details,
             "unavailable": sorted(r.value for r in self.unavailable),
@@ -226,6 +233,7 @@ class WorkspaceContext:
             tables=dict(data.get("tables", {})),
             shortcuts=dict(data.get("shortcuts", {})),
             semantic_models=dict(data.get("semantic_models", {})),
+            warehouse_security=dict(data.get("warehouse_security", {})),
             connections=list(data.get("connections", [])),
             git_details=dict(data.get("git_details", {})),
             unavailable={Resource(v) for v in data.get("unavailable", [])},

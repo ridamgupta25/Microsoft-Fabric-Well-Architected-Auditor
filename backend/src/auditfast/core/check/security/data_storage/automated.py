@@ -31,37 +31,69 @@ def sensitivity_labels(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-RLS", ref="6.2.1", title="Row-Level Security (RLS) implemented on the Gold Warehouse and/or semantic models where required",
     pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.CRITICAL,
-    layers=[Layer.STORAGE], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
+    layers=[Layer.STORAGE],
+    requires=[Resource.SEMANTIC_MODEL_DEFINITIONS, Resource.ITEMS,
+              Resource.WAREHOUSE_SECURITY],
+    required=True,
 )
 def rls_on_semantic_models(ctx: CheckContext) -> list[Verdict]:
-    """Semantic models define RLS roles with table permissions to restrict data access.
+    """Row-level security restricts data access on semantic models and Warehouses.
+
+    The checklist point names both surfaces. Semantic-model RLS comes from the
+    TMSL roles; Warehouse RLS is a T-SQL object (``sys.security_policies``) read
+    over the SQL analytics endpoint. When the SQL endpoint could not be reached the
+    Warehouses are reported as unassessed rather than counted as failing - "we
+    could not look" is not "not configured".
 
     Returns the scored workspace verdict followed by one unscored detail row per
-    model without RLS, so the report names *which* models fail, not just how many.
+    object without RLS, so the report names *which* ones fail, not just how many.
     """
     if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
         return [not_applicable("Semantic model definitions could not be read from Fabric")]
     models = ctx.workspace.semantic_models
-    if not models:
-        return [not_applicable("No semantic models in this workspace")]
+    warehouses = [i.display_name for i in ctx.workspace.items if i.type == "Warehouse"]
+    if not models and not warehouses:
+        return [not_applicable("No semantic models or Warehouses in this workspace")]
 
-    with_rls = []
-    failing = []
+    protected: list[str] = []
+    failing: list[tuple[str, str]] = []
     for name, defn in models.items():
         filtering, defined = rls_roles(defn)
         if filtering:
-            with_rls.append(name)
+            protected.append(name)
         elif defined:
             failing.append((name, f"Defines {defined} role(s) but none carries a filter expression"))
         else:
             failing.append((name, "Defines no RLS role"))
 
-    warehouses = sum(1 for i in ctx.workspace.items if i.type == "Warehouse")
-    caveat = (f"; the {warehouses} Warehouse(s) were not assessed — Warehouse RLS policies "
-              f"are not readable through the Fabric REST API") if warehouses else ""
+    # Warehouses: assessed only when the SQL analytics endpoint answered.
+    security = ctx.workspace.warehouse_security or {}
+    assessed_warehouses = 0
+    for warehouse in warehouses:
+        policies = security.get(warehouse)
+        if policies is None:
+            continue                      # unreadable - excluded, not failed
+        assessed_warehouses += 1
+        if any(p.get("enabled") for p in policies):
+            protected.append(warehouse)
+        else:
+            failing.append((warehouse, "Warehouse defines no enabled security policy"))
+
+    total = len(models) + assessed_warehouses
+    if not total:
+        return [not_applicable(
+            "No semantic models, and Warehouse security policies could not be read "
+            "from the SQL analytics endpoint"
+        )]
+    unread = len(warehouses) - assessed_warehouses
+    caveat = (f"; {unread} Warehouse(s) were not assessed - the SQL analytics "
+              f"endpoint could not be read") if unread else ""
+    scope_note = (f"{len(models)} semantic model(s) and {assessed_warehouses} Warehouse(s)"
+                  if assessed_warehouses else f"{len(models)} semantic model(s)")
     verdicts = [covered(
-        len(with_rls), len(models),
-        f"{len(with_rls)} of {len(models)} semantic models define RLS roles{caveat}",
+        len(protected), total,
+        f"{len(protected)} of {total} objects define row-level security "
+        f"({scope_note}){caveat}",
     )]
     verdicts += [note(reason, obj=name) for name, reason in sorted(failing)]
     return verdicts
@@ -119,7 +151,8 @@ _SENSITIVE_PATTERNS = re.compile(
     id="WS-DDM", ref="6.2.3",
     title="Dynamic Data Masking applied in the Warehouse for sensitive columns where appropriate",
     pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
-    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=True,
 )
 def dynamic_data_masking(ctx: CheckContext) -> Verdict:
     """Warehouse tables apply Dynamic Data Masking on columns that hold sensitive data."""
