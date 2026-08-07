@@ -9,7 +9,6 @@ from __future__ import annotations
 import re
 
 from auditfast.core.check._pipeline import activities as pipeline_activities
-from auditfast.core.check._pipeline import activities as pipeline_activities
 from auditfast.core.check._tables import (
     TABLE_LAYERS,
     col_names,
@@ -308,6 +307,46 @@ _INCREMENTAL_SQL = re.compile(
     r"incremental",
     re.IGNORECASE,
 )
+_TRY_CATCH_SQL = re.compile(
+    r"\bBEGIN\s+TRY\b.*?\bEND\s+TRY\b.*?\bBEGIN\s+CATCH\b.*?\bEND\s+CATCH\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_TXN_SQL = re.compile(
+    r"\bBEGIN\s+TRAN(?:SACTION)?\b|\bCOMMIT\s+TRAN(?:SACTION)?\b|\bROLLBACK\s+TRAN(?:SACTION)?\b",
+    re.IGNORECASE,
+)
+_STATS_UPDATE_SQL = re.compile(
+    r"\bUPDATE\s+STATISTICS\b|\bsp_updatestats\b|\bANALYZE\s+TABLE\b.*\bCOMPUTE\s+STATISTICS\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_TABLES_PATH = re.compile(r"(?:^|/)tables(?:/|$)", re.IGNORECASE)
+_SHORTCUTS_PATH = re.compile(r"(?:^|/)shortcuts(?:/|$)", re.IGNORECASE)
+_BRONZE_TOKEN = re.compile(r"(?:^|[/_\-.])bronze(?:[/_\-.]|$)", re.IGNORECASE)
+_SILVER_TOKEN = re.compile(r"(?:^|[/_\-.])silver(?:[/_\-.]|$)", re.IGNORECASE)
+
+_PARTITION_HINT_COLUMNS = (
+    "event_date", "business_date", "partition_date", "load_date",
+    "event_dt", "load_dt", "year", "month", "day",
+)
+_STRATEGY_METADATA_KEYS = (
+    "partitionBy", "partitionColumns", "partition_keys",
+    "clusterBy", "clusteredBy", "clusteringColumns", "zOrderBy",
+)
+_DECIMAL_TYPE = re.compile(r"^decimal\s*\((\d+)\s*,\s*(\d+)\)$", re.IGNORECASE)
+_OVERSIZED_VARCHAR = re.compile(r"^varchar\s*\((\d+)\)$", re.IGNORECASE)
+_SURROGATE_KEY_NAME = re.compile(r"(?:^|_)(?:sk|surrogate|hash(?:_?key)?)(?:$|_)", re.IGNORECASE)
+_PK_FK_NAME_HINT = re.compile(r"(?:^|_)(?:pk|fk|primary|foreign)(?:$|_)", re.IGNORECASE)
+_VIEW_PROC_HINT = re.compile(r"(?:^|_)(?:vw|view|sp|proc|procedure)(?:$|_)", re.IGNORECASE)
+_LOGIC_HINT = re.compile(r"(?:merge|join|window|row_number|dedup|rule|calc|business|transform)", re.IGNORECASE)
+
+_SQL_PERMISSION_HINT = (
+    "Request workspace Viewer role (CONNECT + ReadData on Warehouse/SQL analytics endpoint and Metadata/Audit DBs) "
+    "plus client approval for schema/catalog and row-level verification queries; this consumes capacity CU"
+)
+_ONELAKE_PERMISSION_HINT = (
+    "Request Workspace.Read.All + OneLake.Read.All (delegated, read-only). "
+    "Reads lakehouse table/column structure, Files hierarchy and shortcuts (structure only, never row data)"
+)
 
 
 def _to_text(value: object) -> str:
@@ -328,6 +367,22 @@ def _to_text(value: object) -> str:
     if isinstance(value, list):
         return " ".join(_to_text(item) for item in value)
     return str(value)
+
+
+def _shortcut_path_tokens(path: str) -> list[str]:
+    norm = (path or "").replace("\\", "/").strip("/").lower()
+    return [part for part in norm.split("/") if part]
+
+
+def _domain_from_path(path: str) -> tuple[str | None, str | None]:
+    """Infer (layer, domain) from a shortcut path when present."""
+    tokens = _shortcut_path_tokens(path)
+    for idx, token in enumerate(tokens):
+        if token in {"bronze", "silver"}:
+            if idx + 1 < len(tokens):
+                return token, tokens[idx + 1]
+            return token, None
+    return None, None
 
 @check(
     id="WS-WH-LOAD", ref="3.6.1",
@@ -414,7 +469,7 @@ def nb_no_cursor(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="WS-STAGING", ref="3.6.3
+    id="WS-STAGING", ref="3.6.3",
     title="Staging tables/schema used for Warehouse loads before merge into final tables",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
@@ -436,7 +491,65 @@ def wh_staging_pattern(ctx: CheckContext) -> Verdict:
         "(stg_* / staging_* / stage_*) — a staging schema buffers loads before the final merge",
     )
 
+@check(
+    id="WS-WH-TRYCATCH", ref="3.6.5",
+    title="Warehouse/lakehouse load SQL uses TRY...CATCH with transaction handling",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
+    required=True,
+)
+def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
+    """Inspectable SQL load logic wraps transactional changes in TRY...CATCH."""
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
 
+    storage_items = [
+        item for item in ctx.workspace.items
+        if item.type in {"Warehouse", "Lakehouse"}
+    ]
+    if not storage_items:
+        return not_applicable("No Warehouse/Lakehouse items found in this workspace")
+
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    inspected: list[tuple[str, bool]] = []
+    opaque_loads: list[str] = []
+
+    for pipeline_name, pipeline_def in ctx.workspace.pipelines.items():
+        for activity in pipeline_activities(pipeline_def):
+            activity_type = str(activity.get("type", "") or "")
+            activity_name = activity.get("name", activity_type) or activity_type
+            marker = f"{pipeline_name}/{activity_name}"
+
+            if activity_type == "Script":
+                text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
+                if not _WAREHOUSE_SQL_LOAD.search(text):
+                    continue
+                has_try_catch = bool(_TRY_CATCH_SQL.search(text))
+                has_transaction = bool(_TXN_SQL.search(text))
+                inspected.append((marker, has_try_catch and has_transaction))
+                continue
+
+            if activity_type in ("SqlServerStoredProcedure", "StoredProcedure", "Copy"):
+                opaque_loads.append(marker)
+
+    if not inspected:
+        if opaque_loads:
+            return not_applicable(
+                "Load logic is present but SQL bodies are not inspectable in this snapshot; "
+                "cannot verify TRY...CATCH transaction handling. " + _SQL_PERMISSION_HINT
+            )
+        return not_applicable("No inspectable scripted SQL load activity was found")
+
+    compliant = [name for name, ok in inspected if ok]
+    return covered(
+        len(compliant),
+        len(inspected),
+        f"{len(compliant)} of {len(inspected)} inspectable SQL load activity/activities use "
+        "TRY...CATCH and BEGIN/COMMIT/ROLLBACK transaction handling"
+        + (f"; compliant: {', '.join(compliant[:5])}" if compliant else ""),
+    )
 
 @check(
     id="WS-WH-INCREMENTAL", ref="3.6.6",
@@ -481,6 +594,71 @@ def wh_incremental_loads(ctx: CheckContext) -> Verdict:
         f"use incremental signals (MERGE / watermark / CDC)"
         + (f"; incremental: {', '.join(incremental[:5])}" if incremental else ""),
     )
+
+
+@check(
+    id="WS-WH-STATS", ref="3.6.7",
+    title="Statistics are updated after significant Warehouse loads",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
+    required=True,
+)
+def wh_stats_updated_after_loads(ctx: CheckContext) -> Verdict:
+    """Significant inspectable SQL loads are paired with statistics maintenance."""
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
+
+    storage_items = [
+        item for item in ctx.workspace.items
+        if item.type in {"Warehouse", "Lakehouse"}
+    ]
+    if not storage_items:
+        return not_applicable("No Warehouse/Lakehouse items found in this workspace")
+
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    pipeline_loads: dict[str, list[str]] = {}
+    pipeline_stats: dict[str, list[str]] = {}
+    opaque_loads: list[str] = []
+
+    for pipeline_name, pipeline_def in ctx.workspace.pipelines.items():
+        for activity in pipeline_activities(pipeline_def):
+            activity_type = str(activity.get("type", "") or "")
+            activity_name = activity.get("name", activity_type) or activity_type
+            marker = f"{pipeline_name}/{activity_name}"
+
+            if activity_type == "Script":
+                text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
+                if _WAREHOUSE_SQL_LOAD.search(text):
+                    pipeline_loads.setdefault(pipeline_name, []).append(marker)
+                if _STATS_UPDATE_SQL.search(text):
+                    pipeline_stats.setdefault(pipeline_name, []).append(marker)
+                continue
+
+            if activity_type in ("Copy", "SqlServerStoredProcedure", "StoredProcedure"):
+                opaque_loads.append(marker)
+
+    inspectable_pipelines = sorted(pipeline_loads)
+    if not inspectable_pipelines:
+        if opaque_loads:
+            return not_applicable(
+                "Significant loads are present but SQL bodies are not inspectable in this snapshot; "
+                "cannot verify post-load statistics maintenance. " + _SQL_PERMISSION_HINT
+            )
+        return not_applicable("No significant inspectable SQL warehouse/lakehouse load was found")
+
+    compliant = [name for name in inspectable_pipelines if pipeline_stats.get(name)]
+    evidence = (
+        f"{len(compliant)} of {len(inspectable_pipelines)} pipeline(s) with significant inspectable SQL loads "
+        "also run statistics maintenance (UPDATE STATISTICS / sp_updatestats / ANALYZE TABLE)"
+    )
+    if opaque_loads:
+        evidence += f"; {len(opaque_loads)} load activity/activities remain non-inspectable"
+    if compliant:
+        evidence += f"; compliant pipelines: {', '.join(compliant[:5])}"
+
+    return covered(len(compliant), len(inspectable_pipelines), evidence)
 
 @check(
     id="WS-WH-LOAD", ref="3.6.1",
