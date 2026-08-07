@@ -74,6 +74,8 @@ export interface CheckSpec {
   question: string;
   /** The scored answers for an interactive check; empty otherwise. */
   options: CheckOption[];
+  /** True once the check has completed Phase 1 validation; false while pending. */
+  validated: boolean;
   description: string;
 }
 
@@ -276,6 +278,8 @@ export interface CheckResult {
   scored: boolean;
   /** True for checks that apply to every project. */
   common: boolean;
+  /** True once the check has completed Phase 1 validation; false while pending. */
+  validated: boolean;
 }
 
 export interface WorkspaceError {

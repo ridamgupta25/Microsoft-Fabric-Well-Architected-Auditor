@@ -93,7 +93,7 @@ _CLEANUP_BEFORE_WRITE = re.compile(
 
 
 @check(
-    id="PL-RETRY", ref="2.4.1", title="Retry policy configured on activities",
+    id="PL-RETRY", ref="2.4.1", title="All pipeline activities have appropriate retry policies configured (copy, notebook, lookup, web, ForEach)",
     pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -106,7 +106,7 @@ def retry_policy(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-FAILPATH", ref="2.4.3", title="On-failure path defined",
+    id="PL-FAILPATH", ref="2.4.3", title="On-failure paths defined for critical activities",
     pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -122,7 +122,7 @@ def failure_path(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-NOTIFY", ref="2.4.5", title="Failure notification present",
+    id="PL-NOTIFY", ref="2.4.5", title="Pipeline failure triggers notification (Data Activator, email, Teams)",
     pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -148,7 +148,7 @@ def failure_notification(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-TIMEOUT", ref="2.4", title="Explicit activity timeouts set",
+    id="PL-TIMEOUT", ref="IMPL-23", title="Pipeline activities set an explicit timeout (not Fabric's multi-day default) [PL-TIMEOUT]",
     pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -220,7 +220,7 @@ def poison_message_handling(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-BADRECORDS", ref="9.1.3",
-    title="Notebook reads survive malformed records (quarantine, not crash)",
+    title="Poison message / corrupt file handling (quarantine, not crash)",
     pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -253,7 +253,7 @@ def notebook_bad_records(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-RETRY-VALUES", ref="2.4.2", title="Retry counts and intervals are sane",
+    id="PL-RETRY-VALUES", ref="2.4.2", title="Retry count and interval follow reasonable patterns (not infinite retries)",
     pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -285,7 +285,7 @@ def retry_values(ctx: CheckContext) -> Verdict:
 
 @check(
     id="PL-IDEMPOTENT", ref="2.4.6",
-    title="Pipeline reruns are idempotent",
+    title="Idempotency ensured — re-running a failed pipeline does not produce duplicates",
     pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -320,7 +320,7 @@ def pipeline_idempotent(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-IDEMPOTENT", ref="9.3.1",
-    title="Notebook reruns are idempotent",
+    title="All pipelines and notebooks are idempotent (safe to re-run)",
     pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -344,7 +344,7 @@ def notebook_idempotent(ctx: CheckContext) -> Verdict:
 
 @check(
     id="PL-DEADLETTER", ref="2.4.4",
-    title="Failed records captured to dead-letter or quarantine output",
+    title="Failed records captured to dead-letter / quarantine area (not silently dropped or halting good records)",
     pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -368,8 +368,8 @@ def pl_deadletter(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-DEADLETTER", ref="3.1.9",
-    title="Failed records captured to dead-letter or quarantine output",
+    id="NB-DEADLETTER", ref="5.1.10",
+    title="DQ quarantine pattern: failed records routed to error tables with failure reason",
     pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )

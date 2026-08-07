@@ -24,6 +24,17 @@ from auditfast.core.models import CheckContext
 
 _NO_TABLES = "No lakehouse/warehouse tables were read for this workspace"
 
+#: N/A reason when lakehouse/warehouse tables exist but none are dimensions with
+#: readable columns. Named to make the scope explicit — semantic-model tables
+#: (e.g. a Power BI ``DateDimension``) are not lakehouse tables and are judged
+#: separately by the 5.4.x semantic-model checks.
+_NO_DIMS = "No lakehouse/warehouse dimension tables with column metadata"
+
+#: N/A reason when lakehouse/warehouse tables exist but none carry readable column
+#: schemas. Scope is made explicit so it is not mistaken for "no columns anywhere"
+#: — semantic-model column metadata is not read by these table checks.
+_NO_COLS = "No lakehouse/warehouse table column metadata available"
+
 #: Column names implying a date/time value, for the data-type check.
 _DATE_NAME = re.compile(r"(date|timestamp|_dt$|_time$)", re.IGNORECASE)
 
@@ -35,7 +46,7 @@ _MAX_TEXT_WIDTH = 4000
 
 
 @check(
-    id="TB-NAMING", ref="4.2.1", title="Tables follow a consistent naming convention",
+    id="TB-NAMING", ref="4.2.1", title="Tables use meaningful, consistent naming conventions (agreed standard)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
 )
@@ -49,7 +60,7 @@ def table_naming(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="TB-MANAGED-DELTA", ref="4.1.1", title="Tables are managed Delta tables",
+    id="TB-MANAGED-DELTA", ref="4.1.1", title="Lakehouse Tables (managed) used for structured data; Files section for raw/unstructured",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
 )
@@ -65,21 +76,23 @@ def table_managed_delta(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="TB-AUDITCOLS", ref="4.2.5", title="Tables carry audit columns",
+    id="TB-AUDITCOLS", ref="4.2.5", title="Audit columns present (created_date, modified_date, source_system, batch_id)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
 )
 def table_audit_columns(ctx: CheckContext) -> Verdict:
     """Each table records lineage via audit columns (created/modified/batch id)."""
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
     tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
     if not tables:
-        return not_applicable("No table column metadata available")
+        return not_applicable(_NO_COLS)
     ok = [n for n, t in tables.items() if any(a in col_names(t) for a in AUDIT_COLUMNS)]
     return covered(len(ok), len(tables), f"{len(ok)} of {len(tables)} tables have audit columns")
 
 
 @check(
-    id="TB-STARSCHEMA", ref="4.4.1", title="Star schema — fact and dimension tables present",
+    id="TB-STARSCHEMA", ref="4.5.1", title="Star schema design implemented (fact + dimension tables, not flat wide tables)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
 )
@@ -96,7 +109,7 @@ def table_star_schema(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="TB-DATEDIM", ref="4.4.8", title="A date/time dimension exists",
+    id="TB-DATEDIM", ref="4.5.7", title="Date/Time dimension exists with all required attributes (fiscal periods, quarter, holidays)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
 )
@@ -115,37 +128,41 @@ def table_date_dimension(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="TB-SURROGATE", ref="4.4.7", title="Dimension tables use surrogate keys",
+    id="TB-SURROGATE", ref="4.5.6", title="Surrogate keys used for dimension tables (not business keys as PKs in facts)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
 )
 def table_surrogate_keys(ctx: CheckContext) -> Verdict:
     """Dimensions have a surrogate key column (``*_sk`` / ``*_key``), not just a business key."""
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
     dims = {n: t for n, t in ctx.workspace.tables.items() if is_dimension(n) and columns(t)}
     if not dims:
-        return not_applicable("No dimension tables with column metadata")
+        return not_applicable(_NO_DIMS)
     ok = [n for n, t in dims.items()
           if any(c.endswith(("_sk", "_key")) for c in col_names(t))]
     return covered(len(ok), len(dims), f"{len(ok)} of {len(dims)} dimensions have a surrogate key")
 
 
 @check(
-    id="TB-COL-NAMING", ref="4.2.3", title="Column names are consistent and self-documenting",
+    id="TB-COL-NAMING", ref="4.2.3", title="Column naming is consistent and self-documenting",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
 )
 def table_column_naming(ctx: CheckContext) -> Verdict:
     """Table columns follow a consistent snake_case convention."""
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
     tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
     if not tables:
-        return not_applicable("No table column metadata available")
+        return not_applicable(_NO_COLS)
     names = [c.get("name", "") for t in tables.values() for c in columns(t)]
     ok = [n for n in names if is_snake_case(n)]
     return covered(len(ok), len(names), f"{len(ok)} of {len(names)} columns use snake_case names")
 
 
 @check(
-    id="TB-DATATYPES", ref="4.2.4", title="Data types are appropriate (temporal dates, no oversized text)",
+    id="TB-DATATYPES", ref="4.2.4", title="Data types are appropriate (no stringly-typed dates, no oversized varchars)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
 )
@@ -155,9 +172,11 @@ def table_data_types(ctx: CheckContext) -> Verdict:
     Only columns that can actually be judged are counted: a date-named column, or a
     text column that declares a width. A bare ``string`` has no width to assess.
     """
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
     tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
     if not tables:
-        return not_applicable("No table column metadata available")
+        return not_applicable(_NO_COLS)
 
     assessed = compliant = stringly_dates = oversized = 0
     for table in tables.values():
@@ -315,15 +334,17 @@ def shortcut_scope(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="TB-SCD2", ref="4.4.10", title="SCD Type 2 dimensions track validity and a current flag",
+    id="TB-SCD2", ref="4.5.9", title="SCD Type 2 includes valid_from, valid_to, and is_current flag correctly maintained (where used)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
 )
 def table_scd2(ctx: CheckContext) -> Verdict:
     """Slowly-changing dimensions carry valid_from, valid_to, and is_current together."""
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
     dims = {n: t for n, t in ctx.workspace.tables.items() if is_dimension(n) and columns(t)}
     if not dims:
-        return not_applicable("No dimension tables with column metadata")
+        return not_applicable(_NO_DIMS)
     tracked = ("valid_from", "valid_to", "is_current")
     scd2 = {n: t for n, t in dims.items() if any(col in col_names(t) for col in tracked)}
     if not scd2:

@@ -29,8 +29,8 @@ SECRET_PATTERNS = [
 
 
 @check(
-    id="WS-ROLES-GROUPS", ref="6.1.2",
-    title="Roles assigned to security groups, not individuals",
+    id="WS-ROLES-GROUPS", ref="IMPL-02",
+    title="No individual user accounts for role assignments — security groups used",
     pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     requires=[Resource.ROLE_ASSIGNMENTS], required=True,
 )
@@ -47,7 +47,7 @@ def roles_use_groups(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="WS-LEASTPRIV", ref="6.1.8", title="Least-privilege admin grants",
+    id="WS-LEASTPRIV", ref="IMPL-06", title="Workspace roles follow least-privilege principle (Admin/Member/Contributor/Viewer used correctly)",
     pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     requires=[Resource.ROLE_ASSIGNMENTS], required=True,
 )
@@ -63,8 +63,8 @@ def least_privilege(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="WS-SPN", ref="6.1.3",
-    title="Automation uses a service principal or managed identity",
+    id="WS-SPN", ref="1.3.5",
+    title="Connections use secure, non-personal identities (SPN / Workspace Identity) rather than individual accounts",
     pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     requires=[Resource.ROLE_ASSIGNMENTS], required=True,
 )
@@ -87,7 +87,7 @@ def automation_identity(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="WS-GUESTS", ref="6.1", title="No unmanaged external/guest access",
+    id="WS-GUESTS", ref="IMPL-01", title="Guest/external user access is explicitly governed",
     pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     requires=[Resource.ROLE_ASSIGNMENTS], required=True,
 )
@@ -101,7 +101,7 @@ def no_guest_access(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-SECRETS", ref="6.4.2", title="No hardcoded secrets in pipeline",
+    id="PL-SECRETS", ref="6.4.2", title="No secrets in notebook code, pipeline expressions, or Spark config",
     pillar=Pillar.SECURITY, scope=Scope.PIPELINE, severity=Severity.CRITICAL,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -130,7 +130,7 @@ def _tls_version(value: object) -> tuple[int, int] | None:
 
 
 @check(
-    id="WS-TLS", ref="6.3.4", title="API and source connections use TLS 1.2+",
+    id="WS-TLS", ref="6.3.4", title="API / source connections use TLS 1.2+",
     pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=(Layer.OPERATIONS,), requires=[Resource.CONNECTIONS], required=True,
 )
