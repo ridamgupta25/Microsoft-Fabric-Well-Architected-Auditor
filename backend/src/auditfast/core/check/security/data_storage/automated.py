@@ -13,7 +13,7 @@ from auditfast.core.check._tables import TABLE_LAYERS, columns
 
 
 @check(
-    id="WS-LABELS", ref="6.2.4", title="Sensitivity labels applied to items",
+    id="WS-LABELS", ref="IMPL-04", title="Sensitivity labels applied across Fabric items",
     pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     requires=[Resource.ITEMS], required=True,
 )
@@ -30,7 +30,7 @@ def sensitivity_labels(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="WS-RLS", ref="6.2.1", title="Row-Level Security (RLS) defined on semantic models",
+    id="WS-RLS", ref="6.2.1", title="Row-Level Security (RLS) implemented on the Gold Warehouse and/or semantic models where required",
     pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.CRITICAL,
     layers=[Layer.STORAGE], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
@@ -90,7 +90,7 @@ _SENSITIVE_PATTERNS = re.compile(
 
 @check(
     id="WS-DDM", ref="6.2.3",
-    title="Dynamic Data Masking applied in the Warehouse for sensitive columns",
+    title="Dynamic Data Masking applied in the Warehouse for sensitive columns where appropriate",
     pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
 )
