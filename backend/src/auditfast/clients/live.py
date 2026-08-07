@@ -416,9 +416,13 @@ class LiveFabricProvider:
             "status": "unknown",
         }
 
-    def _item_shortcuts(self, workspace_id: str, item_id: str) -> list[dict]:
-        """List an item's OneLake shortcuts (name/path/target type), all pages."""
-        rows, _known = self._values(
+    def _item_shortcuts(self, workspace_id: str, item_id: str) -> tuple[list[dict], bool]:
+        """List an item's OneLake shortcuts (name/path/target type), all pages.
+
+        Returns ``(shortcuts, known)``; ``known`` is False when the list call
+        itself failed, so "could not ask" is never recorded as "has none".
+        """
+        rows, known = self._values(
             f"/workspaces/{workspace_id}/items/{item_id}/shortcuts"
         )
         shortcuts = []
@@ -429,7 +433,7 @@ class LiveFabricProvider:
                 "path": row.get("path", ""),
                 "target_type": target.get("type", ""),
             })
-        return shortcuts
+        return shortcuts, known
 
     def _semantic_model_definition(self, workspace_id: str, item_id: str) -> tuple[dict | None, str]:
         """Fetch a semantic model's TMSL definition and reduce it to model facts.
@@ -448,21 +452,65 @@ class LiveFabricProvider:
         return None, failure
 
     @staticmethod
+    def _git_connection(body: Any) -> dict:
+        """Normalize a ``git/connection`` body into the provider/repo/branch facts.
+
+        Fabric answers 200 with ``gitConnectionState: "NotConnected"`` for a
+        workspace that has no repository, so the *state* — not the HTTP status —
+        decides whether the workspace is really Git-connected.
+        """
+        if not isinstance(body, dict):
+            return {}
+        provider = body.get("gitProviderDetails") or {}
+        sync = body.get("gitSyncDetails") or {}
+        state = body.get("gitConnectionState") or ""
+        return {
+            "connected": state != "NotConnected" if state else bool(provider),
+            "state": state,
+            "provider": provider.get("gitProviderType", ""),
+            # Azure DevOps reports organizationName; GitHub reports ownerName.
+            "organization": provider.get("organizationName") or provider.get("ownerName", ""),
+            "project": provider.get("projectName", ""),
+            "repository": provider.get("repositoryName", ""),
+            "branch": provider.get("branchName", ""),
+            "directory": provider.get("directoryName", ""),
+            "head": sync.get("head"),
+            "last_sync_time": sync.get("lastSyncTime"),
+        }
+
+    @staticmethod
+    def _unique_key(store: dict, name: str, item_id: str) -> str:
+        """A key that will not overwrite an item already stored under ``name``.
+
+        Fabric permits two items of the same type to share a display name, so
+        keying purely by name silently loses all but the last one.
+        """
+        if name not in store:
+            return name
+        return f"{name} ({item_id[:8]})"
+
+    @staticmethod
     def _record_failures(ctx: WorkspaceContext, resource: Resource,
-                         attempted: int, read: int, forbidden: int, transient: int) -> None:
+                         attempted: int, read: int, forbidden: int, transient: int,
+                         empty: int = 0) -> None:
         """Record a one-per-item read outcome on the context.
 
         When some items of a type could not be read, store the counts so the gap
         is visible ("N of M could not be read"). When *none* could be read, also
         mark the resource unavailable so its checks report N/A with the reason.
+
+        ``empty`` counts items whose definition call returned but carried nothing
+        usable. Those are a real coverage gap, but re-crawling will not fix them,
+        so they are reported without making the snapshot un-cacheable.
         """
-        if attempted and (forbidden or transient):
+        if attempted and (forbidden or transient or empty):
             ctx.read_failures[resource.value] = {
                 "attempted": attempted,
                 "read": read,
-                "failed": forbidden + transient,
+                "failed": forbidden + transient + empty,
                 "forbidden": forbidden,
                 "transient": transient,
+                "empty": empty,
             }
             if read == 0:
                 ctx.unavailable.add(resource)
@@ -677,9 +725,10 @@ class LiveFabricProvider:
                 ctx.unavailable.add(Resource.ROLE_ASSIGNMENTS)
 
         if Resource.GIT in wanted:
-            git_status, _ = self._get(f"/workspaces/{workspace_id}/git/connection")
+            git_status, git_body = self._get(f"/workspaces/{workspace_id}/git/connection")
             if git_status == 200:
-                ctx.git_connected = True
+                ctx.git_details = self._git_connection(git_body)
+                ctx.git_connected = bool(ctx.git_details.get("connected"))
             elif git_status in (400, 404):
                 ctx.git_connected = False  # genuinely not connected
             else:
@@ -710,7 +759,7 @@ class LiveFabricProvider:
         # The expensive one — one call per pipeline. Only paid for when a
         # selected check actually reads a pipeline definition.
         if Resource.PIPELINE_DEFINITIONS in wanted:
-            attempted = read = forbidden = transient = 0
+            attempted = read = forbidden = transient = empty = 0
             for item in ctx.items:
                 if item.type != "DataPipeline":
                     continue
@@ -720,17 +769,19 @@ class LiveFabricProvider:
                     forbidden += 1
                 elif failure == "transient":
                     transient += 1
-                else:
+                elif definition:
                     read += 1
-                    if definition:
-                        ctx.pipelines[item.display_name or item.id] = definition
+                    key = self._unique_key(ctx.pipelines, item.display_name or item.id, item.id)
+                    ctx.pipelines[key] = definition
+                else:
+                    empty += 1
             self._record_failures(ctx, Resource.PIPELINE_DEFINITIONS,
-                                  attempted, read, forbidden, transient)
+                                  attempted, read, forbidden, transient, empty)
 
         # Notebook definitions: same one-call-per-item getDefinition pattern.
         if Resource.NOTEBOOK_DEFINITIONS in wanted:
             found = [i for i in ctx.items if i.type == "Notebook"]
-            attempted = read = forbidden = transient = 0
+            attempted = read = forbidden = transient = empty = 0
             for item in found:
                 attempted += 1
                 definition, failure = self._notebook_definition(workspace_id, item.id)
@@ -738,7 +789,7 @@ class LiveFabricProvider:
                     forbidden += 1
                 elif failure == "transient":
                     transient += 1
-                else:
+                elif definition:
                     read += 1
                     if definition:
                         binding = self._environment_binding(definition)
@@ -754,7 +805,7 @@ class LiveFabricProvider:
                             definition["_auditfast_monitoring"] = monitoring
                         ctx.notebooks[item.display_name or item.id] = definition
             self._record_failures(ctx, Resource.NOTEBOOK_DEFINITIONS,
-                                  attempted, read, forbidden, transient)
+                                  attempted, read, forbidden, transient, empty)
             log.info("fetch %s: %d notebooks found, %d definitions read",
                      workspace_id, len(found), len(ctx.notebooks))
 
@@ -789,18 +840,27 @@ class LiveFabricProvider:
         # OneLake shortcuts per lakehouse (governance/lineage: external references).
         if Resource.SHORTCUTS in wanted:
             total = 0
+            attempted = failed = 0
             for item in ctx.items:
                 if item.type != "Lakehouse":
                     continue
-                shortcuts = self._item_shortcuts(workspace_id, item.id)
+                attempted += 1
+                shortcuts, known = self._item_shortcuts(workspace_id, item.id)
+                if not known:
+                    failed += 1
+                    continue
                 if shortcuts:
                     ctx.shortcuts[item.display_name or item.id] = shortcuts
                     total += len(shortcuts)
-            log.info("fetch %s: %d shortcuts read", workspace_id, total)
+            # Every listing failed: "could not ask" must not read as "has none".
+            if attempted and failed == attempted:
+                ctx.unavailable.add(Resource.SHORTCUTS)
+            log.info("fetch %s: %d shortcuts read (%d of %d listings failed)",
+                     workspace_id, total, failed, attempted)
 
         # Semantic-model measures + relationships, parsed from the TMSL definition.
         if Resource.SEMANTIC_MODEL_DEFINITIONS in wanted:
-            attempted = read = forbidden = transient = 0
+            attempted = read = forbidden = transient = empty = 0
             for item in ctx.items:
                 if item.type != "SemanticModel":
                     continue
@@ -810,12 +870,16 @@ class LiveFabricProvider:
                     forbidden += 1
                 elif failure == "transient":
                     transient += 1
-                else:
+                elif model:
                     read += 1
-                    if model:
-                        ctx.semantic_models[item.display_name or item.id] = model
+                    key = self._unique_key(
+                        ctx.semantic_models, item.display_name or item.id, item.id
+                    )
+                    ctx.semantic_models[key] = model
+                else:
+                    empty += 1
             self._record_failures(ctx, Resource.SEMANTIC_MODEL_DEFINITIONS,
-                                  attempted, read, forbidden, transient)
+                                  attempted, read, forbidden, transient, empty)
             log.info("fetch %s: %d semantic models parsed", workspace_id, len(ctx.semantic_models))
 
         return ctx
