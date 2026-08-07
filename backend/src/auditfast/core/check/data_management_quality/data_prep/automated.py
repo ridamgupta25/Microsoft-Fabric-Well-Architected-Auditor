@@ -480,7 +480,16 @@ _COUNT_RECONCILE = re.compile(
     # A count that is actually asserted or compared against an expectation. A count
     # merely assigned, used as a column alias, or compared to 0 (an emptiness guard)
     # reconciles nothing.
-    r"assert[^\n]*\.count\s*\(|"
+    #
+    # The assertion arm carries the same zero-guard as the bare-comparison arm, and
+    # skips a line that probes for nulls. Without both, a key-quality assertion such
+    # as ``assert df.filter(col(k).isNull()).count() == 0`` scores as record-count
+    # reconciliation - it counts rows, but it reconciles nothing against a source.
+    #
+    # The guard must be ``(?!\s*0\b)``, not ``\s*(?!0\b)``: the latter lets ``\s*``
+    # backtrack to zero width so the lookahead tests the space rather than the ``0``,
+    # and ``assert df.count() > 0`` slips through.
+    r"assert(?![^\n]*\.is(?:Not)?Null\s*\()[^\n]*?\.count\s*\([^\n]*?(?:==|!=|<=|>=|<|>)(?!\s*0\b)|"
     r"\.count\s*\(\s*\)\s*(?:==|!=|<=|>=|<|>)(?!\s*0\b)|"
     r"(?:row|record|source|target|actual|expected|recon)_count\b\s*(?:==|!=|<=|>=|<|>)(?!\s*0\b)|"
     r"(?:==|!=|<=|>=|<|>)\s*(?:row|record|source|target|actual|expected|recon)_count\b|"
@@ -506,11 +515,19 @@ _RI_PATTERN = re.compile(
     \b(?:referential|integrity|fk_check|integrity_check|orphan|unmatched|missing_parent|no_parent)\b
     """
 )
-_JOIN_PATTERN = re.compile(r"(?is)\.join\s*\(|\bleft\s+join\b|\binner\s+join\b|\bright\s+join\b|\bfull\s+join\b", re.IGNORECASE)
 _FK_INTEGRITY = re.compile(
-    r"left_anti|leftanti|anti.*join|"
-    r"referential|fk_check|integrity_check|"
-    r"\.isNull\s*\(\s*\).*join|join.*\.isNull\s*\(",
+    # An anti-join - the standard way to isolate FK values with no parent row.
+    # ``"anti"`` is quoted so the join-type argument matches but the English word
+    # in a comment or a table name does not.
+    r"left_anti|leftanti|\bleft\s+anti\s+join\b|['\"]anti['\"]|"
+    # A left join whose unmatched rows are then isolated with a null test, in
+    # either the DataFrame or the SQL spelling.
+    r"\.isNull\s*\(\s*\)[^\n]*\bjoin\b|\bjoin\b[^\n]*\.isNull\s*\(|"
+    r"\bIS\s+NULL\b[^\n]*\bjoin\b|\bjoin\b[^\n]*\bIS\s+NULL\b|"
+    # An explicitly named integrity check. It must be a call or an assignment:
+    # a bare ``referential`` also matches a comment, a column name or a docstring
+    # that merely mentions the idea without performing it.
+    r"\b(?:referential_integrity|referential_check|fk_check|integrity_check|ri_check)\s*[\(=]",
     re.IGNORECASE,
 )
 # One physical read. The chained ``spark.read...load(...)`` form is listed first so it
@@ -524,10 +541,106 @@ _MULTI_SOURCE = re.compile(
     re.IGNORECASE,
 )
 _ORPHAN_DETECT = re.compile(
-    r"left_anti|leftanti|orphan|unmatched|no_parent|missing_parent|"
+    r"left_anti|leftanti|\bleft\s+anti\s+join\b|"
+    r"orphan|unmatched|no_parent|missing_parent|"
     r"anti.*join.*parent|parent.*anti.*join",
     re.IGNORECASE,
 )
+
+# -- 5.3.7: identified is not the same as handled -----------------------------
+#: Turning an identified orphan set into an outcome: persisted, raised on, or
+#: recorded. ``display()``/``show()`` are deliberately absent - showing a
+#: dataframe is identification, which the check already credits separately.
+_ORPHAN_HANDLED = (
+    r"\.write\b|saveAsTable\s*\(|\.save\s*\(|insertInto\s*\(|"
+    r"\braise\b|\bassert\b|sys\s*\.\s*exit\s*\(|notebook\s*\.\s*exit\s*\(|"
+    r"logger\s*\.|logging\s*\."
+)
+#: Names teams give a quarantined/rejected record set. Only meaningful next to a
+#: handling verb - a column called ``rejected_flag`` in unrelated business data
+#: must not read as orphan handling.
+_QUARANTINE_NAME = (
+    r"quarantin|reject|bad[_-]?record|error[_-]?record|error[_-]?table|"
+    r"exception[_-]?record|dead[_-]?letter|\bdlq\b"
+)
+#: ``orphans = <expression containing an anti-join>``. The window spans lines so
+#: a multi-line ``spark.sql(\"\"\"... LEFT ANTI JOIN ...\"\"\")`` still binds to
+#: its variable; it is lazy and bounded so it cannot run on into a later
+#: statement's anti-join.
+_ANTI_JOIN_ASSIGN = re.compile(
+    r"^[ \t]*(\w+)\s*=[\s\S]{0,300}?(?:left_anti|leftanti|\bleft\s+anti\s+join\b)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _orphan_set_is_handled(code: str) -> bool:
+    """True when an identified orphan set is persisted, raised on, or recorded.
+
+    Two ways to satisfy it. A write whose destination is a quarantine/reject
+    target is self-evident wherever it appears. Otherwise each anti-join is bound
+    to the variable it is assigned to, and that variable must be used downstream
+    in a handling verb - a set that is computed and never referenced again was
+    identified but not handled.
+    """
+    for first, second in ((_ORPHAN_HANDLED, _QUARANTINE_NAME),
+                          (_QUARANTINE_NAME, _ORPHAN_HANDLED)):
+        if re.search(rf"(?:{first})[^\n]*(?:{second})", code, re.IGNORECASE):
+            return True
+    for match in _ANTI_JOIN_ASSIGN.finditer(code):
+        name = re.escape(match.group(1))
+        rest = code[match.end():]
+        if re.search(rf"\b{name}\b[^\n]*?(?:{_ORPHAN_HANDLED})", rest, re.IGNORECASE):
+            return True
+        if re.search(rf"(?:{_ORPHAN_HANDLED})[^\n]*?\b{name}\b", rest, re.IGNORECASE):
+            return True
+    return False
+
+
+# -- 5.3.9: the validated table must be the merged table ----------------------
+#: A table identifier, optionally schema-qualified and optionally quoted.
+_TABLE_IDENT = r"[`\"\[]?([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)*)[`\"\]]?"
+
+_MERGE_TARGET = re.compile(rf"MERGE\s+INTO\s+{_TABLE_IDENT}", re.IGNORECASE)
+#: ``tgt = DeltaTable.forName(spark, "gold.sales")`` - binds a variable to a table.
+_DELTA_BINDING = re.compile(
+    r"(\w+)\s*=\s*DeltaTable\s*\.\s*(?:forName|forPath)\s*\([^)]*?['\"]([^'\"]+)['\"]",
+    re.IGNORECASE,
+)
+_HISTORY_TABLE = re.compile(rf"DESCRIBE\s+HISTORY\s+{_TABLE_IDENT}", re.IGNORECASE)
+_HISTORY_VAR = re.compile(r"(\w+)\s*\.\s*history\s*\(")
+#: Validation read off the merge itself. These describe the write that just
+#: happened, so they carry no table name and need no cross-check.
+_MERGE_SELF_VALIDATE = re.compile(
+    r"operationMetrics|rows_(?:inserted|updated|deleted)|num_(?:inserted|updated|deleted)|"
+    r"merge[_\s]*count\b|merge_result|merge_valid|post.?merge.*count",
+    re.IGNORECASE,
+)
+
+
+def _table_leaf(name: str) -> str:
+    """Bare table name from a qualified name, a path, or a quoted identifier."""
+    text = str(name or "").strip().strip("`\"'[]")
+    if "/" in text:
+        text = text.rstrip("/").split("/")[-1]
+    return text.split(".")[-1].strip().lower()
+
+
+def _merge_targets(code: str) -> set[str]:
+    """Tables this notebook merges into."""
+    targets = {_table_leaf(m.group(1)) for m in _MERGE_TARGET.finditer(code)}
+    targets |= {_table_leaf(m.group(2)) for m in _DELTA_BINDING.finditer(code)}
+    return {t for t in targets if t}
+
+
+def _validated_tables(code: str) -> set[str]:
+    """Tables whose history this notebook inspects after the merge."""
+    tables = {_table_leaf(m.group(1)) for m in _HISTORY_TABLE.finditer(code)}
+    bound = {m.group(1): _table_leaf(m.group(2)) for m in _DELTA_BINDING.finditer(code)}
+    for match in _HISTORY_VAR.finditer(code):
+        if match.group(1) in bound:
+            tables.add(bound[match.group(1)])
+    return {t for t in tables if t}
+
 # A Delta merge is often issued through a variable bound to DeltaTable.forName/forPath,
 # so the ``.merge(`` call site alone does not carry the DeltaTable name.
 _MERGE_PATTERN = re.compile(
@@ -584,6 +697,71 @@ _KEY_QUALITY = re.compile(
     r"drop[Dd]uplicates\s*\(\s*(?:subset\s*=\s*)?\[|"
     r"drop_duplicates\s*\(\s*(?:subset\s*=\s*)?\[|"
     r"dropna\s*\([^\n]*subset",
+)
+_BRONZE_METADATA = re.compile(
+    r"ingest(?:ed|ion)[_ ]?(?:timestamp|time|date)|ingested_at|"
+    r"source[_ ]?(?:system|file|path)|input_file_name\s*\(|batch[_ ]?(?:id|key)|"
+    r"current_timestamp\s*\(",
+    re.IGNORECASE,
+)
+_SILVER_QUALITY = re.compile(
+    r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.distinct\s*\(\)|"
+    r"\.cast\s*\(|to_date\s*\(|to_timestamp\s*\(|regexp_replace\s*\(|"
+    r"trim\s*\(|standardize|conform|cleanse|cleansing|dedup",
+    re.IGNORECASE,
+)
+_BULK_ACTIVITY = re.compile(
+    r"parallelCopies|batchCount|batch[_ -]?size|bulk|copy activity|"
+    r"COPY\s+INTO|write\.mode|saveAsTable|repartition|coalesce",
+    re.IGNORECASE,
+)
+_ROW_BY_ROW = re.compile(
+    r"ForEach|foreach|row[_ -]?by[_ -]?row|insert\s+into|execute\s+query|"
+    r"SqlServerStoredProcedure|Script",
+    re.IGNORECASE,
+)
+_EAM_JSON = re.compile(r"EAM|JSON|json\.loads|from_json\s*\(|spark\.read\.json", re.IGNORECASE)
+_EAM_EFFICIENT = re.compile(
+    r"readStream|partitionBy\s*\(|repartition\s*\(|multiLine\s*[=:]\s*False|"
+    r"maxFilesPerTrigger|badRecordsPath|from_json\s*\(|schema_of_json",
+    re.IGNORECASE,
+)
+_SOURCE_METADATA = re.compile(
+    r"ingest(?:ed|ion)[_ ]?(?:timestamp|time|date)|ingested_at|"
+    r"source[_ ]?(?:metadata|system|file|path)|input_file_name\s*\(|"
+    r"current_timestamp\s*\(|_metadata|batch[_ ]?timestamp",
+    re.IGNORECASE,
+)
+_INPUT_READ = re.compile(
+    r"spark\.read|\.read\.(?:csv|json|text|format)|json\.loads|from_json\s*\(|"
+    r"read_json|read_csv|EAM\s+JSON|EAM_JSON",
+    re.IGNORECASE,
+)
+_DUPLICATE_VERIFICATION = re.compile(
+    r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.duplicated\s*\(|"
+    r"groupBy[\s\S]{0,160}?\.count\s*\(\s*\)[\s\S]{0,160}?(?:>|duplicate)|"
+    r"count\s*\(\s*\)\s*!=\s*count\s*\(\s*distinct|"
+    r"assert[_ ]?(?:unique|distinct|no[_ ]?duplicates)|duplicate[_ ]?(?:check|count|rows?)|"
+    r"dropDuplicates|distinct\s*\(",
+    re.IGNORECASE,
+)
+_TEXT_ENCODING = re.compile(
+    r"encoding\s*[=:]\s*[\"']?utf[-_]?8|option\s*\(\s*[\"']encoding[\"']\s*,\s*[\"']utf[-_]?8|"
+    r"decode\s*\(\s*[\"']utf[-_]?8|StringType\s*\(\)|utf[-_]?8",
+    re.IGNORECASE,
+)
+_FLAG_DOMAIN = re.compile(
+    r"(?:flag|boolean|is_[A-Za-z0-9_]+|active|enabled|valid)[^\n]{0,120}?\.isin\s*\(|"
+    r"\.isin\s*\(\s*(?:True|False|[\"'](?:Y|N|true|false|0|1)[\"'])|"
+    r"(?:allowed|valid)[_ ]?(?:values|flags)|expected[_ ]?(?:values|flags)|"
+    r"BooleanType\s*\(\)|when\s*\([^\n]{0,120}?\)\.otherwise\s*\(",
+    re.IGNORECASE,
+)
+_DQ_RULE = re.compile(
+    r"assert\b|validation|validate|quality|quarantine|reject|invalid|"
+    r"dropDuplicates|drop_duplicates|left_anti|isNull|isin\s*\(|"
+    r"StructType|StructField|expected[_ ]?(?:schema|columns|values)",
+    re.IGNORECASE,
 )
 
 
@@ -643,13 +821,26 @@ def nb_cross_recon(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_orphan_detect(ctx: CheckContext) -> Verdict:
-    """Notebooks with joins detect orphan/unmatched child records."""
+    """Notebooks with joins detect orphan/unmatched child records **and handle them**.
+
+    The point asks for two things. Identification is an anti-join or an equivalent
+    unmatched-row probe. Handling is what happens next: the unmatched set is
+    persisted (a quarantine/error table), raised on, or recorded. A set that is
+    computed and then dropped satisfies half the point, so it scores in the middle
+    rather than passing outright.
+    """
     code = executable_code(ctx.obj)
     if not _JOIN_PATTERN.search(code):
         return not_applicable("Notebook does not perform joins")
-    ok = bool(_ORPHAN_DETECT.search(code))
-    return binary(ok, "Orphan/unmatched record detection present" if ok
-                  else "Joins tables without orphan record detection")
+    if not _ORPHAN_DETECT.search(code):
+        return binary(False, "Joins tables without orphan record detection")
+    if _orphan_set_is_handled(code):
+        return binary(True, "Orphan/unmatched records are detected and handled")
+    return graded(
+        1,
+        "Orphan/unmatched records are detected but not handled - the unmatched set "
+        "is computed and then dropped, never quarantined, raised on or recorded",
+    )
 
 
 @check(
@@ -659,13 +850,41 @@ def nb_orphan_detect(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_merge_valid(ctx: CheckContext) -> Verdict:
-    """Notebooks performing MERGE validate post-merge counts against I/U/D expectations."""
+    """Notebooks performing MERGE validate post-merge counts against I/U/D expectations.
+
+    Where the validation names a table, that table must be one the notebook merged
+    into - reading ``DESCRIBE HISTORY`` on some *other* table proves nothing about
+    the merge. Metrics read off the merge itself (``operationMetrics``, I/U/D row
+    counts) describe the write that just happened and need no cross-check. When
+    neither the target nor the validated table can be resolved from the code, the
+    result is N/A rather than a guess.
+    """
     code = executable_code(ctx.obj)
     if not _MERGE_PATTERN.search(code):
         return not_applicable("Notebook does not perform MERGE operations")
-    ok = bool(_MERGE_VALIDATE.search(code))
-    return binary(ok, "Post-merge result validation present" if ok
-                  else "MERGE without post-merge count/result validation")
+    if not _MERGE_VALIDATE.search(code):
+        return binary(False, "MERGE without post-merge count/result validation")
+
+    if _MERGE_SELF_VALIDATE.search(code):
+        return binary(True, "Post-merge result validation reads the merge's own metrics")
+
+    targets = _merge_targets(code)
+    validated = _validated_tables(code)
+    if not targets or not validated:
+        return not_applicable(
+            "Post-merge validation is present, but the merged table could not be "
+            "resolved from the notebook, so it cannot be confirmed to validate the "
+            "table that was merged"
+        )
+    matched = targets & validated
+    if matched:
+        return binary(True, f"Post-merge validation covers the merged table(s): "
+                            f"{', '.join(sorted(matched))}")
+    return binary(
+        False,
+        f"Post-merge validation inspects {', '.join(sorted(validated))} but the "
+        f"MERGE targets {', '.join(sorted(targets))} - a different table is validated",
+    )
 
 
 # -- MLC Cat-1: warehouse load idempotency (3.6.4) ----------------------------
@@ -1017,6 +1236,157 @@ def nb_key_quality(ctx: CheckContext) -> Verdict:
     ok = bool(_KEY_QUALITY.search(code))
     return binary(ok, "Key uniqueness / null validation present" if ok
                   else "Writes data without key uniqueness or null validation")
+
+
+@check(
+    id="NB-BRONZE-METADATA", ref="1.2.3",
+    title="Bronze Lakehouse captures raw data with audit metadata (ingestion timestamp, source system, batch ID)",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_bronze_metadata(ctx: CheckContext) -> Verdict:
+    """Bronze writes retain ingestion timestamp, source identity, and batch metadata."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write a raw/Bronze table")
+    if not _BRONZE_METADATA.search(code):
+        return binary(False, "Bronze write has no ingestion/source/batch audit metadata")
+    return binary(True, "Bronze write captures ingestion/source/batch audit metadata")
+
+
+@check(
+    id="NB-SILVER-QUALITY", ref="1.2.5",
+    title="Silver Lakehouse applies cleansing, deduplication, conforming, and type standardization",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_silver_quality(ctx: CheckContext) -> Verdict:
+    """Silver writes apply at least one explicit cleansing, deduplication, or type-conformance transformation."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write a Silver table")
+    if not re.search(r"silver", code, re.IGNORECASE):
+        return not_applicable("Notebook does not identify a Silver-layer write")
+    ok = bool(_SILVER_QUALITY.search(code))
+    return binary(ok, "Silver write applies cleansing/deduplication/conformance/type standardization" if ok
+                  else "Silver write has no recognizable quality transformation")
+
+
+@check(
+    id="PL-BULK-MOVE", ref="2.6.3",
+    title="Large data movements use bulk/batch patterns, not row-by-row",
+    pillar=Pillar.PERFORMANCE, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
+)
+def pl_bulk_move(ctx: CheckContext) -> Verdict:
+    """Data-moving pipelines use bulk or batch movement rather than row-by-row execution."""
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+    acts = activities(ctx.obj)
+    if not any((a.get("type") or "") in _DATA_MOVE_TYPES for a in acts):
+        return not_applicable("Pipeline has no data-movement activity")
+    blob = json.dumps(ctx.obj)
+    if _ROW_BY_ROW.search(blob) and not _BULK_ACTIVITY.search(blob):
+        return binary(False, "Data movement shows row-by-row or serial execution without a bulk/batch pattern")
+    ok = bool(_BULK_ACTIVITY.search(blob))
+    return binary(ok, "Bulk/batch data-movement pattern detected" if ok
+                  else "No bulk/batch data-movement pattern detected")
+
+
+@check(
+    id="NB-EAM-INGEST", ref="2.6.6",
+    title="JSON ingestion (EAM) is efficient (streaming/partitioned parse, no oversized single-file bottlenecks)",
+    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_eam_ingest(ctx: CheckContext) -> Verdict:
+    """EAM/JSON ingestion uses streaming, partitioning, or bounded-file parsing."""
+    code = executable_code(ctx.obj)
+    if not _EAM_JSON.search(code):
+        return not_applicable("Notebook has no recognizable EAM/JSON ingestion")
+    ok = bool(_EAM_EFFICIENT.search(code))
+    return binary(ok, "EAM/JSON ingestion uses streaming, partitioning, or bounded parsing" if ok
+                  else "EAM/JSON ingestion has no streaming/partitioning/bounded-file pattern")
+
+
+@check(
+    id="NB-SOURCE-METADATA", ref="5.2.8",
+    title="Source metadata captured: ingestion timestamp",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_source_metadata(ctx: CheckContext) -> Verdict:
+    """Notebook writes retain source metadata including an ingestion timestamp."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write data to a table")
+    ok = bool(_SOURCE_METADATA.search(code))
+    return binary(ok, "Source metadata and ingestion timestamp are captured" if ok
+                  else "Writes data without source metadata or an ingestion timestamp")
+
+
+@check(
+    id="NB-DEDUP-VERIFY", ref="5.3.4",
+    title="Deduplication verification: no duplicate business records",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_dedup_verify(ctx: CheckContext) -> Verdict:
+    """Notebook logic verifies that duplicate business records are not loaded."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write data to a table")
+    ok = bool(_DUPLICATE_VERIFICATION.search(code))
+    return binary(ok, "Duplicate records are verified and handled" if ok
+                  else "Writes data without duplicate-record verification")
+
+
+@check(
+    id="NB-UTF8", ref="5.5.3",
+    title="String / Text: Encoding validated (UTF-8)",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_utf8_encoding(ctx: CheckContext) -> Verdict:
+    """Notebook input handling explicitly validates or declares UTF-8 text encoding."""
+    code = executable_code(ctx.obj)
+    if not _INPUT_READ.search(code):
+        return not_applicable("Notebook has no recognizable incoming file or JSON read")
+    ok = bool(_TEXT_ENCODING.search(code))
+    return binary(ok, "String/text input encoding is explicitly UTF-8" if ok
+                  else "Incoming string/text data has no explicit UTF-8 encoding validation")
+
+
+@check(
+    id="NB-FLAG-DOMAIN", ref="5.5.7",
+    title="Boolean / Flag: Only expected values permitted",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_flag_domain(ctx: CheckContext) -> Verdict:
+    """Notebook logic restricts Boolean and Flag fields to an approved value set."""
+    code = executable_code(ctx.obj)
+    if not _INPUT_READ.search(code):
+        return not_applicable("Notebook has no recognizable incoming file or JSON read")
+    ok = bool(_FLAG_DOMAIN.search(code))
+    return binary(ok, "Boolean/Flag fields are restricted to expected values" if ok
+                  else "Boolean/Flag fields have no explicit allowed-value validation")
+
+
+@check(
+    id="NB-DQ-RULES", ref="5.1.2",
+    title="DQ rules codified in code/config (not ad-hoc manual checks)",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_dq_rules(ctx: CheckContext) -> Verdict:
+    """Notebook data-quality rules are expressed as executable, repeatable logic."""
+    code = executable_code(ctx.obj)
+    if not (_INPUT_READ.search(code) or _WRITE_PATTERN.search(code)):
+        return not_applicable("Notebook has no recognizable data-ingestion or write operation")
+    ok = bool(_DQ_RULE.search(code))
+    return binary(ok, "Data-quality rule logic is codified in notebook code/config" if ok
+                  else "Data movement has no recognizable codified data-quality rules")
 
 
 
