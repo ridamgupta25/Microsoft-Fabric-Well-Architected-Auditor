@@ -498,6 +498,38 @@ _STAGING_NAME = re.compile(
     re.IGNORECASE,
 )
 
+_WAREHOUSE_SQL_LOAD = re.compile(
+    r"\bMERGE\s+INTO\b|\bINSERT\s+INTO\b|\bCOPY\s+INTO\b|"
+    r"\bCREATE\s+TABLE\b|\bCTAS\b|\bTRUNCATE\s+TABLE\b|\bDELETE\s+FROM\b",
+    re.IGNORECASE,
+)
+_INCREMENTAL_SQL = re.compile(
+    r"\bMERGE\s+INTO\b|\bupsert\b|\bwatermark\b|\bcdc\b|"
+    r"change[_\s]?tracking|change[_\s]?data|last_?modified|high_?water|"
+    r"incremental",
+    re.IGNORECASE,
+)
+
+
+def _to_text(value: object) -> str:
+    """Flatten a nested activity/script payload into plain text for regex checks."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for key in ("text", "query", "commandText", "sqlText", "value"):
+            item = value.get(key)
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, (dict, list)):
+                parts.append(_to_text(item))
+        return " ".join(part for part in parts if part) or str(value)
+    if isinstance(value, list):
+        return " ".join(_to_text(item) for item in value)
+    return str(value)
+
 @check(
     id="WS-WH-LOAD", ref="3.6.1",
     title="Gold Warehouse load pattern is defined and consistent",
@@ -524,24 +556,6 @@ def wh_load_pattern(ctx: CheckContext) -> Verdict:
             f"{len(warehouses)} Warehouse item(s) found but no pipelines defined — "
             "a load pattern (COPY INTO / CTAS / Copy activity / stored procedure) should be established",
         )
-
-    def _to_text(v) -> str:
-        if v is None:
-            return ""
-        if isinstance(v, str):
-            return v
-        if isinstance(v, dict):
-            parts: list[str] = []
-            for k in ("text", "query", "commandText", "sqlText", "value"):
-                x = v.get(k)
-                if isinstance(x, str):
-                    parts.append(x)
-            if parts:
-                return " ".join(parts)
-            return str(v)
-        if isinstance(v, list):
-            return " ".join(_to_text(x) for x in v)
-        return str(v)
 
     load_acts: list[str] = []
 
@@ -621,6 +635,52 @@ def wh_staging_pattern(ctx: CheckContext) -> Verdict:
         1,
         f"{len(tables)} table(s) found but none follow a staging naming pattern "
         "(stg_* / staging_* / stage_*) — a staging schema buffers loads before the final merge",
+    )
+
+
+
+@check(
+    id="WS-WH-INCREMENTAL", ref="3.6.6",
+    title="Warehouse loads avoid unnecessary full reloads",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
+    required=True,
+)
+def wh_incremental_loads(ctx: CheckContext) -> Verdict:
+    """Inspectable warehouse SQL loads favor incremental patterns over full reloads."""
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
+    warehouses = [item for item in ctx.workspace.items if item.type == "Warehouse"]
+    if not warehouses:
+        return not_applicable("No Warehouse items found in this workspace")
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    inspected: list[tuple[str, bool]] = []
+    for pipeline_name, pipeline_def in ctx.workspace.pipelines.items():
+        for activity in pipeline_activities(pipeline_def):
+            if str(activity.get("type", "") or "") != "Script":
+                continue
+            text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
+            if not _WAREHOUSE_SQL_LOAD.search(text):
+                continue
+            inspected.append((
+                f"{pipeline_name}/{activity.get('name', 'Script')}",
+                bool(_INCREMENTAL_SQL.search(text)),
+            ))
+
+    if not inspected:
+        return not_applicable(
+            "No inspectable scripted warehouse load was found; Copy/stored-procedure "
+            "loads do not expose enough logic in the snapshot to judge incremental vs full reload"
+        )
+
+    incremental = [name for name, is_incremental in inspected if is_incremental]
+    return covered(
+        len(incremental), len(inspected),
+        f"{len(incremental)} of {len(inspected)} inspectable warehouse load activity/activities "
+        f"use incremental signals (MERGE / watermark / CDC)"
+        + (f"; incremental: {', '.join(incremental[:5])}" if incremental else ""),
     )
 
 @check(
