@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from .enums import ITEM_TYPE_SCOPE, Automation, Layer, Pillar, Resource, Scope, Severity, Status
+from .validation import is_validated
 
 #: Highest score any single check can award.
 MAX_SCORE = 3
@@ -349,6 +350,10 @@ class CheckSpec:
             "question": self.question or self.title,
             "options": [option.to_dict() for option in self.options],
             "description": self.description or (self.fn.__doc__ or "").strip(),
+            # Whether this check's checklist point has completed Phase 1
+            # validation. Keyed by ref; source of truth:
+            # auditfast.core.validation.VALIDATED_CHECKLIST.
+            "validated": is_validated(self.ref),
         }
 
 
@@ -407,6 +412,10 @@ class CheckResult:
             # Workspace-level checks are common to every project regardless of
             # source system; the UI flags them as such.
             "common": self.scope is Scope.WORKSPACE,
+            # Whether this check's checklist point has completed Phase 1
+            # validation. Keyed by ref; source of truth:
+            # auditfast.core.validation.VALIDATED_CHECKLIST.
+            "validated": is_validated(self.ref),
         }
 
     @classmethod

@@ -6,7 +6,7 @@
  */
 import { useState } from "react";
 
-import { EmptyState, ErrorBanner, SeverityBadge, Section, Spinner } from "@/components/ui";
+import { EmptyState, ErrorBanner, SeverityBadge, Section, Spinner, ValidationBadge } from "@/components/ui";
 import { useAsync } from "@/hooks/useAsync";
 import { listChecks, listLayers, listPillars } from "@/services/catalogService";
 
@@ -93,6 +93,7 @@ export function CatalogPage() {
                 <th scope="col">Severity</th>
                 <th scope="col">Required</th>
                 <th scope="col">Type</th>
+                <th scope="col">Validation</th>
                 <th scope="col">Layers</th>
               </tr>
             </thead>
@@ -122,6 +123,7 @@ export function CatalogPage() {
                           ? "Self-assessed"
                           : "Manual"}
                   </td>
+                  <td><ValidationBadge validated={check.validated} /></td>
                   <td className="text-xs text-slate-500">
                     {check.layers.includes("*") ? "All" : check.layers.join(", ")}
                   </td>
