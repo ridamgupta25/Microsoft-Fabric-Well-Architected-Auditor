@@ -24,6 +24,12 @@ from auditfast.core.models import CheckContext
 
 _NO_TABLES = "No lakehouse/warehouse tables were read for this workspace"
 
+#: N/A reason when lakehouse/warehouse tables exist but none are dimensions with
+#: readable columns. Named to make the scope explicit — semantic-model tables
+#: (e.g. a Power BI ``DateDimension``) are not lakehouse tables and are judged
+#: separately by the 5.4.x semantic-model checks.
+_NO_DIMS = "No lakehouse/warehouse dimension tables with column metadata"
+
 #: Column names implying a date/time value, for the data-type check.
 _DATE_NAME = re.compile(r"(date|timestamp|_dt$|_time$)", re.IGNORECASE)
 
@@ -121,9 +127,11 @@ def table_date_dimension(ctx: CheckContext) -> Verdict:
 )
 def table_surrogate_keys(ctx: CheckContext) -> Verdict:
     """Dimensions have a surrogate key column (``*_sk`` / ``*_key``), not just a business key."""
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
     dims = {n: t for n, t in ctx.workspace.tables.items() if is_dimension(n) and columns(t)}
     if not dims:
-        return not_applicable("No dimension tables with column metadata")
+        return not_applicable(_NO_DIMS)
     ok = [n for n, t in dims.items()
           if any(c.endswith(("_sk", "_key")) for c in col_names(t))]
     return covered(len(ok), len(dims), f"{len(ok)} of {len(dims)} dimensions have a surrogate key")
@@ -240,9 +248,11 @@ def shortcut_scope(ctx: CheckContext) -> Verdict:
 )
 def table_scd2(ctx: CheckContext) -> Verdict:
     """Slowly-changing dimensions carry valid_from, valid_to, and is_current together."""
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
     dims = {n: t for n, t in ctx.workspace.tables.items() if is_dimension(n) and columns(t)}
     if not dims:
-        return not_applicable("No dimension tables with column metadata")
+        return not_applicable(_NO_DIMS)
     tracked = ("valid_from", "valid_to", "is_current")
     scd2 = {n: t for n, t in dims.items() if any(col in col_names(t) for col in tracked)}
     if not scd2:
