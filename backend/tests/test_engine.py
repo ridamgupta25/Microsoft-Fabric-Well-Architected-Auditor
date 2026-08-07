@@ -73,7 +73,7 @@ def test_status_counts_are_unchanged(provider):
     assert agg["counts"][Status.PASS] == 53
     assert agg["counts"][Status.PARTIAL] == 18
     assert agg["counts"][Status.FAIL] == 40
-    assert agg["counts"][Status.NA] == 99
+    assert agg["counts"][Status.NA] == 109
     assert agg["counts"][Status.INFO] == 3
 
 
@@ -274,8 +274,8 @@ def test_progress_callback_fires_per_workspace(provider):
 def test_registry_is_fully_populated():
     """99 checks are evaluated; remaining roadmap checks are not loaded."""
     evaluated = [s for s in REGISTRY if s.automation is Automation.AUTOMATED]
-    assert len(evaluated) == 99
-    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 32
+    assert len(evaluated) == 109
+    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 42
     assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 18
     assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 49
     # Roadmap (gated N/A) checks are intentionally not registered — see
@@ -336,7 +336,7 @@ def test_explicit_registry_is_isolated_from_the_global_one():
     assert registry.get("X-ISOLATED") is not None
     assert REGISTRY.get("X-ISOLATED") is None, "test check leaked into the global registry"
     before = len([s for s in REGISTRY if s.automation is Automation.AUTOMATED])
-    assert before == 99
+    assert before == 109
 
 # -- selection and dispatch ----------------------------------------------------
 
