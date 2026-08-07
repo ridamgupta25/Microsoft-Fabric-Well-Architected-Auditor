@@ -103,6 +103,8 @@ VALIDATED_CHECKLIST: dict[str, str] = {
     "3.5.5":  "No full-table scans when partition pruning is possible",
     "3.5.6":  "Long-running notebooks profiled and optimized",
     "4.1.2":  "OneLake used as the single data lake - no ungoverned shadow storage",
+    "4.6.4":  "Audit Tables capture data quality logs, row counts, null checks, and exceptions",
+    "5.1.2":  "DQ rules codified in code/config (not ad-hoc manual checks)",
     "1.2.3":  "Bronze Lakehouse captures raw data with audit metadata (ingestion timestamp, source system, batch ID)",
     "1.2.5":  "Silver Lakehouse applies cleansing, deduplication, conforming, and type standardization",
     "2.6.3":  "Large data movements use bulk/batch patterns, not row-by-row",
