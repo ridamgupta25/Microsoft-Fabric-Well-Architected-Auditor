@@ -28,7 +28,6 @@ from auditfast.core.check.data_management_quality.data_storage.automated import 
 from auditfast.core.enums import Resource, Status
 from auditfast.core.models import CheckContext, WorkspaceContext
 
-
 # --- discovery ---------------------------------------------------------------
 
 def _fake_get(payloads: dict):
@@ -74,6 +73,22 @@ def test_discovery_failure_yields_no_endpoints_rather_than_raising():
     assert discover_endpoints(boom, "ws") == []
 
 
+@pytest.mark.parametrize("raw,expected,why", [
+    ("abc.datawarehouse.fabric.microsoft.com", "abc.datawarehouse.fabric.microsoft.com",
+     "a plain FQDN passes through"),
+    ("abc.datawarehouse.fabric.microsoft.com,1433", "abc.datawarehouse.fabric.microsoft.com",
+     "a port already in the connection string must not be doubled"),
+    ("tcp:abc.datawarehouse.fabric.microsoft.com", "abc.datawarehouse.fabric.microsoft.com",
+     "a tcp: prefix is not part of the host"),
+    ("  abc.datawarehouse.fabric.microsoft.com  ", "abc.datawarehouse.fabric.microsoft.com",
+     "surrounding whitespace is not part of the host"),
+])
+def test_endpoint_host_is_normalised(raw, expected, why):
+    """``Server=host,1433,1433`` fails only as a timeout - indistinguishable from
+    a blocked port, and therefore the worst possible way to get this wrong."""
+    assert SqlEndpoint("Lakehouse", "db", raw).host == expected, why
+
+
 # --- degradation -------------------------------------------------------------
 
 def test_reader_without_a_token_is_unavailable_not_broken():
@@ -92,11 +107,29 @@ def test_a_read_without_a_token_returns_none_and_records_why():
 @pytest.mark.parametrize("message,expected", [
     ("Couldn't complete the operation because we reached a system limit", "too many"),
     ("Login failed for user '<token-identified principal>'", "no access"),
-    ("TCP Provider: timed out", "did not respond"),
+    ("Login timeout expired", "port 1433"),
+    ("TCP Provider: timed out", "port 1433"),
     ("network-related or instance-specific error", "port 1433"),
+    ("Query timeout expired", "did not finish in time"),
 ])
-def test_failures_are_classified_into_actionable_reasons(message, expected):
-    assert expected in _classify(RuntimeError(message))
+def test_driver_failures_are_classified_into_actionable_reasons(message, expected):
+    pyodbc = pytest.importorskip("pyodbc")
+    assert expected in _classify(pyodbc.Error("HYT00", message))
+
+
+def test_a_bug_in_the_reader_is_never_reported_as_a_blocked_port():
+    """The exact defect this guards against.
+
+    ``cursor.timeout = N`` raises AttributeError (``timeout`` belongs to the
+    Connection, not the Cursor). Its message contains the word "timeout", so a
+    keyword-matching classifier reported a *successful* connection as a blocked
+    port - and sent the whole diagnosis in the wrong direction.
+    """
+    exc = AttributeError("'pyodbc.Cursor' object has no attribute 'timeout'")
+    reason = _classify(exc)
+    assert "internal error" in reason
+    assert "1433" not in reason
+    assert "AttributeError" in reason
 
 
 # --- type rendering ----------------------------------------------------------

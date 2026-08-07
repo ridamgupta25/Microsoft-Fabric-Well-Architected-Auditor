@@ -455,6 +455,16 @@ class LiveFabricProvider:
             # No Warehouse in the workspace: nothing to read, nothing to report.
             ctx.unavailable.add(Resource.WAREHOUSE_SECURITY)
 
+        # The per-endpoint reasons are the only way to tell a blocked port from a
+        # permission gap, so surface the distinct ones rather than burying them.
+        if reader.failures:
+            reasons: dict[str, int] = {}
+            for reason in reader.failures.values():
+                reasons[reason] = reasons.get(reason, 0) + 1
+            for reason, count in sorted(reasons.items(), key=lambda kv: -kv[1]):
+                log.warning("fetch %s: %d SQL endpoint read(s) failed - %s",
+                            workspace_id, count, reason)
+
         log.info("fetch %s: SQL endpoints - columns %d/%d, warehouse security %d/%d%s",
                  workspace_id, col_read, col_attempted, sec_read, sec_attempted,
                  f" ({len(reader.failures)} endpoint(s) failed)" if reader.failures else "")
