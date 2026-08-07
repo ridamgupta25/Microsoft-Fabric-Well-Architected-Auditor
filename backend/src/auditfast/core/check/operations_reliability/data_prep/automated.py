@@ -319,7 +319,7 @@ def pipeline_idempotent(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-IDEMPOTENT", ref="3.1.11",
+    id="NB-IDEMPOTENT", ref="9.3.1",
     title="Notebook reruns are idempotent",
     pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
