@@ -390,3 +390,114 @@ def nb_deadletter(ctx: CheckContext) -> Verdict:
         "Notebook routes failed/invalid records to a retained output" if ok
         else "Notebook detects record errors but does not retain a failed-record output",
     )
+
+
+# =============================================================================
+# MLC Cat-1 · resilience (9.1.2 transient retry, 9.3.4 post-failure integrity)
+# =============================================================================
+
+# -- 9.1.2 transient failure handling: retries with backoff --------------------
+#: A retry loop written in notebook code. The pipeline side of this point is
+#: already covered by ``PL-RETRY`` (2.4.1) and ``PL-RETRY-VALUES`` (2.4.2), which
+#: read the activity ``policy`` block; a notebook that calls an API or a flaky
+#: source has to implement its own, and nothing else in the registry looks for it.
+_NB_RETRY = re.compile(
+    r"@retry\b|\bretry\s*\(|tenacity|backoff|"
+    r"for\s+attempt\s+in\s+range|for\s+_?\s*retry\s+in\s+range|"
+    r"while\s+attempt\s*<|max_retries|max_attempts|retry_count",
+    re.IGNORECASE,
+)
+#: The wait between attempts grows instead of hammering the source immediately.
+_NB_BACKOFF = re.compile(
+    r"exponential|backoff|2\s*\*\*\s*\w+|\w+\s*\*\*\s*attempt|"
+    r"sleep\s*\(\s*\w*\s*\*|sleep\s*\(\s*\d+\s*\*\*|"
+    r"wait_exponential|wait_fixed|retry_delay|jitter",
+    re.IGNORECASE,
+)
+#: The notebook reaches something that can fail transiently in the first place.
+_NB_REMOTE_CALL = re.compile(
+    r"requests\.(?:get|post|put)|http[s]?://|urllib|"
+    r"\.load\s*\(|spark\.read\b|jdbc|\bapi[_ -]?call\b|client\.\w+\(",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-RETRY-BACKOFF", ref="9.1.2",
+    title="Transient failure handling: notebook retries with backoff",
+    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
+)
+def nb_retry_backoff(ctx: CheckContext) -> Verdict:
+    """A notebook calling a remote source retries, and waits longer each time.
+
+    Deliberately notebook-only. ``PL-RETRY`` (2.4.1) and ``PL-RETRY-VALUES``
+    (2.4.2) already judge the pipeline half of this checklist point from the
+    activity ``policy`` block; repeating it here would double-count. Spark's own
+    task-level retries do not help when the notebook itself calls an API.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = notebook_code(ctx.obj)
+    if not _NB_REMOTE_CALL.search(code):
+        return not_applicable("Notebook makes no remote/source call that could fail "
+                              "transiently")
+    if not _NB_RETRY.search(code):
+        return binary(False, "Notebook reads a remote source with no retry — a single "
+                             "transient error fails the whole run")
+    if not _NB_BACKOFF.search(code):
+        return graded(1, "Notebook retries but with no backoff or delay between attempts — "
+                         "it retries into the same overload it just hit")
+    return graded(3, "Notebook retries transient failures with a backoff/delay")
+
+
+# -- 9.3.4 data integrity validated across layers after failures --------------
+#: The notebook is written to run after something went wrong.
+_RECOVERY_CONTEXT = re.compile(
+    r"\brecover\w*|\brestart\w*|\breprocess\w*|\breplay\b|\bbackfill\b|"
+    r"\bresume\b|failed[_ -]?run|after[_ -]?failure|repair\b|reconcile[_ -]?after",
+    re.IGNORECASE,
+)
+#: It proves the layers agree before letting the run continue.
+_INTEGRITY_ASSERT = re.compile(
+    r"assert\b|\braise\s+\w*(?:Error|Exception)|"
+    r"\.count\s*\(\s*\)\s*(?:==|!=|<|>)|"
+    r"if\s+\w*count\w*\s*(?:==|!=|<|>)|"
+    r"mismatch|out[_ -]?of[_ -]?sync|integrity[_ -]?check|validate[_ -]?(?:layer|integrity)",
+    re.IGNORECASE,
+)
+#: …and it looks at more than one layer while doing so.
+_CROSS_LAYER = re.compile(
+    r"bronze[\s\S]{0,400}?silver|silver[\s\S]{0,400}?gold|"
+    r"source[\s\S]{0,400}?target|staging[\s\S]{0,400}?final",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-POST-FAILURE-INTEGRITY", ref="9.3.4",
+    title="Data integrity validated across layers after failures",
+    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
+)
+def nb_post_failure_integrity(ctx: CheckContext) -> Verdict:
+    """A recovery/rerun path proves the layers still agree before continuing.
+
+    Narrower than ``NB-LAYER-RECON`` (5.4.6), which asks whether the routine
+    Silver-to-Gold hop reconciles. This gates on *recovery* wording — the notebook
+    is doing a restart, replay or backfill — and asks whether that path re-checks
+    integrity rather than trusting a partially-written layer.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = notebook_code(ctx.obj)
+    if not _RECOVERY_CONTEXT.search(code):
+        return not_applicable("Notebook implements no recovery / restart / replay path")
+    if not _CROSS_LAYER.search(code):
+        return not_applicable("Recovery path touches only one layer — nothing to "
+                              "cross-check against")
+    ok = bool(_INTEGRITY_ASSERT.search(code))
+    return binary(ok, "Recovery path validates integrity across layers before continuing"
+                  if ok else
+                  "Recovery/replay path reprocesses across layers but never asserts the "
+                  "layers agree — a partially-written layer is trusted as complete")

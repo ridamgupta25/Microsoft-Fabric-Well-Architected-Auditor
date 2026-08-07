@@ -44,7 +44,12 @@ def test_parse_tmsl_extracts_measures_and_relationships():
 
 
 def test_parse_tmsl_tolerates_bare_model_and_garbage():
-    assert parse_tmsl({}) == {"tables": [], "measures": [], "relationships": [], "roles": []}
+    assert parse_tmsl({}) == {
+        "tables": [], "measures": [], "relationships": [], "roles": [],
+        # Storage/refresh/aggregation metadata degrades to empty on the same terms.
+        "storage": {}, "refresh_policies": [], "aggregations": [],
+        "direct_lake_behavior": "",
+    }
     # A bare model object (no "model" envelope) still parses.
     assert parse_tmsl({"tables": [{"name": "T", "measures": []}]})["tables"] == ["T"]
     # Non-dict input degrades to empty rather than raising.
