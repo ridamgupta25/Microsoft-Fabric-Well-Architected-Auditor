@@ -401,8 +401,6 @@ def spark_profile(ctx: CheckContext) -> Verdict:
         return binary(False, "Long-running application has no Advisor or stage profiling metrics")
     return binary(True, f"Profiled {int(duration)} ms application; Advisor or stage metrics captured")
 
-
-# -- Copy activity parallelism (2.6.2) ----------------------------------------
 @check(
     id="NB-PUSHDOWN",
     ref="3.5.7",
@@ -437,6 +435,7 @@ def nb_pushdown(ctx: CheckContext) -> Verdict:
         "all rows are scanned before any selection, preventing predicate pushdown",
     )
 
+# -- Copy activity parallelism (2.6.2) ----------------------------------------
 @check(
     id="PL-COPY-PARALLEL", ref="2.6.2", title="Copy activities use appropriate parallelism (DIU, degree of copy parallelism)",
     pillar=Pillar.PERFORMANCE, scope=Scope.PIPELINE, severity=Severity.LOW,
