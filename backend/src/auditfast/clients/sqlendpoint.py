@@ -40,8 +40,10 @@ log = logging.getLogger("auditfast.sqlendpoint")
 #: ODBC attribute that carries an Entra access token (``SQL_COPT_SS_ACCESS_TOKEN``).
 _SQL_COPT_SS_ACCESS_TOKEN = 1256
 
-#: Per-connection and per-query ceilings. A slow endpoint must not stall a crawl.
-_CONNECT_TIMEOUT_SECONDS = 15
+#: Per-connection and per-query ceilings. A slow endpoint must not stall a crawl,
+#: but the login timeout has to absorb Azure SQL's gateway redirect and Entra
+#: token validation, which are slower than a plain SQL Server handshake.
+_CONNECT_TIMEOUT_SECONDS = 30
 _QUERY_TIMEOUT_SECONDS = 30
 
 #: Microsoft's guidance: beyond roughly this many warehouses + SQL endpoints in one
@@ -72,6 +74,21 @@ class SqlEndpoint:
         """True once Fabric has finished provisioning the endpoint."""
         return (self.status or "").strip().lower() == "success"
 
+    @property
+    def host(self) -> str:
+        """Bare FQDN, with any ``tcp:`` prefix or ``,port`` suffix removed.
+
+        Fabric returns a plain host today, but a connection string is allowed to
+        carry either. Appending ``,1433`` to a value that already has a port
+        yields ``host,1433,1433``, which the driver cannot parse and which
+        surfaces only as a connection timeout - indistinguishable from a blocked
+        port. Normalising here makes that impossible.
+        """
+        text = (self.server or "").strip()
+        if text.lower().startswith("tcp:"):
+            text = text[4:]
+        return text.split(",")[0].strip()
+
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"SqlEndpoint({self.kind} {self.name!r} @ {self.server[:40]}…)"
 
@@ -98,7 +115,8 @@ def discover_endpoints(get_json, workspace_id: str) -> list[SqlEndpoint]:
                     props.get("provisioningStatus") or "",
                 ))
     except Exception as exc:  # noqa: BLE001 - discovery is best-effort
-        log.info("sql endpoint discovery (lakehouses) failed for %s: %s", workspace_id, exc)
+        log.warning("sql endpoint discovery (lakehouses) failed for %s: %s - "
+                    "those lakehouses will have no column data", workspace_id, exc)
 
     try:
         for item in (get_json(f"/workspaces/{workspace_id}/warehouses") or {}).get("value", []):
@@ -109,7 +127,8 @@ def discover_endpoints(get_json, workspace_id: str) -> list[SqlEndpoint]:
                     "Warehouse", item.get("displayName") or "", server, "Success",
                 ))
     except Exception as exc:  # noqa: BLE001
-        log.info("sql endpoint discovery (warehouses) failed for %s: %s", workspace_id, exc)
+        log.warning("sql endpoint discovery (warehouses) failed for %s: %s - "
+                    "Warehouse security policies will not be read", workspace_id, exc)
 
     return [e for e in endpoints if e.queryable and e.name]
 
@@ -229,19 +248,28 @@ class SqlEndpointReader:
             return None
 
         conn_str = (
-            f"Driver={{{self._driver}}};Server={endpoint.server},1433;"
+            f"Driver={{{self._driver}}};Server={endpoint.host},1433;"
             f"Database={endpoint.name};Encrypt=Yes;TrustServerCertificate=No;"
             f"MultipleActiveResultSets=False;"
             f"Connection Timeout={_CONNECT_TIMEOUT_SECONDS};"
         )
         conn = None
         try:
+            # No ``timeout=`` kwarg: that sets SQL_ATTR_CONNECTION_TIMEOUT, which
+            # bounds the *whole* connection including the login handshake and the
+            # gateway redirect Azure SQL performs. Fabric's redirect routinely
+            # exceeds a short value, and the abort surfaces as a plain timeout -
+            # indistinguishable from a blocked port. ``Connection Timeout`` in the
+            # string (SQL_ATTR_LOGIN_TIMEOUT) is the correct knob and is set above.
             conn = pyodbc.connect(
                 conn_str, attrs_before={_SQL_COPT_SS_ACCESS_TOKEN: _token_struct(self._token)},
-                timeout=_CONNECT_TIMEOUT_SECONDS,
             )
+            # ``timeout`` is a *Connection* attribute in pyodbc, not a Cursor one.
+            # Setting it on the cursor raises AttributeError, and because that
+            # message contains the word "timeout" it used to be misreported as a
+            # blocked port - a connection that had in fact already succeeded.
+            conn.timeout = _QUERY_TIMEOUT_SECONDS
             cursor = conn.cursor()
-            cursor.timeout = _QUERY_TIMEOUT_SECONDS
             cursor.execute(sql)
             return [tuple(r) for r in cursor.fetchall()]
         except Exception as exc:  # noqa: BLE001 - every failure must degrade to N/A
@@ -270,17 +298,37 @@ def _render_type(data_type: Any, max_len: Any, precision: Any, scale: Any) -> st
 
 
 def _classify(exc: Exception) -> str:
-    """A short, actionable reason a SQL endpoint read failed."""
+    """A short, actionable reason a SQL endpoint read failed.
+
+    Driver errors are matched on their message; anything that is *not* a driver
+    error is reported as an internal fault rather than being pattern-matched.
+    Keyword matching on an arbitrary exception is how an ``AttributeError`` whose
+    message merely contained the word "timeout" was once reported as a blocked
+    port - a wrong answer that sent a diagnosis in entirely the wrong direction.
+    """
+    if not _is_driver_error(exc):
+        return (f"internal error in the SQL reader - {type(exc).__name__}: "
+                f"{str(exc)[:160]}")
     text = str(exc).lower()
     if "system limit" in text:
         return ("the workspace has too many warehouses/SQL endpoints for one Entra "
                 f"token (Microsoft's limit is about {MAX_ENDPOINTS_PER_WORKSPACE})")
     if "login failed" in text or "cannot open" in text:
         return "the signed-in user has no access to this database"
-    if "timeout" in text or "timed out" in text:
-        return "the endpoint did not respond (port 1433 may be blocked)"
-    if "tcp provider" in text or "network-related" in text or "10060" in text:
-        return "port 1433 is not reachable from the server running the audit"
+    if "login timeout" in text or "tcp provider" in text or "network-related" in text \
+            or "10060" in text:
+        return "the endpoint is not reachable - port 1433 may be blocked"
+    if "query timeout" in text or "timeout" in text or "timed out" in text:
+        return "the endpoint accepted the connection but the query did not finish in time"
     if "driver" in text:
         return "the ODBC driver could not be loaded"
     return f"{type(exc).__name__}: {str(exc)[:160]}"
+
+
+def _is_driver_error(exc: Exception) -> bool:
+    """True when the exception came from pyodbc rather than from this module."""
+    try:
+        import pyodbc
+    except ImportError:  # pragma: no cover - only reachable without pyodbc
+        return False
+    return isinstance(exc, pyodbc.Error)
