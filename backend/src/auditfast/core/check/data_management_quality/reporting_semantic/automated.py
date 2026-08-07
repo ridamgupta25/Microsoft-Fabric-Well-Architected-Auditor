@@ -84,6 +84,7 @@ def _normalised(expression: object) -> str:
 
 @check(
     id="SM-FK-SURROGATE",
+   
     ref="5.4.1",
     title="Fact-dimension relationships join on surrogate keys",
     pillar=Pillar.DATA,

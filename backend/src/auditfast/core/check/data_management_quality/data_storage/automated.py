@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 
 from auditfast.core.check._pipeline import activities as pipeline_activities
+from auditfast.core.check._pipeline import activities as pipeline_activities
 from auditfast.core.check._tables import (
     AUDIT_COLUMNS,
     TABLE_LAYERS,
