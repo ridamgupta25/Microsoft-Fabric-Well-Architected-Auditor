@@ -58,6 +58,32 @@ export function StatusBadge({ status }: { status: CheckStatus }) {
 }
 
 /**
+ * Phase-1 validation state of a check.
+ *
+ * *Validated* (green) means the check's verdict has been confirmed against real
+ * workspace data; *Pending* (slate) means it is registered but still awaiting
+ * validation in the next phase. The single source of truth is the backend's
+ * `core/validation.py`.
+ */
+export function ValidationBadge({ validated }: { validated: boolean }) {
+  return validated ? (
+    <span
+      className="badge bg-green-100 text-green-800 dark:bg-green-950 dark:text-green-300"
+      title="Phase 1 validation complete"
+    >
+      Validated
+    </span>
+  ) : (
+    <span
+      className="badge bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400"
+      title="Registered, awaiting validation in the next phase"
+    >
+      Pending
+    </span>
+  );
+}
+
+/**
  * A score with its rating and a proportional bar.
  *
  * A null score renders as "—" with an empty bar: *not assessed* must never look

@@ -58,7 +58,7 @@ _REFERENCE_MAPPING = re.compile(
 
 
 @check(
-    id="WS-LAYER-CONTENT", ref="1.1.2", title="Contains the expected items for its layer",
+    id="WS-LAYER-CONTENT", ref="1.1.1", title="Clear separation of concerns across the 67 workspaces (Data Prep / Data Store / Data Consumption × Dev / QA / Prod)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     requires=[Resource.ITEMS], required=True,
 )
@@ -78,7 +78,7 @@ def layer_content(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="WS-LAYER-SEP", ref="1.1.2", title="Free of other layers' concerns",
+    id="WS-LAYER-SEP", ref="1.1.9", title="Data Prep workspaces (`MLC_DATAPREP_*`) contain only Pipelines and Notebooks — no Lakehouses or Warehouses (all storage resides in the Data Store workspace)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     requires=[Resource.ITEMS], required=True,
 )
@@ -100,7 +100,7 @@ def layer_separation(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-SCHEMA-VALIDATE", ref="5.2.1",
-    title="Incoming records match the expected schema",
+    title="Schema validation: incoming records match expected schema (column count, names, data types) — incl. EAM JSON",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=(Layer.OPERATIONS,), requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -126,7 +126,7 @@ def notebook_schema_validation(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-FORMAT-VALIDATE", ref="5.2.4",
-    title="Incoming file and EAM JSON formats are validated",
+    title="Format validation: expected encoding (UTF-8), delimiters, and JSON structure for EAM",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -154,7 +154,7 @@ def notebook_format_validation(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-STANDARDIZE", ref="5.3.5",
-    title="Dates, codes, and reference values are standardized",
+    title="Standardization: consistent formatting (dates, codes, reference mappings)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )

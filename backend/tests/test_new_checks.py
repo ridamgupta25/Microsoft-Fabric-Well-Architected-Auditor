@@ -1,4 +1,6 @@
-"""Regression tests for the seven checks added for refs 4.1.2, 5.2.6, 5.3.1, 5.5.6, 14.1.x.
+"""Regression tests for the checks added for refs 4.1.2, 5.2.6, 5.3.1, 5.5.6, 14.1.x,
+and for the Operations · Data Operations checks (1.1.3, 1.1.8, 10.5.1, 11.1.4,
+11.4.2, 11.4.5, 11.5.1).
 
 Every case here is a defect a review found in the first implementation. Each pairs
 the misjudged input with the input that must keep working, so a future rewrite of a
@@ -8,13 +10,26 @@ from __future__ import annotations
 
 import pytest
 
+from auditfast.core.check._dax import (
+    call_spans,
+    expensive_iterator,
+    repeated_subexpressions,
+)
 from auditfast.core.check.data_management_quality.data_prep.automated import (
+    _COUNT_RECONCILE,
     _DEDUP_PATTERN,
+    _FK_INTEGRITY,
     _KEY_QUALITY,
     _TYPE_CAST,
     nb_dedup,
     nb_key_quality,
+    nb_merge_valid,
+    nb_orphan_detect,
     nb_type_cast,
+)
+from auditfast.core.check.data_management_quality.data_storage.automated import (
+    _shadow_reason,
+    shortcut_scope,
 )
 from auditfast.core.check.data_management_quality.reporting_semantic.automated import (
     _normalised,
@@ -22,8 +37,31 @@ from auditfast.core.check.data_management_quality.reporting_semantic.automated i
     measures_not_duplicated,
     single_direction_relationships,
 )
-from auditfast.core.enums import Status
-from auditfast.core.models import CheckContext, WorkspaceContext
+from auditfast.core.check.operations_reliability.data_logs.automated import (
+    eventhouse_for_telemetry,
+    kql_queries_version_controlled,
+)
+from auditfast.core.check.operations_reliability.data_operations.automated import (
+    _TEST_NAME_RE,
+    activator_configured,
+    branching_strategy,
+    environment_isolation,
+    semantic_model_deployment,
+    single_source_of_truth,
+    unit_tests_exist,
+    warehouse_deployment_automated,
+)
+from auditfast.core.check.operations_reliability.data_prep.automated import (
+    notebook_transaction_boundary,
+)
+from auditfast.core.check.operations_reliability.reporting_semantic.automated import (
+    bi_content_source_controlled_and_promoted,
+)
+from auditfast.core.check.performance_capacity.data_prep.automated import (
+    sql_ingestion_tuned,
+)
+from auditfast.core.enums import Resource, Status
+from auditfast.core.models import CheckContext, Item, WorkspaceContext
 
 _WRITES = 'df.write.saveAsTable("t")\n'
 
@@ -105,25 +143,35 @@ def test_notebook_checks_ignore_commented_out_code(evaluator):
 
 # --- semantic-model checks --------------------------------------------------
 
+def _scored(outcome) -> object:
+    """The scored aggregate verdict a multi-verdict check returns first."""
+    return outcome[0] if isinstance(outcome, list) else outcome
+
+
+def _details(outcome) -> list:
+    """The unscored per-object detail rows that follow the aggregate."""
+    return outcome[1:] if isinstance(outcome, list) else []
+
+
 def test_models_without_relationships_are_excluded_from_the_denominator():
     models = {
         "empty": {"relationships": []},
         "single": {"relationships": [{"cross_filter": "oneDirection"}]},
         "bidi": {"relationships": [{"cross_filter": "bothDirections"}]},
     }
-    verdict = single_direction_relationships(_model_ctx(models))
+    verdict = _scored(single_direction_relationships(_model_ctx(models)))
     assert "1 of 2" in verdict.evidence
 
 
 def test_relationship_check_is_na_when_no_model_declares_one():
-    verdict = single_direction_relationships(_model_ctx({"m": {"relationships": []}}))
+    verdict = _scored(single_direction_relationships(_model_ctx({"m": {"relationships": []}})))
     assert verdict.status is Status.NA
 
 
 def test_trivial_expressions_are_not_counted_as_duplicated_logic():
     """The constant 0 repeats across models by convention, not by copy-paste."""
     models = {f"m{i}": {"measures": [{"expression": "0"}]} for i in range(5)}
-    assert measures_not_duplicated(_model_ctx(models)).status is Status.NA
+    assert _scored(measures_not_duplicated(_model_ctx(models))).status is Status.NA
 
 
 def test_pretty_printing_does_not_make_a_measure_look_complex():
@@ -132,7 +180,7 @@ def test_pretty_printing_does_not_make_a_measure_look_complex():
     assert len(padded) > 400
     assert len(_normalised(padded)) < 400
     models = {"m": {"measures": [{"expression": padded}]}}
-    assert complex_measures_use_variables(_model_ctx(models)).status is Status.NA
+    assert _scored(complex_measures_use_variables(_model_ctx(models))).status is Status.NA
 
 
 def test_a_column_named_var_is_not_a_variable_declaration():
@@ -140,4 +188,949 @@ def test_a_column_named_var_is_not_a_variable_declaration():
     long_no_var = "CALCULATE(SUM(t[Var Amount]), " + "FILTER(t, t[a] = 1), " * 25 + "ALL(t))"
     assert len(_normalised(long_no_var)) > 400
     models = {"m": {"measures": [{"expression": long_no_var}]}}
-    assert complex_measures_use_variables(_model_ctx(models)).score == 0
+    assert _scored(complex_measures_use_variables(_model_ctx(models))).score == 0
+
+
+# --- per-object detail rows -------------------------------------------------
+
+def test_the_failing_model_is_named_in_a_detail_row():
+    """"Which model fails" must be reportable, not just "how many"."""
+    models = {
+        "GoodModel": {"relationships": [{"cross_filter": "oneDirection"}]},
+        "BadModel": {"relationships": [
+            {"cross_filter": "bothDirections", "from_table": "Bridge", "to_table": "Dim"},
+        ]},
+    }
+    details = _details(single_direction_relationships(_model_ctx(models)))
+    assert [d.obj for d in details] == ["BadModel"]
+    assert "Bridge <-> Dim" in details[0].evidence
+
+
+def test_detail_rows_are_unscored_so_the_score_is_unchanged():
+    """They inform; only the aggregate row scores, and only it reaches the risk register."""
+    models = {
+        "A": {"relationships": [{"cross_filter": "bothDirections"}]},
+        "B": {"relationships": [{"cross_filter": "bothDirections"}]},
+    }
+    outcome = single_direction_relationships(_model_ctx(models))
+    assert _scored(outcome).scored is True
+    assert all(d.scored is False and d.status is Status.INFO for d in _details(outcome))
+
+
+def test_a_passing_model_gets_no_detail_row():
+    models = {"AllGood": {"relationships": [{"cross_filter": "oneDirection"}]}}
+    assert _details(single_direction_relationships(_model_ctx(models))) == []
+
+
+def test_offending_measures_are_named_against_their_model():
+    long_no_var = "CALCULATE(SUM(t[Var Amount]), " + "FILTER(t, t[a] = 1), " * 25 + "ALL(t))"
+    models = {"M": {"measures": [{"name": "Bad Measure", "expression": long_no_var}]}}
+    details = _details(complex_measures_use_variables(_model_ctx(models)))
+    assert [d.obj for d in details] == ["M"]
+    assert "Bad Measure" in details[0].evidence
+
+
+def test_named_measures_are_capped_so_one_model_cannot_fill_the_report():
+    long_no_var = "CALCULATE(SUM(t[Var Amount]), " + "FILTER(t, t[a] = 1), " * 25 + "ALL(t))"
+    models = {"M": {"measures": [
+        {"name": f"M{i}", "expression": long_no_var} for i in range(40)
+    ]}}
+    details = _details(complex_measures_use_variables(_model_ctx(models)))
+    assert len(details) == 1                      # one row per model, not per measure
+    assert "40 measure(s)" in details[0].evidence
+    assert "(+15 more)" in details[0].evidence
+
+
+# --- 14.1.4: the two DAX practices beyond VAR -------------------------------
+
+def test_a_repeated_substantial_subexpression_is_detected():
+    """The duplication a VAR exists to remove."""
+    expr = ("DIVIDE(CALCULATE(SUM(Sales[Amount]), Sales[Year] = 2024), "
+            "CALCULATE(SUM(Sales[Amount]), Sales[Year] = 2024))")
+    assert repeated_subexpressions(expr)
+
+
+def test_assigning_a_subexpression_to_a_var_removes_the_duplication():
+    """Written once and reused by name, so nothing repeats."""
+    expr = ("VAR Amt = CALCULATE(SUM(Sales[Amount]), Sales[Year] = 2024) "
+            "RETURN DIVIDE(Amt, Amt)")
+    assert not repeated_subexpressions(expr)
+
+
+def test_a_short_repeated_call_is_not_flagged():
+    """``SUM(t[x])`` twice is ordinary DAX, not copy-paste worth reporting."""
+    assert not repeated_subexpressions("DIVIDE(SUM(t[x]), SUM(t[x]))")
+
+
+@pytest.mark.parametrize("expr,expected,why", [
+    ("CALCULATE(SUM(t[x]), FILTER(t, t[Year] = 2024))", True,
+     "a single column predicate over a bare table is a boolean argument"),
+    ("CALCULATE(SUM(t[x]), FILTER(ALL(t), t[Year] = 2024))", False,
+     "FILTER(ALL(...)) replaces filter context - no boolean equivalent"),
+    ("CALCULATE(SUM(t[x]), FILTER(VALUES(t[Year]), t[Year] > 2020))", False,
+     "FILTER(VALUES(...)) is not a bare table scan"),
+    ("CALCULATE(SUM(t[x]), t[Year] = 2024)", False,
+     "already written as a boolean argument"),
+    ("SUMX(Sales, SUMX(Lines, Lines[Qty]))", True,
+     "an iterator nested inside another multiplies row context"),
+    ("SUMX(Sales, Sales[Qty] * Sales[Price])", False,
+     "a single iterator is the normal way to write this"),
+])
+def test_expensive_iterator_detector(expr: str, expected: bool, why: str):
+    assert expensive_iterator(expr) is expected, why
+
+
+def test_a_closing_paren_inside_a_string_does_not_unbalance_the_scan():
+    """A format string may contain ')' - paren matching must ignore string literals."""
+    expr = 'FORMAT(SUM(t[x]), "#,##0);(#,##0)")'
+    assert call_spans(expr)[0] == expr
+
+
+# --- 4.1.2: shadow storage --------------------------------------------------
+
+def _conn(**kwargs) -> dict:
+    base = {"connectivity_type": "ShareableCloud", "connection_type": "",
+            "endpoint": ""}
+    base.update(kwargs)
+    return base
+
+
+@pytest.mark.parametrize("conn,expected,why", [
+    (_conn(connectivity_type="OnPremisesGatewayPersonal", connection_type="File",
+           endpoint=r"C:\Users\someone\Downloads\Sales.xlsx"), True,
+     "a spreadsheet on a laptop behind a personal gateway"),
+    (_conn(connection_type="Web",
+           endpoint="https://contoso-my.sharepoint.com/personal/someone/"), True,
+     "a personal OneDrive is not a governed store"),
+    (_conn(connection_type="HttpServer",
+           endpoint="https://raw.githubusercontent.com/x/y/main/sales.csv"), True,
+     "an ad-hoc file pulled over HTTP"),
+    (_conn(connection_type="AzureDataLakeStorage",
+           endpoint="https://acct.dfs.core.windows.net/"), False,
+     "a governed enterprise object store is allowed"),
+    (_conn(connection_type="GoogleCloudStorage", endpoint="storage.googleapis.com"), False,
+     "external but governed through a shareable cloud connection"),
+    (_conn(connection_type="Lakehouse", endpoint="Lakehouse"), False,
+     "OneLake-native"),
+    (_conn(connection_type="Web", endpoint="https://contoso.sharepoint.com/sites/finance"), False,
+     "a governed team site is not a personal drive"),
+])
+def test_shadow_storage_classifier(conn: dict, expected: bool, why: str):
+    assert (_shadow_reason(conn) is not None) is expected, why
+
+
+def _storage_ctx(shortcuts: dict, connections: list, unavailable=frozenset()) -> CheckContext:
+    workspace = WorkspaceContext(id="w", shortcuts=shortcuts, connections=connections,
+                                 unavailable=set(unavailable))
+    return CheckContext(workspace=workspace, settings={}, obj_name="w", obj=workspace)
+
+
+def test_shadow_storage_is_scored_not_just_reported():
+    """4.1.2 must move the score - a note() would leave the point ungraded."""
+    connections = [
+        _conn(connection_type="Lakehouse"),
+        _conn(connectivity_type="OnPremisesGatewayPersonal", connection_type="File",
+              endpoint=r"C:\Users\a\Downloads\x.xlsx"),
+    ]
+    verdict = shortcut_scope(_storage_ctx({"lh": [{"target_type": "OneLake"}]}, connections))
+    assert verdict.scored is True
+    assert verdict.score == 1          # 1 of 2 governed -> 50% band
+    assert "1 are ungoverned shadow storage" in verdict.evidence
+
+
+def test_shortcut_scope_is_na_when_connections_could_not_be_read():
+    """Unreadable data is N/A, never a failure."""
+    ctx = _storage_ctx({"lh": [{"target_type": "OneLake"}]}, [],
+                       unavailable={Resource.CONNECTIONS})
+    assert shortcut_scope(ctx).status is Status.NA
+
+
+# --- 5.2.5: a count assertion must reconcile, not probe ----------------------
+
+@pytest.mark.parametrize("source,expected,why", [
+    ('assert df.filter(col("CustomerKey").isNull()).count() == 0', False,
+     "a key null probe counts rows but reconciles nothing (this is 5.5.6)"),
+    ("assert df.count() > 0", False, "an emptiness guard is not a reconciliation"),
+    ("assert df.count() == expected_rows", True, "compared against an expectation"),
+    ("assert source_df.count() == target_df.count()", True, "source vs target counts"),
+    ("assert abs(src.count() - tgt.count()) < tolerance", True,
+     "a tolerance comparison still reconciles"),
+    ("row_count = df.count()", False, "assigned but never compared"),
+    ('df.groupBy("k").agg(count("*").alias("row_count"))', False,
+     "a column alias is not a comparison"),
+])
+def test_count_reconcile_detector(source: str, expected: bool, why: str):
+    assert bool(_COUNT_RECONCILE.search(source)) is expected, why
+
+
+# --- 5.3.2: an integrity check must be performed, not mentioned --------------
+
+@pytest.mark.parametrize("source,expected,why", [
+    ('df.join(dim, "k", "left_anti")', True, "an anti-join is the standard RI probe"),
+    ("SELECT * FROM f LEFT ANTI JOIN d ON f.k = d.k", True, "the SQL spelling"),
+    ('f.join(d, "k", "left").filter(col("d.k").isNull())', True,
+     "left join then null test isolates unmatched rows"),
+    ("referential_integrity(df, dim)", True, "a named check that is actually called"),
+    ("fk_check = validate(df)", True, "a named check that is assigned"),
+    ("referential integrity is handled upstream by the source system", False,
+     "prose mentioning the idea is not a check"),
+    ('df = df.withColumn("referential_note", lit("see doc"))', False,
+     "a column name is not a check"),
+])
+def test_fk_integrity_detector(source: str, expected: bool, why: str):
+    assert bool(_FK_INTEGRITY.search(source)) is expected, why
+
+
+# --- 5.3.7: identified is not the same as handled ----------------------------
+
+_JOINS = 'src.join(dim, "k", "left_anti")\n'
+
+
+def test_orphans_detected_but_dropped_score_in_the_middle():
+    """Computing the unmatched set and never using it satisfies half the point."""
+    verdict = nb_orphan_detect(_nb_ctx('orphans = src.join(dim, "k", "left_anti")\n'))
+    assert verdict.score == 1
+    assert "not handled" in verdict.evidence
+
+
+@pytest.mark.parametrize("tail,why", [
+    ('orphans.write.saveAsTable("orphan_log")\n', "persisted"),
+    ("assert orphans.count() == 0\n", "raised on"),
+    ('logger.warning("orphans: %s", orphans.count())\n', "recorded"),
+])
+def test_orphans_detected_and_handled_pass(tail: str, why: str):
+    code = 'orphans = src.join(dim, "k", "left_anti")\n' + tail
+    assert nb_orphan_detect(_nb_ctx(code)).score == 3, why
+
+
+def test_a_quarantine_target_counts_as_handling():
+    code = 'bad = src.join(dim, "k", "left_anti")\nbad.write.saveAsTable("reject_records")\n'
+    assert nb_orphan_detect(_nb_ctx(code)).score == 3
+
+
+def test_an_unrelated_reject_column_is_not_orphan_handling():
+    """A business column named ``rejected_flag`` must not read as quarantining."""
+    code = ('orphans = src.join(dim, "k", "left_anti")\n'
+            'summary = src.withColumn("rejected_flag", lit(False))\n')
+    assert nb_orphan_detect(_nb_ctx(code)).score == 1
+
+
+def test_orphan_check_is_na_without_a_join():
+    assert nb_orphan_detect(_nb_ctx("print(1)\n")).status is Status.NA
+
+
+def test_a_multiline_sql_anti_join_still_binds_to_its_variable():
+    """A ``spark.sql(\"\"\"...\"\"\")` block puts the anti-join on a later line."""
+    code = ('orphans = spark.sql("""\n'
+            "    SELECT f.* FROM fact f\n"
+            "    LEFT ANTI JOIN dim d ON f.k = d.k\n"
+            '""")\n'
+            'orphans.write.saveAsTable("orphan_log")\n')
+    assert nb_orphan_detect(_nb_ctx(code)).score == 3
+
+
+# --- 5.3.9: the validated table must be the merged table ---------------------
+
+def test_merge_validated_on_a_different_table_fails():
+    """DESCRIBE HISTORY on another table proves nothing about the merge."""
+    code = ('spark.sql("MERGE INTO silver_watermark t USING s ON t.id = s.id")\n'
+            'spark.sql("DESCRIBE HISTORY gold_sales")\n')
+    verdict = nb_merge_valid(_nb_ctx(code))
+    assert verdict.score == 0
+    assert "different table is validated" in verdict.evidence
+
+
+def test_merge_validated_on_the_merged_table_passes():
+    code = ('spark.sql("MERGE INTO gold_sales t USING s ON t.id = s.id")\n'
+            'spark.sql("DESCRIBE HISTORY gold_sales")\n')
+    assert nb_merge_valid(_nb_ctx(code)).score == 3
+
+
+def test_a_schema_qualified_target_matches_its_bare_name():
+    code = ('spark.sql("MERGE INTO gold.sales t USING s ON t.id = s.id")\n'
+            'spark.sql("DESCRIBE HISTORY sales")\n')
+    assert nb_merge_valid(_nb_ctx(code)).score == 3
+
+
+def test_merge_metrics_need_no_table_cross_check():
+    """operationMetrics describes the write that just happened."""
+    code = ('DeltaTable.forName(spark, "gold_sales").merge(src, "t.id = s.id").whenMatchedUpdateAll().execute()\n'
+            'm = spark.sql("DESCRIBE HISTORY gold_sales").select("operationMetrics")\n')
+    assert nb_merge_valid(_nb_ctx(code)).score == 3
+
+
+def test_an_unresolvable_merge_target_is_na_not_a_guess():
+    code = ("tgt = DeltaTable.forName(spark, TABLE_NAME)\n"
+            "tgt.merge(src, cond).whenMatchedUpdateAll().execute()\n"
+            'spark.sql("DESCRIBE HISTORY " + AUDIT_TABLE)\n')
+    assert nb_merge_valid(_nb_ctx(code)).status is Status.NA
+
+
+def test_merge_without_any_validation_fails():
+    code = 'spark.sql("MERGE INTO gold_sales t USING s ON t.id = s.id")\n'
+    assert nb_merge_valid(_nb_ctx(code)).score == 0
+
+
+def test_merge_check_is_na_without_a_merge():
+    assert nb_merge_valid(_nb_ctx("print(1)\n")).status is Status.NA
+
+
+# =============================================================================
+# Operations & Reliability · Data Operations — refs 1.1.3, 1.1.8, 10.5.1,
+# 11.1.4, 11.4.2, 11.4.5, 11.5.1
+#
+# Every check below is workspace-scoped, so each case builds the workspace the
+# rule is about. The N/A cases are the important ones: "we could not read it"
+# and "this workspace has none of the thing" must never score as a failure.
+# =============================================================================
+
+def _ws_ctx(**kwargs) -> CheckContext:
+    """A workspace-scoped context — ``ctx.obj`` is the workspace itself."""
+    workspace = WorkspaceContext(**kwargs)
+    return CheckContext(workspace=workspace, settings={},
+                        obj_name=workspace.name, obj=workspace)
+
+
+def _items(*pairs: tuple[str, str]) -> list[Item]:
+    return [Item(id=f"id-{n}", type=t, display_name=n) for t, n in pairs]
+
+
+def _script_pipeline(sql: str, *, parameters: dict | None = None) -> dict:
+    activity = {"name": "Deploy", "type": "Script",
+                "typeProperties": {"scripts": [{"text": sql}]}}
+    properties: dict = {"activities": [activity]}
+    if parameters:
+        properties["parameters"] = parameters
+    return {"properties": properties}
+
+
+# --- 1.1.8 single source of truth -------------------------------------------
+
+def test_a_lakehouse_and_warehouse_for_one_purpose_is_a_duplicate_store():
+    verdict = single_source_of_truth(
+        _ws_ctx(id="w", items=_items(("Lakehouse", "LH_Sales"), ("Warehouse", "WH_SALES")))
+    )
+    assert verdict.score == 0
+    assert "share a purpose" in verdict.evidence
+
+
+def test_distinct_purposes_are_not_duplicates():
+    verdict = single_source_of_truth(
+        _ws_ctx(id="w", items=_items(("Lakehouse", "LH_Sales"),
+                                     ("Lakehouse", "LH_Finance"),
+                                     ("Warehouse", "WH_Sales_Curated")))
+    )
+    assert verdict.score == 3
+
+
+def test_a_lakehouses_auto_created_endpoint_is_not_a_duplicate():
+    """Fabric creates a SQLEndpoint and SemanticModel beside every Lakehouse."""
+    verdict = single_source_of_truth(
+        _ws_ctx(id="w", items=_items(("Lakehouse", "LH_Sales"),
+                                     ("SQLEndpoint", "LH_Sales"),
+                                     ("SemanticModel", "LH_Sales")))
+    )
+    assert verdict.score == 3
+
+
+def test_a_version_suffix_does_not_hide_a_duplicate_store():
+    verdict = single_source_of_truth(
+        _ws_ctx(id="w", items=_items(("Lakehouse", "Sales"), ("Lakehouse", "Sales_v2")))
+    )
+    assert verdict.score == 0
+
+
+def test_single_source_is_na_without_items():
+    ctx = _ws_ctx(id="w", unavailable={Resource.ITEMS})
+    assert single_source_of_truth(ctx).status is Status.NA
+
+
+def test_single_source_is_na_when_the_workspace_stores_nothing():
+    ctx = _ws_ctx(id="w", items=_items(("DataPipeline", "PL_Load")))
+    assert single_source_of_truth(ctx).status is Status.NA
+
+
+# --- 1.1.3 environment isolation --------------------------------------------
+
+def test_a_prod_pipeline_reaching_into_dev_is_a_cross_environment_dependency():
+    pipeline = {"properties": {"activities": [
+        {"name": "Copy from DEV", "type": "Copy",
+         "typeProperties": {"source": {"path": "/lake/MLC_DEV/raw"}}}]}}
+    verdict = environment_isolation(
+        _ws_ctx(id="w", display_name="MLC-Prod-Ops", pipelines={"PL_Load": pipeline})
+    )
+    assert verdict.score == 0
+    assert "another environment" in verdict.evidence
+
+
+def test_a_prod_pipeline_naming_only_prod_is_isolated():
+    pipeline = {"properties": {"activities": [
+        {"name": "Copy PROD", "type": "Copy",
+         "typeProperties": {"source": {"path": "/lake/MLC_PROD/raw"}}}]}}
+    verdict = environment_isolation(
+        _ws_ctx(id="w", display_name="MLC-Prod-Ops", pipelines={"PL_Load": pipeline})
+    )
+    assert verdict.score == 3
+
+
+def test_a_test_activity_is_not_a_cross_environment_reference():
+    """"Run Unit Tests" must not read as the Test environment — WS-UNIT-TESTS asks for it."""
+    pipeline = {"properties": {"activities": [{"name": "Run Unit Tests", "type": "TridentNotebook"}]}}
+    verdict = environment_isolation(
+        _ws_ctx(id="w", display_name="MLC-Prod-Ops", pipelines={"PL_Load": pipeline})
+    )
+    assert verdict.score == 3
+
+
+def test_dev_inside_a_longer_word_is_not_an_environment_reference():
+    pipeline = {"properties": {"activities": [{"name": "Load device telemetry", "type": "Copy"}]}}
+    verdict = environment_isolation(
+        _ws_ctx(id="w", display_name="MLC-Prod-Ops", pipelines={"PL_Load": pipeline})
+    )
+    assert verdict.score == 3
+
+
+def test_environment_isolation_is_na_without_pipeline_definitions():
+    ctx = _ws_ctx(id="w", display_name="MLC-Prod-Ops",
+                  unavailable={Resource.PIPELINE_DEFINITIONS})
+    assert environment_isolation(ctx).status is Status.NA
+
+
+def test_environment_isolation_is_na_when_the_name_declares_no_tier():
+    pipeline = {"properties": {"activities": [{"name": "Copy from DEV", "type": "Copy"}]}}
+    ctx = _ws_ctx(id="w", display_name="Analytics Workspace", pipelines={"PL": pipeline})
+    assert environment_isolation(ctx).status is Status.NA
+
+
+# --- 10.5.1 Data Activator ---------------------------------------------------
+
+def test_a_reflex_item_satisfies_the_activator_check():
+    ctx = _ws_ctx(id="w", items=_items(("DataPipeline", "PL_Load"), ("Reflex", "RX_Alerts")))
+    verdict = activator_configured(ctx)
+    assert verdict.score == 3
+    assert "RX_Alerts" in verdict.evidence
+
+
+def test_operational_items_without_an_activator_fail():
+    ctx = _ws_ctx(id="w", items=_items(("DataPipeline", "PL_Load"), ("Notebook", "NB_Build")))
+    assert activator_configured(ctx).score == 0
+
+
+def test_activator_is_na_without_items():
+    assert activator_configured(_ws_ctx(id="w", unavailable={Resource.ITEMS})).status is Status.NA
+
+
+def test_activator_is_na_when_nothing_can_raise_an_event():
+    ctx = _ws_ctx(id="w", items=_items(("Report", "RPT_Sales")))
+    assert activator_configured(ctx).status is Status.NA
+
+
+# --- 11.1.4 branching strategy ----------------------------------------------
+
+def test_a_prod_workspace_on_main_follows_the_strategy():
+    ctx = _ws_ctx(id="w", display_name="MLC-Prod-Ops", git_connected=True,
+                  git_details={"connected": True, "branch": "main"})
+    assert branching_strategy(ctx).score == 3
+
+
+def test_a_prod_workspace_on_a_feature_branch_has_no_promotion_gate():
+    ctx = _ws_ctx(id="w", display_name="MLC-Prod-Ops", git_connected=True,
+                  git_details={"connected": True, "branch": "feature/wip-rewrite"})
+    verdict = branching_strategy(ctx)
+    assert verdict.score == 0
+    assert "feature branch" in verdict.evidence
+
+
+def test_an_ad_hoc_branch_name_matches_no_strategy():
+    ctx = _ws_ctx(id="w", display_name="MLC-Dev-Ops", git_connected=True,
+                  git_details={"connected": True, "branch": "anmol-scratch"})
+    assert branching_strategy(ctx).score == 0
+
+
+def test_a_dev_workspace_on_a_feature_branch_is_isolated():
+    ctx = _ws_ctx(id="w", display_name="MLC-Dev-Ops", git_connected=True,
+                  git_details={"connected": True, "branch": "feature/new-load"})
+    assert branching_strategy(ctx).score == 3
+
+
+def test_a_dev_workspace_on_trunk_is_partial_not_a_failure():
+    ctx = _ws_ctx(id="w", display_name="MLC-Dev-Ops", git_connected=True,
+                  git_details={"connected": True, "branch": "main"})
+    assert branching_strategy(ctx).score == 2
+
+
+def test_branching_is_na_when_git_is_unreadable():
+    ctx = _ws_ctx(id="w", unavailable={Resource.GIT})
+    assert branching_strategy(ctx).status is Status.NA
+
+
+def test_branching_is_na_when_the_workspace_is_not_git_connected():
+    """Not connected is WS-GIT's finding, not a second failure here."""
+    ctx = _ws_ctx(id="w", display_name="MLC-Prod-Ops", git_connected=False)
+    assert branching_strategy(ctx).status is Status.NA
+
+
+# --- 11.4.2 warehouse deployment --------------------------------------------
+
+_PARAM_DDL = "CREATE TABLE @{pipeline().parameters.schema}.dim_date (d DATE)"
+_LITERAL_DDL = "CREATE TABLE prod_dbo.dim_date (d DATE)"
+
+
+def test_parameterized_warehouse_ddl_under_git_passes():
+    ctx = _ws_ctx(id="w", items=_items(("Warehouse", "WH_Gold")), git_connected=True,
+                  pipelines={"PL_Deploy": _script_pipeline(_PARAM_DDL)})
+    assert warehouse_deployment_automated(ctx).score == 3
+
+
+def test_literal_ddl_with_no_automation_is_manual_tsql():
+    ctx = _ws_ctx(id="w", items=_items(("Warehouse", "WH_Gold")),
+                  pipelines={"PL_Deploy": _script_pipeline(_LITERAL_DDL)})
+    verdict = warehouse_deployment_automated(ctx)
+    assert verdict.score == 0
+    assert "manual T-SQL" in verdict.evidence
+
+
+def test_declared_pipeline_parameters_count_as_parameterization():
+    ctx = _ws_ctx(id="w", items=_items(("Warehouse", "WH_Gold")), deployment_pipeline=True,
+                  pipelines={"PL_Deploy": _script_pipeline(
+                      _LITERAL_DDL, parameters={"schema": {"type": "string"}})})
+    assert warehouse_deployment_automated(ctx).score == 3
+
+
+def test_a_load_without_ddl_is_judged_on_automation_alone():
+    ctx = _ws_ctx(id="w", items=_items(("Warehouse", "WH_Gold")), git_connected=True,
+                  pipelines={"PL_Load": _script_pipeline("MERGE INTO dim_date t USING s ON 1=1")})
+    verdict = warehouse_deployment_automated(ctx)
+    assert verdict.score == 3
+    assert "No schema T-SQL" in verdict.evidence
+
+
+def test_warehouse_deployment_is_na_without_a_warehouse():
+    ctx = _ws_ctx(id="w", items=_items(("Lakehouse", "LH_Bronze")))
+    assert warehouse_deployment_automated(ctx).status is Status.NA
+
+
+def test_warehouse_deployment_is_na_when_pipeline_definitions_are_unreadable():
+    ctx = _ws_ctx(id="w", items=_items(("Warehouse", "WH_Gold")), git_connected=True,
+                  unavailable={Resource.PIPELINE_DEFINITIONS})
+    assert warehouse_deployment_automated(ctx).status is Status.NA
+
+
+# --- 11.4.5 semantic model deployment ---------------------------------------
+
+_REFRESH_PIPELINE = {"properties": {"activities": [
+    {"name": "Refresh model", "type": "PBISemanticModelRefresh"}]}}
+_PLAIN_PIPELINE = {"properties": {"activities": [{"name": "Copy", "type": "Copy"}]}}
+
+
+def test_a_versioned_and_orchestrated_semantic_model_passes():
+    ctx = _ws_ctx(id="w", items=_items(("SemanticModel", "SM_Sales")), git_connected=True,
+                  pipelines={"PL_Consume": _REFRESH_PIPELINE})
+    assert semantic_model_deployment(ctx).score == 3
+
+
+def test_a_versioned_model_no_pipeline_refresh_is_partial():
+    ctx = _ws_ctx(id="w", items=_items(("SemanticModel", "SM_Sales")), git_connected=True,
+                  pipelines={"PL_Load": _PLAIN_PIPELINE})
+    assert semantic_model_deployment(ctx).score == 2
+
+
+def test_an_unversioned_unorchestrated_model_fails():
+    ctx = _ws_ctx(id="w", items=_items(("SemanticModel", "SM_Sales")),
+                  pipelines={"PL_Load": _PLAIN_PIPELINE})
+    verdict = semantic_model_deployment(ctx)
+    assert verdict.score == 0
+    assert "neither" in verdict.evidence
+
+
+def test_a_workspace_with_no_pipeline_is_judged_on_versioning_only():
+    ctx = _ws_ctx(id="w", items=_items(("SemanticModel", "SM_Sales")), git_connected=True)
+    verdict = semantic_model_deployment(ctx)
+    assert verdict.score == 3
+    assert "No pipeline in this workspace" in verdict.evidence
+
+
+def test_semantic_model_deployment_is_na_without_a_model():
+    ctx = _ws_ctx(id="w", items=_items(("DataPipeline", "PL_Load")))
+    assert semantic_model_deployment(ctx).status is Status.NA
+
+
+def test_semantic_model_deployment_is_na_when_git_is_unreadable():
+    ctx = _ws_ctx(id="w", items=_items(("SemanticModel", "SM_Sales")),
+                  unavailable={Resource.GIT})
+    assert semantic_model_deployment(ctx).status is Status.NA
+
+
+# --- 11.5.1 unit tests -------------------------------------------------------
+
+@pytest.mark.parametrize("name,expected,why", [
+    ("NB_Test_Sales", True, "test as its own token"),
+    ("TestSalesLoad", True, "test opening a CamelCase name"),
+    ("nb_unit_tests", True, "unit tests suffix"),
+    ("Run Unit Tests", True, "an activity name"),
+    ("NB_Latest_Load", False, "'latest' is not a test"),
+    ("NB_Contest_Rules", False, "'contest' is not a test"),
+    ("NB_Tested_Rows", False, "'tested' is not a test asset"),
+])
+def test_test_name_detector(name: str, expected: bool, why: str):
+    assert bool(_TEST_NAME_RE.search(name)) is expected, why
+
+
+def test_a_test_framework_notebook_satisfies_the_unit_test_check():
+    ctx = _ws_ctx(id="w", notebooks={
+        "NB_Build": _nb(_WRITES),
+        "NB_Checks": _nb("import pytest\n\ndef test_scd2(): assert transform(1) == 2\n"),
+    })
+    verdict = unit_tests_exist(ctx)
+    assert verdict.score == 3
+    assert "NB_Checks" in verdict.evidence
+
+
+def test_transformations_with_no_test_asset_fail():
+    ctx = _ws_ctx(id="w", notebooks={"NB_Build": _nb(_WRITES)})
+    verdict = unit_tests_exist(ctx)
+    assert verdict.score == 0
+    assert "no test notebook" in verdict.evidence
+
+
+def test_a_commented_out_test_framework_does_not_count():
+    ctx = _ws_ctx(id="w", notebooks={"NB_Build": _nb(_WRITES + "# import pytest\n")})
+    assert unit_tests_exist(ctx).score == 0
+
+
+def test_a_row_count_assert_is_not_a_unit_test():
+    """A data-quality gate on production rows is not a test of the transform."""
+    ctx = _ws_ctx(id="w", notebooks={
+        "NB_Build": _nb(_WRITES + "assert df.count() > 0\n")})
+    assert unit_tests_exist(ctx).score == 0
+
+
+def test_a_test_activity_in_a_pipeline_counts():
+    ctx = _ws_ctx(
+        id="w",
+        notebooks={"NB_Build": _nb(_WRITES)},
+        pipelines={"PL_Load": {"properties": {"activities": [
+            {"name": "Run Unit Tests", "type": "TridentNotebook"}]}}},
+    )
+    assert unit_tests_exist(ctx).score == 3
+
+
+def test_unit_tests_is_na_without_notebook_definitions():
+    ctx = _ws_ctx(id="w", unavailable={Resource.NOTEBOOK_DEFINITIONS})
+    assert unit_tests_exist(ctx).status is Status.NA
+
+
+def test_unit_tests_is_na_when_no_notebook_transforms_anything():
+    ctx = _ws_ctx(id="w", notebooks={"NB_Explore": _nb("df = spark.table('t')\ndisplay(df)\n")})
+    assert unit_tests_exist(ctx).status is Status.NA
+
+
+# =============================================================================
+# Operations & Reliability · Data Logs — refs 10.3.1, 10.3.2
+#
+# Both are judged from the item inventory (plus the Git state for 10.3.2). The
+# N/A cases matter most: a workspace with nothing to store and nothing to query
+# has no telemetry posture to grade, and must not be scored as if it failed.
+# =============================================================================
+
+def test_an_eventhouse_satisfies_the_telemetry_store_check():
+    ctx = _ws_ctx(id="w", items=_items(("Eventhouse", "EH_Ops"),
+                                       ("Eventstream", "ES_Telemetry")))
+    verdict = eventhouse_for_telemetry(ctx)
+    assert verdict.score == 3
+    assert "EH_Ops" in verdict.evidence
+
+
+def test_a_kql_database_alone_is_still_the_real_time_store():
+    ctx = _ws_ctx(id="w", items=_items(("KQLDatabase", "KDB_Logs")))
+    assert eventhouse_for_telemetry(ctx).score == 3
+
+
+def test_a_stream_with_nowhere_real_time_to_land_fails():
+    ctx = _ws_ctx(id="w", items=_items(("Eventstream", "ES_Telemetry"),
+                                       ("Lakehouse", "LH_Logs")))
+    verdict = eventhouse_for_telemetry(ctx)
+    assert verdict.score == 0
+    assert "no Eventhouse" in verdict.evidence
+
+
+def test_a_batch_only_log_workspace_is_partial_not_a_failure():
+    """A low-volume log store may legitimately be a Lakehouse."""
+    ctx = _ws_ctx(id="w", items=_items(("Lakehouse", "LH_Logs")))
+    verdict = eventhouse_for_telemetry(ctx)
+    assert verdict.score == 1
+    assert "batch store" in verdict.evidence
+
+
+def test_telemetry_store_is_na_without_items():
+    ctx = _ws_ctx(id="w", unavailable={Resource.ITEMS})
+    assert eventhouse_for_telemetry(ctx).status is Status.NA
+
+
+def test_telemetry_store_is_na_when_there_is_no_telemetry_to_place():
+    ctx = _ws_ctx(id="w", items=_items(("Report", "RPT_Ops")))
+    assert eventhouse_for_telemetry(ctx).status is Status.NA
+
+
+def test_a_versioned_queryset_satisfies_the_kql_query_check():
+    ctx = _ws_ctx(id="w", git_connected=True,
+                  items=_items(("Eventhouse", "EH_Ops"), ("KQLQueryset", "QS_Failures")))
+    verdict = kql_queries_version_controlled(ctx)
+    assert verdict.score == 3
+    assert "QS_Failures" in verdict.evidence
+
+
+def test_a_real_time_dashboard_counts_as_saved_kql():
+    ctx = _ws_ctx(id="w", git_connected=True,
+                  items=_items(("KQLDatabase", "KDB_Logs"), ("KQLDashboard", "DB_Ops")))
+    assert kql_queries_version_controlled(ctx).score == 3
+
+
+def test_querysets_outside_source_control_are_partial():
+    ctx = _ws_ctx(id="w", items=_items(("Eventhouse", "EH_Ops"),
+                                       ("KQLQueryset", "QS_Failures")))
+    verdict = kql_queries_version_controlled(ctx)
+    assert verdict.score == 1
+    assert "no history" in verdict.evidence
+
+
+def test_an_eventhouse_with_no_saved_query_fails():
+    ctx = _ws_ctx(id="w", git_connected=True, items=_items(("Eventhouse", "EH_Ops")))
+    verdict = kql_queries_version_controlled(ctx)
+    assert verdict.score == 0
+    assert "no saved KQL queryset" in verdict.evidence
+
+
+def test_kql_queries_is_na_without_a_store_to_query():
+    """A queryset check has nothing to say about a workspace with no KQL data."""
+    ctx = _ws_ctx(id="w", git_connected=True, items=_items(("Lakehouse", "LH_Logs")))
+    assert kql_queries_version_controlled(ctx).status is Status.NA
+
+
+def test_kql_queries_is_na_when_git_is_unreadable():
+    ctx = _ws_ctx(id="w", items=_items(("Eventhouse", "EH_Ops")),
+                  unavailable={Resource.GIT})
+    assert kql_queries_version_controlled(ctx).status is Status.NA
+
+
+def test_kql_queries_is_na_without_items():
+    assert kql_queries_version_controlled(
+        _ws_ctx(id="w", unavailable={Resource.ITEMS})).status is Status.NA
+
+
+# =============================================================================
+# Performance & Capacity · Data Prep — ref 2.6.5
+#
+# Three independent tunings on every Copy that reads a SQL database. Scored as
+# coverage over all three, so a half-tuned pipeline lands in the middle.
+# =============================================================================
+
+def _copy_pipeline(source: dict, sink: dict | None = None, *, nested: bool = False) -> dict:
+    copy = {"name": "Copy_Source", "type": "Copy",
+            "typeProperties": {"source": source, "sink": sink or {"type": "DeltaSink"}}}
+    if nested:
+        loop = {"name": "ForEachTable", "type": "ForEach",
+                "typeProperties": {"activities": [copy]}}
+        return {"properties": {"activities": [loop]}}
+    return {"properties": {"activities": [copy]}}
+
+
+def _pl_ctx(definition: dict, *, unavailable=frozenset()) -> CheckContext:
+    workspace = WorkspaceContext(id="w", unavailable=set(unavailable))
+    return CheckContext(workspace=workspace, settings={}, obj_name="PL", obj=definition)
+
+
+_TUNED_SOURCE = {
+    "type": "AzureSqlSource",
+    "sqlReaderQuery": "SELECT id, amount FROM dbo.orders WHERE modified >= @{pipeline().parameters.wm}",
+    "partitionOption": "DynamicRange",
+}
+_TUNED_SINK = {"type": "DeltaSink", "writeBatchSize": 100000}
+
+
+def test_a_fully_tuned_sql_copy_passes():
+    verdict = sql_ingestion_tuned(_pl_ctx(_copy_pipeline(_TUNED_SOURCE, _TUNED_SINK)))
+    assert verdict.score == 3
+    assert "1 fold" in verdict.evidence
+
+
+def test_a_tuned_copy_nested_in_a_foreach_is_still_seen():
+    """Metadata-driven ingestion puts the Copy inside a loop."""
+    verdict = sql_ingestion_tuned(
+        _pl_ctx(_copy_pipeline(_TUNED_SOURCE, _TUNED_SINK, nested=True)))
+    assert verdict.score == 3
+
+
+def test_an_untuned_sql_copy_fails():
+    verdict = sql_ingestion_tuned(_pl_ctx(_copy_pipeline({"type": "AzureSqlSource"})))
+    assert verdict.score == 0
+    assert "query folding" in verdict.evidence
+
+
+def test_a_select_star_with_no_predicate_folds_nothing():
+    source = {"type": "SqlServerSource", "sqlReaderQuery": "SELECT * FROM dbo.orders"}
+    verdict = sql_ingestion_tuned(_pl_ctx(_copy_pipeline(source)))
+    assert verdict.score == 0
+    assert "0 fold the source read" in verdict.evidence
+
+
+def test_a_select_star_with_a_predicate_does_fold():
+    source = {"type": "SqlServerSource",
+              "sqlReaderQuery": "SELECT * FROM dbo.orders WHERE modified > '2024-01-01'",
+              "partitionOption": "PhysicalPartitionsOfTable"}
+    verdict = sql_ingestion_tuned(_pl_ctx(_copy_pipeline(source, _TUNED_SINK)))
+    assert verdict.score == 3
+
+
+def test_a_stored_procedure_source_always_folds():
+    source = {"type": "AzureSqlSource", "sqlReaderStoredProcedureName": "usp_get_orders"}
+    assert "1 fold the source read" in sql_ingestion_tuned(
+        _pl_ctx(_copy_pipeline(source))).evidence
+
+
+def test_partition_option_none_is_not_a_ranged_read():
+    """"None" is the default — it means nothing was chosen."""
+    source = {"type": "AzureSqlSource", "sqlReaderStoredProcedureName": "usp_x",
+              "partitionOption": "None"}
+    assert "0 set a partitionOption" in sql_ingestion_tuned(
+        _pl_ctx(_copy_pipeline(source))).evidence
+
+
+def test_half_tuned_ingestion_lands_in_the_middle():
+    source = {"type": "AzureSqlSource", "sqlReaderStoredProcedureName": "usp_x",
+              "partitionOption": "DynamicRange"}
+    verdict = sql_ingestion_tuned(_pl_ctx(_copy_pipeline(source)))
+    assert 0 < verdict.score < 3
+
+
+def test_sql_ingestion_is_na_without_a_sql_source():
+    definition = _copy_pipeline({"type": "DelimitedTextSource"})
+    assert sql_ingestion_tuned(_pl_ctx(definition)).status is Status.NA
+
+
+def test_sql_ingestion_is_na_when_pipeline_definitions_are_unreadable():
+    ctx = _pl_ctx(_copy_pipeline(_TUNED_SOURCE, _TUNED_SINK),
+                  unavailable={Resource.PIPELINE_DEFINITIONS})
+    assert sql_ingestion_tuned(ctx).status is Status.NA
+
+
+# =============================================================================
+# Operations & Reliability · Data Prep — ref 9.3.3 (transaction boundaries)
+#
+# Judged on the notebook surface: a notebook with two or more writes must bound
+# the sequence. One write is not a multi-step operation and is N/A.
+# =============================================================================
+
+_TWO_WRITES = ('a.write.mode("append").saveAsTable("gold.dim")\n'
+               'b.write.mode("append").saveAsTable("gold.fact")\n')
+
+
+def test_a_single_write_notebook_has_no_boundary_to_judge():
+    ctx = _nb_ctx('a.write.mode("append").saveAsTable("gold.dim")\n')
+    assert notebook_transaction_boundary(ctx).status is Status.NA
+
+
+def test_an_explicit_tsql_transaction_bounds_the_sequence():
+    code = ('cur.execute("BEGIN TRANSACTION")\n' + _TWO_WRITES + "conn.commit()\n")
+    verdict = notebook_transaction_boundary(_nb_ctx(code))
+    assert verdict.score == 3
+    assert "explicit transaction" in verdict.evidence
+
+
+def test_a_staging_swap_bounds_the_sequence():
+    code = ('a.write.saveAsTable("gold.dim_stg")\n'
+            'b.write.saveAsTable("gold.fact_stg")\n'
+            'spark.sql("ALTER TABLE gold.dim_stg RENAME TO gold.dim")\n')
+    assert notebook_transaction_boundary(_nb_ctx(code)).score == 3
+
+
+def test_failure_compensation_bounds_the_sequence():
+    code = ("try:\n    " + _TWO_WRITES.replace("\n", "\n    ") +
+            '\nexcept Exception:\n    spark.sql("RESTORE TABLE gold.dim VERSION AS OF 3")\n')
+    verdict = notebook_transaction_boundary(_nb_ctx(code))
+    assert verdict.score == 3
+    assert "compensation" in verdict.evidence
+
+
+def test_individually_atomic_writes_without_a_boundary_are_partial():
+    """Each table survives; the set of them does not."""
+    code = ('spark.sql("MERGE INTO gold.dim t USING s ON t.k = s.k")\n'
+            'spark.sql("MERGE INTO gold.fact t USING s ON t.k = s.k")\n')
+    verdict = notebook_transaction_boundary(_nb_ctx(code))
+    assert verdict.score == 1
+    assert "unbounded" in verdict.evidence
+
+
+def test_unbounded_appending_writes_fail():
+    verdict = notebook_transaction_boundary(_nb_ctx(_TWO_WRITES))
+    assert verdict.score == 0
+    assert "half-applied" in verdict.evidence
+
+
+def test_a_commented_out_rollback_is_not_a_boundary():
+    code = _TWO_WRITES + "# except Exception: rollback()\n"
+    assert notebook_transaction_boundary(_nb_ctx(code)).score == 0
+
+
+def test_transaction_boundary_is_na_without_notebook_definitions():
+    workspace = WorkspaceContext(id="w", unavailable={Resource.NOTEBOOK_DEFINITIONS})
+    ctx = CheckContext(workspace=workspace, settings={}, obj_name="nb",
+                       obj=_nb(_TWO_WRITES))
+    assert notebook_transaction_boundary(ctx).status is Status.NA
+
+
+# =============================================================================
+# Operations & Reliability · Reporting / Semantic — ref 14.5.4
+#
+# Two distinct mechanics, credited separately: a version history (Git) and a
+# promotion path (deployment pipeline).
+# =============================================================================
+
+def test_git_and_a_deployment_pipeline_together_pass():
+    ctx = _ws_ctx(id="w", items=_items(("SemanticModel", "SM_Sales"), ("Report", "RPT_Sales")),
+                  git_connected=True, deployment_pipeline=True)
+    verdict = bi_content_source_controlled_and_promoted(ctx)
+    assert verdict.score == 3
+    assert "1 semantic model(s) and 1 report(s)" in verdict.evidence
+
+
+def test_git_without_a_promotion_path_is_partial():
+    ctx = _ws_ctx(id="w", items=_items(("Report", "RPT_Sales")), git_connected=True)
+    verdict = bi_content_source_controlled_and_promoted(ctx)
+    assert verdict.score == 2
+    assert "promotion to the next tier is manual" in verdict.evidence
+
+
+def test_a_promotion_path_without_a_history_scores_lower_than_git_alone():
+    ctx = _ws_ctx(id="w", items=_items(("Report", "RPT_Sales")), deployment_pipeline=True)
+    verdict = bi_content_source_controlled_and_promoted(ctx)
+    assert verdict.score == 1
+    assert "without a version history" in verdict.evidence
+
+
+def test_neither_mechanic_fails():
+    ctx = _ws_ctx(id="w", items=_items(("SemanticModel", "SM_Sales")))
+    verdict = bi_content_source_controlled_and_promoted(ctx)
+    assert verdict.score == 0
+    assert "edited in place" in verdict.evidence
+
+
+def test_bi_deploy_is_na_without_reporting_content():
+    ctx = _ws_ctx(id="w", items=_items(("Lakehouse", "LH_Gold")), git_connected=True)
+    assert bi_content_source_controlled_and_promoted(ctx).status is Status.NA
+
+
+def test_a_classic_dashboard_is_not_git_supported_so_it_is_not_counted():
+    ctx = _ws_ctx(id="w", items=_items(("Dashboard", "DASH_Sales")), git_connected=True)
+    assert bi_content_source_controlled_and_promoted(ctx).status is Status.NA
+
+
+def test_bi_deploy_is_na_when_git_is_unreadable():
+    ctx = _ws_ctx(id="w", items=_items(("Report", "RPT_Sales")),
+                  unavailable={Resource.GIT})
+    assert bi_content_source_controlled_and_promoted(ctx).status is Status.NA
+
+
+def test_bi_deploy_is_na_without_items():
+    assert bi_content_source_controlled_and_promoted(
+        _ws_ctx(id="w", unavailable={Resource.ITEMS})).status is Status.NA

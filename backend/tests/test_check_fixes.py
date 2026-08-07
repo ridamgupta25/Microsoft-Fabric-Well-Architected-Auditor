@@ -18,15 +18,29 @@ from auditfast.core.check.data_management_quality.data_operations.automated impo
     notebook_standardization,
 )
 from auditfast.core.check.data_management_quality.data_prep.automated import (
+    nb_bronze_metadata,
+    nb_dedup_verify,
+    nb_dq_rules,
+    nb_eam_ingest,
+    nb_flag_domain,
     nb_no_display,
     nb_no_udf,
+    nb_silver_quality,
+    nb_source_metadata,
     nb_timeout,
+    nb_utf8_encoding,
+    pl_bulk_move,
 )
 from auditfast.core.check.data_management_quality.data_storage.automated import (
     table_date_dimension,
 )
+from auditfast.core.check.operations_reliability.data_logs.automated import (
+    audit_tables_capture_quality_logs,
+    pipeline_failure_alert,
+)
 from auditfast.core.check.operations_reliability.data_prep.automated import (
     failure_notification,
+    restart_from_failure,
 )
 from auditfast.core.check.performance_capacity.data_prep.automated import (
     delta_optimize,
@@ -233,6 +247,136 @@ def test_notebook_quality_checks_are_na_without_input():
     assert notebook_schema_validation(notebook).status is Status.NA
     assert notebook_format_validation(notebook).status is Status.NA
     assert notebook_standardization(notebook).status is Status.NA
+
+
+# -- DATA QUALITY INGESTION CONTROLS ------------------------------------------
+
+def test_source_metadata_requires_ingestion_timestamp():
+    code = """
+df = spark.read.json('Files/events.json')
+df = df.withColumn('ingestion_timestamp', current_timestamp())
+df.write.saveAsTable('bronze_events')
+"""
+    assert nb_source_metadata(_ctx(_nb(code))).score == _PASS
+
+
+def test_deduplication_verification_detects_duplicate_keys():
+    code = """
+df = spark.read.json('Files/events.json')
+duplicates = df.groupBy('event_id').count().filter('count > 1')
+assert duplicates.count() == 0
+df.write.saveAsTable('bronze_events')
+"""
+    assert nb_dedup_verify(_ctx(_nb(code))).score == _PASS
+
+
+def test_utf8_encoding_validation_passes():
+    code = "df = spark.read.option('encoding', 'UTF-8').json('Files/events.json')"
+    assert nb_utf8_encoding(_ctx(_nb(code))).score == _PASS
+
+
+def test_flag_domain_validation_passes():
+    code = "df = spark.read.json('Files/events.json')\nvalid = df.filter(df.active.isin(True, False))"
+    assert nb_flag_domain(_ctx(_nb(code))).score == _PASS
+
+
+def test_ingestion_controls_are_na_without_relevant_input_or_write():
+    context = _ctx(_nb("print('no input or write')"))
+    assert nb_source_metadata(context).status is Status.NA
+    assert nb_dedup_verify(context).status is Status.NA
+    assert nb_utf8_encoding(context).status is Status.NA
+    assert nb_flag_domain(context).status is Status.NA
+
+
+# -- BRONZE / SILVER / BULK / EAM CONTROLS -----------------------------------
+
+def test_bronze_metadata_passes_with_audit_fields():
+    code = """
+raw = spark.read.json('Files/raw.json')
+raw = raw.withColumn('ingestion_timestamp', current_timestamp())
+raw = raw.withColumn('source_file', input_file_name()).withColumn('batch_id', lit('b1'))
+raw.write.saveAsTable('bronze_events')
+"""
+    assert nb_bronze_metadata(_ctx(_nb(code))).score == _PASS
+
+
+def test_silver_quality_passes_with_dedup_and_type_conformance():
+    code = """
+silver = spark.read.table('bronze_events')
+silver = silver.dropDuplicates(['event_id']).withColumn('event_date', to_date('event_date'))
+silver.write.saveAsTable('silver_events')
+"""
+    assert nb_silver_quality(_ctx(_nb(code))).score == _PASS
+
+
+def test_bulk_pipeline_passes_with_parallel_copy():
+    pipeline = _pipe({
+        "name": "Bulk copy", "type": "Copy",
+        "typeProperties": {"parallelCopies": 8},
+    })
+    assert pl_bulk_move(_ctx(pipeline)).score == _PASS
+
+
+def test_eam_ingestion_passes_with_bounded_streaming_json():
+    code = """
+events = (spark.readStream.option('maxFilesPerTrigger', 10)
+          .json('Files/eam'))
+events.writeStream.partitionBy('event_date').start()
+"""
+    assert nb_eam_ingest(_ctx(_nb(code))).score == _PASS
+
+
+def test_layer_specific_checks_return_na_when_not_applicable():
+    notebook = _ctx(_nb("print('unrelated notebook')"))
+    pipeline = _ctx(_pipe({"name": "copy", "type": "Copy"}))
+    assert nb_bronze_metadata(notebook).status is Status.NA
+    assert nb_silver_quality(notebook).status is Status.NA
+    assert nb_eam_ingest(notebook).status is Status.NA
+    assert pl_bulk_move(pipeline).score == _FAIL
+
+
+# -- DQ RULES / RESTART / AUDIT LOG / FAILURE ALERT ---------------------------
+
+def test_dq_rules_are_codified():
+    code = "df = spark.read.json('Files/input.json')\nassert df.filter(df.id.isNull()).count() == 0"
+    assert nb_dq_rules(_ctx(_nb(code))).score == _PASS
+
+
+def test_restart_boundary_is_detected():
+    pipeline = _pipe({
+        "name": "Load batch", "type": "Copy",
+        "typeProperties": {"watermark": "control_table.last_loaded"},
+    })
+    assert restart_from_failure(_ctx(pipeline)).score == _PASS
+
+
+def test_audit_quality_log_writer_is_detected():
+    code = """
+quality_log = df.select('batch_id', 'row_count', 'null_count', 'exception_count')
+quality_log.write.mode('append').saveAsTable('dq_audit_log')
+"""
+    context = CheckContext(
+        workspace=WorkspaceContext(id="w", notebooks={"dq": _nb(code)}),
+        settings={}, obj_name="w", obj=None,
+    )
+    assert audit_tables_capture_quality_logs(context).score == _PASS
+
+
+def test_failure_alert_requires_failed_link():
+    pipeline = _pipe(
+        {"name": "Load", "type": "Copy"},
+        {"name": "Send Teams Alert", "type": "Teams",
+         "dependsOn": [{"activity": "Load", "dependencyConditions": ["Failed"]}]},
+    )
+    assert pipeline_failure_alert(_ctx(pipeline)).score == _PASS
+
+
+def test_new_checks_return_na_when_required_artifact_is_missing():
+    notebook = _ctx(_nb("print('no data')"))
+    pipeline = _ctx(_pipe())
+    assert nb_dq_rules(notebook).status is Status.NA
+    assert restart_from_failure(pipeline).status is Status.NA
+    assert pipeline_failure_alert(pipeline).status is Status.NA
 
 
 # -- DELTA-OPTIMIZE ------------------------------------------------------------

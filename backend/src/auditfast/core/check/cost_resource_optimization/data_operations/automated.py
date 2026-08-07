@@ -10,7 +10,7 @@ from auditfast.core.models import CheckContext, Item
 
 
 @check(
-    id="WS-CAPACITY", ref="12.1", title="Capacity assigned",
+    id="WS-CAPACITY", ref="IMPL-15", title="Workspace is assigned to a Fabric capacity [WS-CAPACITY]",
     pillar=Pillar.COST, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     requires=[Resource.WORKSPACE], required=True,
 )
@@ -41,7 +41,7 @@ def _is_stale(item: Item, *, cutoff_days: int, now: datetime) -> bool:
 
 
 @check(
-    id="WS-ORPHAN", ref="12.3.4", title="No orphaned / stale items",
+    id="WS-ORPHAN", ref="12.3.4", title="Unused or orphaned Fabric items cleaned up (esp. Dev/QA)",
     pillar=Pillar.COST, scope=Scope.WORKSPACE, severity=Severity.LOW,
     requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=False,
 )

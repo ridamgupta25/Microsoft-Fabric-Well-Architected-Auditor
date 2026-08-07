@@ -9,10 +9,11 @@ import { useMemo, useState } from "react";
 
 import type { CheckResult, CheckStatus } from "@/types/api";
 import { SEVERITY_RANK } from "@/utils/format";
-import { EmptyState, SeverityBadge, StatusBadge } from "./ui";
+import { EmptyState, SeverityBadge, StatusBadge, ValidationBadge } from "./ui";
 
 type SeverityFilter = "all" | "Critical" | "High" | "Medium" | "Low";
 type StatusFilter = "all" | "actionable" | CheckStatus;
+type ValidationFilter = "all" | "validated" | "pending";
 
 const STATUS_OPTIONS: { value: StatusFilter; label: string }[] = [
   { value: "all", label: "All statuses" },
@@ -52,6 +53,7 @@ function CheckScore({ score }: { score: number | null }) {
 export function FindingsTable({ results }: { results: CheckResult[] }) {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [severity, setSeverity] = useState<SeverityFilter>("all");
+  const [validation, setValidation] = useState<ValidationFilter>("all");
   const [query, setQuery] = useState("");
 
   const findings = useMemo(() => {
@@ -60,6 +62,9 @@ export function FindingsTable({ results }: { results: CheckResult[] }) {
     return results
       .filter((r) => matchesStatus(r.status, statusFilter))
       .filter((r) => severity === "all" || r.severity === severity)
+      .filter((r) =>
+        validation === "all" ? true : validation === "validated" ? r.validated : !r.validated,
+      )
       .filter((r) =>
         needle === ""
           ? true
@@ -73,7 +78,7 @@ export function FindingsTable({ results }: { results: CheckResult[] }) {
           SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity] ||
           (a.score ?? 9) - (b.score ?? 9),
       );
-  }, [results, statusFilter, severity, query]);
+  }, [results, statusFilter, severity, validation, query]);
 
   return (
     <div className="space-y-3">
@@ -110,6 +115,16 @@ export function FindingsTable({ results }: { results: CheckResult[] }) {
           <option value="Medium">Medium</option>
           <option value="Low">Low</option>
         </select>
+        <select
+          value={validation}
+          onChange={(event) => setValidation(event.target.value as ValidationFilter)}
+          className="input max-w-[12rem]"
+          aria-label="Filter by validation"
+        >
+          <option value="all">All validation</option>
+          <option value="validated">Validated</option>
+          <option value="pending">Pending validation</option>
+        </select>
         <span className="text-sm text-slate-500">
           Showing {findings.length} of {results.length} checks
         </span>
@@ -128,6 +143,7 @@ export function FindingsTable({ results }: { results: CheckResult[] }) {
                 <th scope="col">Severity</th>
                 <th scope="col">Ref</th>
                 <th scope="col">Check</th>
+                <th scope="col">Validation</th>
                 <th scope="col">Pillar</th>
                 <th scope="col">Workspace</th>
                 <th scope="col">Object</th>
@@ -143,6 +159,7 @@ export function FindingsTable({ results }: { results: CheckResult[] }) {
                   <td><SeverityBadge severity={finding.severity} /></td>
                   <td className="whitespace-nowrap font-mono text-xs">{finding.ref}</td>
                   <td className="min-w-[14rem]">{finding.title}</td>
+                  <td><ValidationBadge validated={finding.validated} /></td>
                   <td className="whitespace-nowrap">{finding.pillar}</td>
                   <td className="whitespace-nowrap">{finding.workspace}</td>
                   <td className="whitespace-nowrap">{finding.obj || finding.workspace}</td>
