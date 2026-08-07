@@ -14,7 +14,13 @@ import re
 from collections import Counter
 from typing import Any
 
-from auditfast.core.check.helpers import Verdict, covered, not_applicable
+from auditfast.core.check._dax import (
+    expensive_iterator,
+    repeated_subexpressions,
+    uses_variables,
+)
+from auditfast.core.check._dax import normalised as dax_normalised
+from auditfast.core.check.helpers import Verdict, covered, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
@@ -32,12 +38,6 @@ _MIN_MEASURE_CHARS = 60
 
 #: Above this a measure is complex enough that VAR is the readable way to write it.
 _COMPLEX_MEASURE_CHARS = 400
-
-_WHITESPACE = re.compile(r"\s+")
-
-#: A real DAX variable declaration. A loose ``VAR`` substring also matches a column
-#: named "Var Amount".
-_VAR_DECLARATION = re.compile(r"\bVAR\s+\w+\s*=", re.IGNORECASE)
 
 _KEY_HINT_RE = re.compile(
     r"(?:^id$|_id$|^key$|_key$|^sk$|_sk$|code$|number$|num$|date$)",
@@ -74,7 +74,20 @@ def _query_results(ctx: CheckContext) -> dict[str, Any]:
 
 def _normalised(expression: object) -> str:
     """Expression with runs of whitespace collapsed, so pretty-printing adds no length."""
-    return _WHITESPACE.sub(" ", str(expression or "")).strip()
+    return dax_normalised(expression)
+
+
+#: How many offending measure names a detail row spells out before summarising. A
+#: model with hundreds of them is a model-level problem, not a list to work through.
+_MAX_NAMED_MEASURES = 25
+
+
+def _measure_detail(names: list[str], verb: str) -> str:
+    """``N measures <verb>: a, b, c`` - capped so one model cannot fill the report."""
+    shown = ", ".join(names[:_MAX_NAMED_MEASURES])
+    more = (f" (+{len(names) - _MAX_NAMED_MEASURES} more)"
+            if len(names) > _MAX_NAMED_MEASURES else "")
+    return f"{len(names)} measure(s) {verb}: {shown}{more}"
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +98,7 @@ def _normalised(expression: object) -> str:
 @check(
     id="SM-FK-SURROGATE",
     ref="5.4.1",
-    title="Fact-dimension relationships join on surrogate keys",
+    title="Fact-dimension referential integrity: all FKs in fact tables match dimension surrogate keys",
     pillar=Pillar.DATA,
     scope=Scope.SEMANTIC_MODEL,
     severity=Severity.HIGH,
@@ -136,7 +149,7 @@ def sm_fk_surrogate(ctx: CheckContext) -> Verdict:
 @check(
     id="SM-FK-RI-DATA",
     ref="5.4.1",
-    title="Fact FK values resolve to dimension surrogate keys (no orphans)",
+    title="Fact-dimension referential integrity: all FKs in fact tables match dimension surrogate keys",
     pillar=Pillar.DATA,
     scope=Scope.WORKSPACE,
     severity=Severity.HIGH,
@@ -176,26 +189,29 @@ def sm_fk_ri_data(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="R-BIDI-REL", ref="14.1.1", title="Star schema: relationships filter in a single direction",
+    id="R-BIDI-REL", ref="14.1.1", title="Star schema followed in the semantic model (single-direction relationships, no unnecessary bidirectional filters)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
-def single_direction_relationships(ctx: CheckContext) -> Verdict:
+def single_direction_relationships(ctx: CheckContext) -> list[Verdict]:
     """Relationships filter one way, so filter propagation stays predictable.
 
     A bidirectional filter is legitimate for a bridge table, so this reports the
-    count for review rather than judging whether each one is necessary.
+    count for review rather than judging whether each one is necessary. The scored
+    workspace verdict is followed by one unscored detail row per model carrying a
+    bidirectional relationship, naming the relationship.
     """
     if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
-        return not_applicable(_UNREADABLE)
+        return [not_applicable(_UNREADABLE)]
     models = ctx.workspace.semantic_models
     if not models:
-        return not_applicable(_NO_MODELS)
+        return [not_applicable(_NO_MODELS)]
 
     with_relationships = 0
     single_direction = 0
     bidirectional = 0
-    for defn in models.values():
+    failing: list[tuple[str, str]] = []
+    for name, defn in models.items():
         rels = defn.get("relationships") or []
         if not rels:
             continue
@@ -205,78 +221,141 @@ def single_direction_relationships(ctx: CheckContext) -> Verdict:
         bidirectional += len(both)
         if not both:
             single_direction += 1
+        else:
+            named = ", ".join(
+                f"{r.get('from_table') or '?'} <-> {r.get('to_table') or '?'}" for r in both[:10]
+            )
+            more = f" (+{len(both) - 10} more)" if len(both) > 10 else ""
+            failing.append((name, f"{len(both)} bidirectional relationship(s): {named}{more}"))
 
     if not with_relationships:
-        return not_applicable("No semantic models define relationships")
-    return covered(
+        return [not_applicable("No semantic models define relationships")]
+    verdicts = [covered(
         single_direction, with_relationships,
         f"{single_direction} of {with_relationships} semantic models filter in a single "
         f"direction; {bidirectional} bidirectional relationship(s) found",
-    )
+    )]
+    verdicts += [note(reason, obj=name) for name, reason in sorted(failing)]
+    return verdicts
 
 
 @check(
-    id="R-MEASURE-DUP", ref="14.1.3", title="Measures centralized: no duplicated calculation logic",
+    id="R-MEASURE-DUP", ref="14.1.3", title="Measures centralized (no duplicated calculation logic across reports)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
-def measures_not_duplicated(ctx: CheckContext) -> Verdict:
+def measures_not_duplicated(ctx: CheckContext) -> list[Verdict]:
     """Each substantial calculation is defined once and re-used, not copy-pasted.
 
     Duplication is counted across every model in the workspace, which is where
-    copy-pasted logic usually lands: the same measure cloned into many models.
+    copy-pasted logic usually lands: the same measure cloned into many models. The
+    scored workspace verdict is followed by one unscored detail row per model that
+    carries a repeated expression, naming the measures.
     """
     if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
-        return not_applicable(_UNREADABLE)
+        return [not_applicable(_UNREADABLE)]
     models = ctx.workspace.semantic_models
     if not models:
-        return not_applicable(_NO_MODELS)
+        return [not_applicable(_NO_MODELS)]
 
-    expressions = [
-        normalised
-        for defn in models.values()
-        for measure in defn.get("measures") or []
-        if len(normalised := _normalised(measure.get("expression"))) > _MIN_MEASURE_CHARS
-    ]
-    if not expressions:
-        return not_applicable("No semantic model measures long enough to assess for duplication")
+    # (model, measure name, normalised expression) for every substantial measure.
+    entries: list[tuple[str, str, str]] = []
+    for model_name, defn in models.items():
+        for measure in defn.get("measures") or []:
+            expr = _normalised(measure.get("expression"))
+            if len(expr) > _MIN_MEASURE_CHARS:
+                entries.append((model_name, measure.get("name") or "?", expr))
+    if not entries:
+        return [not_applicable("No semantic model measures long enough to assess for duplication")]
 
-    counts = Counter(expressions)
+    counts = Counter(expr for _, _, expr in entries)
     duplicated = {expr for expr, n in counts.items() if n > 1}
-    unique = sum(1 for expr in expressions if expr not in duplicated)
-    return covered(
-        unique, len(expressions),
-        f"{unique} of {len(expressions)} substantial measures carry an expression used "
+    unique = sum(1 for _, _, expr in entries if expr not in duplicated)
+
+    offenders: dict[str, list[str]] = {}
+    for model_name, measure_name, expr in entries:
+        if expr in duplicated:
+            offenders.setdefault(model_name, []).append(measure_name)
+
+    verdicts = [covered(
+        unique, len(entries),
+        f"{unique} of {len(entries)} substantial measures carry an expression used "
         f"nowhere else; {len(duplicated)} distinct expression(s) are repeated across the "
         f"workspace's {len(models)} semantic model(s)",
-    )
+    )]
+    verdicts += [
+        note(_measure_detail(names, "repeat an expression defined elsewhere"), obj=model_name)
+        for model_name, names in sorted(offenders.items())
+    ]
+    return verdicts
 
 
 @check(
-    id="R-DAX-VAR", ref="14.1.4", title="Complex DAX measures use variables",
+    id="R-DAX-VAR", ref="14.1.4", title="DAX follows good practices (variables, no repeated sub-expressions, avoids expensive iterators where avoidable)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
-def complex_measures_use_variables(ctx: CheckContext) -> Verdict:
-    """Long DAX measures declare VAR, so intermediate steps are named and evaluated once."""
+def complex_measures_use_variables(ctx: CheckContext) -> list[Verdict]:
+    """Substantial measures are readable and cheap to evaluate.
+
+    Three mechanically checkable practices, judged per measure:
+
+    * a long measure declares ``VAR``, so intermediate steps are named and
+      evaluated once;
+    * no substantial sub-expression is written twice — the duplication a ``VAR``
+      exists to remove;
+    * no iterator pattern with a cheaper equivalent — an iterator nested inside
+      another, or ``CALCULATE(..., FILTER(<table>, <table>[col] = x))`` where a
+      plain boolean argument does the same job.
+
+    Whether a *particular* iterator is truly avoidable is a modelling judgement,
+    so only the two unambiguous anti-patterns above count against a measure. The
+    scored workspace verdict is followed by one unscored detail row per model,
+    naming the offending measures and which practice each breaks.
+    """
     if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
-        return not_applicable(_UNREADABLE)
+        return [not_applicable(_UNREADABLE)]
     models = ctx.workspace.semantic_models
     if not models:
-        return not_applicable(_NO_MODELS)
+        return [not_applicable(_NO_MODELS)]
 
-    complex_expressions = [
-        normalised
-        for defn in models.values()
-        for measure in defn.get("measures") or []
-        if len(normalised := _normalised(measure.get("expression"))) > _COMPLEX_MEASURE_CHARS
+    total = compliant = 0
+    no_var = repeated = iterators = 0
+    offenders: dict[str, list[str]] = {}
+    for model_name, defn in models.items():
+        for measure in defn.get("measures") or []:
+            expr = _normalised(measure.get("expression"))
+            if len(expr) <= _MIN_MEASURE_CHARS:
+                continue
+            total += 1
+            faults = []
+            if len(expr) > _COMPLEX_MEASURE_CHARS and not uses_variables(expr):
+                faults.append("no VAR")
+                no_var += 1
+            if repeated_subexpressions(expr):
+                faults.append("repeated sub-expression")
+                repeated += 1
+            if expensive_iterator(expr):
+                faults.append("avoidable iterator")
+                iterators += 1
+            if faults:
+                name = measure.get("name") or "?"
+                offenders.setdefault(model_name, []).append(f"{name} ({', '.join(faults)})")
+            else:
+                compliant += 1
+
+    if not total:
+        return [not_applicable("No semantic model measures substantial enough to assess")]
+
+    verdicts = [covered(
+        compliant, total,
+        f"{compliant} of {total} substantial measures follow all three DAX practices — "
+        f"{no_var} measure(s) longer than {_COMPLEX_MEASURE_CHARS} characters declare no VAR, "
+        f"{repeated} repeat a substantial sub-expression, "
+        f"{iterators} use an iterator pattern with a cheaper equivalent",
+    )]
+    verdicts += [
+        note(_measure_detail(names, "break a DAX practice"), obj=model_name)
+        for model_name, names in sorted(offenders.items())
     ]
-    if not complex_expressions:
-        return not_applicable("No semantic model measures are complex enough to require variables")
-
-    using_var = sum(1 for expr in complex_expressions if _VAR_DECLARATION.search(expr))
-    return covered(
-        using_var, len(complex_expressions),
-        f"{using_var} of {len(complex_expressions)} measures longer than "
-        f"{_COMPLEX_MEASURE_CHARS} characters use VAR",
-    )
+    return verdicts

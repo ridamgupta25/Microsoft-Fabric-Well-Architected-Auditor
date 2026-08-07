@@ -11,8 +11,10 @@ guidance from the vendored ``fabric-skills``.
 """
 from __future__ import annotations
 
+import re
+
 from auditfast.core.check._notebook import notebook_code
-from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities
+from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities, walk_activities
 from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Pillar, Resource, Scope, Severity
@@ -24,7 +26,7 @@ from ._spark import NOTEBOOK_LAYERS, pip_targets, unpinned_targets, writes_delta
 # -- Delta table maintenance (3.3.x) ------------------------------------------
 
 @check(
-    id="DELTA-MERGE", ref="3.3.1", title="Upserts use a single atomic MERGE",
+    id="DELTA-MERGE", ref="3.3.1", title="Single `MERGE INTO` handles I/U/D atomically — not separate sequential DELETE/INSERT/UPDATE",
     pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -39,7 +41,7 @@ def delta_merge(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="DELTA-OPTIMIZE", ref="3.3.2", title="OPTIMIZE runs after write-heavy operations",
+    id="DELTA-OPTIMIZE", ref="3.3.2", title="`OPTIMIZE` (bin-compaction) scheduled appropriately (not after every micro-batch)",
     pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -54,7 +56,7 @@ def delta_optimize(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="DELTA-VACUUM", ref="3.3.3", title="VACUUM scheduled to clean up old Delta files",
+    id="DELTA-VACUUM", ref="3.3.3", title="`VACUUM` scheduled to clean up old Delta files",
     pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -69,7 +71,7 @@ def delta_vacuum(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="DELTA-ZORDER", ref="3.3.4", title="Z-ORDER applied on high-cardinality filter columns",
+    id="DELTA-ZORDER", ref="3.3.4", title="Z-ORDER / liquid clustering applied on high-cardinality filter columns",
     pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -84,7 +86,7 @@ def delta_zorder(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="DELTA-VORDER", ref="3.3.5", title="V-Order enabled for read-optimized workloads",
+    id="DELTA-VORDER", ref="3.3.5", title="V-Order enabled where Fabric recommends for read-optimized workloads",
     pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -102,7 +104,7 @@ def delta_vorder(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="DELTA-TBLPROPS", ref="3.3.6", title="Delta table optimization properties set",
+    id="DELTA-TBLPROPS", ref="3.3.6", title="Table properties set appropriately (optimizeWrite, autoCompaction)",
     pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -120,7 +122,7 @@ def delta_tblprops(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="DELTA-RETENTION", ref="3.3.7", title="Delta history retention configured",
+    id="DELTA-RETENTION", ref="3.3.7", title="Delta table history / log retention configured and monitored",
     pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -140,7 +142,7 @@ def delta_retention(ctx: CheckContext) -> Verdict:
 # -- Spark environment & tuning (3.4.x / 3.5.x) -------------------------------
 
 @check(
-    id="SPARK-ENV", ref="3.4.1", title="Fabric Environments manage Spark dependencies",
+    id="SPARK-ENV", ref="3.4.1", title="Fabric Environments used to manage Spark dependencies",
     pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -158,7 +160,7 @@ def spark_env(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="SPARK-LIBPIN", ref="3.4.2", title="Custom library versions pinned (not floating)",
+    id="SPARK-LIBPIN", ref="3.4.2", title="Custom library versions pinned (not latest/floating)",
     pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -186,7 +188,7 @@ def spark_libpin(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="SPARK-CONF", ref="3.4.4", title="Spark configuration tuned from defaults",
+    id="SPARK-CONF", ref="3.4.4", title="Spark configuration tuned from defaults where justified (shuffle partitions, memory)",
     pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -202,7 +204,7 @@ def spark_conf(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="SPARK-SHUFFLE", ref="3.5.2", title="Shuffle partition count tuned for data size",
+    id="SPARK-SHUFFLE", ref="3.5.2", title="Partition count appropriate (not 200 default for small/medium data)",
     pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -217,7 +219,7 @@ def spark_shuffle(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="SPARK-CACHE", ref="3.5.3", title="Caching used judiciously and released",
+    id="SPARK-CACHE", ref="3.5.3", title="Caching (`persist`/`cache`) used judiciously, not indiscriminately",
     pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -232,7 +234,7 @@ def spark_cache(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="SPARK-REPARTITION", ref="3.5.4", title="Write partition strategy is explicit",
+    id="SPARK-REPARTITION", ref="3.5.4", title="Write operations use appropriate partition strategy (coalesce vs repartition; right-sized files)",
     pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -247,7 +249,7 @@ def spark_repartition(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="SPARK-SELECT", ref="3.5.9", title="Explicit column projection (no SELECT *)",
+    id="SPARK-SELECT", ref="3.5.8", title="Unnecessary columns eliminated in reads (explicit select, not `SELECT *`)",
     pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -264,7 +266,7 @@ def spark_select(ctx: CheckContext) -> Verdict:
 # -- Workload evidence (3.4.x / 3.5.x) ----------------------------------------
 
 @check(
-    id="SPARK-RUNTIME", ref="3.4.5", title="Python/Spark runtime is current and supported",
+    id="SPARK-RUNTIME", ref="3.4.5", title="Python/Spark runtime version is current and supported",
     pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS, Resource.ENVIRONMENT_DEFINITIONS], required=True,
 )
@@ -302,7 +304,7 @@ def spark_runtime(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="SPARK-POOL", ref="3.4.6", title="Spark pool size appropriate for workload",
+    id="SPARK-POOL", ref="3.4.3", title="Spark pool size appropriate for workload (not over- or under-provisioned)",
     pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -329,7 +331,7 @@ def spark_pool(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="SPARK-UI", ref="3.5.6", title="Spark UI has no skew, spill, or excessive shuffle issues",
+    id="SPARK-UI", ref="3.5.1", title="Spark UI reviewed for skew, spill, shuffle issues on key jobs",
     pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -367,7 +369,7 @@ def spark_partition_pruning(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="SPARK-PROFILE", ref="3.5.10", title="Long-running notebooks profiled and optimized",
+    id="SPARK-PROFILE", ref="3.5.6", title="Long-running notebooks profiled and optimized",
     pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -402,7 +404,7 @@ def spark_profile(ctx: CheckContext) -> Verdict:
 # -- Copy activity parallelism (2.6.2) ----------------------------------------
 
 @check(
-    id="PL-COPY-PARALLEL", ref="2.6.2", title="Copy activities use appropriate parallelism",
+    id="PL-COPY-PARALLEL", ref="2.6.2", title="Copy activities use appropriate parallelism (DIU, degree of copy parallelism)",
     pillar=Pillar.PERFORMANCE, scope=Scope.PIPELINE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -420,3 +422,123 @@ def copy_parallelism(ctx: CheckContext) -> Verdict:
         tuned, len(copies),
         f"{tuned} of {len(copies)} Copy activities set parallelCopies/DIU",
     )
+
+
+# -- Relational-source ingestion tuning (2.6.5) -------------------------------
+
+#: A Copy *source* that reads a relational SQL database — Azure SQL DB, SQL
+#: Server/MI, Synapse, or an RDS-hosted SQL Server. Matched on the source type
+#: name rather than a source-system name, so the rule holds for every relational
+#: feed rather than one tenant's.
+_SQL_SOURCE_TYPE = re.compile(r"^(?=.*sql).*source$", re.IGNORECASE)
+
+#: A reader query that folds nothing: the whole table, every column.
+_UNFOLDED_QUERY = re.compile(r"select\s+\*", re.IGNORECASE)
+#: A predicate or a pipeline expression inside the reader query — the projection
+#: or restriction being pushed down to the source engine.
+_FOLDED_QUERY = re.compile(r"\bwhere\b|\btop\b|@\{|@pipeline\s*\(|@activity\s*\(", re.IGNORECASE)
+
+
+def _sql_copy_sources(definition: dict) -> list[tuple[str, dict, dict]]:
+    """``(activity name, source, sink)`` for every Copy reading a SQL database.
+
+    Uses :func:`walk_activities` so a Copy nested inside a ForEach — the usual
+    shape for metadata-driven ingestion — is judged like a top-level one.
+    """
+    found: list[tuple[str, dict, dict]] = []
+    for activity in walk_activities(definition):
+        if activity.get("type") != "Copy":
+            continue
+        props = activity.get("typeProperties") or {}
+        source = props.get("source") if isinstance(props.get("source"), dict) else {}
+        sink = props.get("sink") if isinstance(props.get("sink"), dict) else {}
+        if _SQL_SOURCE_TYPE.match(str(source.get("type") or "")):
+            found.append((activity.get("name") or "?", source, sink))
+    return found
+
+
+def _folds_source_read(source: dict) -> bool:
+    """The source read pushes projection or restriction into the database.
+
+    A stored procedure always folds — the work happens in the source engine. A
+    reader query folds when it names its columns or carries a predicate; a bare
+    ``SELECT *`` with no ``WHERE`` reads the whole table and folds nothing.
+    """
+    if source.get("sqlReaderStoredProcedureName"):
+        return True
+    query = source.get("sqlReaderQuery") or source.get("query") or ""
+    if isinstance(query, dict):  # an expression object — value lives under "value"
+        query = query.get("value") or ""
+    query = str(query)
+    if not query.strip():
+        return False
+    return bool(_FOLDED_QUERY.search(query)) or not _UNFOLDED_QUERY.search(query)
+
+
+def _partitions_source_read(source: dict) -> bool:
+    """The read is split into partitions rather than pulled as one stream.
+
+    Whether the partition column is *indexed* is not readable — Fabric exposes no
+    source-schema metadata — so a configured ``partitionOption`` is the readable
+    proxy for an index-friendly ranged read. ``"None"`` is the default and means
+    nothing was chosen.
+    """
+    option = str(source.get("partitionOption") or "").strip()
+    return bool(option) and option.lower() != "none"
+
+
+def _sizes_write_batch(sink: dict) -> bool:
+    """The sink writes in explicitly sized batches instead of the default."""
+    return bool(sink.get("writeBatchSize") or sink.get("writeBatchTimeout"))
+
+
+@check(
+    id="PL-SQL-INGEST-TUNED", ref="2.6.5",
+    title="Relational (Azure SQL DB) ingestion is tuned — query folding, ranged source reads, batch sizing",
+    pillar=Pillar.PERFORMANCE, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
+)
+def sql_ingestion_tuned(ctx: CheckContext) -> Verdict:
+    """Copy activities reading a SQL database fold, partition, and batch their I/O.
+
+    Three independent tunings, each read straight off the Copy activity:
+
+    * *query folding* — a reader query or stored procedure that projects columns
+      or carries a predicate, so the source engine does the filtering rather than
+      the whole table crossing the wire;
+    * *ranged source read* — a ``partitionOption`` other than ``None``, so the
+      read is split instead of pulled as one long-running stream. Index metadata
+      is not exposed by any Fabric API, so this is the readable proxy for an
+      index-friendly read, and the docstring says so rather than pretending;
+    * *batch sizing* — an explicit ``writeBatchSize``/``writeBatchTimeout`` on the
+      sink instead of the conservative default.
+
+    Scored as coverage over all three signals across every SQL-source Copy, so a
+    pipeline that folds but never partitions lands in the middle rather than at
+    either extreme. A pipeline that reads no SQL database is N/A.
+    """
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    sql_copies = _sql_copy_sources(ctx.obj)
+    if not sql_copies:
+        return not_applicable("Pipeline has no Copy activity reading a SQL database")
+
+    folded = [name for name, source, _ in sql_copies if _folds_source_read(source)]
+    partitioned = [name for name, source, _ in sql_copies if _partitions_source_read(source)]
+    batched = [name for name, _, sink in sql_copies if _sizes_write_batch(sink)]
+
+    total = len(sql_copies)
+    met = len(folded) + len(partitioned) + len(batched)
+    gaps = [
+        label for label, hit in (
+            ("query folding", folded), ("ranged source read", partitioned),
+            ("sink batch sizing", batched),
+        ) if len(hit) < total
+    ]
+    detail = (f"{total} SQL-source Copy activit(y/ies): {len(folded)} fold the source read, "
+              f"{len(partitioned)} set a partitionOption, {len(batched)} set a sink write "
+              f"batch size")
+    if gaps:
+        detail += f" — untuned on {', '.join(gaps)}"
+    return covered(met, total * 3, detail)

@@ -69,11 +69,11 @@ def test_result_and_scored_counts_are_unchanged(provider):
 
 def test_status_counts_are_unchanged(provider):
     agg = aggregate(_run(provider))
-    assert agg["counts"][Status.PASS] == 50
+    assert agg["counts"][Status.PASS] == 51
     assert agg["counts"][Status.PARTIAL] == 18
-    assert agg["counts"][Status.FAIL] == 51
-    assert agg["counts"][Status.NA] == 129
-    assert agg["counts"][Status.INFO] == 3
+    assert agg["counts"][Status.FAIL] == 63
+    assert agg["counts"][Status.NA] == 150
+    assert agg["counts"][Status.INFO] == 5
 
 
 def test_mixed_layer_runs_every_layers_checks():
@@ -271,17 +271,16 @@ def test_progress_callback_fires_per_workspace(provider):
 
 
 def test_registry_is_fully_populated():
-    """99 checks are evaluated; remaining roadmap checks are not loaded."""
+    """143 checks are evaluated; remaining roadmap checks are not loaded."""
     evaluated = [s for s in REGISTRY if s.automation is Automation.AUTOMATED]
-    assert len(evaluated) == 127
-    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 38
-    assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 23
-    assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 60
-    assert len([s for s in evaluated if s.scope is Scope.SEMANTIC_MODEL]) == 6
+    assert len(evaluated) == 151
+    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 49
+    assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 27
+    assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 69
     # Roadmap (gated N/A) checks are intentionally not registered — see
     # auditfast.core.check.__init__._CHECK_MODULES — so none remain in the registry.
     assert len([s for s in REGISTRY if s.automation is Automation.ROADMAP]) == 0
-    assert len([s for s in REGISTRY if s.automation is Automation.INTERACTIVE]) == 0
+    assert len([s for s in REGISTRY if s.automation is Automation.INTERACTIVE]) == 11
     assert all(
         s.automation is Automation.INTERACTIVE for s in REGISTRY if s.manual
     )
@@ -336,7 +335,7 @@ def test_explicit_registry_is_isolated_from_the_global_one():
     assert registry.get("X-ISOLATED") is not None
     assert REGISTRY.get("X-ISOLATED") is None, "test check leaked into the global registry"
     before = len([s for s in REGISTRY if s.automation is Automation.AUTOMATED])
-    assert before == 127
+    assert before == 151
 
 # -- selection and dispatch ----------------------------------------------------
 

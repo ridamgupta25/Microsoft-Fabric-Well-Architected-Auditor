@@ -100,6 +100,11 @@ class CheckResultOut(BaseModel):
     weight: float
     scored: bool
     common: bool = Field(description="True for checks that apply to every project.")
+    validated: bool = Field(
+        default=False,
+        description="True once the check has completed Phase 1 validation; False "
+        "while it is still pending validation for the next phase.",
+    )
 
 
 class WorkspaceError(BaseModel):

@@ -31,9 +31,9 @@ def test_matching_is_deterministic():
 
 
 def test_ref_in_text_boosts_the_matching_check():
-    match = matching.best_match("Point about ref 11.1.2")
+    match = matching.best_match("Point about ref 11.1.1")
     assert match is not None
-    assert match.spec.ref == "11.1.2"
+    assert match.spec.ref == "11.1.1"
 
 
 # -- proposal drafting ---------------------------------------------------------

@@ -39,6 +39,11 @@ _DEFAULT_FABRIC_SCOPES = [
 # just their email when no app registration is available.
 _AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
 _POWERBI_DEFAULT_SCOPE = ["https://analysis.windows.net/powerbi/api/.default"]
+#: The SQL analytics endpoint (TDS, port 1433). A third audience alongside Fabric
+#: and Power BI: Fabric REST *discovers* the endpoint, TDS *reads* it. The Azure
+#: CLI public client is pre-authorized for it, so the SQL token comes silently
+#: from the refresh token minted at sign-in - the user is never prompted twice.
+_SQL_DEFAULT_SCOPE = ["https://database.windows.net/.default"]
 #: The Fabric API, requested as .default so the built-in Azure CLI client's full
 #: set of pre-authorized Fabric permissions (including the item read/write needed
 #: for getDefinition) is included. Power BI .default did not carry them.
@@ -122,6 +127,43 @@ def powerbi_token_for(session_id: str | None) -> str | None:
 
 def _azcli_powerbi_token() -> str | None:
     """Get a Power BI-audience token from an existing ``az login``, or ``None``."""
+    return _azcli_token("https://analysis.windows.net/powerbi/api")
+
+
+def sql_token_for(session_id: str | None) -> str | None:
+    """Mint a SQL-analytics-endpoint token for a signed-in session, or ``None``.
+
+    Lakehouse/Warehouse column schemas and Warehouse security policies are not in
+    the Fabric REST API at all - they are only readable over TDS against the SQL
+    analytics endpoint, whose audience is ``https://database.windows.net``. The
+    endpoint address itself *is* discoverable over REST, so the user is never
+    asked for a connection string.
+
+    Acquired *silently* from the session's existing MSAL refresh token (the Azure
+    CLI public client is pre-authorized for this resource), so one sign-in covers
+    Fabric, Power BI and SQL. It never prompts; on any failure it returns ``None``
+    and the crawl leaves column schemas empty rather than guessing - exactly the
+    behaviour before the SQL endpoint existed.
+    """
+    sess = _SESSIONS.get(session_id or "")
+    if not sess:
+        return None
+    app = sess.get("_msal_app")
+    account = sess.get("_msal_account")
+    if app and account:
+        try:
+            res = app.acquire_token_silent(_SQL_DEFAULT_SCOPE, account=account)
+            if res and "access_token" in res:
+                return res["access_token"]
+        except Exception:
+            pass
+    if sess.get("_azcli"):
+        return _azcli_token("https://database.windows.net")
+    return None
+
+
+def _azcli_token(resource: str) -> str | None:
+    """Get a token for ``resource`` from an existing ``az login``, or ``None``."""
     import shutil
     import subprocess
 
@@ -129,8 +171,8 @@ def _azcli_powerbi_token() -> str | None:
         return None
     try:
         out = subprocess.run(
-            ["az", "account", "get-access-token", "--resource",
-             "https://analysis.windows.net/powerbi/api", "--output", "json"],
+            ["az", "account", "get-access-token", "--resource", resource,
+             "--output", "json"],
             capture_output=True, text=True, timeout=90)
     except Exception:
         return None

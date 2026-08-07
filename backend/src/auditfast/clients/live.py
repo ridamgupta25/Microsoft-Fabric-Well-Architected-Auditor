@@ -41,7 +41,7 @@ class LiveFabricProvider:
     BASE = "https://api.fabric.microsoft.com/v1"
 
     def __init__(self, token: str, timeout: int = 60, token_refresher=None,
-                 powerbi_token: str | None = None):
+                 powerbi_token: str | None = None, sql_token: str | None = None):
         import requests  # imported lazily so offline mode needs no HTTP stack
 
         self._session = requests.Session()
@@ -55,6 +55,13 @@ class LiveFabricProvider:
         #: is left unknown, never guessed.
         self._powerbi_token = powerbi_token
         self._powerbi_client = None
+        #: A SQL-analytics-endpoint token (``https://database.windows.net``) — a
+        #: third audience. Column schemas and Warehouse RLS policies exist nowhere
+        #: in the Fabric REST API, only over TDS on port 1433. Absent, or the port
+        #: blocked ⇒ those reads are skipped and the affected checks report N/A,
+        #: exactly as they did before the endpoint was wired in.
+        self._sql_token = sql_token
+        self._sql_reader = None
 
     # -- transport -------------------------------------------------------------
     def _get(self, path: str) -> tuple[int | None, Any]:
@@ -363,6 +370,94 @@ class LiveFabricProvider:
             if metric_status == 200 and metric is not None:
                 monitoring[key] = metric
         return monitoring
+
+    def _read_sql_endpoints(self, ctx: WorkspaceContext, workspace_id: str,
+                            wanted: set) -> None:
+        """Enrich the context with column schemas and Warehouse RLS over TDS.
+
+        Discovery is plain Fabric REST, so nothing is ever asked of the user - the
+        connection string comes from the lakehouse/warehouse item itself. The TDS
+        reads are strictly best-effort: no token, no ODBC driver, a blocked port
+        1433 or a throttled endpoint all leave the data absent and mark the
+        resource unavailable, so the affected checks report **N/A with a reason**
+        rather than failing a workspace for something we could not look at.
+        """
+        from .sqlendpoint import MAX_ENDPOINTS_PER_WORKSPACE, SqlEndpointReader, discover_endpoints
+
+        want_columns = Resource.TABLE_COLUMNS in wanted
+        want_security = Resource.WAREHOUSE_SECURITY in wanted
+
+        def get_json(path: str):
+            status, body = self._get(path)
+            return body if status == 200 and isinstance(body, dict) else {}
+
+        endpoints = discover_endpoints(get_json, workspace_id)
+        if not endpoints:
+            if want_columns:
+                ctx.unavailable.add(Resource.TABLE_COLUMNS)
+            if want_security:
+                ctx.unavailable.add(Resource.WAREHOUSE_SECURITY)
+            log.info("fetch %s: no provisioned SQL endpoints discovered", workspace_id)
+            return
+
+        reader = SqlEndpointReader(self._sql_token)
+        if not reader.available:
+            if want_columns:
+                ctx.unavailable.add(Resource.TABLE_COLUMNS)
+            if want_security:
+                ctx.unavailable.add(Resource.WAREHOUSE_SECURITY)
+            log.warning("fetch %s: SQL endpoint unavailable - %s",
+                        workspace_id, reader.unavailable_reason)
+            return
+
+        # Beyond Microsoft's per-workspace guidance the Entra token can exceed its
+        # size limit. Read what we can rather than losing the workspace entirely.
+        if len(endpoints) > MAX_ENDPOINTS_PER_WORKSPACE:
+            log.warning("fetch %s: %d SQL endpoints exceeds the ~%d guidance; "
+                        "reads may fail on the Entra token size limit",
+                        workspace_id, len(endpoints), MAX_ENDPOINTS_PER_WORKSPACE)
+
+        col_attempted = col_read = 0
+        sec_attempted = sec_read = 0
+        for endpoint in endpoints:
+            if want_columns:
+                col_attempted += 1
+                tables = reader.columns(endpoint)
+                if tables is not None:
+                    col_read += 1
+                    for table_name, cols in tables.items():
+                        existing = ctx.tables.get(table_name)
+                        if existing is not None:
+                            existing["columns"] = cols
+                        else:
+                            # A table the REST listing did not return (a Warehouse
+                            # table, say) is still worth recording.
+                            ctx.tables[table_name] = {
+                                "type": "Managed", "format": "",
+                                "columns": cols,
+                            }
+            if want_security and endpoint.kind == "Warehouse":
+                sec_attempted += 1
+                policies = reader.security_policies(endpoint)
+                if policies is not None:
+                    sec_read += 1
+                    ctx.warehouse_security[endpoint.name] = policies
+
+        # None readable means "we could not look", which must not read as "none
+        # configured". Some readable is a partial gap, recorded but still usable.
+        if want_columns:
+            self._record_failures(ctx, Resource.TABLE_COLUMNS, col_attempted,
+                                  col_read, 0, col_attempted - col_read)
+        if want_security and sec_attempted:
+            self._record_failures(ctx, Resource.WAREHOUSE_SECURITY, sec_attempted,
+                                  sec_read, 0, sec_attempted - sec_read)
+        elif want_security:
+            # No Warehouse in the workspace: nothing to read, nothing to report.
+            ctx.unavailable.add(Resource.WAREHOUSE_SECURITY)
+
+        log.info("fetch %s: SQL endpoints - columns %d/%d, warehouse security %d/%d%s",
+                 workspace_id, col_read, col_attempted, sec_read, sec_attempted,
+                 f" ({len(reader.failures)} endpoint(s) failed)" if reader.failures else "")
 
     def _lakehouse_tables(self, workspace_id: str, item_id: str) -> tuple[list[dict], str]:
         """List a lakehouse's tables via REST (name/type/format; no columns).
@@ -836,6 +931,14 @@ class LiveFabricProvider:
                                   attempted, read, forbidden, transient)
             log.info("fetch %s: %d lakehouses, %d tables read",
                      workspace_id, len(lakehouses), len(ctx.tables))
+
+        # Column schemas + Warehouse RLS, over the SQL analytics endpoint. Not in
+        # the Fabric REST API at all - only reachable over TDS (port 1433). Every
+        # failure here leaves the data absent, which the checks already report as
+        # N/A, so a blocked port degrades to the pre-SQL behaviour rather than
+        # failing the crawl.
+        if Resource.TABLE_COLUMNS in wanted or Resource.WAREHOUSE_SECURITY in wanted:
+            self._read_sql_endpoints(ctx, workspace_id, wanted)
 
         # OneLake shortcuts per lakehouse (governance/lineage: external references).
         if Resource.SHORTCUTS in wanted:

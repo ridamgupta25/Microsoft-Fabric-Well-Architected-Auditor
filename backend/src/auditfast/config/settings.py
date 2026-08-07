@@ -67,6 +67,19 @@ class Settings(BaseSettings):
         description="Root folder for the permanent, per-run KB archive.",
     )
 
+    # -- SQL analytics endpoint ------------------------------------------------
+    # Column schemas and Warehouse security policies are not in the Fabric REST
+    # API; they are only readable over TDS (port 1433) against the SQL analytics
+    # endpoint Fabric provisions per Lakehouse/Warehouse. The endpoint address is
+    # discovered over REST, so nothing is ever asked of the user - but the port
+    # must be open outbound and an ODBC driver must be installed. Disable this to
+    # skip the SQL reads entirely; column-level checks then report N/A exactly as
+    # they did before the endpoint was wired in.
+    sql_endpoint_enabled: bool = Field(
+        default=True,
+        description="Read column schemas and Warehouse RLS over the SQL analytics endpoint.",
+    )
+
     # -- CORS -----------------------------------------------------------------
     # The React dev server runs on a different origin, so the API must allow it
     # explicitly. In production this should be the deployed frontend origin only.

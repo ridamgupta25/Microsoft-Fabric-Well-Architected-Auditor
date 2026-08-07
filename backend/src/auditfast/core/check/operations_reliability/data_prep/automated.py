@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import re
 
-from auditfast.core.check._notebook import NOTEBOOK_LAYERS, notebook_code
+from auditfast.core.check._notebook import NOTEBOOK_LAYERS, executable_code, notebook_code
 from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities, walk_activities
 from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable
 from auditfast.core.check.registry import check
@@ -90,10 +90,15 @@ _CLEANUP_BEFORE_WRITE = re.compile(
     r"(?:\.write\b|saveastable\b|insert\s+into|merge\s+into|overwrite)",
     re.IGNORECASE | re.DOTALL,
 )
+_RESTART_BOUNDARY = re.compile(
+    r"restart|resume|checkpoint|watermark|batch[_ -]?id|run[_ -]?id|"
+    r"from[_ -]?(?:activity|failure|checkpoint)|start[_ -]?from|control[_ -]?(?:table|store)",
+    re.IGNORECASE,
+)
 
 
 @check(
-    id="PL-RETRY", ref="2.4.1", title="Retry policy configured on activities",
+    id="PL-RETRY", ref="2.4.1", title="All pipeline activities have appropriate retry policies configured (copy, notebook, lookup, web, ForEach)",
     pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -106,7 +111,7 @@ def retry_policy(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-FAILPATH", ref="2.4.3", title="On-failure path defined",
+    id="PL-FAILPATH", ref="2.4.3", title="On-failure paths defined for critical activities",
     pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -122,7 +127,7 @@ def failure_path(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-NOTIFY", ref="2.4.5", title="Failure notification present",
+    id="PL-NOTIFY", ref="2.4.5", title="Pipeline failure triggers notification (Data Activator, email, Teams)",
     pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -148,7 +153,27 @@ def failure_notification(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-TIMEOUT", ref="2.4", title="Explicit activity timeouts set",
+    id="PL-RESTART", ref="9.1.1",
+    title="Failed pipelines can be restarted from point of failure (not full re-run)",
+    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
+)
+def restart_from_failure(ctx: CheckContext) -> Verdict:
+    """Pipeline definitions expose a restart boundary or durable progress marker."""
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+    acts = activities(ctx.obj)
+    data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
+    if not data_acts:
+        return not_applicable("Pipeline has no data-movement activity to restart")
+    blob = json.dumps(ctx.obj)
+    ok = bool(_RESTART_BOUNDARY.search(blob))
+    return binary(ok, "Restart boundary/checkpoint or durable progress marker detected" if ok
+                  else "No restart-from-failure boundary; a retry may re-run the full pipeline")
+
+
+@check(
+    id="PL-TIMEOUT", ref="IMPL-23", title="Pipeline activities set an explicit timeout (not Fabric's multi-day default) [PL-TIMEOUT]",
     pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -220,7 +245,7 @@ def poison_message_handling(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-BADRECORDS", ref="9.1.3",
-    title="Notebook reads survive malformed records (quarantine, not crash)",
+    title="Poison message / corrupt file handling (quarantine, not crash)",
     pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -253,7 +278,7 @@ def notebook_bad_records(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-RETRY-VALUES", ref="2.4.2", title="Retry counts and intervals are sane",
+    id="PL-RETRY-VALUES", ref="2.4.2", title="Retry count and interval follow reasonable patterns (not infinite retries)",
     pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -285,7 +310,7 @@ def retry_values(ctx: CheckContext) -> Verdict:
 
 @check(
     id="PL-IDEMPOTENT", ref="2.4.6",
-    title="Pipeline reruns are idempotent",
+    title="Idempotency ensured — re-running a failed pipeline does not produce duplicates",
     pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -320,7 +345,7 @@ def pipeline_idempotent(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-IDEMPOTENT", ref="9.3.1",
-    title="Notebook reruns are idempotent",
+    title="All pipelines and notebooks are idempotent (safe to re-run)",
     pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -344,7 +369,7 @@ def notebook_idempotent(ctx: CheckContext) -> Verdict:
 
 @check(
     id="PL-DEADLETTER", ref="2.4.4",
-    title="Failed records captured to dead-letter or quarantine output",
+    title="Failed records captured to dead-letter / quarantine area (not silently dropped or halting good records)",
     pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -368,8 +393,8 @@ def pl_deadletter(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-DEADLETTER", ref="3.1.9",
-    title="Failed records captured to dead-letter or quarantine output",
+    id="NB-DEADLETTER", ref="5.1.10",
+    title="DQ quarantine pattern: failed records routed to error tables with failure reason",
     pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -389,6 +414,134 @@ def nb_deadletter(ctx: CheckContext) -> Verdict:
         ok,
         "Notebook routes failed/invalid records to a retained output" if ok
         else "Notebook detects record errors but does not retain a failed-record output",
+    )
+
+
+# =============================================================================
+# 9.3.3 — transaction boundaries around a multi-step operation
+# =============================================================================
+#
+# Which reading of "transaction boundary" this check uses, and why.
+#
+# The checklist point names two surfaces (Notebook; Warehouse) but a boundary
+# means something different on each, and only one of them is readable per object:
+#
+#   * Fabric Warehouse T-SQL genuinely supports BEGIN TRANSACTION / COMMIT /
+#     ROLLBACK — but that T-SQL lives inside stored procedures the API does not
+#     return, or in a pipeline Script activity, which is a *pipeline* object.
+#   * Spark has no multi-statement transaction at all. Delta gives atomicity per
+#     *statement*, so a notebook that writes three times has three independent
+#     commits and can fail half-done.
+#
+# So the reading implemented here is the notebook one, judged on the notebook the
+# check is scoped to: **when a notebook performs more than one write, that
+# sequence must be bounded** — by an explicit T-SQL transaction where it drives
+# a Warehouse, by staging-then-atomic-swap, or by failure compensation that
+# undoes the partial work. A notebook whose writes are each individually atomic
+# but unbounded as a sequence sits in the middle: no single write leaves a torn
+# table, but a mid-sequence failure still leaves the *set* of tables
+# inconsistent. A single-write notebook has no multi-step operation to bound and
+# is N/A, never a failure.
+
+#: A *terminal* write — the call or statement that actually commits. Chosen so
+#: one write expression counts once: ``df.write.mode(...).saveAsTable(t)`` matches
+#: only at ``saveAsTable``, and a Delta merge builder only at its ``execute()``.
+_TXN_WRITE_OP = re.compile(
+    r"\.saveAsTable\s*\(|\.insertInto\s*\(|\.toTable\s*\(|\.save\s*\(|"
+    r"\bINSERT\s+(?:INTO|OVERWRITE)\b|\bMERGE\s+INTO\b|\.execute\s*\(\s*\)|"
+    r"\bUPDATE\s+[`\"\[]?\w[\w.`\"\]]*\s+SET\b|\bDELETE\s+FROM\b|"
+    r"\bCREATE\s+(?:OR\s+REPLACE\s+)?TABLE\b|\bTRUNCATE\s+TABLE\b",
+    re.IGNORECASE,
+)
+#: A write whose *own* effect is all-or-nothing. Counted, not paired, so the
+#: comparison against the write count is an approximation — it only decides the
+#: middle band (1 vs 0) and never the N/A gate.
+_TXN_ATOMIC_WRITE = re.compile(
+    r"\bMERGE\s+INTO\b|\.merge\s*\(|\bINSERT\s+OVERWRITE\b|"
+    r"mode\s*\(\s*[\"']overwrite[\"']\s*\)|replaceWhere|"
+    r"\bCREATE\s+OR\s+REPLACE\s+TABLE\b",
+    re.IGNORECASE,
+)
+#: An explicit T-SQL transaction — the real thing, available when the notebook
+#: drives a Warehouse or SQL database over JDBC/pyodbc.
+_TXN_EXPLICIT = re.compile(
+    r"\bBEGIN\s+TRAN(?:SACTION)?\b|\bSET\s+IMPLICIT_TRANSACTIONS\b|"
+    r"\bconn(?:ection)?\.commit\s*\(|\.rollback\s*\(|\bautocommit\s*=\s*False\b",
+    re.IGNORECASE,
+)
+#: Stage everything aside, then swap it in with one atomic rename/replace.
+#: ``_tmp``/``_temp`` are deliberately absent — they are ordinary variable
+#: suffixes, so including them would let any notebook holding a ``df_tmp`` pass
+#: on an unrelated ``CREATE OR REPLACE TABLE``.
+_TXN_STAGING_SWAP = re.compile(
+    r"(?:_stg\b|_stage\b|_staging\b|staging[_.]|\bstage_)"
+    r"[\s\S]{0,2000}?"
+    r"(?:\bALTER\s+TABLE\b[\s\S]{0,200}?\bRENAME\b|\bRENAME\s+TO\b|"
+    r"\bCREATE\s+OR\s+REPLACE\s+TABLE\b|\bREPLACE\s+TABLE\b|\bSWAP\b)",
+    re.IGNORECASE,
+)
+#: A caught failure that undoes or cleans up the partial work — the hand-rolled
+#: compensating transaction. Bare words like "restore" or "revert" are excluded:
+#: a log message mentioning one is not a compensation, so only an operation that
+#: actually reverses or removes the partial write counts.
+_TXN_COMPENSATION = re.compile(
+    r"\bexcept\b[\s\S]{0,800}?"
+    r"(?:\brollback\b|compensat|"
+    r"\bRESTORE\s+TABLE\b|VERSION\s+AS\s+OF|restoreToVersion|"
+    r"\bDROP\s+TABLE\b|\bDELETE\s+FROM\b|\bTRUNCATE\s+TABLE\b|fs\.rm\s*\()",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-TXN-BOUNDARY", ref="9.3.3",
+    title="Transaction boundaries defined for multi-step operations (incl. Warehouse loads)",
+    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def notebook_transaction_boundary(ctx: CheckContext) -> Verdict:
+    """A notebook writing more than once bounds the sequence so it cannot half-apply.
+
+    Any one of three boundaries satisfies the point: an explicit T-SQL
+    transaction (the Warehouse case), staging the work and swapping it in
+    atomically, or catching the failure and compensating for the partial writes.
+    Individually atomic writes with no boundary across them score in the middle —
+    each table survives, the set of them does not. Read from *executable* code
+    only, so a commented-out rollback proves nothing.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+
+    code = executable_code(ctx.obj)
+    writes = _TXN_WRITE_OP.findall(code)
+    if len(writes) < 2:
+        return not_applicable(
+            f"Notebook performs {len(writes)} write operation(s) — no multi-step "
+            f"operation to bound"
+        )
+
+    if _TXN_EXPLICIT.search(code):
+        return graded(3, f"{len(writes)} writes bounded by an explicit transaction "
+                         f"(BEGIN/COMMIT/ROLLBACK or a managed connection commit)")
+    if _TXN_STAGING_SWAP.search(code):
+        return graded(3, f"{len(writes)} writes staged and swapped in atomically, so a "
+                         f"mid-sequence failure leaves the published tables untouched")
+    if _TXN_COMPENSATION.search(code):
+        return graded(3, f"{len(writes)} writes bounded by failure compensation — the "
+                         f"partial work is rolled back, restored, or cleaned up on error")
+
+    atomic = len(_TXN_ATOMIC_WRITE.findall(code))
+    if atomic >= len(writes):
+        return graded(
+            1,
+            f"All {len(writes)} writes are individually atomic (merge/overwrite/replace) "
+            f"but the sequence is unbounded — a failure part-way leaves the set of "
+            f"targets inconsistent",
+        )
+    return graded(
+        0,
+        f"{len(writes)} dependent writes with no transaction, staging swap, or "
+        f"compensation — a failure part-way through leaves the load half-applied",
     )
 
 

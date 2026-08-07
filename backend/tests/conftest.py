@@ -44,9 +44,9 @@ FIXTURE_SETTINGS = {
 #: The overall score the recorded tenant must produce. Pinned to the value the
 #: engine returns for the fixture, so any change to a check, a band, or the
 #: roll-up fails loudly here.
-EXPECTED_OVERALL = 47.33893557422969
-EXPECTED_SCORED_CHECKS = 119
-EXPECTED_RESULT_ROWS = 251
+EXPECTED_OVERALL = 43.43434343434344
+EXPECTED_SCORED_CHECKS = 132
+EXPECTED_RESULT_ROWS = 287
 
 #: A session id the auth-service patch below always resolves to a token.
 #: Anything else — including a missing session — resolves to no token, so
@@ -92,7 +92,7 @@ def client(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> TestClient:
         return FAKE_TOKEN if session_id == AUTHENTICATED_SESSION else None
 
     def fake_build_provider(config, token=None, *, refresh=False, token_refresher=None,
-                            powerbi_token=None):
+                            powerbi_token=None, sql_token=None):
         return RecordedProvider(FIXTURE_FILE)
 
     monkeypatch.setattr(auth_service, "token_for", fake_token_for)

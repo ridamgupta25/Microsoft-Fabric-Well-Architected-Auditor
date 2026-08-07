@@ -11,7 +11,23 @@ rather than raising, so a partial or future TMSL variant still parses cleanly.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
+
+# Power BI's "Auto date/time" feature silently generates one hidden date table per
+# date/datetime column (``LocalDateTable_<guid>``) plus a single ``DateTableTemplate_<guid>``.
+# These system tables never appear in the Power BI model or report UI, so they are
+# excluded from the captured facts to match what a reviewer actually sees.
+_AUTO_DATE_TABLE = re.compile(
+    r"^(?:LocalDateTable|DateTableTemplate)_"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def _is_auto_date_table(name: str) -> bool:
+    """True for a Power BI "Auto date/time" hidden table (not shown in the model UI)."""
+    return bool(_AUTO_DATE_TABLE.match(name or ""))
 
 
 def _expression(value: Any) -> str:
@@ -90,34 +106,8 @@ def parse_tmsl(document: dict) -> dict:
         if not isinstance(table, dict):
             continue
         table_name = table.get("name", "")
-        storage[table_name] = _table_storage(table)
-
-        # Incremental refresh: a table-level refreshPolicy with a rolling window.
-        policy = table.get("refreshPolicy")
-        if isinstance(policy, dict):
-            refresh_policies.append({
-                "table": table_name,
-                "policy_type": policy.get("policyType", "") or "",
-                "rolling_window_granularity": policy.get("rollingWindowGranularity", "") or "",
-                "rolling_window_periods": policy.get("rollingWindowPeriods", 0) or 0,
-                "incremental_granularity": policy.get("incrementalGranularity", "") or "",
-                "incremental_periods": policy.get("incrementalPeriods", 0) or 0,
-            })
-
-        # Aggregations are declared as ``alternateOf`` on the aggregation
-        # table's columns, pointing back at the detail table they summarize.
-        for column in table.get("columns") or []:
-            if not isinstance(column, dict):
-                continue
-            alternate = column.get("alternateOf")
-            if isinstance(alternate, dict):
-                base = alternate.get("baseTable") or alternate.get("baseColumn") or {}
-                aggregations.append({
-                    "table": table_name,
-                    "column": column.get("name", ""),
-                    "summarization": alternate.get("summarization", "") or "",
-                    "base": base.get("table", "") if isinstance(base, dict) else str(base),
-                })
+        if _is_auto_date_table(table_name):
+            continue  # skip Power BI auto date/time hidden tables
         table_names.append(table_name)
         for measure in table.get("measures") or []:
             if not isinstance(measure, dict):
@@ -135,11 +125,15 @@ def parse_tmsl(document: dict) -> dict:
     for rel in model.get("relationships") or []:
         if not isinstance(rel, dict):
             continue
+        from_table = rel.get("fromTable", "")
+        to_table = rel.get("toTable", "")
+        if _is_auto_date_table(from_table) or _is_auto_date_table(to_table):
+            continue  # drop relationships that point at the hidden auto date tables
         relationships.append({
             "name": rel.get("name", ""),
-            "from_table": rel.get("fromTable", ""),
+            "from_table": from_table,
             "from_column": rel.get("fromColumn", ""),
-            "to_table": rel.get("toTable", ""),
+            "to_table": to_table,
             "to_column": rel.get("toColumn", ""),
             "cross_filter": rel.get("crossFilteringBehavior", "") or "",
             "is_active": bool(rel.get("isActive", True)),
