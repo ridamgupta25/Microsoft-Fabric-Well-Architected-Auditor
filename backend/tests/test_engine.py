@@ -71,8 +71,8 @@ def test_status_counts_are_unchanged(provider):
     agg = aggregate(_run(provider))
     assert agg["counts"][Status.PASS] == 51
     assert agg["counts"][Status.PARTIAL] == 18
-    assert agg["counts"][Status.FAIL] == 52
-    assert agg["counts"][Status.NA] == 133
+    assert agg["counts"][Status.FAIL] == 62
+    assert agg["counts"][Status.NA] == 134
     assert agg["counts"][Status.INFO] == 5
 
 
@@ -274,13 +274,13 @@ def test_registry_is_fully_populated():
     """131 checks are evaluated; remaining roadmap checks are not loaded."""
     evaluated = [s for s in REGISTRY if s.automation is Automation.AUTOMATED]
     assert len(evaluated) == 131
-    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 47
-    assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 24
-    assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 59
+    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 38
+    assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 26
+    assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 66
     # Roadmap (gated N/A) checks are intentionally not registered — see
     # auditfast.core.check.__init__._CHECK_MODULES — so none remain in the registry.
     assert len([s for s in REGISTRY if s.automation is Automation.ROADMAP]) == 0
-    assert len([s for s in REGISTRY if s.automation is Automation.INTERACTIVE]) == 0
+    assert len([s for s in REGISTRY if s.automation is Automation.INTERACTIVE]) == 11
     assert all(
         s.automation is Automation.INTERACTIVE for s in REGISTRY if s.manual
     )

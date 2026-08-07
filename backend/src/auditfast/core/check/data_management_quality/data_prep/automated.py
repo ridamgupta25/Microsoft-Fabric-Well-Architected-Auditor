@@ -698,6 +698,71 @@ _KEY_QUALITY = re.compile(
     r"drop_duplicates\s*\(\s*(?:subset\s*=\s*)?\[|"
     r"dropna\s*\([^\n]*subset",
 )
+_BRONZE_METADATA = re.compile(
+    r"ingest(?:ed|ion)[_ ]?(?:timestamp|time|date)|ingested_at|"
+    r"source[_ ]?(?:system|file|path)|input_file_name\s*\(|batch[_ ]?(?:id|key)|"
+    r"current_timestamp\s*\(",
+    re.IGNORECASE,
+)
+_SILVER_QUALITY = re.compile(
+    r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.distinct\s*\(\)|"
+    r"\.cast\s*\(|to_date\s*\(|to_timestamp\s*\(|regexp_replace\s*\(|"
+    r"trim\s*\(|standardize|conform|cleanse|cleansing|dedup",
+    re.IGNORECASE,
+)
+_BULK_ACTIVITY = re.compile(
+    r"parallelCopies|batchCount|batch[_ -]?size|bulk|copy activity|"
+    r"COPY\s+INTO|write\.mode|saveAsTable|repartition|coalesce",
+    re.IGNORECASE,
+)
+_ROW_BY_ROW = re.compile(
+    r"ForEach|foreach|row[_ -]?by[_ -]?row|insert\s+into|execute\s+query|"
+    r"SqlServerStoredProcedure|Script",
+    re.IGNORECASE,
+)
+_EAM_JSON = re.compile(r"EAM|JSON|json\.loads|from_json\s*\(|spark\.read\.json", re.IGNORECASE)
+_EAM_EFFICIENT = re.compile(
+    r"readStream|partitionBy\s*\(|repartition\s*\(|multiLine\s*[=:]\s*False|"
+    r"maxFilesPerTrigger|badRecordsPath|from_json\s*\(|schema_of_json",
+    re.IGNORECASE,
+)
+_SOURCE_METADATA = re.compile(
+    r"ingest(?:ed|ion)[_ ]?(?:timestamp|time|date)|ingested_at|"
+    r"source[_ ]?(?:metadata|system|file|path)|input_file_name\s*\(|"
+    r"current_timestamp\s*\(|_metadata|batch[_ ]?timestamp",
+    re.IGNORECASE,
+)
+_INPUT_READ = re.compile(
+    r"spark\.read|\.read\.(?:csv|json|text|format)|json\.loads|from_json\s*\(|"
+    r"read_json|read_csv|EAM\s+JSON|EAM_JSON",
+    re.IGNORECASE,
+)
+_DUPLICATE_VERIFICATION = re.compile(
+    r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.duplicated\s*\(|"
+    r"groupBy[\s\S]{0,160}?\.count\s*\(\s*\)[\s\S]{0,160}?(?:>|duplicate)|"
+    r"count\s*\(\s*\)\s*!=\s*count\s*\(\s*distinct|"
+    r"assert[_ ]?(?:unique|distinct|no[_ ]?duplicates)|duplicate[_ ]?(?:check|count|rows?)|"
+    r"dropDuplicates|distinct\s*\(",
+    re.IGNORECASE,
+)
+_TEXT_ENCODING = re.compile(
+    r"encoding\s*[=:]\s*[\"']?utf[-_]?8|option\s*\(\s*[\"']encoding[\"']\s*,\s*[\"']utf[-_]?8|"
+    r"decode\s*\(\s*[\"']utf[-_]?8|StringType\s*\(\)|utf[-_]?8",
+    re.IGNORECASE,
+)
+_FLAG_DOMAIN = re.compile(
+    r"(?:flag|boolean|is_[A-Za-z0-9_]+|active|enabled|valid)[^\n]{0,120}?\.isin\s*\(|"
+    r"\.isin\s*\(\s*(?:True|False|[\"'](?:Y|N|true|false|0|1)[\"'])|"
+    r"(?:allowed|valid)[_ ]?(?:values|flags)|expected[_ ]?(?:values|flags)|"
+    r"BooleanType\s*\(\)|when\s*\([^\n]{0,120}?\)\.otherwise\s*\(",
+    re.IGNORECASE,
+)
+_DQ_RULE = re.compile(
+    r"assert\b|validation|validate|quality|quarantine|reject|invalid|"
+    r"dropDuplicates|drop_duplicates|left_anti|isNull|isin\s*\(|"
+    r"StructType|StructField|expected[_ ]?(?:schema|columns|values)",
+    re.IGNORECASE,
+)
 
 
 @check(
@@ -1171,6 +1236,157 @@ def nb_key_quality(ctx: CheckContext) -> Verdict:
     ok = bool(_KEY_QUALITY.search(code))
     return binary(ok, "Key uniqueness / null validation present" if ok
                   else "Writes data without key uniqueness or null validation")
+
+
+@check(
+    id="NB-BRONZE-METADATA", ref="1.2.3",
+    title="Bronze Lakehouse captures raw data with audit metadata (ingestion timestamp, source system, batch ID)",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_bronze_metadata(ctx: CheckContext) -> Verdict:
+    """Bronze writes retain ingestion timestamp, source identity, and batch metadata."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write a raw/Bronze table")
+    if not _BRONZE_METADATA.search(code):
+        return binary(False, "Bronze write has no ingestion/source/batch audit metadata")
+    return binary(True, "Bronze write captures ingestion/source/batch audit metadata")
+
+
+@check(
+    id="NB-SILVER-QUALITY", ref="1.2.5",
+    title="Silver Lakehouse applies cleansing, deduplication, conforming, and type standardization",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_silver_quality(ctx: CheckContext) -> Verdict:
+    """Silver writes apply at least one explicit cleansing, deduplication, or type-conformance transformation."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write a Silver table")
+    if not re.search(r"silver", code, re.IGNORECASE):
+        return not_applicable("Notebook does not identify a Silver-layer write")
+    ok = bool(_SILVER_QUALITY.search(code))
+    return binary(ok, "Silver write applies cleansing/deduplication/conformance/type standardization" if ok
+                  else "Silver write has no recognizable quality transformation")
+
+
+@check(
+    id="PL-BULK-MOVE", ref="2.6.3",
+    title="Large data movements use bulk/batch patterns, not row-by-row",
+    pillar=Pillar.PERFORMANCE, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
+)
+def pl_bulk_move(ctx: CheckContext) -> Verdict:
+    """Data-moving pipelines use bulk or batch movement rather than row-by-row execution."""
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+    acts = activities(ctx.obj)
+    if not any((a.get("type") or "") in _DATA_MOVE_TYPES for a in acts):
+        return not_applicable("Pipeline has no data-movement activity")
+    blob = json.dumps(ctx.obj)
+    if _ROW_BY_ROW.search(blob) and not _BULK_ACTIVITY.search(blob):
+        return binary(False, "Data movement shows row-by-row or serial execution without a bulk/batch pattern")
+    ok = bool(_BULK_ACTIVITY.search(blob))
+    return binary(ok, "Bulk/batch data-movement pattern detected" if ok
+                  else "No bulk/batch data-movement pattern detected")
+
+
+@check(
+    id="NB-EAM-INGEST", ref="2.6.6",
+    title="JSON ingestion (EAM) is efficient (streaming/partitioned parse, no oversized single-file bottlenecks)",
+    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_eam_ingest(ctx: CheckContext) -> Verdict:
+    """EAM/JSON ingestion uses streaming, partitioning, or bounded-file parsing."""
+    code = executable_code(ctx.obj)
+    if not _EAM_JSON.search(code):
+        return not_applicable("Notebook has no recognizable EAM/JSON ingestion")
+    ok = bool(_EAM_EFFICIENT.search(code))
+    return binary(ok, "EAM/JSON ingestion uses streaming, partitioning, or bounded parsing" if ok
+                  else "EAM/JSON ingestion has no streaming/partitioning/bounded-file pattern")
+
+
+@check(
+    id="NB-SOURCE-METADATA", ref="5.2.8",
+    title="Source metadata captured: ingestion timestamp",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_source_metadata(ctx: CheckContext) -> Verdict:
+    """Notebook writes retain source metadata including an ingestion timestamp."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write data to a table")
+    ok = bool(_SOURCE_METADATA.search(code))
+    return binary(ok, "Source metadata and ingestion timestamp are captured" if ok
+                  else "Writes data without source metadata or an ingestion timestamp")
+
+
+@check(
+    id="NB-DEDUP-VERIFY", ref="5.3.4",
+    title="Deduplication verification: no duplicate business records",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_dedup_verify(ctx: CheckContext) -> Verdict:
+    """Notebook logic verifies that duplicate business records are not loaded."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write data to a table")
+    ok = bool(_DUPLICATE_VERIFICATION.search(code))
+    return binary(ok, "Duplicate records are verified and handled" if ok
+                  else "Writes data without duplicate-record verification")
+
+
+@check(
+    id="NB-UTF8", ref="5.5.3",
+    title="String / Text: Encoding validated (UTF-8)",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_utf8_encoding(ctx: CheckContext) -> Verdict:
+    """Notebook input handling explicitly validates or declares UTF-8 text encoding."""
+    code = executable_code(ctx.obj)
+    if not _INPUT_READ.search(code):
+        return not_applicable("Notebook has no recognizable incoming file or JSON read")
+    ok = bool(_TEXT_ENCODING.search(code))
+    return binary(ok, "String/text input encoding is explicitly UTF-8" if ok
+                  else "Incoming string/text data has no explicit UTF-8 encoding validation")
+
+
+@check(
+    id="NB-FLAG-DOMAIN", ref="5.5.7",
+    title="Boolean / Flag: Only expected values permitted",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_flag_domain(ctx: CheckContext) -> Verdict:
+    """Notebook logic restricts Boolean and Flag fields to an approved value set."""
+    code = executable_code(ctx.obj)
+    if not _INPUT_READ.search(code):
+        return not_applicable("Notebook has no recognizable incoming file or JSON read")
+    ok = bool(_FLAG_DOMAIN.search(code))
+    return binary(ok, "Boolean/Flag fields are restricted to expected values" if ok
+                  else "Boolean/Flag fields have no explicit allowed-value validation")
+
+
+@check(
+    id="NB-DQ-RULES", ref="5.1.2",
+    title="DQ rules codified in code/config (not ad-hoc manual checks)",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_dq_rules(ctx: CheckContext) -> Verdict:
+    """Notebook data-quality rules are expressed as executable, repeatable logic."""
+    code = executable_code(ctx.obj)
+    if not (_INPUT_READ.search(code) or _WRITE_PATTERN.search(code)):
+        return not_applicable("Notebook has no recognizable data-ingestion or write operation")
+    ok = bool(_DQ_RULE.search(code))
+    return binary(ok, "Data-quality rule logic is codified in notebook code/config" if ok
+                  else "Data movement has no recognizable codified data-quality rules")
 
 
 

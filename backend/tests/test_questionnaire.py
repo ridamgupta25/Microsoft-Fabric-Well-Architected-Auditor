@@ -56,13 +56,16 @@ def test_interactive_specs_are_all_interactive():
 
 def test_build_questionnaire_scopes_by_pillar_and_layer():
     q = build_questionnaire(
-        pillars=["Performance & Capacity"],
-        workspaces=[{"id": "w", "role": "Data Prep"}],
+        pillars=["Operations & Reliability"],
+        workspaces=[{"id": "w", "role": "Data Operations"}],
     )
-    assert q, "expected Performance & Capacity questionnaire items"
-    assert all(item["pillar"] == "Performance & Capacity" for item in q)
+    assert q, "expected Operations & Reliability questionnaire items"
+    assert all(item["pillar"] == "Operations & Reliability" for item in q)
     ids = {item["id"] for item in q}
-    assert ids == {"SPARK-POOL", "SPARK-PROFILE", "SPARK-UI"}
+    assert ids == {
+        "WS-DOMAIN-FOLDERS", "PL-SLA-MONITORED", "PL-SLA-ALERTS",
+        "OPS-INTEGRATION-TESTS", "OPS-DATA-VALIDATION-TESTS",
+    }
     # Every item is serialized with its question and scored options for the UI.
     for item in q:
         assert item["question"]
@@ -85,37 +88,37 @@ def test_answers_score_and_fan_out(provider):
 
     merged = merge_answers_into_report(
         report,
-        {"SPARK-POOL": "validated", "SPARK-PROFILE": SKIP_VALUE},
-        ["SPARK-POOL", "SPARK-PROFILE"],
+        {"PL-SLA-MONITORED": "yes", "PL-SLA-ALERTS": SKIP_VALUE},
+        ["PL-SLA-MONITORED", "PL-SLA-ALERTS"],
     )
     rows = merged["results"]
 
-    pool = [r for r in rows if r["check_id"] == "SPARK-POOL"]
-    profile = [r for r in rows if r["check_id"] == "SPARK-PROFILE"]
+    pool = [r for r in rows if r["check_id"] == "PL-SLA-MONITORED"]
+    alerts = [r for r in rows if r["check_id"] == "PL-SLA-ALERTS"]
 
-    prep_workspaces = {
-        r["workspace"] for r in report["results"] if r["layer"] == "Data Prep"
+    ops_workspaces = {
+        r["workspace"] for r in report["results"] if r["layer"] == "Data Operations"
     }
-    assert {r["workspace"] for r in pool} == prep_workspaces
+    assert {r["workspace"] for r in pool} == ops_workspaces
     assert all(r["status"] == Status.PASS.value for r in pool)
     assert all(r["score"] == 3 for r in pool)
     assert all(r["scored"] is True for r in pool)
     assert all("Self-assessed" in r["evidence"] for r in pool)
 
-    assert {r["workspace"] for r in profile} == prep_workspaces
-    assert all(r["status"] == Status.NA.value for r in profile)
-    assert all(r["scored"] is False for r in profile)
+    assert {r["workspace"] for r in alerts} == ops_workspaces
+    assert all(r["status"] == Status.NA.value for r in alerts)
+    assert all(r["scored"] is False for r in alerts)
 
 
 def test_low_option_carries_guidance_as_recommendation(provider):
     report = _report(provider)
     merged = merge_answers_into_report(
-        report, {"SPARK-UI": "not_reviewed"}, ["SPARK-UI"]
+        report, {"PL-SLA-MONITORED": "no"}, ["PL-SLA-MONITORED"]
     )
-    rows = [r for r in merged["results"] if r["check_id"] == "SPARK-UI"]
+    rows = [r for r in merged["results"] if r["check_id"] == "PL-SLA-MONITORED"]
     assert rows
-    spec = REGISTRY.get("SPARK-UI")
-    guidance = next(o.guidance for o in spec.options if o.value == "not_reviewed")
+    spec = REGISTRY.get("PL-SLA-MONITORED")
+    guidance = next(o.guidance for o in spec.options if o.value == "no")
     assert all(r["status"] == Status.FAIL.value for r in rows)
     assert all(r["recommendation"] == guidance for r in rows)
 
@@ -125,10 +128,10 @@ def test_low_option_carries_guidance_as_recommendation(provider):
 def test_merge_is_idempotent(provider):
     report = _report(provider)
     once = merge_answers_into_report(
-        report, {"SPARK-POOL": "validated"}, ["SPARK-POOL"]
+        report, {"PL-SLA-MONITORED": "yes"}, ["PL-SLA-MONITORED"]
     )
     twice = merge_answers_into_report(
-        once, {"SPARK-POOL": "validated"}, ["SPARK-POOL"]
+        once, {"PL-SLA-MONITORED": "yes"}, ["PL-SLA-MONITORED"]
     )
     assert len(once["results"]) == len(twice["results"])
     assert once["total_scored"] == twice["total_scored"]
@@ -139,7 +142,7 @@ def test_merging_only_adds_results(provider):
     report = _report(provider)
     before = len(report["results"])
     merged = merge_answers_into_report(
-        report, {"SPARK-POOL": "validated"}, ["SPARK-POOL"]
+        report, {"PL-SLA-MONITORED": "yes"}, ["PL-SLA-MONITORED"]
     )
-    pool = [r for r in merged["results"] if r["check_id"] == "SPARK-POOL"]
+    pool = [r for r in merged["results"] if r["check_id"] == "PL-SLA-MONITORED"]
     assert len(merged["results"]) == before + len(pool)
