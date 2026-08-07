@@ -71,6 +71,22 @@ az version         # only if you installed Azure CLI
 
 ### 1. Get the code
 
+**Windows only — enable long paths first.** This repo contains some deeply
+nested files that exceed Windows' default 260-character path limit. If you skip
+this, some files may fail to check out during clone. Enable long path support in
+Git (no admin needed):
+
+```powershell
+git config --global core.longpaths true
+```
+
+> To also enable long paths system-wide (optional, requires an **Administrator**
+> PowerShell):
+>
+> ```powershell
+> Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled -Value 1
+> ```
+
 Clone the repository:
 
 ```powershell
