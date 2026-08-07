@@ -9,7 +9,6 @@ from __future__ import annotations
 import re
 
 from auditfast.core.check._pipeline import activities as pipeline_activities
-from auditfast.core.check._pipeline import activities as pipeline_activities
 from auditfast.core.check._tables import (
     AUDIT_COLUMNS,
     TABLE_LAYERS,
@@ -85,6 +84,46 @@ _INCREMENTAL_SQL = re.compile(
     r"incremental",
     re.IGNORECASE,
 )
+_TRY_CATCH_SQL = re.compile(
+    r"\bBEGIN\s+TRY\b.*?\bEND\s+TRY\b.*?\bBEGIN\s+CATCH\b.*?\bEND\s+CATCH\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_TXN_SQL = re.compile(
+    r"\bBEGIN\s+TRAN(?:SACTION)?\b|\bCOMMIT\s+TRAN(?:SACTION)?\b|\bROLLBACK\s+TRAN(?:SACTION)?\b",
+    re.IGNORECASE,
+)
+_STATS_UPDATE_SQL = re.compile(
+    r"\bUPDATE\s+STATISTICS\b|\bsp_updatestats\b|\bANALYZE\s+TABLE\b.*\bCOMPUTE\s+STATISTICS\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_TABLES_PATH = re.compile(r"(?:^|/)tables(?:/|$)", re.IGNORECASE)
+_SHORTCUTS_PATH = re.compile(r"(?:^|/)shortcuts(?:/|$)", re.IGNORECASE)
+_BRONZE_TOKEN = re.compile(r"(?:^|[/_\-.])bronze(?:[/_\-.]|$)", re.IGNORECASE)
+_SILVER_TOKEN = re.compile(r"(?:^|[/_\-.])silver(?:[/_\-.]|$)", re.IGNORECASE)
+
+_PARTITION_HINT_COLUMNS = (
+    "event_date", "business_date", "partition_date", "load_date",
+    "event_dt", "load_dt", "year", "month", "day",
+)
+_STRATEGY_METADATA_KEYS = (
+    "partitionBy", "partitionColumns", "partition_keys",
+    "clusterBy", "clusteredBy", "clusteringColumns", "zOrderBy",
+)
+_DECIMAL_TYPE = re.compile(r"^decimal\s*\((\d+)\s*,\s*(\d+)\)$", re.IGNORECASE)
+_OVERSIZED_VARCHAR = re.compile(r"^varchar\s*\((\d+)\)$", re.IGNORECASE)
+_SURROGATE_KEY_NAME = re.compile(r"(?:^|_)(?:sk|surrogate|hash(?:_?key)?)(?:$|_)", re.IGNORECASE)
+_PK_FK_NAME_HINT = re.compile(r"(?:^|_)(?:pk|fk|primary|foreign)(?:$|_)", re.IGNORECASE)
+_VIEW_PROC_HINT = re.compile(r"(?:^|_)(?:vw|view|sp|proc|procedure)(?:$|_)", re.IGNORECASE)
+_LOGIC_HINT = re.compile(r"(?:merge|join|window|row_number|dedup|rule|calc|business|transform)", re.IGNORECASE)
+
+_SQL_PERMISSION_HINT = (
+    "Request workspace Viewer role (CONNECT + ReadData on Warehouse/SQL analytics endpoint and Metadata/Audit DBs) "
+    "plus client approval for schema/catalog and row-level verification queries; this consumes capacity CU"
+)
+_ONELAKE_PERMISSION_HINT = (
+    "Request Workspace.Read.All + OneLake.Read.All (delegated, read-only). "
+    "Reads lakehouse table/column structure, Files hierarchy and shortcuts (structure only, never row data)"
+)
 
 
 def _to_text(value: object) -> str:
@@ -105,6 +144,22 @@ def _to_text(value: object) -> str:
     if isinstance(value, list):
         return " ".join(_to_text(item) for item in value)
     return str(value)
+
+
+def _shortcut_path_tokens(path: str) -> list[str]:
+    norm = (path or "").replace("\\", "/").strip("/").lower()
+    return [part for part in norm.split("/") if part]
+
+
+def _domain_from_path(path: str) -> tuple[str | None, str | None]:
+    """Infer (layer, domain) from a shortcut path when present."""
+    tokens = _shortcut_path_tokens(path)
+    for idx, token in enumerate(tokens):
+        if token in {"bronze", "silver"}:
+            if idx + 1 < len(tokens):
+                return token, tokens[idx + 1]
+            return token, None
+    return None, None
 
 @check(
     id="WS-WH-LOAD", ref="3.6.1",
@@ -191,7 +246,7 @@ def nb_no_cursor(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="WS-STAGING", ref="3.6.3
+    id="WS-STAGING", ref="3.6.3",
     title="Staging tables/schema used for Warehouse loads before merge into final tables",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
@@ -213,7 +268,65 @@ def wh_staging_pattern(ctx: CheckContext) -> Verdict:
         "(stg_* / staging_* / stage_*) — a staging schema buffers loads before the final merge",
     )
 
+@check(
+    id="WS-WH-TRYCATCH", ref="3.6.5",
+    title="Warehouse/lakehouse load SQL uses TRY...CATCH with transaction handling",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
+    required=True,
+)
+def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
+    """Inspectable SQL load logic wraps transactional changes in TRY...CATCH."""
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
 
+    storage_items = [
+        item for item in ctx.workspace.items
+        if item.type in {"Warehouse", "Lakehouse"}
+    ]
+    if not storage_items:
+        return not_applicable("No Warehouse/Lakehouse items found in this workspace")
+
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    inspected: list[tuple[str, bool]] = []
+    opaque_loads: list[str] = []
+
+    for pipeline_name, pipeline_def in ctx.workspace.pipelines.items():
+        for activity in pipeline_activities(pipeline_def):
+            activity_type = str(activity.get("type", "") or "")
+            activity_name = activity.get("name", activity_type) or activity_type
+            marker = f"{pipeline_name}/{activity_name}"
+
+            if activity_type == "Script":
+                text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
+                if not _WAREHOUSE_SQL_LOAD.search(text):
+                    continue
+                has_try_catch = bool(_TRY_CATCH_SQL.search(text))
+                has_transaction = bool(_TXN_SQL.search(text))
+                inspected.append((marker, has_try_catch and has_transaction))
+                continue
+
+            if activity_type in ("SqlServerStoredProcedure", "StoredProcedure", "Copy"):
+                opaque_loads.append(marker)
+
+    if not inspected:
+        if opaque_loads:
+            return not_applicable(
+                "Load logic is present but SQL bodies are not inspectable in this snapshot; "
+                "cannot verify TRY...CATCH transaction handling. " + _SQL_PERMISSION_HINT
+            )
+        return not_applicable("No inspectable scripted SQL load activity was found")
+
+    compliant = [name for name, ok in inspected if ok]
+    return covered(
+        len(compliant),
+        len(inspected),
+        f"{len(compliant)} of {len(inspected)} inspectable SQL load activity/activities use "
+        "TRY...CATCH and BEGIN/COMMIT/ROLLBACK transaction handling"
+        + (f"; compliant: {', '.join(compliant[:5])}" if compliant else ""),
+    )
 
 @check(
     id="WS-WH-INCREMENTAL", ref="3.6.6",
@@ -259,6 +372,71 @@ def wh_incremental_loads(ctx: CheckContext) -> Verdict:
         + (f"; incremental: {', '.join(incremental[:5])}" if incremental else ""),
     )
 
+
+@check(
+    id="WS-WH-STATS", ref="3.6.7",
+    title="Statistics are updated after significant Warehouse loads",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
+    required=True,
+)
+def wh_stats_updated_after_loads(ctx: CheckContext) -> Verdict:
+    """Significant inspectable SQL loads are paired with statistics maintenance."""
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
+
+    storage_items = [
+        item for item in ctx.workspace.items
+        if item.type in {"Warehouse", "Lakehouse"}
+    ]
+    if not storage_items:
+        return not_applicable("No Warehouse/Lakehouse items found in this workspace")
+
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    pipeline_loads: dict[str, list[str]] = {}
+    pipeline_stats: dict[str, list[str]] = {}
+    opaque_loads: list[str] = []
+
+    for pipeline_name, pipeline_def in ctx.workspace.pipelines.items():
+        for activity in pipeline_activities(pipeline_def):
+            activity_type = str(activity.get("type", "") or "")
+            activity_name = activity.get("name", activity_type) or activity_type
+            marker = f"{pipeline_name}/{activity_name}"
+
+            if activity_type == "Script":
+                text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
+                if _WAREHOUSE_SQL_LOAD.search(text):
+                    pipeline_loads.setdefault(pipeline_name, []).append(marker)
+                if _STATS_UPDATE_SQL.search(text):
+                    pipeline_stats.setdefault(pipeline_name, []).append(marker)
+                continue
+
+            if activity_type in ("Copy", "SqlServerStoredProcedure", "StoredProcedure"):
+                opaque_loads.append(marker)
+
+    inspectable_pipelines = sorted(pipeline_loads)
+    if not inspectable_pipelines:
+        if opaque_loads:
+            return not_applicable(
+                "Significant loads are present but SQL bodies are not inspectable in this snapshot; "
+                "cannot verify post-load statistics maintenance. " + _SQL_PERMISSION_HINT
+            )
+        return not_applicable("No significant inspectable SQL warehouse/lakehouse load was found")
+
+    compliant = [name for name in inspectable_pipelines if pipeline_stats.get(name)]
+    evidence = (
+        f"{len(compliant)} of {len(inspectable_pipelines)} pipeline(s) with significant inspectable SQL loads "
+        "also run statistics maintenance (UPDATE STATISTICS / sp_updatestats / ANALYZE TABLE)"
+    )
+    if opaque_loads:
+        evidence += f"; {len(opaque_loads)} load activity/activities remain non-inspectable"
+    if compliant:
+        evidence += f"; compliant pipelines: {', '.join(compliant[:5])}"
+
+    return covered(len(compliant), len(inspectable_pipelines), evidence)
+
 @check(
     id="TB-NAMING", ref="4.2.1", title="Tables follow a consistent naming convention",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
@@ -290,6 +468,220 @@ def table_managed_delta(ctx: CheckContext) -> Verdict:
 
 
 @check(
+    id="WS-SHORTCUT-GOVERNANCE", ref="4.1.3",
+    title="Shortcuts avoid circular and ungoverned access paths",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS], required=True,
+)
+def shortcut_governance(ctx: CheckContext) -> Verdict:
+    """Shortcut paths are structurally governed and avoid loop-prone patterns."""
+    if not ctx.workspace.has(Resource.SHORTCUTS):
+        return not_applicable(
+            "Shortcut metadata could not be read. Request Workspace.Read.All + OneLake.Read.All "
+            "(delegated, read-only) to inspect lakehouse files hierarchy and shortcuts"
+        )
+
+    if not ctx.workspace.shortcuts:
+        return not_applicable("No lakehouse shortcuts found in this workspace")
+
+    total = 0
+    risky: list[str] = []
+
+    for lakehouse_name, shortcuts in (ctx.workspace.shortcuts or {}).items():
+        seen_paths: set[str] = set()
+        for row in (shortcuts or []):
+            total += 1
+            name = str((row or {}).get("name") or "")
+            path = str((row or {}).get("path") or "")
+            target_type = str((row or {}).get("target_type") or "")
+            normalized = path.replace("\\", "/").strip().strip("/")
+            normalized_low = normalized.lower()
+
+            issues: list[str] = []
+            if not target_type.strip():
+                issues.append("missing target type")
+            if ".." in normalized_low:
+                issues.append("path traversal segment '..'")
+            if _TABLES_PATH.search(normalized_low):
+                issues.append("shortcut rooted under Tables path")
+            if _SHORTCUTS_PATH.search(normalized_low):
+                issues.append("nested Shortcut path (loop-prone)")
+            if normalized_low in seen_paths and normalized_low:
+                issues.append("duplicate shortcut path")
+            seen_paths.add(normalized_low)
+
+            if issues:
+                risky.append(
+                    f"{lakehouse_name}/{name or '<unnamed>'}: " + ", ".join(issues)
+                )
+
+    if total == 0:
+        return not_applicable("No shortcut entries were returned from the lakehouse metadata")
+
+    safe = total - len(risky)
+    return covered(
+        safe,
+        total,
+        f"{safe} of {total} shortcut(s) passed governance path checks"
+        + (f"; flagged: {', '.join(risky[:5])}" if risky else ""),
+    )
+
+@check(
+    id="WS-LH-BRONZE-SILVER-SEP", ref="4.1.4",
+    title="Bronze and Silver lakehouse responsibilities are clearly separated per domain",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS, Resource.TABLE_SCHEMAS], required=True,
+)
+def bronze_silver_separation(ctx: CheckContext) -> Verdict:
+    """Domain paths should map cleanly to either Bronze or Silver, not both in one route."""
+    domain_layers: dict[str, set[str]] = {}
+    unknown: list[str] = []
+
+    if ctx.workspace.has(Resource.SHORTCUTS):
+        for lakehouse_name, shortcuts in (ctx.workspace.shortcuts or {}).items():
+            for row in (shortcuts or []):
+                path = str((row or {}).get("path") or "")
+                shortcut_name = str((row or {}).get("name") or "<unnamed>")
+                layer, domain = _domain_from_path(path)
+                if not layer or not domain:
+                    unknown.append(f"{lakehouse_name}/{shortcut_name}")
+                    continue
+                domain_layers.setdefault(domain, set()).add(layer)
+
+    # Fallback: infer from table naming when shortcuts are absent/empty.
+    if not domain_layers and ctx.workspace.has(Resource.TABLE_SCHEMAS):
+        for table_name in (ctx.workspace.tables or {}):
+            tokens = [t for t in re.split(r"[._-]+", str(table_name).lower()) if t]
+            for idx, token in enumerate(tokens):
+                if token in {"bronze", "silver"} and idx + 1 < len(tokens):
+                    domain_layers.setdefault(tokens[idx + 1], set()).add(token)
+                    break
+
+    if not domain_layers:
+        if not ctx.workspace.has(Resource.SHORTCUTS) and not ctx.workspace.has(Resource.TABLE_SCHEMAS):
+            return not_applicable("Shortcut/table structure metadata could not be read. " + _ONELAKE_PERMISSION_HINT)
+        return not_applicable("No Bronze/Silver domain pattern was found in shortcuts or table names to assess separation")
+
+    mixed_domains = sorted([d for d, layers in domain_layers.items() if len(layers) > 1])
+    separated = len(domain_layers) - len(mixed_domains)
+    return covered(
+        separated,
+        len(domain_layers),
+        f"{separated} of {len(domain_layers)} domain(s) map to a single layer responsibility"
+        + (f"; mixed domains: {', '.join(mixed_domains[:5])}" if mixed_domains else "")
+        + (f"; {len(unknown)} shortcut(s) had no parseable Bronze/Silver domain path" if unknown else ""),
+    )
+
+
+@check(
+    id="WS-LH-TAXONOMY", ref="4.1.5",
+    title="Bronze/Silver domain folders follow a consistent workspace taxonomy",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS, Resource.TABLE_SCHEMAS], required=True,
+)
+def bronze_silver_taxonomy(ctx: CheckContext) -> Verdict:
+    """Paths should consistently follow bronze/<domain>/... or silver/<domain>/..."""
+    assessed = 0
+    good = 0
+    bad_examples: list[str] = []
+
+    if ctx.workspace.has(Resource.SHORTCUTS):
+        for lakehouse_name, shortcuts in (ctx.workspace.shortcuts or {}).items():
+            for row in (shortcuts or []):
+                path = str((row or {}).get("path") or "")
+                name = str((row or {}).get("name") or "<unnamed>")
+                path_low = path.lower()
+                if not (_BRONZE_TOKEN.search(path_low) or _SILVER_TOKEN.search(path_low)):
+                    continue
+                assessed += 1
+                layer, domain = _domain_from_path(path)
+                if layer and domain and re.fullmatch(r"[a-z0-9_\-]+", domain):
+                    good += 1
+                else:
+                    bad_examples.append(f"{lakehouse_name}/{name}")
+
+    # Fallback: use table naming taxonomy when shortcuts are absent/empty.
+    if assessed == 0 and ctx.workspace.has(Resource.TABLE_SCHEMAS):
+        for table_name in (ctx.workspace.tables or {}):
+            name = str(table_name)
+            low = name.lower()
+            if not (_BRONZE_TOKEN.search(low) or _SILVER_TOKEN.search(low)):
+                continue
+            assessed += 1
+            tokens = [t for t in re.split(r"[._-]+", low) if t]
+            ok = False
+            for idx, token in enumerate(tokens):
+                if token in {"bronze", "silver"} and idx + 1 < len(tokens):
+                    domain = tokens[idx + 1]
+                    ok = bool(re.fullmatch(r"[a-z0-9_\-]+", domain))
+                    break
+            if ok:
+                good += 1
+            else:
+                bad_examples.append(name)
+
+    if assessed == 0:
+        if not ctx.workspace.has(Resource.SHORTCUTS) and not ctx.workspace.has(Resource.TABLE_SCHEMAS):
+            return not_applicable("Shortcut/table structure metadata could not be read. " + _ONELAKE_PERMISSION_HINT)
+        return not_applicable("No Bronze/Silver folder/table naming pattern was found to validate taxonomy")
+
+    return covered(
+        good,
+        assessed,
+        f"{good} of {assessed} Bronze/Silver shortcut/table path(s) match the expected taxonomy"
+        + (f"; inconsistent: {', '.join(bad_examples[:5])}" if bad_examples else ""),
+    )
+
+@check(
+    id="TB-PARTITION-STRATEGY", ref="4.2.2",
+    title="Partitioning or clustering strategy is defined for large tables",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+)
+def table_partition_strategy(ctx: CheckContext) -> Verdict:
+    """Large-table candidates should expose explicit partition/clustering metadata."""
+    tables = ctx.workspace.tables
+    if not tables:
+        return not_applicable(_NO_TABLES)
+
+    large_candidates = {
+        name: meta
+        for name, meta in tables.items()
+        if any(token in name.lower() for token in ("fact", "fct", "event", "txn", "sales", "orders"))
+    }
+    if not large_candidates:
+        return not_applicable("No large-table naming candidates found to assess partition/clustering strategy")
+
+    with_strategy: list[str] = []
+    inspectable = 0
+    hint_only: list[str] = []
+
+    for name, meta in large_candidates.items():
+        table_meta = meta or {}
+        cols = [str(c.get("name", "")).lower() for c in columns(table_meta)]
+        explicit = any(table_meta.get(key) for key in _STRATEGY_METADATA_KEYS)
+        hinted = any(col in _PARTITION_HINT_COLUMNS or col.endswith(("_date", "_dt", "_month", "_year")) for col in cols)
+
+        if explicit:
+            inspectable += 1
+            with_strategy.append(name)
+        elif hinted:
+            hint_only.append(name)
+
+    if inspectable == 0:
+        return not_applicable(
+            "Large-table candidates were found but no partition/clustering metadata was available to verify strategy. "
+            + _ONELAKE_PERMISSION_HINT
+        )
+
+    return covered(
+        len(with_strategy),
+        inspectable,
+        f"{len(with_strategy)} of {inspectable} large-table candidate(s) expose explicit partition/clustering strategy"
+        + (f"; explicit strategy: {', '.join(with_strategy[:5])}" if with_strategy else ""),
+    )
+
+@check(
     id="TB-AUDITCOLS", ref="4.2.5", title="Tables carry audit columns",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
@@ -319,6 +711,203 @@ def table_star_schema(ctx: CheckContext) -> Verdict:
                   "Both fact and dimension tables present" if has_fact and has_dim
                   else f"fact tables present: {has_fact}; dimension tables present: {has_dim}")
 
+
+
+@check(
+    id="TB-TYPE-SIZING", ref="4.4.3",
+    title="Data types are appropriate and sized for analytical use",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+)
+def table_type_sizing(ctx: CheckContext) -> Verdict:
+    """Check numeric precision validity and oversized varchar declarations where available."""
+    tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
+    if not tables:
+        return not_applicable("No table column metadata available")
+
+    inspectable = 0
+    sized_ok = 0
+    flagged: list[str] = []
+
+    for table_name, table_meta in tables.items():
+        # SQL-endpoint sizing checks require warehouse-style typed metadata.
+        if "." not in table_name:
+            continue
+        for column in columns(table_meta):
+            col_name = str(column.get("name", "") or "")
+            col_type = str(column.get("type", "") or "").strip().lower()
+            if not col_type:
+                continue
+
+            decimal = _DECIMAL_TYPE.match(col_type)
+            varchar = _OVERSIZED_VARCHAR.match(col_type)
+            if not decimal and not varchar:
+                continue
+
+            inspectable += 1
+            if decimal:
+                precision = int(decimal.group(1))
+                scale = int(decimal.group(2))
+                if 0 < precision <= 38 and 0 <= scale <= precision:
+                    sized_ok += 1
+                else:
+                    flagged.append(f"{table_name}.{col_name}={col_type}")
+                continue
+
+            width = int(varchar.group(1))
+            if width <= 2000:
+                sized_ok += 1
+            else:
+                flagged.append(f"{table_name}.{col_name}=varchar({width})")
+
+    if inspectable == 0:
+        return not_applicable(
+            "No inspectable decimal(v,s) or varchar(n) declarations were available in metadata to validate sizing. "
+            + _SQL_PERMISSION_HINT
+        )
+
+    return covered(
+        sized_ok,
+        inspectable,
+        f"{sized_ok} of {inspectable} inspectable column type declaration(s) meet sizing/precision rules"
+        + (f"; flagged: {', '.join(flagged[:5])}" if flagged else ""),
+    )
+
+
+@check(
+    id="TB-SURROGATE-PATTERN", ref="4.4.4",
+    title="Dimension surrogate keys use a generated-key pattern",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+)
+def table_surrogate_pattern(ctx: CheckContext) -> Verdict:
+    """Dimensions should expose surrogate key columns consistent with generated-key patterns."""
+    dims = {n: t for n, t in ctx.workspace.tables.items() if is_dimension(n) and columns(t)}
+    if not dims:
+        return not_applicable("No dimension tables with column metadata")
+
+    inspectable = 0
+    patterned = 0
+    missing: list[str] = []
+    for name, table_meta in dims.items():
+        if "." not in name:
+            continue
+        names = col_names(table_meta)
+        if not names:
+            continue
+        inspectable += 1
+        has_pattern = any(_SURROGATE_KEY_NAME.search(col) or col.endswith(("_sk", "_key")) for col in names)
+        if has_pattern:
+            patterned += 1
+        else:
+            missing.append(name)
+
+    if inspectable == 0:
+        return not_applicable("No dimension columns were inspectable for surrogate key pattern checks")
+
+    return covered(
+        patterned,
+        inspectable,
+        f"{patterned} of {inspectable} dimension table(s) expose surrogate key naming patterns"
+        + (f"; missing: {', '.join(missing[:5])}" if missing else ""),
+    )
+
+
+@check(
+    id="TB-PKFK-DECLARED", ref="4.4.5",
+    title="Primary and foreign key constraints are declared where supported",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+)
+def table_pkfk_declared(ctx: CheckContext) -> Verdict:
+    """Use structural metadata hints for declared PK/FK patterns; Fabric Warehouse enforcement is documented separately."""
+    tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
+    if not tables:
+        return not_applicable("No table column metadata available")
+
+    inspectable = 0
+    hinted = 0
+    missing: list[str] = []
+    for name, table_meta in tables.items():
+        if "." not in name:
+            continue
+        names = col_names(table_meta)
+        if not names:
+            continue
+        inspectable += 1
+        has_hint = any(
+            _PK_FK_NAME_HINT.search(col)
+            or col.endswith(("_id", "_sk", "_fk", "_key"))
+            for col in names
+        )
+        if has_hint:
+            hinted += 1
+        else:
+            missing.append(name)
+
+    if inspectable == 0:
+        return not_applicable("No tables were inspectable for PK/FK declaration hints")
+
+    return covered(
+        hinted,
+        inspectable,
+        f"{hinted} of {inspectable} table(s) include PK/FK structural naming hints"
+        + (f"; no hints: {', '.join(missing[:5])}" if missing else "")
+        + "; note: Fabric Warehouse constraints are declarative and not enforced",
+    )
+
+
+@check(
+    id="WS-STATS-STRATEGY", ref="4.4.6",
+    title="Statistics maintenance strategy is defined and automated",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS], required=True,
+)
+def stats_strategy_defined(ctx: CheckContext) -> Verdict:
+    """Inspect pipeline SQL automation for recurring stats maintenance patterns."""
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
+
+    storage_items = [item for item in ctx.workspace.items if item.type in {"Warehouse", "Lakehouse"}]
+    if not storage_items:
+        return not_applicable("No Warehouse/Lakehouse items found in this workspace")
+
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    inspectable = 0
+    automated = 0
+    opaque = 0
+
+    for _, pipeline_def in (ctx.workspace.pipelines or {}).items():
+        for activity in pipeline_activities(pipeline_def):
+            activity_type = str(activity.get("type", "") or "")
+            if activity_type == "Script":
+                text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
+                if _STATS_UPDATE_SQL.search(text):
+                    inspectable += 1
+                    automated += 1
+                elif _WAREHOUSE_SQL_LOAD.search(text):
+                    inspectable += 1
+                continue
+
+            if activity_type in ("Copy", "SqlServerStoredProcedure", "StoredProcedure"):
+                opaque += 1
+
+    if inspectable == 0:
+        if opaque:
+            return not_applicable(
+                "Storage load automation is present but SQL bodies are not inspectable, so statistics strategy cannot be verified. "
+                + _SQL_PERMISSION_HINT
+            )
+        return not_applicable("No inspectable storage-load automation was found to evaluate statistics strategy")
+
+    return covered(
+        automated,
+        inspectable,
+        f"{automated} of {inspectable} inspectable load automation step(s) include statistics maintenance",
+        obj="inspectable load automation steps",
+    )
 
 @check(
     id="TB-DATEDIM", ref="4.4.8", title="A date/time dimension exists",
