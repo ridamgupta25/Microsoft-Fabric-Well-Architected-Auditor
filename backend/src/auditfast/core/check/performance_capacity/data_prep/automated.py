@@ -470,6 +470,7 @@ def nb_pushdown(ctx: CheckContext) -> Verdict:
         "all rows are scanned before any selection, preventing predicate pushdown",
     )
 
+# -- Copy activity parallelism (2.6.2) ----------------------------------------
 @check(
     id="PL-COPY-PARALLEL", ref="2.6.2", title="Copy activities use appropriate parallelism (DIU, degree of copy parallelism)",
     pillar=Pillar.PERFORMANCE, scope=Scope.PIPELINE, severity=Severity.LOW,
