@@ -1,15 +1,14 @@
 """Security · Data Storage — how the data at rest is classified and protected."""
 from __future__ import annotations
 
+import re
+
 from auditfast.core.check._semantic import hidden_columns, rls_roles
-from auditfast.core.check.helpers import Verdict, covered, not_applicable
+from auditfast.core.check._tables import TABLE_LAYERS, columns
+from auditfast.core.check.helpers import Verdict, covered, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
-
-import re
-
-from auditfast.core.check._tables import TABLE_LAYERS, columns
 
 
 @check(
@@ -34,19 +33,38 @@ def sensitivity_labels(ctx: CheckContext) -> Verdict:
     pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.CRITICAL,
     layers=[Layer.STORAGE], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
-def rls_on_semantic_models(ctx: CheckContext) -> Verdict:
-    """Semantic models define RLS roles with table permissions to restrict data access."""
+def rls_on_semantic_models(ctx: CheckContext) -> list[Verdict]:
+    """Semantic models define RLS roles with table permissions to restrict data access.
+
+    Returns the scored workspace verdict followed by one unscored detail row per
+    model without RLS, so the report names *which* models fail, not just how many.
+    """
     if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
-        return not_applicable("Semantic model definitions could not be read from Fabric")
+        return [not_applicable("Semantic model definitions could not be read from Fabric")]
     models = ctx.workspace.semantic_models
     if not models:
-        return not_applicable("No semantic models in this workspace")
-    with_rls = [name for name, defn in models.items() if rls_roles(defn)[0]]
+        return [not_applicable("No semantic models in this workspace")]
+
+    with_rls = []
+    failing = []
+    for name, defn in models.items():
+        filtering, defined = rls_roles(defn)
+        if filtering:
+            with_rls.append(name)
+        elif defined:
+            failing.append((name, f"Defines {defined} role(s) but none carries a filter expression"))
+        else:
+            failing.append((name, "Defines no RLS role"))
+
     warehouses = sum(1 for i in ctx.workspace.items if i.type == "Warehouse")
     caveat = (f"; the {warehouses} Warehouse(s) were not assessed — Warehouse RLS policies "
               f"are not readable through the Fabric REST API") if warehouses else ""
-    return covered(len(with_rls), len(models),
-                   f"{len(with_rls)} of {len(models)} semantic models define RLS roles{caveat}")
+    verdicts = [covered(
+        len(with_rls), len(models),
+        f"{len(with_rls)} of {len(models)} semantic models define RLS roles{caveat}",
+    )]
+    verdicts += [note(reason, obj=name) for name, reason in sorted(failing)]
+    return verdicts
 
 
 @check(
@@ -54,24 +72,33 @@ def rls_on_semantic_models(ctx: CheckContext) -> Verdict:
     pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.CRITICAL,
     layers=[Layer.STORAGE], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
-def ols_on_semantic_models(ctx: CheckContext) -> Verdict:
+def ols_on_semantic_models(ctx: CheckContext) -> list[Verdict]:
     """A column permission denies a column, so column-level security is in force.
 
     Which fields count as sensitive is a business classification, so this reports
-    whether the control exists — not whether it covers the right columns.
+    whether the control exists — not whether it covers the right columns. The
+    scored workspace verdict is followed by one unscored detail row per model
+    applying no column-level security.
     """
     if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
-        return not_applicable("Semantic model definitions could not be read from Fabric")
+        return [not_applicable("Semantic model definitions could not be read from Fabric")]
     models = ctx.workspace.semantic_models
     if not models:
-        return not_applicable("No semantic models in this workspace")
+        return [not_applicable("No semantic models in this workspace")]
+
     restricted = [name for name, defn in models.items() if hidden_columns(defn)]
-    return covered(
+    failing = [name for name in models if name not in set(restricted)]
+    verdicts = [covered(
         len(restricted), len(models),
         f"{len(restricted)} of {len(models)} semantic models deny at least one column "
         f"through a column-level security permission; which fields need protecting is a "
         f"business judgement this check does not make",
-    )
+    )]
+    verdicts += [
+        note("No column-level security permission denies any column", obj=name)
+        for name in sorted(failing)
+    ]
+    return verdicts
 
 
 
