@@ -123,6 +123,7 @@
 # load-safety advice, so it reads coherently either way.
 "3.6.4": "Make the load safe to re-run and orphan-aware: write with MERGE INTO (or TRUNCATE / DELETE-by-batch followed by INSERT) so re-running cannot duplicate rows, and detect orphan child records with an anti-join, routing unmatched keys to an error table or quarantine before loading."
 "3.6.5": "After a MERGE INTO, validate the result by checking operationMetrics or DESCRIBE HISTORY to confirm inserted/updated/deleted counts match expectations."
+"3.6.6": "Avoid full reloads of Warehouse targets when an incremental pattern is possible: replace unconditional INSERT/overwrite loads with MERGE INTO, CDC, or watermark-based processing so only changed rows are applied to the Gold table."
 "5.2.1": "Define and enforce the expected incoming schema, including column count, names, and data types, before processing records such as EAM JSON."
 "5.2.4": "Validate incoming file format before processing: require UTF-8 encoding, the expected delimiter, and a valid JSON structure for EAM payloads."
 "5.3.5": "Standardize incoming dates, codes, and reference values with explicit conversions, normalization rules, and approved lookup mappings."
