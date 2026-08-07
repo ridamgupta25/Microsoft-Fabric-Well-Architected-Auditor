@@ -41,7 +41,7 @@ _MAX_TEXT_WIDTH = 4000
 
 
 @check(
-    id="TB-NAMING", ref="4.2.1", title="Tables follow a consistent naming convention",
+    id="TB-NAMING", ref="4.2.1", title="Tables use meaningful, consistent naming conventions (agreed standard)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
 )
@@ -55,7 +55,7 @@ def table_naming(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="TB-MANAGED-DELTA", ref="4.1.1", title="Tables are managed Delta tables",
+    id="TB-MANAGED-DELTA", ref="4.1.1", title="Lakehouse Tables (managed) used for structured data; Files section for raw/unstructured",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
 )
@@ -71,7 +71,7 @@ def table_managed_delta(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="TB-AUDITCOLS", ref="4.2.5", title="Tables carry audit columns",
+    id="TB-AUDITCOLS", ref="4.2.5", title="Audit columns present (created_date, modified_date, source_system, batch_id)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
 )
@@ -85,7 +85,7 @@ def table_audit_columns(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="TB-STARSCHEMA", ref="4.4.1", title="Star schema — fact and dimension tables present",
+    id="TB-STARSCHEMA", ref="4.5.1", title="Star schema design implemented (fact + dimension tables, not flat wide tables)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
 )
@@ -102,7 +102,7 @@ def table_star_schema(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="TB-DATEDIM", ref="4.4.8", title="A date/time dimension exists",
+    id="TB-DATEDIM", ref="4.5.7", title="Date/Time dimension exists with all required attributes (fiscal periods, quarter, holidays)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
 )
@@ -121,7 +121,7 @@ def table_date_dimension(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="TB-SURROGATE", ref="4.4.7", title="Dimension tables use surrogate keys",
+    id="TB-SURROGATE", ref="4.5.6", title="Surrogate keys used for dimension tables (not business keys as PKs in facts)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
 )
@@ -138,7 +138,7 @@ def table_surrogate_keys(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="TB-COL-NAMING", ref="4.2.3", title="Column names are consistent and self-documenting",
+    id="TB-COL-NAMING", ref="4.2.3", title="Column naming is consistent and self-documenting",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
 )
@@ -153,7 +153,7 @@ def table_column_naming(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="TB-DATATYPES", ref="4.2.4", title="Data types are appropriate (temporal dates, no oversized text)",
+    id="TB-DATATYPES", ref="4.2.4", title="Data types are appropriate (no stringly-typed dates, no oversized varchars)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
 )
@@ -209,7 +209,7 @@ def _too_wide(column_type: str) -> bool | None:
 
 
 @check(
-    id="WS-SHORTCUT-SCOPE", ref="4.1.2", title="OneLake used as the single data lake",
+    id="WS-SHORTCUT-SCOPE", ref="4.1.2", title="OneLake used as the single data lake — no ungoverned shadow storage",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS], required=False,
 )
@@ -242,7 +242,7 @@ def shortcut_scope(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="TB-SCD2", ref="4.4.10", title="SCD Type 2 dimensions track validity and a current flag",
+    id="TB-SCD2", ref="4.5.9", title="SCD Type 2 includes valid_from, valid_to, and is_current flag correctly maintained (where used)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
 )

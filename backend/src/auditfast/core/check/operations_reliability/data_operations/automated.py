@@ -69,7 +69,7 @@ def _style_issues(name: str) -> str:
 
 
 @check(
-    id="WS-NAME", ref="1.1.7", title="Workspace naming convention",
+    id="WS-NAME", ref="IMPL-24", title="Workspace name follows the organization naming convention (e.g., <Domain>-<Env>-<Project>) [WS-NAME]",
     pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.LOW,
     requires=[Resource.WORKSPACE, Resource.ITEMS], required=False,
 )
@@ -111,7 +111,7 @@ def naming_convention(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="WS-GIT", ref="11.1.2", title="Git integration enabled",
+    id="WS-GIT", ref="11.1.1", title="Git integration enabled for Fabric workspaces",
     pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     requires=[Resource.GIT], required=True,
 )
@@ -125,7 +125,7 @@ def git_connected(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="WS-DEPLOY", ref="11.2", title="Deployment pipeline configured",
+    id="WS-DEPLOY", ref="11.2.1", title="Fabric Deployment Pipelines configured (Dev → QA → Prod) for all three layer workspaces",
     pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     requires=[Resource.WORKSPACE], required=True,
 )

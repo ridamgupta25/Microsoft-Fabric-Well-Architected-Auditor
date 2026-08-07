@@ -31,8 +31,8 @@ def _has_reconciliation(blob: str) -> bool:
 
 
 @check(
-    id="PL-RECONCILE", ref="13.1.2",
-    title="Source-to-target reconciliation for financial data",
+    id="PL-RECONCILE", ref="7.2.6",
+    title="Source-to-target reconciliation exists for financial data (completeness and accuracy)",
     pillar=Pillar.GOVERNANCE, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -54,8 +54,8 @@ def pipeline_reconciliation(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-RECONCILE", ref="13.1.3",
-    title="Source-to-target reconciliation for financial data",
+    id="NB-RECONCILE", ref="7.2.6",
+    title="Source-to-target reconciliation exists for financial data (completeness and accuracy)",
     pillar=Pillar.GOVERNANCE, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
