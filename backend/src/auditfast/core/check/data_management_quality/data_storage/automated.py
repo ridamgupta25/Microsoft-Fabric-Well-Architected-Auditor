@@ -30,6 +30,11 @@ _NO_TABLES = "No lakehouse/warehouse tables were read for this workspace"
 #: separately by the 5.4.x semantic-model checks.
 _NO_DIMS = "No lakehouse/warehouse dimension tables with column metadata"
 
+#: N/A reason when lakehouse/warehouse tables exist but none carry readable column
+#: schemas. Scope is made explicit so it is not mistaken for "no columns anywhere"
+#: — semantic-model column metadata is not read by these table checks.
+_NO_COLS = "No lakehouse/warehouse table column metadata available"
+
 #: Column names implying a date/time value, for the data-type check.
 _DATE_NAME = re.compile(r"(date|timestamp|_dt$|_time$)", re.IGNORECASE)
 
@@ -77,9 +82,11 @@ def table_managed_delta(ctx: CheckContext) -> Verdict:
 )
 def table_audit_columns(ctx: CheckContext) -> Verdict:
     """Each table records lineage via audit columns (created/modified/batch id)."""
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
     tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
     if not tables:
-        return not_applicable("No table column metadata available")
+        return not_applicable(_NO_COLS)
     ok = [n for n, t in tables.items() if any(a in col_names(t) for a in AUDIT_COLUMNS)]
     return covered(len(ok), len(tables), f"{len(ok)} of {len(tables)} tables have audit columns")
 
@@ -144,9 +151,11 @@ def table_surrogate_keys(ctx: CheckContext) -> Verdict:
 )
 def table_column_naming(ctx: CheckContext) -> Verdict:
     """Table columns follow a consistent snake_case convention."""
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
     tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
     if not tables:
-        return not_applicable("No table column metadata available")
+        return not_applicable(_NO_COLS)
     names = [c.get("name", "") for t in tables.values() for c in columns(t)]
     ok = [n for n in names if is_snake_case(n)]
     return covered(len(ok), len(names), f"{len(ok)} of {len(names)} columns use snake_case names")
@@ -163,9 +172,11 @@ def table_data_types(ctx: CheckContext) -> Verdict:
     Only columns that can actually be judged are counted: a date-named column, or a
     text column that declares a width. A bare ``string`` has no width to assess.
     """
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
     tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
     if not tables:
-        return not_applicable("No table column metadata available")
+        return not_applicable(_NO_COLS)
 
     assessed = compliant = stringly_dates = oversized = 0
     for table in tables.values():
