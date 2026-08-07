@@ -78,7 +78,8 @@ def table_managed_delta(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-AUDITCOLS", ref="4.2.5", title="Audit columns present (created_date, modified_date, source_system, batch_id)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=False,
 )
 def table_audit_columns(ctx: CheckContext) -> Verdict:
     """Each table records lineage via audit columns (created/modified/batch id)."""
@@ -130,7 +131,8 @@ def table_date_dimension(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-SURROGATE", ref="4.5.6", title="Surrogate keys used for dimension tables (not business keys as PKs in facts)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=False,
 )
 def table_surrogate_keys(ctx: CheckContext) -> Verdict:
     """Dimensions have a surrogate key column (``*_sk`` / ``*_key``), not just a business key."""
@@ -147,7 +149,8 @@ def table_surrogate_keys(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-COL-NAMING", ref="4.2.3", title="Column naming is consistent and self-documenting",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
-    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=False,
 )
 def table_column_naming(ctx: CheckContext) -> Verdict:
     """Table columns follow a consistent snake_case convention."""
@@ -164,7 +167,8 @@ def table_column_naming(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-DATATYPES", ref="4.2.4", title="Data types are appropriate (no stringly-typed dates, no oversized varchars)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=False,
 )
 def table_data_types(ctx: CheckContext) -> Verdict:
     """Date-named columns are typed temporally, and declared text widths are sane.
@@ -179,6 +183,7 @@ def table_data_types(ctx: CheckContext) -> Verdict:
         return not_applicable(_NO_COLS)
 
     assessed = compliant = stringly_dates = oversized = 0
+    lakehouse_defaults = 0
     for table in tables.values():
         for col in columns(table):
             name = col.get("name", "")
@@ -191,7 +196,16 @@ def table_data_types(ctx: CheckContext) -> Verdict:
                     stringly_dates += 1
                 else:
                     compliant += 1
-            elif _too_wide(ctype) is not None:
+                continue
+            if _is_lakehouse_default_text(col, ctype):
+                # A Lakehouse SQL endpoint renders every Delta ``string`` as
+                # varchar(8000) regardless of intent, so the width is the
+                # platform's, not the author's. Judging it would fail every
+                # string column in every lakehouse - a tool artefact, not a
+                # finding. Only a Warehouse width is a real design choice.
+                lakehouse_defaults += 1
+                continue
+            if _too_wide(ctype) is not None:
                 assessed += 1
                 if _too_wide(ctype):
                     oversized += 1
@@ -200,14 +214,44 @@ def table_data_types(ctx: CheckContext) -> Verdict:
 
     if not assessed:
         return not_applicable(
-            "No date/time-named columns and no text columns with a declared width"
+            "No date/time-named columns and no text columns whose width the author "
+            "chose" + (f"; {lakehouse_defaults} Lakehouse column(s) carry the platform's "
+                       f"default varchar(8000) and cannot be judged"
+                       if lakehouse_defaults else "")
         )
     return covered(
         compliant, assessed,
         f"{compliant} of {assessed} assessable columns are appropriately typed — "
         f"{stringly_dates} date column(s) typed as text, "
-        f"{oversized} text column(s) wider than {_MAX_TEXT_WIDTH}",
+        f"{oversized} text column(s) wider than {_MAX_TEXT_WIDTH}"
+        + (f"; {lakehouse_defaults} Lakehouse column(s) excluded — a Lakehouse SQL "
+           f"endpoint forces every Delta string to varchar({_LAKEHOUSE_TEXT_WIDTH}), "
+           f"so that width is the platform's choice, not the model's"
+           if lakehouse_defaults else ""),
     )
+
+
+#: A Lakehouse SQL analytics endpoint maps every Delta ``string`` column to this
+#: width, whatever the author intended. See
+#: ``fabric-skills/common/SQLDW-CONSUMPTION-CORE.md``: "Lakehouse SQLEP maps Delta
+#: string -> varchar(8000)".
+_LAKEHOUSE_TEXT_WIDTH = 8000
+
+
+def _is_lakehouse_default_text(col: dict, column_type: str) -> bool:
+    """True when a width was imposed by a Lakehouse endpoint rather than chosen.
+
+    Only applies to ``varchar(8000)`` read from a Lakehouse: a Warehouse author
+    picks their own widths, and any other Lakehouse width had to be declared
+    deliberately, so both remain assessable.
+    """
+    if (col.get("source_kind") or "").strip().lower() != "lakehouse":
+        return False
+    match = _DECLARED_WIDTH.match(column_type)
+    if not match:
+        return False
+    width = match.group(1).lower()
+    return width != "max" and int(width) == _LAKEHOUSE_TEXT_WIDTH
 
 
 def _too_wide(column_type: str) -> bool | None:
@@ -336,7 +380,8 @@ def shortcut_scope(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-SCD2", ref="4.5.9", title="SCD Type 2 includes valid_from, valid_to, and is_current flag correctly maintained (where used)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=False,
 )
 def table_scd2(ctx: CheckContext) -> Verdict:
     """Slowly-changing dimensions carry valid_from, valid_to, and is_current together."""

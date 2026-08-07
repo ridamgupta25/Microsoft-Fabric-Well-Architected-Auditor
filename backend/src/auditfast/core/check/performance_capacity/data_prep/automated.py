@@ -11,8 +11,10 @@ guidance from the vendored ``fabric-skills``.
 """
 from __future__ import annotations
 
+import re
+
 from auditfast.core.check._notebook import notebook_code
-from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities
+from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities, walk_activities
 from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Pillar, Resource, Scope, Severity
@@ -420,3 +422,123 @@ def copy_parallelism(ctx: CheckContext) -> Verdict:
         tuned, len(copies),
         f"{tuned} of {len(copies)} Copy activities set parallelCopies/DIU",
     )
+
+
+# -- Relational-source ingestion tuning (2.6.5) -------------------------------
+
+#: A Copy *source* that reads a relational SQL database — Azure SQL DB, SQL
+#: Server/MI, Synapse, or an RDS-hosted SQL Server. Matched on the source type
+#: name rather than a source-system name, so the rule holds for every relational
+#: feed rather than one tenant's.
+_SQL_SOURCE_TYPE = re.compile(r"^(?=.*sql).*source$", re.IGNORECASE)
+
+#: A reader query that folds nothing: the whole table, every column.
+_UNFOLDED_QUERY = re.compile(r"select\s+\*", re.IGNORECASE)
+#: A predicate or a pipeline expression inside the reader query — the projection
+#: or restriction being pushed down to the source engine.
+_FOLDED_QUERY = re.compile(r"\bwhere\b|\btop\b|@\{|@pipeline\s*\(|@activity\s*\(", re.IGNORECASE)
+
+
+def _sql_copy_sources(definition: dict) -> list[tuple[str, dict, dict]]:
+    """``(activity name, source, sink)`` for every Copy reading a SQL database.
+
+    Uses :func:`walk_activities` so a Copy nested inside a ForEach — the usual
+    shape for metadata-driven ingestion — is judged like a top-level one.
+    """
+    found: list[tuple[str, dict, dict]] = []
+    for activity in walk_activities(definition):
+        if activity.get("type") != "Copy":
+            continue
+        props = activity.get("typeProperties") or {}
+        source = props.get("source") if isinstance(props.get("source"), dict) else {}
+        sink = props.get("sink") if isinstance(props.get("sink"), dict) else {}
+        if _SQL_SOURCE_TYPE.match(str(source.get("type") or "")):
+            found.append((activity.get("name") or "?", source, sink))
+    return found
+
+
+def _folds_source_read(source: dict) -> bool:
+    """The source read pushes projection or restriction into the database.
+
+    A stored procedure always folds — the work happens in the source engine. A
+    reader query folds when it names its columns or carries a predicate; a bare
+    ``SELECT *`` with no ``WHERE`` reads the whole table and folds nothing.
+    """
+    if source.get("sqlReaderStoredProcedureName"):
+        return True
+    query = source.get("sqlReaderQuery") or source.get("query") or ""
+    if isinstance(query, dict):  # an expression object — value lives under "value"
+        query = query.get("value") or ""
+    query = str(query)
+    if not query.strip():
+        return False
+    return bool(_FOLDED_QUERY.search(query)) or not _UNFOLDED_QUERY.search(query)
+
+
+def _partitions_source_read(source: dict) -> bool:
+    """The read is split into partitions rather than pulled as one stream.
+
+    Whether the partition column is *indexed* is not readable — Fabric exposes no
+    source-schema metadata — so a configured ``partitionOption`` is the readable
+    proxy for an index-friendly ranged read. ``"None"`` is the default and means
+    nothing was chosen.
+    """
+    option = str(source.get("partitionOption") or "").strip()
+    return bool(option) and option.lower() != "none"
+
+
+def _sizes_write_batch(sink: dict) -> bool:
+    """The sink writes in explicitly sized batches instead of the default."""
+    return bool(sink.get("writeBatchSize") or sink.get("writeBatchTimeout"))
+
+
+@check(
+    id="PL-SQL-INGEST-TUNED", ref="2.6.5",
+    title="Relational (Azure SQL DB) ingestion is tuned — query folding, ranged source reads, batch sizing",
+    pillar=Pillar.PERFORMANCE, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
+)
+def sql_ingestion_tuned(ctx: CheckContext) -> Verdict:
+    """Copy activities reading a SQL database fold, partition, and batch their I/O.
+
+    Three independent tunings, each read straight off the Copy activity:
+
+    * *query folding* — a reader query or stored procedure that projects columns
+      or carries a predicate, so the source engine does the filtering rather than
+      the whole table crossing the wire;
+    * *ranged source read* — a ``partitionOption`` other than ``None``, so the
+      read is split instead of pulled as one long-running stream. Index metadata
+      is not exposed by any Fabric API, so this is the readable proxy for an
+      index-friendly read, and the docstring says so rather than pretending;
+    * *batch sizing* — an explicit ``writeBatchSize``/``writeBatchTimeout`` on the
+      sink instead of the conservative default.
+
+    Scored as coverage over all three signals across every SQL-source Copy, so a
+    pipeline that folds but never partitions lands in the middle rather than at
+    either extreme. A pipeline that reads no SQL database is N/A.
+    """
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    sql_copies = _sql_copy_sources(ctx.obj)
+    if not sql_copies:
+        return not_applicable("Pipeline has no Copy activity reading a SQL database")
+
+    folded = [name for name, source, _ in sql_copies if _folds_source_read(source)]
+    partitioned = [name for name, source, _ in sql_copies if _partitions_source_read(source)]
+    batched = [name for name, _, sink in sql_copies if _sizes_write_batch(sink)]
+
+    total = len(sql_copies)
+    met = len(folded) + len(partitioned) + len(batched)
+    gaps = [
+        label for label, hit in (
+            ("query folding", folded), ("ranged source read", partitioned),
+            ("sink batch sizing", batched),
+        ) if len(hit) < total
+    ]
+    detail = (f"{total} SQL-source Copy activit(y/ies): {len(folded)} fold the source read, "
+              f"{len(partitioned)} set a partitionOption, {len(batched)} set a sink write "
+              f"batch size")
+    if gaps:
+        detail += f" — untuned on {', '.join(gaps)}"
+    return covered(met, total * 3, detail)
