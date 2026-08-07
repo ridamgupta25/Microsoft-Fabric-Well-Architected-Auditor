@@ -1548,3 +1548,413 @@ def ws_runtime_baseline(ctx: CheckContext) -> Verdict:
     return graded(2, f"Run duration is measured in {where}, but is never compared "
                      f"against a baseline, SLA or expected value — the number is "
                      f"recorded, not monitored")
+
+
+# =============================================================================
+# MLC Cat-1 · data-quality dimensions (5.1.x, 5.2.x, 5.3.x, 5.5.x)
+# Notebook-code checks: they read NOTEBOOK_DEFINITIONS (already crawled) and
+# never query row data, so they add no knowledge-base cost. Each gates to N/A
+# when the notebook is not doing the kind of work the point is about.
+# =============================================================================
+
+#: Any physical read of an external file or JSON source (the point at which
+#: completeness/timeliness/format questions apply).
+_DQ_FILE_READ = re.compile(
+    r"spark\.read\b|\.read\.(?:csv|json|text|parquet|format|load)|read_csv|read_json|"
+    r"\.load\s*\(|json\.loads|from_json\s*\(",
+    re.IGNORECASE,
+)
+
+
+# -- 5.1.7 · DQ tool/library standardized across the solution -----------------
+_DQ_FRAMEWORKS = {
+    "great_expectations": re.compile(
+        r"great_expectations|ExpectationSuite|\bge\.(?:from_pandas|dataset|read_)", re.IGNORECASE),
+    "pydeequ": re.compile(
+        r"pydeequ|VerificationSuite|\.hasSize\s*\(|\.isComplete\s*\(|\.isUnique\s*\(", re.IGNORECASE),
+    "soda": re.compile(r"\bsoda_core\b|\bSodaCL\b|\bsoda\.scan\b", re.IGNORECASE),
+    "custom framework": re.compile(
+        r"def\s+validate\w*\s*\(|\bdq_check\b|\bdata_quality\b|\bquality_check\b|"
+        r"\brun_checks\b|\bdq_rules?\b", re.IGNORECASE),
+}
+
+
+@check(
+    id="NB-DQ-STANDARD", ref="5.1.7",
+    title="Data-quality tool/library standardized across the solution",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
+)
+def nb_dq_standardized(ctx: CheckContext) -> Verdict:
+    """Notebooks that validate data use one consistent DQ approach, not many ad-hoc ones."""
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    notebooks = ctx.workspace.notebooks or {}
+    if not notebooks:
+        return not_applicable("No notebooks in this workspace")
+
+    used: dict[str, int] = {}
+    dq_notebooks = 0
+    for defn in notebooks.values():
+        code = executable_code(defn)
+        families = {name for name, rx in _DQ_FRAMEWORKS.items() if rx.search(code)}
+        if families:
+            dq_notebooks += 1
+            for family in families:
+                used[family] = used.get(family, 0) + 1
+    if dq_notebooks == 0:
+        return not_applicable(
+            "No data-quality validation library or framework detected in any notebook")
+
+    dominant = max(used.values())
+    detail = (
+        f"{dq_notebooks} notebook(s) validate data quality using {sorted(used)}; "
+        f"{dominant} share the most common approach"
+    )
+    if len(used) > 1:
+        detail += f" — {len(used)} different DQ approaches are mixed across the solution"
+    return covered(dominant, dq_notebooks, detail)
+
+
+# -- 5.1.9 · DQ failures halt pipeline progression ----------------------------
+_DQ_VALIDATION_INTENT = re.compile(
+    r"\bassert\b|expect_\w+\s*\(|great_expectations|VerificationSuite|"
+    r"validate\w*\s*\(|\bdq_check\b|\bdata_quality\b|\bquality_check\b|"
+    r"\.count\s*\(\s*\)\s*(?:==|!=|<=|>=|<|>)(?!\s*0\b)",
+    re.IGNORECASE,
+)
+_DQ_HALT = re.compile(
+    r"\braise\b|sys\.exit\s*\(|os\._exit\s*\(|"
+    r"(?:mssparkutils|notebookutils|dbutils)\.notebook\.exit|\bassert\b",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-DQ-HALT", ref="5.1.9",
+    title="DQ failures halt progression (bad data does not silently flow downstream)",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_dq_halts(ctx: CheckContext) -> Verdict:
+    """A failed data-quality check raises or exits, so bad data cannot flow on unchecked."""
+    code = executable_code(ctx.obj)
+    if not _DQ_VALIDATION_INTENT.search(code):
+        return not_applicable("Notebook performs no recognizable data-quality validation")
+    ok = bool(_DQ_HALT.search(code))
+    return binary(
+        ok,
+        "DQ failures halt execution (raise / notebook-exit / assert on failure)" if ok else
+        "Runs DQ validation but never halts on failure — bad data can flow downstream",
+    )
+
+
+# -- 5.2.2 · Completeness: all expected files/batches received -----------------
+_FILE_LIST = re.compile(
+    r"(?:mssparkutils|notebookutils|dbutils)\.fs\.ls|os\.listdir|glob\.glob|"
+    r"\.g?lob\s*\(|listFiles|list_files",
+    re.IGNORECASE,
+)
+_COMPLETENESS = re.compile(
+    r"expected[_ ]?(?:files|count|batches|partitions|tables|records)|"
+    r"missing[_ ]?(?:files|partitions|tables|batches)|file[_ ]?count|"
+    r"received[_ ]?(?:files|count|batches)|all[_ ]?(?:files|batches)[_ ]?(?:present|received)|"
+    r"len\s*\([^\n]*\)\s*(?:==|!=|<|>|<=|>=)|set\s*\([^\n]*\)\s*-\s*set\s*\(",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-COMPLETENESS", ref="5.2.2",
+    title="Completeness: all expected source files/batches received",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_completeness(ctx: CheckContext) -> Verdict:
+    """Notebooks reading batched sources verify every expected file/batch/partition arrived."""
+    code = executable_code(ctx.obj)
+    if not (_FILE_LIST.search(code) or _DQ_FILE_READ.search(code)):
+        return not_applicable("Notebook does not list or read source files/batches")
+    ok = bool(_COMPLETENESS.search(code))
+    return binary(
+        ok,
+        "Validates all expected files/batches/partitions were received" if ok else
+        "Reads sources without checking that all expected files/batches/partitions arrived",
+    )
+
+
+# -- 5.2.3 · Timeliness: data arrives within the expected SLA window ----------
+_TIMELINESS = re.compile(
+    r"modificationTime|modification_time|last[_ ]?modified|lastModified|st_mtime|"
+    r"\bSLA\b|freshness|\bstale\b|arriv\w*[_ ]?(?:time|within|by|late)|"
+    r"within[_ ]?(?:hours|minutes|days|sla)|datediff\s*\([^\n]*current|"
+    r"current_(?:date|timestamp)\s*\(\s*\)[^\n]{0,120}(?:-|<|>|datediff)",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-TIMELINESS", ref="5.2.3",
+    title="Timeliness: data arrives within the expected SLA window",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_timeliness(ctx: CheckContext) -> Verdict:
+    """Notebooks reading sources check the data landed within its freshness/SLA window."""
+    code = executable_code(ctx.obj)
+    if not (_FILE_LIST.search(code) or _DQ_FILE_READ.search(code)):
+        return not_applicable("Notebook does not list or read source files")
+    ok = bool(_TIMELINESS.search(code))
+    return binary(
+        ok,
+        "Checks source data freshness against an SLA / arrival-time window" if ok else
+        "Reads sources without checking they arrived within the expected SLA window",
+    )
+
+
+# -- 5.2.7 · Null/empty handling: unexpected nulls flagged --------------------
+_NULL_HANDLING = re.compile(
+    r"\.isNull\s*\(|\.isNotNull\s*\(|isnan\s*\(|null[_ ]?count|"
+    r"when\s*\([^\n]*isNull|filter\s*\([^\n]*isNull|dropna\s*\(|fillna\s*\(|"
+    r"\.na\.(?:drop|fill)|coalesce\s*\(|\bIS\s+(?:NOT\s+)?NULL\b",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-NULL-HANDLING", ref="5.2.7",
+    title="Null/empty handling: unexpected nulls flagged",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_null_handling(ctx: CheckContext) -> Verdict:
+    """Notebooks that write data handle or flag null/empty values rather than passing them through."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write data to a table")
+    ok = bool(_NULL_HANDLING.search(code))
+    return binary(
+        ok,
+        "Null/empty values are handled or flagged before write" if ok else
+        "Writes data without any null/empty handling or flagging",
+    )
+
+
+# -- 5.3.3 · Business rule validation (domain-specific rules) ------------------
+_BUSINESS_RULE = re.compile(
+    r"start[_ ]?date[^\n]{0,40}(?:<=|<|>=|>)[^\n]{0,40}end[_ ]?date|"
+    r"end[_ ]?date[^\n]{0,40}(?:>=|>|<=|<)[^\n]{0,40}start[_ ]?date|"
+    r"col\s*\([^\n]*\)\s*(?:<=|<|>=|>)\s*col\s*\(|"
+    r"when\s*\([^\n]*col\s*\([^\n]*\)\s*(?:<=|<|>=|>)[^\n]*col\s*\(|"
+    r"assert[^\n]*(?:<=|>=|<|>)|business[_ ]?rule|valid[_ ]?range|sanity[_ ]?check",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-BUSINESS-RULE", ref="5.3.3",
+    title="Business rule validation: domain-specific rules applied",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_business_rule(ctx: CheckContext) -> Verdict:
+    """Notebooks that write data apply domain business rules (e.g. start_date <= end_date)."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write data to a table")
+    ok = bool(_BUSINESS_RULE.search(code))
+    return binary(
+        ok,
+        "Applies a domain business-rule / cross-column validation" if ok else
+        "Writes data without any domain business-rule validation (e.g. start_date <= end_date)",
+    )
+
+
+# -- 5.3.10 · Null propagation: no nulls introduced by joins or casts ---------
+_CAST_OP = re.compile(
+    r"\.cast\s*\(|to_date\s*\(|to_timestamp\s*\(|\.astype\s*\(|\bCAST\s*\(",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-NULL-PROPAGATION", ref="5.3.10",
+    title="Null propagation: no nulls introduced by failed joins or casts",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_null_propagation(ctx: CheckContext) -> Verdict:
+    """Notebooks that join or cast then write check for nulls those operations can introduce."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write data to a table")
+    if not (_JOIN_PATTERN.search(code) or _CAST_OP.search(code)):
+        return not_applicable("Notebook performs no join or type cast that could introduce nulls")
+    ok = bool(_NULL_HANDLING.search(code))
+    return binary(
+        ok,
+        "Checks for nulls introduced by joins or type casts" if ok else
+        "Joins/casts and writes without checking for nulls introduced by failed matches or coercions",
+    )
+
+
+# -- 5.5.1 · Dates: valid ranges, timezone, no invalid future dates ----------
+_DATE_CONTEXT = re.compile(
+    r"to_date\s*\(|to_timestamp\s*\(|DateType|TimestampType|date_format\s*\(|"
+    r"current_date\s*\(|current_timestamp\s*\(",
+    re.IGNORECASE,
+)
+_DATE_VALIDATION = re.compile(
+    r"current_date\s*\(\s*\)|current_timestamp\s*\(\s*\)|\bfuture\b|"
+    r"year\s*\([^\n]*\)\s*(?:<|>|between|BETWEEN)|to_utc_timestamp|from_utc_timestamp|"
+    r"\btimezone\b|\btz\b|between[^\n]*date|date[^\n]{0,40}(?:<=|>=|<|>|between)|"
+    r"valid[_ ]?date|invalid[_ ]?date|date[_ ]?range",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-DATE-VALIDATION", ref="5.5.1",
+    title="Dates: valid ranges, timezone handling, no invalid future dates",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_date_validation(ctx: CheckContext) -> Verdict:
+    """Notebooks handling dates validate ranges, timezone, and reject invalid future dates."""
+    code = executable_code(ctx.obj)
+    if not _DATE_CONTEXT.search(code):
+        return not_applicable("Notebook does not parse or handle date/timestamp columns")
+    ok = bool(_DATE_VALIDATION.search(code))
+    return binary(
+        ok,
+        "Validates date ranges / timezone / future dates" if ok else
+        "Handles dates without validating ranges, timezone, or invalid future dates",
+    )
+
+
+# -- 5.5.2 · Numeric / Financial: precision, rounding, currency codes --------
+_NUMERIC_CONTEXT = re.compile(
+    r"DecimalType|\bamount\b|\bprice\b|\bcost\b|revenue|\bqty\b|quantity|"
+    r"\bcurrency\b|financ|\btotal\b",
+    re.IGNORECASE,
+)
+_NUMERIC_VALIDATION = re.compile(
+    r"DecimalType\s*\(|\.cast\s*\([^\n]*[Dd]ecimal|round\s*\(|bround\s*\(|"
+    r"format_number\s*\(|\bprecision\b|\bscale\s*=|currency[_ ]?code|ISO[_ ]?4217|"
+    r"isin\s*\([^\n]*(?:USD|EUR|GBP|currenc)",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-NUMERIC-VALIDATION", ref="5.5.2",
+    title="Numeric/Financial: precision preserved, currency codes valid",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_numeric_validation(ctx: CheckContext) -> Verdict:
+    """Notebooks handling financial/numeric data preserve precision and validate currency codes."""
+    code = executable_code(ctx.obj)
+    if not _NUMERIC_CONTEXT.search(code):
+        return not_applicable("Notebook does not handle numeric/financial columns")
+    ok = bool(_NUMERIC_VALIDATION.search(code))
+    return binary(
+        ok,
+        "Preserves numeric precision / validates currency codes" if ok else
+        "Handles numeric/financial data without explicit precision or currency-code validation",
+    )
+
+
+# -- 5.5.4 · Sensitive data: masked/tokenized where required -----------------
+_SENSITIVE_CONTEXT = re.compile(
+    r"\bssn\b|social[_ ]?security|\bemail\b|\bphone\b|\bpii\b|sensitive|tax[_ ]?id|"
+    r"\biban\b|account[_ ]?(?:number|no)|credit[_ ]?card|passport|national[_ ]?id|"
+    r"\bsalary\b|\bdob\b|date[_ ]?of[_ ]?birth",
+    re.IGNORECASE,
+)
+_MASKING = re.compile(
+    r"sha2\s*\(|md5\s*\(|\bhash\s*\(|mask\w*\s*\(|tokeniz|encrypt|"
+    r"regexp_replace\s*\(|redact|anonymiz|pseudonymiz",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-SENSITIVE-MASK", ref="5.5.4",
+    title="Sensitive data: masked/tokenized where required",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_sensitive_mask(ctx: CheckContext) -> Verdict:
+    """Notebooks referencing sensitive fields mask, hash, or tokenize them before persisting."""
+    code = executable_code(ctx.obj)
+    if not _SENSITIVE_CONTEXT.search(code):
+        return not_applicable("Notebook references no recognizable sensitive/PII columns")
+    ok = bool(_MASKING.search(code))
+    return binary(
+        ok,
+        "Sensitive columns are masked / hashed / tokenized" if ok else
+        "References sensitive/PII columns without masking, hashing, or tokenization",
+    )
+
+
+# -- 5.5.5 · Categorical / Enum: values within the expected domain -----------
+_ENUM_VALIDATION = re.compile(
+    r"\.isin\s*\(|\bisin\s*\(|allowed[_ ]?(?:values|codes|list)|"
+    r"valid[_ ]?(?:values|codes|set)|expected[_ ]?(?:values|codes)|"
+    r"domain[_ ]?(?:values|check)|when\s*\([^\n]*isin|filter\s*\([^\n]*isin|"
+    r"\bIN\s*\(\s*['\"]",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-ENUM-DOMAIN", ref="5.5.5",
+    title="Categorical/Enum: values within the expected domain",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_enum_domain(ctx: CheckContext) -> Verdict:
+    """Notebooks that write data validate categorical values against an allowed domain."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write data to a table")
+    ok = bool(_ENUM_VALIDATION.search(code))
+    return binary(
+        ok,
+        "Validates categorical/enum values against an allowed domain" if ok else
+        "Writes data without validating categorical values against an allowed domain",
+    )
+
+
+# -- 5.5.8 · JSON (EAM): structure validated, required elements present -------
+_JSON_CONTEXT = re.compile(
+    r"from_json\s*\(|json\.loads|get_json_object|json_tuple|schema_of_json|"
+    r"read\.json|\bEAM\b",
+    re.IGNORECASE,
+)
+_JSON_VALIDATION = re.compile(
+    r"from_json\s*\([^\n]*(?:StructType|schema)|schema_of_json|jsonschema|json[_ ]?schema|"
+    r"required[_ ]?(?:keys|elements|fields)|\.keys\s*\(\s*\)[^\n]*(?:issubset|in\b|==|-)|"
+    r"assert[^\n]*json|validate[^\n]*json|StructType[^\n]*from_json|type[_ ]?coerc",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-JSON-VALIDATE", ref="5.5.8",
+    title="JSON (EAM): structure validated, required elements present, type coercion verified",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_json_validate(ctx: CheckContext) -> Verdict:
+    """Notebooks parsing JSON (EAM) validate structure, required elements, and type coercion."""
+    code = executable_code(ctx.obj)
+    if not _JSON_CONTEXT.search(code):
+        return not_applicable("Notebook does not parse JSON / EAM sources")
+    ok = bool(_JSON_VALIDATION.search(code))
+    return binary(
+        ok,
+        "JSON structure is validated with an explicit schema / required-element check" if ok else
+        "Parses JSON without validating structure, required elements, or type coercion",
+    )
