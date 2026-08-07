@@ -72,7 +72,7 @@ def test_status_counts_are_unchanged(provider):
     assert agg["counts"][Status.PASS] == 50
     assert agg["counts"][Status.PARTIAL] == 18
     assert agg["counts"][Status.FAIL] == 40
-    assert agg["counts"][Status.NA] == 99
+    assert agg["counts"][Status.NA] == 102
     assert agg["counts"][Status.INFO] == 3
 
 
@@ -273,10 +273,10 @@ def test_progress_callback_fires_per_workspace(provider):
 def test_registry_is_fully_populated():
     """99 checks are evaluated; remaining roadmap checks are not loaded."""
     evaluated = [s for s in REGISTRY if s.automation is Automation.AUTOMATED]
-    assert len(evaluated) == 99
+    assert len(evaluated) == 102
     assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 31
     assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 18
-    assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 49
+    assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 52
     # Roadmap (gated N/A) checks are intentionally not registered — see
     # auditfast.core.check.__init__._CHECK_MODULES — so none remain in the registry.
     assert len([s for s in REGISTRY if s.automation is Automation.ROADMAP]) == 0
@@ -335,7 +335,7 @@ def test_explicit_registry_is_isolated_from_the_global_one():
     assert registry.get("X-ISOLATED") is not None
     assert REGISTRY.get("X-ISOLATED") is None, "test check leaked into the global registry"
     before = len([s for s in REGISTRY if s.automation is Automation.AUTOMATED])
-    assert before == 99
+    assert before == 102
 
 # -- selection and dispatch ----------------------------------------------------
 

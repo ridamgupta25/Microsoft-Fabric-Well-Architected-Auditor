@@ -43,7 +43,7 @@
 "3.1.8": "Configure an execution timeout / max runtime so a hung Spark session cannot run indefinitely."
 "3.1.9": "Write invalid or failed records to a durable quarantine/dead-letter table or path instead of dropping them or halting valid records."
 "3.1.10": "Handle late records with an event-time lookback and version-aware MERGE or deduplication before writing the target table."
-"3.1.11": "Make notebook writes rerun-safe with MERGE/upsert, deterministic overwrite, or cleanup-before-write and run-level deduplication keys."
+"9.3.1": "Make notebook writes rerun-safe with MERGE/upsert, deterministic overwrite, or cleanup-before-write and run-level deduplication keys."
 "13.1.2": "Add a pipeline source-to-target reconciliation that compares source and target row counts or financial control totals and fails or alerts on variance."
 "13.1.3": "Add notebook source-to-target reconciliation that compares source and target row counts or financial control totals and fails or alerts on variance."
 "3.2.1": "Pick one primary language (PySpark or Spark SQL) per notebook rather than mixing them."
@@ -93,8 +93,12 @@
 # load-safety advice, so it reads coherently either way.
 "3.6.4": "Make the load safe to re-run and orphan-aware: write with MERGE INTO (or TRUNCATE / DELETE-by-batch followed by INSERT) so re-running cannot duplicate rows, and detect orphan child records with an anti-join, routing unmatched keys to an error table or quarantine before loading."
 "3.6.5": "After a MERGE INTO, validate the result by checking operationMetrics or DESCRIBE HISTORY to confirm inserted/updated/deleted counts match expectations."
+"5.2.1": "Define and enforce the expected incoming schema, including column count, names, and data types, before processing records such as EAM JSON."
+"5.2.4": "Validate incoming file format before processing: require UTF-8 encoding, the expected delimiter, and a valid JSON structure for EAM payloads."
+"5.3.5": "Standardize incoming dates, codes, and reference values with explicit conversions, normalization rules, and approved lookup mappings."
 # -- MLC Cat-1 checklist points ------------------------------------------------
 "9.1.3": "Enable Copy activity fault tolerance (skip incompatible rows and/or skip error files) and set redirect/log settings so the skipped rows are written somewhere, or route failures to a quarantine activity. One malformed record must not fail the whole run, and skipped records must never be discarded silently."
+"9.1.4": "Compare table schemas across Dev, Test, and Production during promotion; reconcile approved additions/changes through version-controlled migrations and block unapproved drift."
 "4.5.10": "Handle late-arriving data with the inferred-member pattern: when a fact's dimension key is not yet present, insert a stub dimension row (or substitute the conventional -1 unknown member) and backfill it when the real record arrives, rather than dropping the fact or failing the load."
 "5.4.4": "Count how many rows land on the unknown/inferred member on each run and write that number to the audit tables, so a source feed that starts producing unmatched keys is detected instead of quietly inflating the unknown member."
 "5.4.6": "Reconcile record counts across the Silver-to-Gold hop: capture the Silver source count, compare it against the Gold result (allowing for documented aggregation), and raise an alert when the two do not tie out."

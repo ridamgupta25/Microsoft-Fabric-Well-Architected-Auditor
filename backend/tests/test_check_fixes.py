@@ -12,6 +12,11 @@ from datetime import datetime, timezone
 from auditfast.core.check.cost_resource_optimization.data_operations.automated import (
     no_orphaned_items,
 )
+from auditfast.core.check.data_management_quality.data_operations.automated import (
+    notebook_format_validation,
+    notebook_schema_validation,
+    notebook_standardization,
+)
 from auditfast.core.check.data_management_quality.data_prep.automated import (
     nb_no_display,
     nb_no_udf,
@@ -175,6 +180,59 @@ def test_os_system_pip_install_is_flagged():
 
 def test_no_inline_install_still_passes():
     assert spark_env(_ctx(_nb("import pandas as pd"))).score == 3
+
+
+# -- NOTEBOOK DATA QUALITY VALIDATION -----------------------------------------
+
+def test_notebook_schema_validation_checks_names_and_types():
+    code = """
+from pyspark.sql.types import StructType, StructField, StringType
+schema = StructType([StructField('employee_id', StringType(), True)])
+records = spark.read.schema(schema).json('Files/eam.json')
+assert records.columns == ['employee_id']
+"""
+    assert notebook_schema_validation(_ctx(_nb(code))).score == _PASS
+
+
+def test_notebook_schema_validation_rejects_unchecked_input():
+    code = "records = spark.read.json('Files/eam.json')"
+    assert notebook_schema_validation(_ctx(_nb(code))).score == _FAIL
+
+
+def test_notebook_format_validation_covers_utf8_delimiter_and_json():
+    code = """
+records = (spark.read.option('encoding', 'UTF-8')
+    .option('delimiter', '|')
+    .json('Files/eam.json'))
+validated_json = json.loads(payload)
+"""
+    assert notebook_format_validation(_ctx(_nb(code))).score == _PASS
+
+
+def test_notebook_format_validation_rejects_missing_format_controls():
+    assert notebook_format_validation(_ctx(_nb("records = spark.read.json('Files/eam.json')"))).score == _FAIL
+
+
+def test_notebook_standardization_covers_dates_codes_and_reference_mapping():
+    code = """
+records = spark.read.json('Files/eam.json')
+records = records.withColumn('event_date', to_date('event_date'))
+records = records.withColumn('employee_code', upper(trim('employee_code')))
+records = records.join(reference_mapping, 'employee_code')
+"""
+    assert notebook_standardization(_ctx(_nb(code))).score == _PASS
+
+
+def test_notebook_standardization_rejects_missing_categories():
+    code = "records = spark.read.json('Files/eam.json')\nrecords = records.withColumn('event_date', to_date('event_date'))"
+    assert notebook_standardization(_ctx(_nb(code))).score == _FAIL
+
+
+def test_notebook_quality_checks_are_na_without_input():
+    notebook = _ctx(_nb("print('no incoming data')"))
+    assert notebook_schema_validation(notebook).status is Status.NA
+    assert notebook_format_validation(notebook).status is Status.NA
+    assert notebook_standardization(notebook).status is Status.NA
 
 
 # -- DELTA-OPTIMIZE ------------------------------------------------------------
