@@ -134,7 +134,9 @@ VALIDATED_CHECKLIST: dict[str, str] = {
     "14.5.4": "Reporting content (semantic models and reports) is deployed under version control",
     "4.2.4":  "Columns use appropriate data types (dates as DATE, no over-wide text columns)",
     "4.2.5":  "Tables carry audit columns (load timestamp, source system, batch id)",
-    "6.2.1":  "Row-Level Security implemented where required (semantic models and Warehouse)",
+    "3.4.3":  "Spark pool size appropriate for workload (not over- or under-provisioned)",
+    "9.1.1":  "Failed pipelines can be restarted from point of failure (not full re-run)",
+    "10.1.4": "Alerting on pipeline failure (Data Activator or equivalent)",
     "11.5.1": "Unit tests exist for critical transformation logic",
 }
 

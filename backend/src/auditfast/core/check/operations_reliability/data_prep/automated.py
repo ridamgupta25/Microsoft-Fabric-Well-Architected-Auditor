@@ -91,7 +91,7 @@ _CLEANUP_BEFORE_WRITE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _RESTART_BOUNDARY = re.compile(
-    r"restart|resume|checkpoint|watermark|batch[_ -]?id|run[_ -]?id|"
+    r"restart|resume|checkpoint|watermark|batch[_ -]?id|"
     r"from[_ -]?(?:activity|failure|checkpoint)|start[_ -]?from|control[_ -]?(?:table|store)",
     re.IGNORECASE,
 )

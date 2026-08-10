@@ -357,6 +357,30 @@ def test_restart_boundary_is_detected():
     assert restart_from_failure(_ctx(pipeline)).score == _PASS
 
 
+def test_run_id_logging_is_not_restart_boundary():
+    """A failure logger carrying Fabric's run id is not proof of restart-from-failure."""
+    pipeline = _pipe(
+        {"name": "Notebook1", "type": "TridentNotebook"},
+        {
+            "name": "Error Notebook", "type": "TridentNotebook",
+            "dependsOn": [{"activity": "Notebook1", "dependencyConditions": ["Failed"]}],
+            "typeProperties": {
+                "parameters": {
+                    "run_id": {
+                        "value": {"value": "@pipeline().RunId", "type": "Expression"},
+                        "type": "string",
+                    },
+                    "error_message": {
+                        "value": {"value": "@activity('Notebook1').Error.Message", "type": "Expression"},
+                        "type": "string",
+                    },
+                },
+            },
+        },
+    )
+    assert restart_from_failure(_ctx(pipeline)).score == _FAIL
+
+
 def test_audit_quality_log_writer_is_detected():
     code = """
 quality_log = df.select('batch_id', 'row_count', 'null_count', 'exception_count')
