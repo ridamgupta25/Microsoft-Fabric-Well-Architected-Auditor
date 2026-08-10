@@ -117,6 +117,12 @@ class WorkspaceContext:
     #: ("defines no policy"); the warehouse being absent from the map means it could
     #: not be read, which is N/A.
     warehouse_security: dict[str, list] = field(default_factory=dict)
+    #: Configured trigger schedules, keyed the same way as ``pipelines`` (display
+    #: name, deduplicated). Each entry is a list of simplified schedule dicts —
+    #: ``{"type", "enabled", "times", "weekdays", "interval", "start", "end"}`` —
+    #: read from the Fabric job scheduler. What is *configured* to run, not what
+    #: has *run*; that is ``Item.last_run_utc``.
+    schedules: dict[str, list] = field(default_factory=dict)
     #: Tenant-level Fabric connection metadata. Credentials and secrets are
     #: never stored; TLS version and health remain unknown unless a provider
     #: supplies explicit evidence for them.
@@ -209,6 +215,7 @@ class WorkspaceContext:
             "shortcuts": self.shortcuts,
             "semantic_models": self.semantic_models,
             "warehouse_security": self.warehouse_security,
+            "schedules": self.schedules,
             "connections": self.connections,
             "git_details": self.git_details,
             "unavailable": sorted(r.value for r in self.unavailable),
@@ -234,6 +241,7 @@ class WorkspaceContext:
             shortcuts=dict(data.get("shortcuts", {})),
             semantic_models=dict(data.get("semantic_models", {})),
             warehouse_security=dict(data.get("warehouse_security", {})),
+            schedules=dict(data.get("schedules", {})),
             connections=list(data.get("connections", [])),
             git_details=dict(data.get("git_details", {})),
             unavailable={Resource(v) for v in data.get("unavailable", [])},

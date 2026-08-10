@@ -175,6 +175,24 @@ class Resource(StrEnum):
     #: (``…/items/{id}/jobs/instances``) — the List Items API carries no
     #: timestamp, so this is a one-call-per-runnable-item enrichment.
     ITEM_RUN_HISTORY = "itemRunHistory"
+    #: Configured trigger times (``…/items/{id}/jobs/{jobType}/schedules``) — a
+    #: different signal from ITEM_RUN_HISTORY, which is when a job last *ran*.
+    #: One call per pipeline; opt-in so a run that never judges scheduling does
+    #: not pay for it.
+    ITEM_SCHEDULES = "itemSchedules"
+    #: A semantic model's Power BI scheduled-refresh configuration (days, times,
+    #: enabled, notifyOption) — a different API audience and call from the
+    #: refresh *history* (Resource.ITEM_RUN_HISTORY reads the latest run; this
+    #: reads what was configured, including whether a failure alerts anyone).
+    REFRESH_SCHEDULES = "refreshSchedules"
+    #: Per-column distinct-value counts and row counts, read over the SQL
+    #: analytics endpoint as one aggregate query per table (``APPROX_COUNT_DISTINCT``
+    #: + ``COUNT_BIG``). Deliberately separate from TABLE_COLUMNS: this issues an
+    #: extra query per table beyond the free INFORMATION_SCHEMA read, so it is
+    #: fetched only when a selected check actually judges cardinality. Never row
+    #: data — an aggregate count, computed live, never cached beyond one crawl's
+    #: worth of summary numbers.
+    TABLE_COLUMN_STATS = "tableColumnStats"
 
 
 class Status(StrEnum):

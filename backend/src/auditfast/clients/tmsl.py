@@ -109,6 +109,7 @@ def parse_tmsl(document: dict) -> dict:
         if _is_auto_date_table(table_name):
             continue  # skip Power BI auto date/time hidden tables
         table_names.append(table_name)
+        storage[table_name] = _table_storage(table)
         for measure in table.get("measures") or []:
             if not isinstance(measure, dict):
                 continue

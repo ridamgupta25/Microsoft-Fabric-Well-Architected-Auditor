@@ -165,6 +165,33 @@ class PowerBIClient:
                 failure = "forbidden"  # token rejected; the other form will fare no better
         return None, failure
 
+    def get_refresh_schedule(
+        self, dataset_id: str, group_id: str | None = None
+    ) -> dict | None:
+        """Return a semantic model's configured scheduled-refresh settings, or None.
+
+        ``GET .../datasets/{id}/refreshSchedule`` — a different question from
+        :meth:`dataset_last_refresh`: that reads what last *ran*; this reads what
+        is *configured*, including ``notifyOption`` (whether a failed scheduled
+        refresh alerts anyone). Only Import-mode models have one; a Direct Lake
+        or DirectQuery model, or an Import model with no schedule configured,
+        returns 400/404 here — a real, readable answer, not a failure, so it comes
+        back as ``None`` with no exception raised.
+
+        The workspace-scoped form is tried first; a personal ("My workspace")
+        model 404s there, so the no-group form is used as a fallback — the same
+        shape as :meth:`dataset_last_refresh`.
+        """
+        paths = []
+        if group_id:
+            paths.append(f"/groups/{group_id}/datasets/{dataset_id}/refreshSchedule")
+        paths.append(f"/datasets/{dataset_id}/refreshSchedule")
+        for path in paths:
+            status, body = self._get(path)
+            if status == 200 and isinstance(body, dict):
+                return body
+        return None
+
     def dataset_created_dates(self, group_id: str | None = None) -> dict[str, str]:
         """Map ``dataset id -> createdDate`` for a workspace's semantic models.
 
