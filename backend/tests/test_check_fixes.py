@@ -21,8 +21,8 @@ from auditfast.core.check.data_management_quality.data_operations.automated impo
     notebook_standardization,
 )
 from auditfast.core.check.data_management_quality.data_prep.automated import (
-    nb_bronze_metadata,
     nb_broadcast,
+    nb_bronze_metadata,
     nb_cross_recon,
     nb_dedup_verify,
     nb_dq_rules,
