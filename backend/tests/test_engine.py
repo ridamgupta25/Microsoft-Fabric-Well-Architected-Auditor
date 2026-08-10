@@ -69,9 +69,9 @@ def test_result_and_scored_counts_are_unchanged(provider):
 
 def test_status_counts_are_unchanged(provider):
     agg = aggregate(_run(provider))
-    assert agg["counts"][Status.PASS] == 51
+    assert agg["counts"][Status.PASS] == 53
     assert agg["counts"][Status.PARTIAL] == 18
-    assert agg["counts"][Status.FAIL] == 63
+    assert agg["counts"][Status.FAIL] == 65
     assert agg["counts"][Status.NA] == 150
     assert agg["counts"][Status.INFO] == 5
 
@@ -271,10 +271,10 @@ def test_progress_callback_fires_per_workspace(provider):
 
 
 def test_registry_is_fully_populated():
-    """143 checks are evaluated; remaining roadmap checks are not loaded."""
+    """155 checks are evaluated; remaining roadmap checks are not loaded."""
     evaluated = [s for s in REGISTRY if s.automation is Automation.AUTOMATED]
-    assert len(evaluated) == 151
-    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 49
+    assert len(evaluated) == 155
+    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 53
     assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 27
     assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 69
     # Roadmap (gated N/A) checks are intentionally not registered — see
@@ -335,7 +335,7 @@ def test_explicit_registry_is_isolated_from_the_global_one():
     assert registry.get("X-ISOLATED") is not None
     assert REGISTRY.get("X-ISOLATED") is None, "test check leaked into the global registry"
     before = len([s for s in REGISTRY if s.automation is Automation.AUTOMATED])
-    assert before == 151
+    assert before == 155
 
 # -- selection and dispatch ----------------------------------------------------
 

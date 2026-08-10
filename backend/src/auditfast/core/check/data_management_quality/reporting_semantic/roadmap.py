@@ -10,12 +10,11 @@ Do not edit by hand — regenerate with build-manual-checks.py.
 """
 from auditfast.core.check._gated import Requirement, gated
 from auditfast.core.check.registry import check
-from auditfast.core.enums import Automation, Layer, Pillar, Resource, Scope
+from auditfast.core.enums import Automation, Pillar, Resource, Scope
 
 # (id, ref, title, layers, required, requirement)
 _CHECKS: list[tuple[str, str, str, tuple[str, ...], bool, str]] = [
 
-    ("R-4-4-4", "4.4.4", "Measures correctly classified: additive, semi-additive, and non-additive", (Layer.REPORTING,), True, "SQL_ENDPOINT"),
 ]
 
 for _id, _ref, _title, _layers, _required, _requirement in _CHECKS:

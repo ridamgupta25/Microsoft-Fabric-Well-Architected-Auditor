@@ -43,6 +43,25 @@ _DECLARED_WIDTH = re.compile(r"^n?(?:varchar|char)\s*\(\s*(max|\d+)\s*\)", re.IG
 
 #: Widths above this are treated as oversized — they defeat statistics and inflate row size.
 _MAX_TEXT_WIDTH = 4000
+_DECIMAL_PRECISION = re.compile(r"^(?:decimal|numeric)\((\d+)\s*,\s*(\d+)\)$", re.IGNORECASE)
+
+#: Signals a column that can drive partitioning/cluster strategy on large tables.
+_PARTITION_HINT = re.compile(
+    r"(?:^|_)(date|dt|year|month|region|country|tenant|partition)(?:$|_)",
+    re.IGNORECASE,
+)
+
+#: Naming hints that a surrogate key was generated (hash/window/sequence style).
+_GENERATED_KEY_HINT = re.compile(
+    r"(?:hash|row_?number|row_?num|sequence|seq|surrogate)",
+    re.IGNORECASE,
+)
+
+#: Natural/business key hints used alongside a surrogate key column.
+_BUSINESS_KEY_HINT = re.compile(
+    r"(?:business|natural|code|number|_bk$)",
+    re.IGNORECASE,
+)
 
 
 @check(
@@ -266,6 +285,218 @@ def _too_wide(column_type: str) -> bool | None:
         return None
     width = match.group(1).lower()
     return True if width == "max" else int(width) > _MAX_TEXT_WIDTH
+
+
+def _decimal_is_reasonable(column_type: str) -> bool | None:
+    """True/False for decimal precision/scale sanity, None when not a decimal type."""
+    match = _DECIMAL_PRECISION.match(column_type)
+    if not match:
+        return None
+    precision = int(match.group(1))
+    scale = int(match.group(2))
+    return 1 <= precision <= 38 and 0 <= scale <= precision
+
+
+def _norm_name(text: str) -> str:
+    """Lowercased identifier with separators normalized for name matching."""
+    return re.sub(r"[\s\-.]+", "_", (text or "").strip().lower())
+
+
+@check(
+    id="TB-PARTITION-STRATEGY", ref="4.2.2",
+    title="Partitioning / clustering strategy defined for large tables",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=True,
+)
+def table_partition_strategy(ctx: CheckContext) -> Verdict:
+    """Likely large tables define a partition-driving key in their schema.
+
+    Fabric's table metadata does not expose physical partition specs directly, so
+    this check uses schema-level evidence: likely large tables (fact-like names or
+    wide schemas) should carry a partition-driving key column (date/region/tenant
+    style) that enables a partitioning strategy.
+    """
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
+    tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
+    if not tables:
+        return not_applicable(_NO_COLS)
+
+    likely_large = {
+        name: table
+        for name, table in tables.items()
+        if is_fact(name) or len(columns(table)) >= 30
+    }
+    if not likely_large:
+        return not_applicable(
+            "No likely large table found (fact-like name or wide schema)"
+        )
+
+    with_strategy = [
+        name for name, table in likely_large.items()
+        if any(_PARTITION_HINT.search(col) for col in col_names(table))
+    ]
+    return covered(
+        len(with_strategy), len(likely_large),
+        f"{len(with_strategy)} of {len(likely_large)} likely large table(s) "
+        "define a partition-driving key column",
+    )
+
+
+@check(
+    id="TB-DATATYPE-SIZING", ref="4.4.3",
+    title="Data types are appropriate and sized correctly",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=True,
+)
+def table_datatype_sizing(ctx: CheckContext) -> Verdict:
+    """Declared text widths and decimal precision/scale are within sane bounds."""
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
+    tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
+    if not tables:
+        return not_applicable(_NO_COLS)
+
+    assessed = compliant = oversized_text = imprecise_numeric = 0
+    lakehouse_defaults = 0
+
+    for table in tables.values():
+        for col in columns(table):
+            ctype = (col.get("type", "") or "").lower()
+            if not ctype:
+                continue
+
+            if _is_lakehouse_default_text(col, ctype):
+                lakehouse_defaults += 1
+                continue
+
+            text_sizing = _too_wide(ctype)
+            if text_sizing is not None:
+                assessed += 1
+                if text_sizing:
+                    oversized_text += 1
+                else:
+                    compliant += 1
+                continue
+
+            numeric_sizing = _decimal_is_reasonable(ctype)
+            if numeric_sizing is not None:
+                assessed += 1
+                if numeric_sizing:
+                    compliant += 1
+                else:
+                    imprecise_numeric += 1
+
+    if not assessed:
+        return not_applicable(
+            "No assessable declared text widths or decimal/numeric precision "
+            "metadata"
+            + (f"; {lakehouse_defaults} Lakehouse default varchar("
+               f"{_LAKEHOUSE_TEXT_WIDTH}) column(s) excluded" if lakehouse_defaults else "")
+        )
+
+    return covered(
+        compliant, assessed,
+        f"{compliant} of {assessed} assessable columns have appropriate sizing — "
+        f"{oversized_text} oversized text column(s), {imprecise_numeric} "
+        "decimal/numeric column(s) with invalid precision/scale"
+        + (f"; {lakehouse_defaults} Lakehouse default varchar({_LAKEHOUSE_TEXT_WIDTH}) "
+           "column(s) excluded" if lakehouse_defaults else ""),
+    )
+
+
+@check(
+    id="TB-SURROGATE-GEN", ref="4.4.4",
+    title="Surrogate keys are implemented for dimensions with a generated-key pattern",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=True,
+)
+def table_surrogate_generated(ctx: CheckContext) -> Verdict:
+    """Dimension schemas include surrogate keys with generation-oriented naming hints.
+
+    This is a schema-level proxy for generated-key patterns. It cannot inspect ETL
+    code paths (hash/window/key-table logic), so it looks for surrogate-key columns
+    plus a generation hint in the declared column names.
+    """
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
+    dims = {n: t for n, t in ctx.workspace.tables.items() if is_dimension(n) and columns(t)}
+    if not dims:
+        return not_applicable(_NO_DIMS)
+
+    compliant = 0
+    for table in dims.values():
+        names = col_names(table)
+        has_surrogate = any(
+            n.endswith(("_sk", "_key")) or n in {"surrogate_key", "surrogate_id"}
+            for n in names
+        )
+        has_generated_hint = any(_GENERATED_KEY_HINT.search(n) for n in names)
+        has_business_hint = any(_BUSINESS_KEY_HINT.search(n) for n in names)
+        if has_surrogate and (has_generated_hint or has_business_hint):
+            compliant += 1
+
+    return covered(
+        compliant, len(dims),
+        f"{compliant} of {len(dims)} dimension table(s) include surrogate keys with "
+        "generation-oriented naming evidence",
+    )
+
+
+@check(
+    id="TB-REL-DECLARED", ref="4.4.5",
+    title="Primary/foreign key relationships are declared where supported",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS,
+    requires=[Resource.TABLE_SCHEMAS, Resource.SEMANTIC_MODEL_DEFINITIONS],
+    required=True,
+)
+def table_relationships_declared(ctx: CheckContext) -> Verdict:
+    """Fact tables are represented in declared semantic-model relationships.
+
+    Fabric Warehouse PK/FK constraints are metadata (not enforced), and direct
+    constraint metadata is not available in ``WorkspaceContext``. This check uses
+    semantic-model relationships as the machine-readable declaration of PK/FK
+    structure for workspace storage tables.
+    """
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
+    if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
+        return not_applicable("Semantic model definitions could not be read from Fabric")
+    models = ctx.workspace.semantic_models
+    if not models:
+        return not_applicable("No semantic models were read for this workspace")
+
+    facts = [name for name in ctx.workspace.tables if is_fact(name)]
+    if not facts:
+        return not_applicable("No fact-like tables found to assess for declared FK relationships")
+
+    table_names = {_norm_name(name) for name in ctx.workspace.tables}
+    linked_tables: set[str] = set()
+    for model in models.values():
+        for rel in model.get("relationships") or []:
+            from_table = _norm_name(str(rel.get("from_table") or rel.get("fromTable") or ""))
+            to_table = _norm_name(str(rel.get("to_table") or rel.get("toTable") or ""))
+            if from_table in table_names:
+                linked_tables.add(from_table)
+            if to_table in table_names:
+                linked_tables.add(to_table)
+
+    if not linked_tables:
+        return covered(
+            0, len(facts),
+            "No semantic-model relationships reference workspace storage tables"
+        )
+
+    linked_facts = [name for name in facts if _norm_name(name) in linked_tables]
+    return covered(
+        len(linked_facts), len(facts),
+        f"{len(linked_facts)} of {len(facts)} fact-like table(s) participate in declared "
+        "semantic-model relationships",
+    )
 
 
 #: Connection types that stay inside OneLake's governance boundary.
