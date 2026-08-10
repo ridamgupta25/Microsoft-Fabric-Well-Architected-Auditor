@@ -44,9 +44,9 @@ FIXTURE_SETTINGS = {
 #: The overall score the recorded tenant must produce. Pinned to the value the
 #: engine returns for the fixture, so any change to a check, a band, or the
 #: roll-up fails loudly here.
-EXPECTED_OVERALL = 43.91891891891892
-EXPECTED_SCORED_CHECKS = 148
-EXPECTED_RESULT_ROWS = 343
+EXPECTED_OVERALL = 45.41387024608501
+EXPECTED_SCORED_CHECKS = 149
+EXPECTED_RESULT_ROWS = 347
 
 #: A session id the auth-service patch below always resolves to a token.
 #: Anything else — including a missing session — resolves to no token, so
