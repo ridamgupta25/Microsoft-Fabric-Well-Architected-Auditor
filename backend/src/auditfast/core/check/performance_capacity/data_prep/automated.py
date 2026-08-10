@@ -374,7 +374,12 @@ def spark_partition_pruning(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def spark_profile(ctx: CheckContext) -> Verdict:
-    """Long-running applications have monitoring evidence and no open issue."""
+    """Long-running applications carry Spark profiling evidence.
+
+    This check verifies profiling *coverage* for long-running notebooks. The
+    quality of that profiling (skew/spill/shuffle issues) is evaluated by
+    SPARK-UI (3.5.1) to avoid duplicate issue scoring under two refs.
+    """
     evidence = _spark.monitoring(ctx.obj)
     usage = evidence.get("resource_usage")
     if not isinstance(usage, dict):
@@ -390,15 +395,8 @@ def spark_profile(ctx: CheckContext) -> Verdict:
             f"Latest Spark application ran for {int(duration)} ms; below {threshold} ms threshold"
         )
     if "advice" not in evidence and "stages" not in evidence:
-        return not_applicable("Long-running application has no Advisor or stage profiling metrics")
-    shuffle_threshold = int(
-        _spark.number(ctx.setting("heavy_shuffle_bytes", 1_073_741_824), -1)
-    )
-    if shuffle_threshold < 0:
-        return not_applicable("Project heavy_shuffle_bytes threshold is invalid")
-    issues = _spark.performance_issues(ctx.obj, shuffle_threshold)
-    return binary(not issues, f"Profiled {int(duration)} ms application; no open performance issue"
-                  if not issues else f"Profiled {int(duration)} ms application; open issues: {', '.join(issues)}")
+        return binary(False, "Long-running application has no Advisor or stage profiling metrics")
+    return binary(True, f"Profiled {int(duration)} ms application; Advisor or stage metrics captured")
 
 
 # -- Copy activity parallelism (2.6.2) ----------------------------------------
