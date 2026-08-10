@@ -122,6 +122,20 @@ VALIDATED_CHECKLIST: dict[str, str] = {
     "14.1.1": "Star schema followed in the semantic model (single-direction relationships, no unnecessary bidirectional filters)",
     "14.1.3": "Measures centralized (no duplicated calculation logic across reports)",
     "14.1.4": "DAX follows good practices (variables, no repeated sub-expressions, avoids expensive iterators)",
+    "5.3.2":  "Range / domain validation: values fall within expected ranges and allowed value sets",
+    "1.1.8":  "Single source of truth per data domain (no duplicate stores serving the same purpose)",
+    "2.6.5":  "SQL-source Copy activities are tuned (source read folded, partitioned, sink batch size set)",
+    "9.3.3":  "Transaction boundaries defined so a part-way failure leaves no inconsistent set of targets",
+    "10.3.1": "Eventhouse / KQL DB used for high-volume or real-time telemetry where appropriate",
+    "10.3.2": "KQL queries exist for common operational investigations and are version-controlled",
+    "10.5.1": "Data Activator (or equivalent) triggers configured for critical events",
+    "11.4.2": "Warehouse schema changes deployed through source control or a deployment pipeline",
+    "11.4.5": "Semantic model deployment is versioned and orchestrated, not manual",
+    "14.5.4": "Reporting content (semantic models and reports) is deployed under version control",
+    "4.2.4":  "Columns use appropriate data types (dates as DATE, no over-wide text columns)",
+    "4.2.5":  "Tables carry audit columns (load timestamp, source system, batch id)",
+    "6.2.1":  "Row-Level Security implemented where required (semantic models and Warehouse)",
+    "11.5.1": "Unit tests exist for critical transformation logic",
 }
 
 #: The set of validated refs, derived from the checklist above — what the flag

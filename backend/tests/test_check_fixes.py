@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
+from auditfast.core.check._tables import is_audit_column
 from auditfast.core.check.cost_resource_optimization.data_operations.automated import (
     no_orphaned_items,
 )
@@ -19,10 +22,13 @@ from auditfast.core.check.data_management_quality.data_operations.automated impo
 )
 from auditfast.core.check.data_management_quality.data_prep.automated import (
     nb_bronze_metadata,
+    nb_broadcast,
+    nb_cross_recon,
     nb_dedup_verify,
     nb_dq_rules,
     nb_eam_ingest,
     nb_flag_domain,
+    nb_language,
     nb_no_display,
     nb_no_udf,
     nb_silver_quality,
@@ -32,6 +38,7 @@ from auditfast.core.check.data_management_quality.data_prep.automated import (
     pl_bulk_move,
 )
 from auditfast.core.check.data_management_quality.data_storage.automated import (
+    table_audit_columns,
     table_date_dimension,
 )
 from auditfast.core.check.operations_reliability.data_logs.automated import (
@@ -451,3 +458,98 @@ def test_orphan_scores_only_items_with_a_timestamp():
         Item(id="2", type="Notebook", display_name="B"),  # no timestamp -> excluded
     )
     assert no_orphaned_items(ctx).coverage == 1.0  # 1 dated item, and it is fresh
+
+
+# =============================================================================
+# Review fixes: 4.2.5 audit-column matching, 3.2.1 vacuous pass,
+# 3.2.4 evidence, 5.3.6 cross-source reconciliation.
+# =============================================================================
+
+@pytest.mark.parametrize("name", [
+    "created_date", "CreatedDate", "createdDate", "_CREATED_DT", "created_at",
+    "modified_at", "LastModified", "date_created", "load_date", "load_ts",
+    "ingestion_timestamp", "createdOnBehalfBy", "SinkModifiedOn",
+    "ETLInsertedDateTime", "batch_id", "BatchId", "etl_batch_id",
+    "collection_batch_id", "root_batch_id", "run_id", "source_system",
+    "SourceSystem", "source_file", "source_table",
+])
+def test_audit_column_spellings_are_recognised(name: str):
+    """Exact-tuple matching saw only ``created_date`` and reported 7 of 502 tables."""
+    assert is_audit_column(name), name
+
+
+@pytest.mark.parametrize("name", [
+    "order_date", "birth_date", "start_date", "end_date", "due_date",
+    "ship_date", "customer_id", "product_key", "amount", "invoice_date",
+    # Dataverse business-process metadata, not lineage. A first cut matched all
+    # of these through a "process" event word and inflated the result.
+    "processid", "processname", "process", "processversion", "processmapversion",
+    # As often a business attribute as a lineage one.
+    "SourceName", "SourceID",
+    # Batch *sizing* settings, which are configuration rather than lineage.
+    "syncbulkoperationbatchsize", "recurrenceexpansionjobbatchinterval",
+])
+def test_business_columns_are_not_audit_columns(name: str):
+    """A business event is not lineage metadata - the vocabulary stays narrow."""
+    assert not is_audit_column(name), name
+
+
+def test_audit_columns_check_accepts_camel_case():
+    ctx = _tables_ctx(
+        dim_customer={"columns": [{"name": "CreatedDate"}, {"name": "CustomerId"}]},
+        fact_sales={"columns": [{"name": "order_date"}, {"name": "amount"}]},
+    )
+    assert table_audit_columns(ctx).coverage == 0.5
+
+
+def test_a_notebook_using_neither_spark_dialect_is_na():
+    """Pure pandas has no Spark language choice - it must not score a vacuous pass."""
+    ctx = _ctx(_nb("import pandas as pd\ndf = pd.read_csv('x.csv')\nprint(df.head())\n"))
+    assert nb_language(ctx).status is Status.NA
+
+
+def test_a_single_spark_dialect_still_passes():
+    ctx = _ctx(_nb('df = spark.table("t").withColumn("a", lit(1))\n'))
+    verdict = nb_language(ctx)
+    assert verdict.score == _PASS
+    assert "DataFrame API only" in verdict.evidence
+
+
+def test_mixed_spark_dialects_are_partial():
+    ctx = _ctx(_nb('df = spark.table("t").withColumn("a", lit(1))\nspark.sql("SELECT 1")\n'))
+    assert nb_language(ctx).score == 1
+
+
+def test_broadcast_evidence_does_not_claim_per_join_analysis():
+    """The check searches the whole notebook, so the evidence must say so."""
+    ctx = _ctx(_nb('a.join(b, "k")\nc.join(d, "k")\n'))
+    evidence = nb_broadcast(ctx).evidence
+    assert "no broadcast() hint anywhere in the notebook" in evidence
+    assert "join(s) without a broadcast() hint" not in evidence
+
+
+def test_a_lone_row_count_assert_is_not_cross_source_reconciliation():
+    """5.3.6 shared 5.2.5's regex, so one count assertion satisfied both."""
+    code = ('a = spark.read.parquet("/a")\nb = spark.read.parquet("/b")\n'
+            'assert a.count() == 100\n')
+    verdict = nb_cross_recon(_ctx(_nb(code)))
+    assert verdict.score == 1
+    assert "nothing compares the sources" in verdict.evidence
+
+
+def test_two_counts_compared_is_cross_source_reconciliation():
+    code = ('a = spark.read.parquet("/a")\nb = spark.read.parquet("/b")\n'
+            'assert a.count() == b.count()\n')
+    assert nb_cross_recon(_ctx(_nb(code))).score == _PASS
+
+
+def test_a_set_difference_is_cross_source_reconciliation():
+    code = ('a = spark.read.parquet("/a")\nb = spark.read.parquet("/b")\n'
+            'missing = a.subtract(b)\n')
+    assert nb_cross_recon(_ctx(_nb(code))).score == _PASS
+
+
+def test_multi_source_with_no_validation_at_all_still_fails():
+    code = ('a = spark.read.parquet("/a")\nb = spark.read.parquet("/b")\n'
+            'a.join(b, "k").write.saveAsTable("t")\n')
+    assert nb_cross_recon(_ctx(_nb(code))).score == _FAIL

@@ -9,10 +9,10 @@ from __future__ import annotations
 import re
 
 from auditfast.core.check._tables import (
-    AUDIT_COLUMNS,
     TABLE_LAYERS,
     col_names,
     columns,
+    has_audit_column,
     is_dimension,
     is_fact,
     is_snake_case,
@@ -82,13 +82,18 @@ def table_managed_delta(ctx: CheckContext) -> Verdict:
     required=False,
 )
 def table_audit_columns(ctx: CheckContext) -> Verdict:
-    """Each table records lineage via audit columns (created/modified/batch id)."""
+    """Each table records lineage via audit columns (created/modified/batch id).
+
+    Matched on the *normalised* column name, so ``CreatedDate``, ``created_date``
+    and ``load_dt`` all count. Business dates (``order_date``, ``birth_date``) do
+    not — the event vocabulary is deliberately narrow.
+    """
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
     tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
     if not tables:
         return not_applicable(_NO_COLS)
-    ok = [n for n, t in tables.items() if any(a in col_names(t) for a in AUDIT_COLUMNS)]
+    ok = [n for n, t in tables.items() if has_audit_column(t)]
     return covered(len(ok), len(tables), f"{len(ok)} of {len(tables)} tables have audit columns")
 
 

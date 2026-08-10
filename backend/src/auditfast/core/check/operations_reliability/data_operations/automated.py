@@ -700,7 +700,7 @@ _TRANSFORM_WRITE_RE = re.compile(
     requires=[Resource.NOTEBOOK_DEFINITIONS, Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def unit_tests_exist(ctx: CheckContext) -> Verdict:
-    """A workspace that transforms data also holds something that tests the transform.
+    """A workspace that transforms data holds tests in proportion to that logic.
 
     A test asset is a notebook whose *name* marks it as a test, or whose
     executable code uses a testing framework (``unittest``, ``pytest``,
@@ -708,10 +708,12 @@ def unit_tests_exist(ctx: CheckContext) -> Verdict:
     function / ``Test`` class. A pipeline activity named as a test counts too,
     since a test notebook is usually invoked from one.
 
-    Deliberately not satisfied by a bare ``assert`` in load code: asserting a row
-    count on production data is a data-quality gate, not a unit test of the
-    transformation logic. Comments are stripped first, so a commented-out
-    ``import pytest`` proves nothing.
+    Scored as *coverage*, not presence: the point asks that critical
+    transformation logic is tested, so nine test notebooks beside sixty untested
+    transforms is a partial result. Deliberately not satisfied by a bare
+    ``assert`` in load code: asserting a row count on production data is a
+    data-quality gate, not a unit test of the transformation logic. Comments are
+    stripped first, so a commented-out ``import pytest`` proves nothing.
     """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
@@ -745,11 +747,20 @@ def unit_tests_exist(ctx: CheckContext) -> Verdict:
             "workspace holds no transformation logic to unit test"
         )
 
-    if test_notebooks or test_activities:
-        found = ", ".join(sorted(test_notebooks + test_activities)[:3])
-        return binary(True, f"{len(test_notebooks)} test notebook(s) and "
-                            f"{len(test_activities)} test activity(ies) cover "
-                            f"{len(transforming)} transformation notebook(s): {found}")
-    return binary(False, f"{len(transforming)} transformation notebook(s) write tables, "
-                         f"but no test notebook, test framework, or test activity was "
-                         f"found anywhere in the workspace")
+    if not test_notebooks and not test_activities:
+        return binary(False, f"{len(transforming)} transformation notebook(s) write tables, "
+                             f"but no test notebook, test framework, or test activity was "
+                             f"found anywhere in the workspace")
+
+    # Coverage, not mere presence. The point asks that critical transformation
+    # logic *is* tested, so a handful of test notebooks beside a large body of
+    # untested transforms is a partial result, not a pass. One test asset is
+    # credited per transformation notebook; the helper clamps the ratio, so a
+    # workspace with more tests than transforms is simply fully covered.
+    tests = len(test_notebooks) + len(test_activities)
+    found = ", ".join(sorted(test_notebooks + test_activities)[:3])
+    return covered(
+        tests, len(transforming),
+        f"{len(test_notebooks)} test notebook(s) and {len(test_activities)} test "
+        f"activity(ies) against {len(transforming)} transformation notebook(s): {found}",
+    )
