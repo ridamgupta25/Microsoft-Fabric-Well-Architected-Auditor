@@ -30,6 +30,10 @@ from auditfast.core.check.data_management_quality.data_prep.automated import (
 from auditfast.core.check.data_management_quality.data_storage.automated import (
     _shadow_reason,
     shortcut_scope,
+    table_datatype_sizing,
+    table_partition_strategy,
+    table_relationships_declared,
+    table_surrogate_generated,
 )
 from auditfast.core.check.data_management_quality.reporting_semantic.automated import (
     _normalised,
@@ -955,6 +959,121 @@ def test_kql_queries_is_na_when_git_is_unreadable():
 def test_kql_queries_is_na_without_items():
     assert kql_queries_version_controlled(
         _ws_ctx(id="w", unavailable={Resource.ITEMS})).status is Status.NA
+
+
+# =============================================================================
+# Data Management & Quality · Data Storage — refs 4.2.2, 4.4.3, 4.4.4, 4.4.5
+# =============================================================================
+
+def _table(columns: list[dict], *, table_type: str = "Managed", fmt: str = "Delta") -> dict:
+    return {"type": table_type, "format": fmt, "columns": columns}
+
+
+def _col(name: str, ctype: str, source_kind: str = "Warehouse") -> dict:
+    return {"name": name, "type": ctype, "source_kind": source_kind}
+
+
+def test_partition_strategy_passes_when_large_fact_has_partition_key_columns():
+    ctx = _ws_ctx(
+        id="w",
+        tables={
+            "fact_sales": _table([
+                _col("sales_sk", "bigint"),
+                _col("order_date", "date"),
+                _col("region_code", "varchar(20)"),
+            ] * 12),
+        },
+    )
+    assert table_partition_strategy(ctx).score == 3
+
+
+def test_partition_strategy_fails_when_large_fact_has_no_partition_hints():
+    ctx = _ws_ctx(
+        id="w",
+        tables={
+            "fact_sales": _table([
+                _col("sales_sk", "bigint"),
+                _col("metric_a", "decimal(18,2)"),
+                _col("metric_b", "decimal(18,2)"),
+            ] * 12),
+        },
+    )
+    assert table_partition_strategy(ctx).score == 0
+
+
+def test_datatype_sizing_flags_oversized_text_and_invalid_decimal_precision():
+    ctx = _ws_ctx(
+        id="w",
+        tables={
+            "fact_sales": _table([
+                _col("good_text", "varchar(200)"),
+                _col("bad_text", "varchar(max)"),
+                _col("good_amount", "decimal(18,2)"),
+                _col("bad_amount", "decimal(50,3)"),
+            ]),
+        },
+    )
+    verdict = table_datatype_sizing(ctx)
+    assert verdict.score == 1
+    assert "oversized text" in verdict.evidence
+
+
+def test_surrogate_generated_requires_surrogate_plus_generation_hint():
+    ctx = _ws_ctx(
+        id="w",
+        tables={
+            "dim_customer": _table([
+                _col("customer_sk", "bigint"),
+                _col("customer_hash", "varchar(64)"),
+                _col("customer_code", "varchar(30)"),
+            ]),
+            "dim_product": _table([
+                _col("product_id", "bigint"),
+                _col("product_name", "varchar(120)"),
+            ]),
+        },
+    )
+    verdict = table_surrogate_generated(ctx)
+    assert verdict.score == 1
+
+
+def test_relationships_declared_fails_when_fact_has_no_modeled_relationship():
+    ctx = _ws_ctx(
+        id="w",
+        tables={
+            "fact_sales": _table([_col("sales_sk", "bigint")]),
+            "dim_customer": _table([_col("customer_sk", "bigint")]),
+        },
+        semantic_models={
+            "model": {"tables": ["fact_sales", "dim_customer"], "relationships": []}
+        },
+    )
+    assert table_relationships_declared(ctx).score == 0
+
+
+def test_relationships_declared_passes_when_fact_is_linked_in_model_relationships():
+    ctx = _ws_ctx(
+        id="w",
+        tables={
+            "fact_sales": _table([_col("customer_sk", "bigint")]),
+            "dim_customer": _table([_col("customer_sk", "bigint")]),
+        },
+        semantic_models={
+            "model": {
+                "tables": ["fact_sales", "dim_customer"],
+                "relationships": [
+                    {
+                        "name": "fact_to_customer",
+                        "from_table": "fact_sales",
+                        "from_column": "customer_sk",
+                        "to_table": "dim_customer",
+                        "to_column": "customer_sk",
+                    }
+                ],
+            }
+        },
+    )
+    assert table_relationships_declared(ctx).score == 3
 
 
 # =============================================================================

@@ -375,7 +375,12 @@ def spark_partition_pruning(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def spark_profile(ctx: CheckContext) -> Verdict:
-    """Long-running applications have monitoring evidence and no open issue."""
+    """Long-running applications carry Spark profiling evidence.
+
+    This check verifies profiling *coverage* for long-running notebooks. The
+    quality of that profiling (skew/spill/shuffle issues) is evaluated by
+    SPARK-UI (3.5.1) to avoid duplicate issue scoring under two refs.
+    """
     evidence = _spark.monitoring(ctx.obj)
     usage = evidence.get("resource_usage")
     if not isinstance(usage, dict):
@@ -391,15 +396,8 @@ def spark_profile(ctx: CheckContext) -> Verdict:
             f"Latest Spark application ran for {int(duration)} ms; below {threshold} ms threshold"
         )
     if "advice" not in evidence and "stages" not in evidence:
-        return not_applicable("Long-running application has no Advisor or stage profiling metrics")
-    shuffle_threshold = int(
-        _spark.number(ctx.setting("heavy_shuffle_bytes", 1_073_741_824), -1)
-    )
-    if shuffle_threshold < 0:
-        return not_applicable("Project heavy_shuffle_bytes threshold is invalid")
-    issues = _spark.performance_issues(ctx.obj, shuffle_threshold)
-    return binary(not issues, f"Profiled {int(duration)} ms application; no open performance issue"
-                  if not issues else f"Profiled {int(duration)} ms application; open issues: {', '.join(issues)}")
+        return binary(False, "Long-running application has no Advisor or stage profiling metrics")
+    return binary(True, f"Profiled {int(duration)} ms application; Advisor or stage metrics captured")
 
 
 # -- Copy activity parallelism (2.6.2) ----------------------------------------
@@ -410,15 +408,26 @@ def spark_profile(ctx: CheckContext) -> Verdict:
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def copy_parallelism(ctx: CheckContext) -> Verdict:
-    """Copy activities set ``parallelCopies`` or ``dataIntegrationUnits``."""
+    """Copy activities set ``parallelCopies`` or ``dataIntegrationUnits``.
+
+    A lone Copy activity with no explicit parallelism is N/A, not a finding: DIU
+    and parallelCopies default to Auto, and tuning them is only material across
+    multiple copies or at a data volume the audit cannot see. An explicitly-tuned
+    single copy is still credited.
+    """
     copies = [a for a in activities(ctx.obj) if a.get("type") == "Copy"]
     if not copies:
         return not_applicable("Pipeline has no Copy activities")
-    tuned = 0
-    for activity in copies:
-        props = activity.get("typeProperties") or {}
-        if props.get("parallelCopies") or props.get("dataIntegrationUnits"):
-            tuned += 1
+    tuned = sum(
+        1 for a in copies
+        if (a.get("typeProperties") or {}).get("parallelCopies")
+        or (a.get("typeProperties") or {}).get("dataIntegrationUnits")
+    )
+    if len(copies) == 1 and tuned == 0:
+        return not_applicable(
+            "Only 1 Copy activity with no explicit parallelism — DIU / parallelCopies "
+            "default to Auto; tuning is material mainly across multiple or large copies"
+        )
     return covered(
         tuned, len(copies),
         f"{tuned} of {len(copies)} Copy activities set parallelCopies/DIU",

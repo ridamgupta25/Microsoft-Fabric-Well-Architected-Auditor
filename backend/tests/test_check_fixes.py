@@ -35,7 +35,10 @@ from auditfast.core.check.data_management_quality.data_prep.automated import (
     nb_source_metadata,
     nb_timeout,
     nb_utf8_encoding,
+    parameterized,
     pl_bulk_move,
+    pl_incremental,
+    pl_load_mode,
 )
 from auditfast.core.check.data_management_quality.data_storage.automated import (
     table_audit_columns,
@@ -46,10 +49,13 @@ from auditfast.core.check.operations_reliability.data_logs.automated import (
     pipeline_failure_alert,
 )
 from auditfast.core.check.operations_reliability.data_prep.automated import (
+    explicit_timeouts,
     failure_notification,
+    pipeline_idempotent,
     restart_from_failure,
 )
 from auditfast.core.check.performance_capacity.data_prep.automated import (
+    copy_parallelism,
     delta_optimize,
     spark_env,
 )
@@ -357,6 +363,30 @@ def test_restart_boundary_is_detected():
     assert restart_from_failure(_ctx(pipeline)).score == _PASS
 
 
+def test_run_id_logging_is_not_restart_boundary():
+    """A failure logger carrying Fabric's run id is not proof of restart-from-failure."""
+    pipeline = _pipe(
+        {"name": "Notebook1", "type": "TridentNotebook"},
+        {
+            "name": "Error Notebook", "type": "TridentNotebook",
+            "dependsOn": [{"activity": "Notebook1", "dependencyConditions": ["Failed"]}],
+            "typeProperties": {
+                "parameters": {
+                    "run_id": {
+                        "value": {"value": "@pipeline().RunId", "type": "Expression"},
+                        "type": "string",
+                    },
+                    "error_message": {
+                        "value": {"value": "@activity('Notebook1').Error.Message", "type": "Expression"},
+                        "type": "string",
+                    },
+                },
+            },
+        },
+    )
+    assert restart_from_failure(_ctx(pipeline)).score == _FAIL
+
+
 def test_audit_quality_log_writer_is_detected():
     code = """
 quality_log = df.select('batch_id', 'row_count', 'null_count', 'exception_count')
@@ -384,6 +414,159 @@ def test_new_checks_return_na_when_required_artifact_is_missing():
     assert nb_dq_rules(notebook).status is Status.NA
     assert restart_from_failure(pipeline).status is Status.NA
     assert pipeline_failure_alert(pipeline).status is Status.NA
+
+
+# -- PL-PARAM parameterization (design-aware) ---------------------------------
+
+def test_declared_pipeline_parameters_pass():
+    pipeline = {"properties": {"parameters": {"p_load_date": {"type": "string"}},
+                               "activities": []}}
+    verdict = parameterized(_ctx(pipeline))
+    assert verdict.score == _PASS
+    assert "pipeline parameters" in verdict.evidence
+
+
+def test_metadata_driven_lookup_passes_without_declared_parameters():
+    """A control-table framework resolves source/target from a lookup + item, not
+    from a declared ``parameters`` block — it must score PASS, not PARTIAL."""
+    pipeline = _pipe({
+        "name": "Copy_From_Control_Table", "type": "Copy",
+        "typeProperties": {"source": {
+            "schemaName": "@item().source_schema_name",
+            "query": "@activity('LKP_control').output.value[0].source_table_name",
+        }},
+    })
+    assert parameterized(_ctx(pipeline)).score == _PASS
+
+
+def test_managed_connection_reference_counts_as_parameterized():
+    pipeline = _pipe({
+        "name": "Copy", "type": "Copy",
+        "typeProperties": {"source": {"type": "OracleSource"}},
+        "externalReferences": {"connection": "52b0fafd-1111-2222-3333-444455556666"},
+    })
+    assert parameterized(_ctx(pipeline)).score == _PASS
+
+
+def test_static_pipeline_without_any_parameterization_is_partial():
+    pipeline = _pipe({"name": "Run_NB", "type": "TridentNotebook"})
+    assert parameterized(_ctx(pipeline)).score == 1
+
+
+def test_hardcoded_endpoint_still_fails():
+    pipeline = _pipe({
+        "name": "Copy", "type": "Script",
+        "typeProperties": {"scripts": [{"text": "Server=tcp:prod.database.windows.net;"}]},
+    })
+    assert parameterized(_ctx(pipeline)).score == _FAIL
+
+
+# -- PL-INCREMENTAL / PL-LOADMODE (dedicated full-load pipelines) --------------
+
+_COPY = {"name": "Copy", "type": "Copy"}
+_MERGE = {"name": "Merge", "type": "Script",
+          "typeProperties": {"scripts": [{"text": "MERGE INTO t USING s ON t.id = s.id"}]}}
+
+
+def _named_pipe_ctx(name: str, *acts: dict) -> CheckContext:
+    return CheckContext(workspace=WorkspaceContext(id="w"), settings={},
+                        obj_name=name, obj=_pipe(*acts))
+
+
+def test_incremental_full_load_pipeline_is_na_by_name():
+    verdict = pl_incremental(_named_pipe_ctx("PL_IN_WHITM_TBL_FullLoad", _COPY))
+    assert verdict.status is Status.NA
+    assert "full-load" in verdict.evidence.lower()
+
+
+def test_incremental_non_full_load_pipeline_still_fails():
+    assert pl_incremental(_named_pipe_ctx("PL_Bronze_Load", _COPY)).score == _FAIL
+
+
+def test_incremental_pattern_wins_over_a_full_load_name():
+    # An explicit watermark/merge means incremental *is* implemented — PASS beats N/A.
+    assert pl_incremental(_named_pipe_ctx("PL_Something_FullLoad", _MERGE)).score == _PASS
+
+
+def test_incremental_notebook_only_pipeline_is_na():
+    # Only data-movement is a notebook — the load logic is inside code this
+    # pipeline-scoped check cannot read, so it is N/A rather than a full-reload FAIL.
+    verdict = pl_incremental(_named_pipe_ctx("PL_Auditing", {"name": "Run NB", "type": "TridentNotebook"}))
+    assert verdict.status is Status.NA
+    assert "notebook" in verdict.evidence.lower()
+
+
+def test_incremental_copy_plus_notebook_is_still_assessed():
+    # A real Copy means the pipeline moves data itself — still FAIL without a pattern.
+    ctx = _named_pipe_ctx("PL_Bronze_Load", _COPY, {"name": "NB", "type": "TridentNotebook"})
+    assert pl_incremental(ctx).score == _FAIL
+
+
+def test_load_mode_notebook_only_pipeline_is_na():
+    ctx = _named_pipe_ctx("PL_Auditing", {"name": "Run NB", "type": "TridentNotebook"})
+    verdict = pl_load_mode(ctx)
+    assert verdict.status is Status.NA
+    assert "notebook" in verdict.evidence.lower()
+
+
+def test_idempotent_notebook_only_pipeline_is_na():
+    ctx = _named_pipe_ctx("PL_Auditing", {"name": "Run NB", "type": "TridentNotebook"})
+    verdict = pipeline_idempotent(ctx)
+    assert verdict.status is Status.NA
+    assert "notebook" in verdict.evidence.lower()
+
+
+# -- PL-TIMEOUT (default timeout → partial, not fail) --------------------------
+
+def test_timeout_default_value_is_partial():
+    verdict = explicit_timeouts(_ctx(_pipe(
+        {"name": "Copy", "type": "Copy", "policy": {"timeout": "0.12:00:00"}})))
+    assert verdict.score == 1
+    assert "default timeout" in verdict.evidence.lower()
+
+
+def test_timeout_custom_value_passes():
+    assert explicit_timeouts(_ctx(_pipe(
+        {"name": "Copy", "type": "Copy", "policy": {"timeout": "0.02:00:00"}}))).score == _PASS
+
+
+def test_timeout_no_timeout_declared_is_na():
+    verdict = explicit_timeouts(_ctx(_pipe(
+        {"name": "Invoke", "type": "ExecutePipeline", "policy": {"secureInput": False}})))
+    assert verdict.status is Status.NA
+
+
+def test_load_mode_passes_when_the_name_declares_a_dedicated_mode():
+    assert pl_load_mode(_named_pipe_ctx("PL_IN_WHITM_TBL_FullLoad", _COPY)).score == _PASS
+    assert pl_load_mode(_named_pipe_ctx("PL_DynamicIngestionPipelineIncrmLoad", _COPY)).score == _PASS
+
+
+def test_load_mode_without_name_param_or_branch_still_fails():
+    assert pl_load_mode(_named_pipe_ctx("PL_Generic_Copy", _COPY)).score == _FAIL
+
+
+# -- PL-COPY-PARALLEL (lone copy → N/A) ----------------------------------------
+
+def test_copy_parallel_single_untuned_copy_is_na():
+    verdict = copy_parallelism(_ctx(_pipe({"name": "Copy", "type": "Copy"})))
+    assert verdict.status is Status.NA
+    assert "Only 1 Copy activity" in verdict.evidence
+
+
+def test_copy_parallel_single_tuned_copy_passes():
+    copy = {"name": "Copy", "type": "Copy", "typeProperties": {"parallelCopies": 4}}
+    assert copy_parallelism(_ctx(_pipe(copy))).score == _PASS
+
+
+def test_copy_parallel_multiple_untuned_copies_still_fail():
+    copy = {"name": "Copy", "type": "Copy"}
+    assert copy_parallelism(_ctx(_pipe(copy, dict(copy, name="Copy2")))).score == _FAIL
+
+
+def test_copy_parallel_no_copy_activity_is_na():
+    verdict = copy_parallelism(_ctx(_pipe({"name": "NB", "type": "TridentNotebook"})))
+    assert verdict.status is Status.NA
+    assert "no Copy activities" in verdict.evidence
 
 
 # -- DELTA-OPTIMIZE ------------------------------------------------------------
@@ -418,6 +601,23 @@ def test_missing_timeout_metadata_is_na():
 
 def test_positive_timeout_passes():
     nb = _nb(metadata={"sessionKeepAliveTimeout": 1800})
+    assert nb_timeout(_ctx(nb)).score == _PASS
+
+
+def test_default_session_timeout_is_partial_not_pass():
+    """Fabric stamps spark.synapse.nbs.session.timeout=600000 (10 min) on every
+    notebook; carrying only that default is a PARTIAL (tune it), not a PASS."""
+    nb = _nb(metadata={"spark_compute": {"session_options": {"conf": {
+        "spark.synapse.nbs.session.timeout": "600000"}}}})
+    v = nb_timeout(_ctx(nb))
+    assert v.score == 1
+    assert "default" in v.evidence.lower()
+
+
+def test_custom_session_timeout_passes():
+    """A non-default session timeout is a deliberately configured cap -> PASS."""
+    nb = _nb(metadata={"spark_compute": {"session_options": {"conf": {
+        "spark.synapse.nbs.session.timeout": "300000"}}}})
     assert nb_timeout(_ctx(nb)).score == _PASS
 
 
