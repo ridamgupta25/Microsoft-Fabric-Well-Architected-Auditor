@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
+from auditfast.core.check._tables import is_audit_column
 from auditfast.core.check.cost_resource_optimization.data_operations.automated import (
     no_orphaned_items,
 )
@@ -18,15 +21,33 @@ from auditfast.core.check.data_management_quality.data_operations.automated impo
     notebook_standardization,
 )
 from auditfast.core.check.data_management_quality.data_prep.automated import (
+    nb_bronze_metadata,
+    nb_broadcast,
+    nb_cross_recon,
+    nb_dedup_verify,
+    nb_dq_rules,
+    nb_eam_ingest,
+    nb_flag_domain,
+    nb_language,
     nb_no_display,
     nb_no_udf,
+    nb_silver_quality,
+    nb_source_metadata,
     nb_timeout,
+    nb_utf8_encoding,
+    pl_bulk_move,
 )
 from auditfast.core.check.data_management_quality.data_storage.automated import (
+    table_audit_columns,
     table_date_dimension,
+)
+from auditfast.core.check.operations_reliability.data_logs.automated import (
+    audit_tables_capture_quality_logs,
+    pipeline_failure_alert,
 )
 from auditfast.core.check.operations_reliability.data_prep.automated import (
     failure_notification,
+    restart_from_failure,
 )
 from auditfast.core.check.performance_capacity.data_prep.automated import (
     delta_optimize,
@@ -235,6 +256,160 @@ def test_notebook_quality_checks_are_na_without_input():
     assert notebook_standardization(notebook).status is Status.NA
 
 
+# -- DATA QUALITY INGESTION CONTROLS ------------------------------------------
+
+def test_source_metadata_requires_ingestion_timestamp():
+    code = """
+df = spark.read.json('Files/events.json')
+df = df.withColumn('ingestion_timestamp', current_timestamp())
+df.write.saveAsTable('bronze_events')
+"""
+    assert nb_source_metadata(_ctx(_nb(code))).score == _PASS
+
+
+def test_deduplication_verification_detects_duplicate_keys():
+    code = """
+df = spark.read.json('Files/events.json')
+duplicates = df.groupBy('event_id').count().filter('count > 1')
+assert duplicates.count() == 0
+df.write.saveAsTable('bronze_events')
+"""
+    assert nb_dedup_verify(_ctx(_nb(code))).score == _PASS
+
+
+def test_utf8_encoding_validation_passes():
+    code = "df = spark.read.option('encoding', 'UTF-8').json('Files/events.json')"
+    assert nb_utf8_encoding(_ctx(_nb(code))).score == _PASS
+
+
+def test_flag_domain_validation_passes():
+    code = "df = spark.read.json('Files/events.json')\nvalid = df.filter(df.active.isin(True, False))"
+    assert nb_flag_domain(_ctx(_nb(code))).score == _PASS
+
+
+def test_ingestion_controls_are_na_without_relevant_input_or_write():
+    context = _ctx(_nb("print('no input or write')"))
+    assert nb_source_metadata(context).status is Status.NA
+    assert nb_dedup_verify(context).status is Status.NA
+    assert nb_utf8_encoding(context).status is Status.NA
+    assert nb_flag_domain(context).status is Status.NA
+
+
+# -- BRONZE / SILVER / BULK / EAM CONTROLS -----------------------------------
+
+def test_bronze_metadata_passes_with_audit_fields():
+    code = """
+raw = spark.read.json('Files/raw.json')
+raw = raw.withColumn('ingestion_timestamp', current_timestamp())
+raw = raw.withColumn('source_file', input_file_name()).withColumn('batch_id', lit('b1'))
+raw.write.saveAsTable('bronze_events')
+"""
+    assert nb_bronze_metadata(_ctx(_nb(code))).score == _PASS
+
+
+def test_silver_quality_passes_with_dedup_and_type_conformance():
+    code = """
+silver = spark.read.table('bronze_events')
+silver = silver.dropDuplicates(['event_id']).withColumn('event_date', to_date('event_date'))
+silver.write.saveAsTable('silver_events')
+"""
+    assert nb_silver_quality(_ctx(_nb(code))).score == _PASS
+
+
+def test_bulk_pipeline_passes_with_parallel_copy():
+    pipeline = _pipe({
+        "name": "Bulk copy", "type": "Copy",
+        "typeProperties": {"parallelCopies": 8},
+    })
+    assert pl_bulk_move(_ctx(pipeline)).score == _PASS
+
+
+def test_eam_ingestion_passes_with_bounded_streaming_json():
+    code = """
+events = (spark.readStream.option('maxFilesPerTrigger', 10)
+          .json('Files/eam'))
+events.writeStream.partitionBy('event_date').start()
+"""
+    assert nb_eam_ingest(_ctx(_nb(code))).score == _PASS
+
+
+def test_layer_specific_checks_return_na_when_not_applicable():
+    notebook = _ctx(_nb("print('unrelated notebook')"))
+    pipeline = _ctx(_pipe({"name": "copy", "type": "Copy"}))
+    assert nb_bronze_metadata(notebook).status is Status.NA
+    assert nb_silver_quality(notebook).status is Status.NA
+    assert nb_eam_ingest(notebook).status is Status.NA
+    assert pl_bulk_move(pipeline).score == _FAIL
+
+
+# -- DQ RULES / RESTART / AUDIT LOG / FAILURE ALERT ---------------------------
+
+def test_dq_rules_are_codified():
+    code = "df = spark.read.json('Files/input.json')\nassert df.filter(df.id.isNull()).count() == 0"
+    assert nb_dq_rules(_ctx(_nb(code))).score == _PASS
+
+
+def test_restart_boundary_is_detected():
+    pipeline = _pipe({
+        "name": "Load batch", "type": "Copy",
+        "typeProperties": {"watermark": "control_table.last_loaded"},
+    })
+    assert restart_from_failure(_ctx(pipeline)).score == _PASS
+
+
+def test_run_id_logging_is_not_restart_boundary():
+    """A failure logger carrying Fabric's run id is not proof of restart-from-failure."""
+    pipeline = _pipe(
+        {"name": "Notebook1", "type": "TridentNotebook"},
+        {
+            "name": "Error Notebook", "type": "TridentNotebook",
+            "dependsOn": [{"activity": "Notebook1", "dependencyConditions": ["Failed"]}],
+            "typeProperties": {
+                "parameters": {
+                    "run_id": {
+                        "value": {"value": "@pipeline().RunId", "type": "Expression"},
+                        "type": "string",
+                    },
+                    "error_message": {
+                        "value": {"value": "@activity('Notebook1').Error.Message", "type": "Expression"},
+                        "type": "string",
+                    },
+                },
+            },
+        },
+    )
+    assert restart_from_failure(_ctx(pipeline)).score == _FAIL
+
+
+def test_audit_quality_log_writer_is_detected():
+    code = """
+quality_log = df.select('batch_id', 'row_count', 'null_count', 'exception_count')
+quality_log.write.mode('append').saveAsTable('dq_audit_log')
+"""
+    context = CheckContext(
+        workspace=WorkspaceContext(id="w", notebooks={"dq": _nb(code)}),
+        settings={}, obj_name="w", obj=None,
+    )
+    assert audit_tables_capture_quality_logs(context).score == _PASS
+
+
+def test_failure_alert_requires_failed_link():
+    pipeline = _pipe(
+        {"name": "Load", "type": "Copy"},
+        {"name": "Send Teams Alert", "type": "Teams",
+         "dependsOn": [{"activity": "Load", "dependencyConditions": ["Failed"]}]},
+    )
+    assert pipeline_failure_alert(_ctx(pipeline)).score == _PASS
+
+
+def test_new_checks_return_na_when_required_artifact_is_missing():
+    notebook = _ctx(_nb("print('no data')"))
+    pipeline = _ctx(_pipe())
+    assert nb_dq_rules(notebook).status is Status.NA
+    assert restart_from_failure(pipeline).status is Status.NA
+    assert pipeline_failure_alert(pipeline).status is Status.NA
+
+
 # -- DELTA-OPTIMIZE ------------------------------------------------------------
 
 def test_optimize_word_in_string_is_not_a_command():
@@ -307,3 +482,98 @@ def test_orphan_scores_only_items_with_a_timestamp():
         Item(id="2", type="Notebook", display_name="B"),  # no timestamp -> excluded
     )
     assert no_orphaned_items(ctx).coverage == 1.0  # 1 dated item, and it is fresh
+
+
+# =============================================================================
+# Review fixes: 4.2.5 audit-column matching, 3.2.1 vacuous pass,
+# 3.2.4 evidence, 5.3.6 cross-source reconciliation.
+# =============================================================================
+
+@pytest.mark.parametrize("name", [
+    "created_date", "CreatedDate", "createdDate", "_CREATED_DT", "created_at",
+    "modified_at", "LastModified", "date_created", "load_date", "load_ts",
+    "ingestion_timestamp", "createdOnBehalfBy", "SinkModifiedOn",
+    "ETLInsertedDateTime", "batch_id", "BatchId", "etl_batch_id",
+    "collection_batch_id", "root_batch_id", "run_id", "source_system",
+    "SourceSystem", "source_file", "source_table",
+])
+def test_audit_column_spellings_are_recognised(name: str):
+    """Exact-tuple matching saw only ``created_date`` and reported 7 of 502 tables."""
+    assert is_audit_column(name), name
+
+
+@pytest.mark.parametrize("name", [
+    "order_date", "birth_date", "start_date", "end_date", "due_date",
+    "ship_date", "customer_id", "product_key", "amount", "invoice_date",
+    # Dataverse business-process metadata, not lineage. A first cut matched all
+    # of these through a "process" event word and inflated the result.
+    "processid", "processname", "process", "processversion", "processmapversion",
+    # As often a business attribute as a lineage one.
+    "SourceName", "SourceID",
+    # Batch *sizing* settings, which are configuration rather than lineage.
+    "syncbulkoperationbatchsize", "recurrenceexpansionjobbatchinterval",
+])
+def test_business_columns_are_not_audit_columns(name: str):
+    """A business event is not lineage metadata - the vocabulary stays narrow."""
+    assert not is_audit_column(name), name
+
+
+def test_audit_columns_check_accepts_camel_case():
+    ctx = _tables_ctx(
+        dim_customer={"columns": [{"name": "CreatedDate"}, {"name": "CustomerId"}]},
+        fact_sales={"columns": [{"name": "order_date"}, {"name": "amount"}]},
+    )
+    assert table_audit_columns(ctx).coverage == 0.5
+
+
+def test_a_notebook_using_neither_spark_dialect_is_na():
+    """Pure pandas has no Spark language choice - it must not score a vacuous pass."""
+    ctx = _ctx(_nb("import pandas as pd\ndf = pd.read_csv('x.csv')\nprint(df.head())\n"))
+    assert nb_language(ctx).status is Status.NA
+
+
+def test_a_single_spark_dialect_still_passes():
+    ctx = _ctx(_nb('df = spark.table("t").withColumn("a", lit(1))\n'))
+    verdict = nb_language(ctx)
+    assert verdict.score == _PASS
+    assert "DataFrame API only" in verdict.evidence
+
+
+def test_mixed_spark_dialects_are_partial():
+    ctx = _ctx(_nb('df = spark.table("t").withColumn("a", lit(1))\nspark.sql("SELECT 1")\n'))
+    assert nb_language(ctx).score == 1
+
+
+def test_broadcast_evidence_does_not_claim_per_join_analysis():
+    """The check searches the whole notebook, so the evidence must say so."""
+    ctx = _ctx(_nb('a.join(b, "k")\nc.join(d, "k")\n'))
+    evidence = nb_broadcast(ctx).evidence
+    assert "no broadcast() hint anywhere in the notebook" in evidence
+    assert "join(s) without a broadcast() hint" not in evidence
+
+
+def test_a_lone_row_count_assert_is_not_cross_source_reconciliation():
+    """5.3.6 shared 5.2.5's regex, so one count assertion satisfied both."""
+    code = ('a = spark.read.parquet("/a")\nb = spark.read.parquet("/b")\n'
+            'assert a.count() == 100\n')
+    verdict = nb_cross_recon(_ctx(_nb(code)))
+    assert verdict.score == 1
+    assert "nothing compares the sources" in verdict.evidence
+
+
+def test_two_counts_compared_is_cross_source_reconciliation():
+    code = ('a = spark.read.parquet("/a")\nb = spark.read.parquet("/b")\n'
+            'assert a.count() == b.count()\n')
+    assert nb_cross_recon(_ctx(_nb(code))).score == _PASS
+
+
+def test_a_set_difference_is_cross_source_reconciliation():
+    code = ('a = spark.read.parquet("/a")\nb = spark.read.parquet("/b")\n'
+            'missing = a.subtract(b)\n')
+    assert nb_cross_recon(_ctx(_nb(code))).score == _PASS
+
+
+def test_multi_source_with_no_validation_at_all_still_fails():
+    code = ('a = spark.read.parquet("/a")\nb = spark.read.parquet("/b")\n'
+            'a.join(b, "k").write.saveAsTable("t")\n')
+    assert nb_cross_recon(_ctx(_nb(code))).score == _FAIL

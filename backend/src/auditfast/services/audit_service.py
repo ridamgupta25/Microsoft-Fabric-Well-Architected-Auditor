@@ -50,7 +50,8 @@ class AuditRun:
 # -- provider construction ----------------------------------------------------
 
 def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: bool = False,
-                   token_refresher=None, powerbi_token: str | None = None):
+                   token_refresher=None, powerbi_token: str | None = None,
+                   sql_token: str | None = None):
     """Create the provider for a run.
 
     Every run reads the live tenant, but through the on-disk **knowledge base**:
@@ -62,12 +63,19 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
 
     ``powerbi_token`` is an optional Power BI-audience token used only to read
     semantic-model refresh recency; without it that one signal stays unknown.
+
+    ``sql_token`` is an optional SQL-analytics-endpoint token used to read column
+    schemas and Warehouse RLS policies, which the Fabric REST API does not expose.
+    Without it - or with ``AUDITFAST_SQL_ENDPOINT_ENABLED=false``, or with port
+    1433 blocked - those reads are skipped and the column-level checks report N/A,
+    exactly as they did before the endpoint was wired in.
     """
     if not token:
         raise AuditError("A sign-in token is required to run an audit.")
     settings = get_settings()
     live = LiveFabricProvider(token, token_refresher=token_refresher,
-                              powerbi_token=powerbi_token)
+                              powerbi_token=powerbi_token,
+                              sql_token=sql_token if settings.sql_endpoint_enabled else None)
     provider = live
     if settings.cache_enabled:
         from .context_store import CachingProvider, ContextStore
@@ -206,6 +214,7 @@ def run_audit(
     refresh: bool = False,
     token_refresher=None,
     powerbi_token: str | None = None,
+    sql_token: str | None = None,
 ) -> AuditRun:
     """Run an audit and, when ``out_dir`` is given, write the report files.
 
@@ -217,7 +226,7 @@ def run_audit(
     """
     config = load_project(project_path)
     provider = build_provider(config, token, refresh=refresh, token_refresher=token_refresher,
-                              powerbi_token=powerbi_token)
+                              powerbi_token=powerbi_token, sql_token=sql_token)
     remediation: RemediationBook = load_remediation(config)
 
     def _progress(partial: list[CheckResult]) -> None:

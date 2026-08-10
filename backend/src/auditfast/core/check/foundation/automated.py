@@ -15,7 +15,7 @@ from auditfast.core.models import CheckContext
 
 
 @check(
-    id="WS-INVENTORY", ref="1.1", title="Item inventory",
+    id="WS-INVENTORY", ref="IMPL-20", title="Workspace item inventory captured (informational — enumerates all items; never fails) [WS-INVENTORY]",
     pillar=Pillar.FOUNDATION, scope=Scope.WORKSPACE,
     requires=[Resource.ITEMS], required=False,
 )

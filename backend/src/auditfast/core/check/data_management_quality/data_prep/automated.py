@@ -33,7 +33,7 @@ HARDCODED_PATTERNS = [
 
 
 @check(
-    id="PL-NAME", ref="2.1.1", title="Pipeline naming convention",
+    id="PL-NAME", ref="2.1.1", title="Pipelines follow consistent naming conventions (including domain prefix/folder alignment)",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -47,7 +47,7 @@ def naming_convention(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-DESC", ref="2.1.6", title="Descriptions / annotations populated",
+    id="PL-DESC", ref="2.1.6", title="Pipeline annotations/descriptions populated for pipelines and key activities",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -65,7 +65,7 @@ def descriptions(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-PARAM", ref="2.1.2", title="Parameterized — no hardcoded endpoints",
+    id="PL-PARAM", ref="2.1.2", title="Pipelines are parameterized (no hardcoded sources, targets, dates, or environment values)",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -97,7 +97,7 @@ _WIDE_CALL = re.compile(r"\.(?:collect|toPandas)\s*\(|\.count\s*\(\s*\)")
 
 
 @check(
-    id="NB-SECRETS", ref="3.1.3", title="No hardcoded secrets or endpoints in notebooks",
+    id="NB-SECRETS", ref="3.1.3", title="No hardcoded paths, connection strings, secrets, or environment-specific values",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.CRITICAL,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -109,7 +109,7 @@ def nb_no_secrets(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-PARAMS", ref="3.1.2", title="Notebook is parameterized",
+    id="NB-PARAMS", ref="3.1.2", title="Notebooks are parameterized using Fabric notebook parameters or widgets",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -122,7 +122,7 @@ def nb_parameterized(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-IMPORTS", ref="3.2.7", title="Explicit imports (no wildcard)",
+    id="NB-IMPORTS", ref="3.2.7", title="Explicit imports only (no `import *`)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -134,7 +134,7 @@ def nb_explicit_imports(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-DISPLAY", ref="3.1.6", title="No display()/show() in production paths",
+    id="NB-DISPLAY", ref="3.1.6", title="Notebooks avoid `display()` / `show()` in production execution paths",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -146,7 +146,7 @@ def nb_no_display(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-COLLECT", ref="3.2.3", title="No collect()/toPandas()/count() on datasets",
+    id="NB-COLLECT", ref="3.2.3", title="No unnecessary `collect()`, `toPandas()`, or `count()` on large datasets",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -211,7 +211,7 @@ def _has_positive_timeout(node: object) -> bool:
 
 
 @check(
-    id="NB-STRUCTURE", ref="3.1.1", title="Notebook follows a consistent structure",
+    id="NB-STRUCTURE", ref="3.1.1", title="Notebooks follow a consistent structure (parameters → imports → config → logic → output)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -230,7 +230,7 @@ def nb_structure(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-MARKDOWN", ref="3.1.4", title="Cell-level documentation (markdown) explains the logic",
+    id="NB-MARKDOWN", ref="3.1.4", title="Cell-level documentation (markdown cells) explains business logic, not just code",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -242,7 +242,7 @@ def nb_markdown(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-MODULAR", ref="3.1.5", title="Logic is modular (uses functions)",
+    id="NB-MODULAR", ref="3.1.5", title="Functions are modular and reusable — not monolithic single-cell scripts",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -254,7 +254,7 @@ def nb_modular(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-NAME", ref="3.1.7", title="Notebook naming is meaningful and consistent",
+    id="NB-NAME", ref="3.1.7", title="All notebooks have meaningful, consistent names aligned to domain/layer",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -272,7 +272,7 @@ def nb_name(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-TIMEOUT", ref="3.1.8", title="Execution timeout / max runtime configured",
+    id="NB-TIMEOUT", ref="3.1.8", title="Notebook execution timeout / max runtime configured to prevent runaway Spark sessions",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -294,21 +294,33 @@ def nb_timeout(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-LANG", ref="3.2.1", title="Consistent language approach (not mixed PySpark / Spark SQL)",
+    id="NB-LANG", ref="3.2.1", title="Consistent language approach (PySpark vs Spark SQL — one primary, not mixed ad-hoc)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_language(ctx: CheckContext) -> Verdict:
-    """One primary language rather than a mix of PySpark and Spark SQL."""
+    """One primary language rather than a mix of PySpark and Spark SQL.
+
+    A notebook using neither — pure Python, pandas, or plain orchestration — has
+    no Spark language choice to be consistent about, so it is N/A rather than a
+    vacuous pass.
+    """
     code = executable_code(ctx.obj)
-    mixed = bool(_SPARK_SQL.search(code)) and bool(_DATAFRAME_OP.search(code))
-    if mixed:
+    sql = bool(_SPARK_SQL.search(code))
+    dataframe = bool(_DATAFRAME_OP.search(code))
+    if not sql and not dataframe:
+        return not_applicable(
+            "Notebook uses neither Spark SQL nor the DataFrame API, so it makes no "
+            "Spark language choice to be consistent about"
+        )
+    if sql and dataframe:
         return graded(1, "Mixes PySpark and Spark SQL — pick one primary approach")
-    return binary(True, "Consistent language approach")
+    return binary(True, f"Consistent language approach "
+                        f"({'Spark SQL' if sql else 'PySpark DataFrame API'} only)")
 
 
 @check(
-    id="NB-DATAFRAME", ref="3.2.2", title="DataFrame API used over the RDD API",
+    id="NB-DATAFRAME", ref="3.2.2", title="DataFrame API used over RDD API",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -320,23 +332,29 @@ def nb_dataframe_api(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-BROADCAST", ref="3.2.4", title="Broadcast joins used for small-large joins",
+    id="NB-BROADCAST", ref="3.2.4", title="Broadcast joins used for small-large table joins where appropriate",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_broadcast(ctx: CheckContext) -> Verdict:
-    """Joins carry a broadcast() hint where a small dimension meets a large fact."""
+    """A notebook that joins carries a broadcast() hint somewhere in its code.
+
+    Judged at *notebook* level, not per join: no Fabric API reports table sizes,
+    so which join deserves a hint cannot be determined. The evidence says exactly
+    that rather than implying each join was inspected.
+    """
     code = executable_code(ctx.obj)
     joins = _JOIN_PATTERN.findall(code)
     if not joins:
         return not_applicable("No joins present to evaluate for broadcast hints")
     ok = bool(_BROADCAST.search(code))
-    return binary(ok, "broadcast() hint present on join(s)" if ok
-                  else f"{len(joins)} join(s) without a broadcast() hint")
+    return binary(ok, f"{len(joins)} join(s) and a broadcast() hint is present" if ok
+                  else f"{len(joins)} join(s) present; no broadcast() hint anywhere in the "
+                       f"notebook — confirm none joins a small table to a large one")
 
 
 @check(
-    id="NB-NO-UDF", ref="3.2.5", title="UDFs avoided where native functions exist",
+    id="NB-NO-UDF", ref="3.2.5", title="UDFs avoided where native Spark functions exist",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -348,7 +366,7 @@ def nb_no_udf(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-SCHEMA", ref="3.2.6", title="Schema explicitly defined for external file reads",
+    id="NB-SCHEMA", ref="3.2.6", title="Schema explicitly defined at read time for external sources (not inferred on CSV/JSON)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -363,8 +381,8 @@ def nb_schema(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="NB-LATE-ARRIVAL", ref="3.1.10",
-    title="Late-arriving changes handled without corruption",
+    id="NB-LATE-ARRIVAL", ref="2.3.8",
+    title="Out-of-order / late-arriving change records handled without data corruption",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -410,7 +428,7 @@ _LATE_SAFE_WRITE = re.compile(
 
 
 @check(
-    id="PL-ORCHESTRATION", ref="2.1.3", title="Orchestration coordinates dependent pipelines",
+    id="PL-ORCHESTRATION", ref="2.1.3", title="Master/orchestrator pipeline pattern used for coordinating dependent domain pipelines",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -429,7 +447,7 @@ def pl_orchestration(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-INCREMENTAL", ref="2.2.1", title="Incremental load pattern used",
+    id="PL-INCREMENTAL", ref="2.2.1", title="Incremental load implemented where applicable (watermark, CDC, delta detection) for IFS/EAM/LIMS",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -445,7 +463,7 @@ def pl_incremental(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-LOADMODE", ref="2.2.5", title="Initial vs incremental load separated or parameterized",
+    id="PL-LOADMODE", ref="2.2.5", title="Initial load vs. incremental load clearly separated or parameterized",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -480,7 +498,16 @@ _COUNT_RECONCILE = re.compile(
     # A count that is actually asserted or compared against an expectation. A count
     # merely assigned, used as a column alias, or compared to 0 (an emptiness guard)
     # reconciles nothing.
-    r"assert[^\n]*\.count\s*\(|"
+    #
+    # The assertion arm carries the same zero-guard as the bare-comparison arm, and
+    # skips a line that probes for nulls. Without both, a key-quality assertion such
+    # as ``assert df.filter(col(k).isNull()).count() == 0`` scores as record-count
+    # reconciliation - it counts rows, but it reconciles nothing against a source.
+    #
+    # The guard must be ``(?!\s*0\b)``, not ``\s*(?!0\b)``: the latter lets ``\s*``
+    # backtrack to zero width so the lookahead tests the space rather than the ``0``,
+    # and ``assert df.count() > 0`` slips through.
+    r"assert(?![^\n]*\.is(?:Not)?Null\s*\()[^\n]*?\.count\s*\([^\n]*?(?:==|!=|<=|>=|<|>)(?!\s*0\b)|"
     r"\.count\s*\(\s*\)\s*(?:==|!=|<=|>=|<|>)(?!\s*0\b)|"
     r"(?:row|record|source|target|actual|expected|recon)_count\b\s*(?:==|!=|<=|>=|<|>)(?!\s*0\b)|"
     r"(?:==|!=|<=|>=|<|>)\s*(?:row|record|source|target|actual|expected|recon)_count\b|"
@@ -506,11 +533,19 @@ _RI_PATTERN = re.compile(
     \b(?:referential|integrity|fk_check|integrity_check|orphan|unmatched|missing_parent|no_parent)\b
     """
 )
-_JOIN_PATTERN = re.compile(r"(?is)\.join\s*\(|\bleft\s+join\b|\binner\s+join\b|\bright\s+join\b|\bfull\s+join\b", re.IGNORECASE)
 _FK_INTEGRITY = re.compile(
-    r"left_anti|leftanti|anti.*join|"
-    r"referential|fk_check|integrity_check|"
-    r"\.isNull\s*\(\s*\).*join|join.*\.isNull\s*\(",
+    # An anti-join - the standard way to isolate FK values with no parent row.
+    # ``"anti"`` is quoted so the join-type argument matches but the English word
+    # in a comment or a table name does not.
+    r"left_anti|leftanti|\bleft\s+anti\s+join\b|['\"]anti['\"]|"
+    # A left join whose unmatched rows are then isolated with a null test, in
+    # either the DataFrame or the SQL spelling.
+    r"\.isNull\s*\(\s*\)[^\n]*\bjoin\b|\bjoin\b[^\n]*\.isNull\s*\(|"
+    r"\bIS\s+NULL\b[^\n]*\bjoin\b|\bjoin\b[^\n]*\bIS\s+NULL\b|"
+    # An explicitly named integrity check. It must be a call or an assignment:
+    # a bare ``referential`` also matches a comment, a column name or a docstring
+    # that merely mentions the idea without performing it.
+    r"\b(?:referential_integrity|referential_check|fk_check|integrity_check|ri_check)\s*[\(=]",
     re.IGNORECASE,
 )
 # One physical read. The chained ``spark.read...load(...)`` form is listed first so it
@@ -524,10 +559,129 @@ _MULTI_SOURCE = re.compile(
     re.IGNORECASE,
 )
 _ORPHAN_DETECT = re.compile(
-    r"left_anti|leftanti|orphan|unmatched|no_parent|missing_parent|"
+    r"left_anti|leftanti|\bleft\s+anti\s+join\b|"
+    r"orphan|unmatched|no_parent|missing_parent|"
     r"anti.*join.*parent|parent.*anti.*join",
     re.IGNORECASE,
 )
+
+# -- 5.3.6: reconciliation *across* sources, not just a row-count assertion ----
+#: Comparing one source against another. ``_COUNT_RECONCILE`` alone is not
+#: enough here: it is satisfied by a single ``assert df.count() == 100``, which
+#: validates one dataset against an expectation and reconciles nothing *between*
+#: sources. Each alternative below needs two datasets to be meaningful.
+_CROSS_SOURCE_RECON = re.compile(
+    # Two counts compared against each other in one expression.
+    r"\.count\s*\(\s*\)[^\n]{0,120}?(?:==|!=|<=|>=|<|>)[^\n]{0,120}?\.count\s*\(\s*\)|"
+    # Named per-side counts compared, either way round.
+    r"\b(?:source|src|left|before|expected)_count\b[^\n]{0,60}(?:==|!=|<=|>=|<|>)"
+    r"[^\n]{0,60}\b(?:target|tgt|right|after|actual)_count\b|"
+    r"\b(?:target|tgt|right|after|actual)_count\b[^\n]{0,60}(?:==|!=|<=|>=|<|>)"
+    r"[^\n]{0,60}\b(?:source|src|left|before|expected)_count\b|"
+    # A set difference — the primitive that answers "what is in A but not B".
+    r"\.subtract\s*\(|\.exceptAll\s*\(|\bEXCEPT\s+(?:ALL\s+)?SELECT\b|\bMINUS\s+SELECT\b|"
+    # An anti-join between the two sources, which surfaces the non-matching rows.
+    r"left_anti|leftanti|\bleft\s+anti\s+join\b|"
+    # Explicitly named cross-source reconciliation.
+    r"cross[_\s-]?source[_\s-]?recon|source[_\s-]?to[_\s-]?target|"
+    r"\breconcile_sources\b|\bcompare_sources\b",
+    re.IGNORECASE,
+)
+
+# -- 5.3.7: identified is not the same as handled -----------------------------
+#: Turning an identified orphan set into an outcome: persisted, raised on, or
+#: recorded. ``display()``/``show()`` are deliberately absent - showing a
+#: dataframe is identification, which the check already credits separately.
+_ORPHAN_HANDLED = (
+    r"\.write\b|saveAsTable\s*\(|\.save\s*\(|insertInto\s*\(|"
+    r"\braise\b|\bassert\b|sys\s*\.\s*exit\s*\(|notebook\s*\.\s*exit\s*\(|"
+    r"logger\s*\.|logging\s*\."
+)
+#: Names teams give a quarantined/rejected record set. Only meaningful next to a
+#: handling verb - a column called ``rejected_flag`` in unrelated business data
+#: must not read as orphan handling.
+_QUARANTINE_NAME = (
+    r"quarantin|reject|bad[_-]?record|error[_-]?record|error[_-]?table|"
+    r"exception[_-]?record|dead[_-]?letter|\bdlq\b"
+)
+#: ``orphans = <expression containing an anti-join>``. The window spans lines so
+#: a multi-line ``spark.sql(\"\"\"... LEFT ANTI JOIN ...\"\"\")`` still binds to
+#: its variable; it is lazy and bounded so it cannot run on into a later
+#: statement's anti-join.
+_ANTI_JOIN_ASSIGN = re.compile(
+    r"^[ \t]*(\w+)\s*=[\s\S]{0,300}?(?:left_anti|leftanti|\bleft\s+anti\s+join\b)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _orphan_set_is_handled(code: str) -> bool:
+    """True when an identified orphan set is persisted, raised on, or recorded.
+
+    Two ways to satisfy it. A write whose destination is a quarantine/reject
+    target is self-evident wherever it appears. Otherwise each anti-join is bound
+    to the variable it is assigned to, and that variable must be used downstream
+    in a handling verb - a set that is computed and never referenced again was
+    identified but not handled.
+    """
+    for first, second in ((_ORPHAN_HANDLED, _QUARANTINE_NAME),
+                          (_QUARANTINE_NAME, _ORPHAN_HANDLED)):
+        if re.search(rf"(?:{first})[^\n]*(?:{second})", code, re.IGNORECASE):
+            return True
+    for match in _ANTI_JOIN_ASSIGN.finditer(code):
+        name = re.escape(match.group(1))
+        rest = code[match.end():]
+        if re.search(rf"\b{name}\b[^\n]*?(?:{_ORPHAN_HANDLED})", rest, re.IGNORECASE):
+            return True
+        if re.search(rf"(?:{_ORPHAN_HANDLED})[^\n]*?\b{name}\b", rest, re.IGNORECASE):
+            return True
+    return False
+
+
+# -- 5.3.9: the validated table must be the merged table ----------------------
+#: A table identifier, optionally schema-qualified and optionally quoted.
+_TABLE_IDENT = r"[`\"\[]?([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)*)[`\"\]]?"
+
+_MERGE_TARGET = re.compile(rf"MERGE\s+INTO\s+{_TABLE_IDENT}", re.IGNORECASE)
+#: ``tgt = DeltaTable.forName(spark, "gold.sales")`` - binds a variable to a table.
+_DELTA_BINDING = re.compile(
+    r"(\w+)\s*=\s*DeltaTable\s*\.\s*(?:forName|forPath)\s*\([^)]*?['\"]([^'\"]+)['\"]",
+    re.IGNORECASE,
+)
+_HISTORY_TABLE = re.compile(rf"DESCRIBE\s+HISTORY\s+{_TABLE_IDENT}", re.IGNORECASE)
+_HISTORY_VAR = re.compile(r"(\w+)\s*\.\s*history\s*\(")
+#: Validation read off the merge itself. These describe the write that just
+#: happened, so they carry no table name and need no cross-check.
+_MERGE_SELF_VALIDATE = re.compile(
+    r"operationMetrics|rows_(?:inserted|updated|deleted)|num_(?:inserted|updated|deleted)|"
+    r"merge[_\s]*count\b|merge_result|merge_valid|post.?merge.*count",
+    re.IGNORECASE,
+)
+
+
+def _table_leaf(name: str) -> str:
+    """Bare table name from a qualified name, a path, or a quoted identifier."""
+    text = str(name or "").strip().strip("`\"'[]")
+    if "/" in text:
+        text = text.rstrip("/").split("/")[-1]
+    return text.split(".")[-1].strip().lower()
+
+
+def _merge_targets(code: str) -> set[str]:
+    """Tables this notebook merges into."""
+    targets = {_table_leaf(m.group(1)) for m in _MERGE_TARGET.finditer(code)}
+    targets |= {_table_leaf(m.group(2)) for m in _DELTA_BINDING.finditer(code)}
+    return {t for t in targets if t}
+
+
+def _validated_tables(code: str) -> set[str]:
+    """Tables whose history this notebook inspects after the merge."""
+    tables = {_table_leaf(m.group(1)) for m in _HISTORY_TABLE.finditer(code)}
+    bound = {m.group(1): _table_leaf(m.group(2)) for m in _DELTA_BINDING.finditer(code)}
+    for match in _HISTORY_VAR.finditer(code):
+        if match.group(1) in bound:
+            tables.add(bound[match.group(1)])
+    return {t for t in tables if t}
+
 # A Delta merge is often issued through a variable bound to DeltaTable.forName/forPath,
 # so the ``.merge(`` call site alone does not carry the DeltaTable name.
 _MERGE_PATTERN = re.compile(
@@ -585,11 +739,76 @@ _KEY_QUALITY = re.compile(
     r"drop_duplicates\s*\(\s*(?:subset\s*=\s*)?\[|"
     r"dropna\s*\([^\n]*subset",
 )
+_BRONZE_METADATA = re.compile(
+    r"ingest(?:ed|ion)[_ ]?(?:timestamp|time|date)|ingested_at|"
+    r"source[_ ]?(?:system|file|path)|input_file_name\s*\(|batch[_ ]?(?:id|key)|"
+    r"current_timestamp\s*\(",
+    re.IGNORECASE,
+)
+_SILVER_QUALITY = re.compile(
+    r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.distinct\s*\(\)|"
+    r"\.cast\s*\(|to_date\s*\(|to_timestamp\s*\(|regexp_replace\s*\(|"
+    r"trim\s*\(|standardize|conform|cleanse|cleansing|dedup",
+    re.IGNORECASE,
+)
+_BULK_ACTIVITY = re.compile(
+    r"parallelCopies|batchCount|batch[_ -]?size|bulk|copy activity|"
+    r"COPY\s+INTO|write\.mode|saveAsTable|repartition|coalesce",
+    re.IGNORECASE,
+)
+_ROW_BY_ROW = re.compile(
+    r"ForEach|foreach|row[_ -]?by[_ -]?row|insert\s+into|execute\s+query|"
+    r"SqlServerStoredProcedure|Script",
+    re.IGNORECASE,
+)
+_EAM_JSON = re.compile(r"EAM|JSON|json\.loads|from_json\s*\(|spark\.read\.json", re.IGNORECASE)
+_EAM_EFFICIENT = re.compile(
+    r"readStream|partitionBy\s*\(|repartition\s*\(|multiLine\s*[=:]\s*False|"
+    r"maxFilesPerTrigger|badRecordsPath|from_json\s*\(|schema_of_json",
+    re.IGNORECASE,
+)
+_SOURCE_METADATA = re.compile(
+    r"ingest(?:ed|ion)[_ ]?(?:timestamp|time|date)|ingested_at|"
+    r"source[_ ]?(?:metadata|system|file|path)|input_file_name\s*\(|"
+    r"current_timestamp\s*\(|_metadata|batch[_ ]?timestamp",
+    re.IGNORECASE,
+)
+_INPUT_READ = re.compile(
+    r"spark\.read|\.read\.(?:csv|json|text|format)|json\.loads|from_json\s*\(|"
+    r"read_json|read_csv|EAM\s+JSON|EAM_JSON",
+    re.IGNORECASE,
+)
+_DUPLICATE_VERIFICATION = re.compile(
+    r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.duplicated\s*\(|"
+    r"groupBy[\s\S]{0,160}?\.count\s*\(\s*\)[\s\S]{0,160}?(?:>|duplicate)|"
+    r"count\s*\(\s*\)\s*!=\s*count\s*\(\s*distinct|"
+    r"assert[_ ]?(?:unique|distinct|no[_ ]?duplicates)|duplicate[_ ]?(?:check|count|rows?)|"
+    r"dropDuplicates|distinct\s*\(",
+    re.IGNORECASE,
+)
+_TEXT_ENCODING = re.compile(
+    r"encoding\s*[=:]\s*[\"']?utf[-_]?8|option\s*\(\s*[\"']encoding[\"']\s*,\s*[\"']utf[-_]?8|"
+    r"decode\s*\(\s*[\"']utf[-_]?8|StringType\s*\(\)|utf[-_]?8",
+    re.IGNORECASE,
+)
+_FLAG_DOMAIN = re.compile(
+    r"(?:flag|boolean|is_[A-Za-z0-9_]+|active|enabled|valid)[^\n]{0,120}?\.isin\s*\(|"
+    r"\.isin\s*\(\s*(?:True|False|[\"'](?:Y|N|true|false|0|1)[\"'])|"
+    r"(?:allowed|valid)[_ ]?(?:values|flags)|expected[_ ]?(?:values|flags)|"
+    r"BooleanType\s*\(\)|when\s*\([^\n]{0,120}?\)\.otherwise\s*\(",
+    re.IGNORECASE,
+)
+_DQ_RULE = re.compile(
+    r"assert\b|validation|validate|quality|quarantine|reject|invalid|"
+    r"dropDuplicates|drop_duplicates|left_anti|isNull|isin\s*\(|"
+    r"StructType|StructField|expected[_ ]?(?:schema|columns|values)",
+    re.IGNORECASE,
+)
 
 
 @check(
     id="NB-RECON-COUNT", ref="5.2.5",
-    title="Record count reconciliation after writes",
+    title="Record count reconciliation vs. source system control counts",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -605,7 +824,7 @@ def nb_recon_count(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-FK-INTEGRITY", ref="5.3.2",
-    title="Referential integrity: FK values validated against lookup tables",
+    title="Referential integrity: FK values exist in corresponding dimension/lookup tables",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -621,51 +840,108 @@ def nb_fk_integrity(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-CROSS-RECON", ref="5.3.6",
-    title="Cross-source reconciliation for multi-source loads",
+    title="Cross-source reconciliation: records from multiple sources reconciled correctly",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_cross_recon(ctx: CheckContext) -> Verdict:
-    """Notebooks reading multiple sources reconcile records across them."""
+    """Notebooks reading multiple sources reconcile records **across** them.
+
+    A single row-count assertion validates one dataset against an expectation; it
+    says nothing about whether two sources agree. This therefore looks for a
+    comparison that needs both sides — two counts compared with each other, a set
+    difference, an anti-join, or an explicitly named cross-source reconciliation.
+
+    A notebook that validates counts but never compares the sources scores in the
+    middle: the discipline is there, the cross-source part is not.
+    """
     code = executable_code(ctx.obj)
     sources = _MULTI_SOURCE.findall(code)
     if len(sources) < 2:
         return not_applicable("Notebook reads from fewer than 2 sources")
-    ok = bool(_COUNT_RECONCILE.search(code))
-    return binary(ok, "Cross-source reconciliation present" if ok
-                  else f"Reads {len(sources)} sources without cross-source reconciliation")
+    if _CROSS_SOURCE_RECON.search(code):
+        return binary(True, f"Reads {len(sources)} sources and reconciles across them")
+    if _COUNT_RECONCILE.search(code):
+        return graded(
+            1,
+            f"Reads {len(sources)} sources and validates a record count, but nothing "
+            f"compares the sources against each other — no count-vs-count check, set "
+            f"difference, or anti-join",
+        )
+    return binary(False, f"Reads {len(sources)} sources without cross-source reconciliation")
 
 
 @check(
     id="NB-ORPHAN-DETECT", ref="5.3.7",
-    title="Orphan detection: child records without parents identified",
+    title="Orphan detection: child records without matching parent records identified and handled",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_orphan_detect(ctx: CheckContext) -> Verdict:
-    """Notebooks with joins detect orphan/unmatched child records."""
+    """Notebooks with joins detect orphan/unmatched child records **and handle them**.
+
+    The point asks for two things. Identification is an anti-join or an equivalent
+    unmatched-row probe. Handling is what happens next: the unmatched set is
+    persisted (a quarantine/error table), raised on, or recorded. A set that is
+    computed and then dropped satisfies half the point, so it scores in the middle
+    rather than passing outright.
+    """
     code = executable_code(ctx.obj)
     if not _JOIN_PATTERN.search(code):
         return not_applicable("Notebook does not perform joins")
-    ok = bool(_ORPHAN_DETECT.search(code))
-    return binary(ok, "Orphan/unmatched record detection present" if ok
-                  else "Joins tables without orphan record detection")
+    if not _ORPHAN_DETECT.search(code):
+        return binary(False, "Joins tables without orphan record detection")
+    if _orphan_set_is_handled(code):
+        return binary(True, "Orphan/unmatched records are detected and handled")
+    return graded(
+        1,
+        "Orphan/unmatched records are detected but not handled - the unmatched set "
+        "is computed and then dropped, never quarantined, raised on or recorded",
+    )
 
 
 @check(
     id="NB-MERGE-VALID", ref="5.3.9",
-    title="Merge result validation: post-merge counts reconciled",
+    title="Merge result validation: post-merge counts reconcile with source I/U/D counts",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_merge_valid(ctx: CheckContext) -> Verdict:
-    """Notebooks performing MERGE validate post-merge counts against I/U/D expectations."""
+    """Notebooks performing MERGE validate post-merge counts against I/U/D expectations.
+
+    Where the validation names a table, that table must be one the notebook merged
+    into - reading ``DESCRIBE HISTORY`` on some *other* table proves nothing about
+    the merge. Metrics read off the merge itself (``operationMetrics``, I/U/D row
+    counts) describe the write that just happened and need no cross-check. When
+    neither the target nor the validated table can be resolved from the code, the
+    result is N/A rather than a guess.
+    """
     code = executable_code(ctx.obj)
     if not _MERGE_PATTERN.search(code):
         return not_applicable("Notebook does not perform MERGE operations")
-    ok = bool(_MERGE_VALIDATE.search(code))
-    return binary(ok, "Post-merge result validation present" if ok
-                  else "MERGE without post-merge count/result validation")
+    if not _MERGE_VALIDATE.search(code):
+        return binary(False, "MERGE without post-merge count/result validation")
+
+    if _MERGE_SELF_VALIDATE.search(code):
+        return binary(True, "Post-merge result validation reads the merge's own metrics")
+
+    targets = _merge_targets(code)
+    validated = _validated_tables(code)
+    if not targets or not validated:
+        return not_applicable(
+            "Post-merge validation is present, but the merged table could not be "
+            "resolved from the notebook, so it cannot be confirmed to validate the "
+            "table that was merged"
+        )
+    matched = targets & validated
+    if matched:
+        return binary(True, f"Post-merge validation covers the merged table(s): "
+                            f"{', '.join(sorted(matched))}")
+    return binary(
+        False,
+        f"Post-merge validation inspects {', '.join(sorted(validated))} but the "
+        f"MERGE targets {', '.join(sorted(targets))} - a different table is validated",
+    )
 
 
 # -- MLC Cat-1: warehouse load idempotency (3.6.4) ----------------------------
@@ -763,7 +1039,7 @@ _GOLD_REF = re.compile(r"\bgold\b", re.IGNORECASE)
 
 @check(
     id="NB-LATE-ARRIVING", ref="4.5.10",
-    title="Late-arriving dimensions and facts handled (inferred member pattern)",
+    title="Late-arriving dimensions and facts handled (unknown/inferred member pattern)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -788,7 +1064,7 @@ def nb_late_arriving(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-UNKNOWN-MONITOR", ref="5.4.4",
-    title="Completeness: unknown / orphan member usage is monitored",
+    title="Completeness: all expected dimension members present; unknown/orphan member usage monitored",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -811,7 +1087,7 @@ def nb_unknown_monitored(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-LAYER-RECON", ref="5.4.6",
-    title="Cross-layer reconciliation: Gold counts reconcile with Silver",
+    title="Cross-layer reconciliation: Gold record counts reconcile with Silver (accounting for aggregation)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -846,7 +1122,7 @@ _GRAIN_GUARD = re.compile(
 
 @check(
     id="NB-GRAIN-UNIQUE", ref="5.4.9",
-    title="No duplicate grain: fact loads enforce one row per grain",
+    title="No duplicate grain: fact tables contain unique records per defined grain",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -872,7 +1148,7 @@ def nb_grain_unique(ctx: CheckContext) -> Verdict:
 # -- MLC Cat-1: fact-to-dimension referential integrity (4.5.12) --------------
 @check(
     id="NB-FACT-DIM-RI", ref="4.5.12",
-    title="Referential integrity: fact FKs validated against dimension records",
+    title="Referential integrity validated (every FK in fact tables has a matching dimension record)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -913,7 +1189,7 @@ _FILE_PURGE = re.compile(
 
 @check(
     id="WS-FILE-PURGE", ref="4.3.4",
-    title="Orphaned files cleaned up periodically (archiving / purging policy)",
+    title="Orphaned files cleaned up periodically (archiving/purging policy)",
     pillar=Pillar.PERFORMANCE, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=(Layer.STORAGE, Layer.PREP, Layer.MIXED),
     requires=[Resource.ITEMS, Resource.NOTEBOOK_DEFINITIONS], required=False,
@@ -946,7 +1222,7 @@ def ws_file_purge(ctx: CheckContext) -> Verdict:
 
 @check(
     id="PL-LATE-ARRIVAL", ref="2.3.8",
-    title="Late-arriving changes handled without corruption",
+    title="Out-of-order / late-arriving change records handled without data corruption",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -989,7 +1265,7 @@ def nb_dedup(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-TYPE-CAST", ref="5.3.1",
-    title="Data type conformance: columns cast to standard types",
+    title="Data type conformance: all columns cast to standard types (dates as DATE, correct numeric precision)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -1005,7 +1281,7 @@ def nb_type_cast(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-KEY-QUALITY", ref="5.5.6",
-    title="Identifiers and keys: uniqueness verified, no nulls in key columns",
+    title="**Identifiers / Keys**: Uniqueness verified; format consistent; no nulls in key columns",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -1019,6 +1295,157 @@ def nb_key_quality(ctx: CheckContext) -> Verdict:
                   else "Writes data without key uniqueness or null validation")
 
 
+@check(
+    id="NB-BRONZE-METADATA", ref="1.2.3",
+    title="Bronze Lakehouse captures raw data with audit metadata (ingestion timestamp, source system, batch ID)",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_bronze_metadata(ctx: CheckContext) -> Verdict:
+    """Bronze writes retain ingestion timestamp, source identity, and batch metadata."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write a raw/Bronze table")
+    if not _BRONZE_METADATA.search(code):
+        return binary(False, "Bronze write has no ingestion/source/batch audit metadata")
+    return binary(True, "Bronze write captures ingestion/source/batch audit metadata")
+
+
+@check(
+    id="NB-SILVER-QUALITY", ref="1.2.5",
+    title="Silver Lakehouse applies cleansing, deduplication, conforming, and type standardization",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_silver_quality(ctx: CheckContext) -> Verdict:
+    """Silver writes apply at least one explicit cleansing, deduplication, or type-conformance transformation."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write a Silver table")
+    if not re.search(r"silver", code, re.IGNORECASE):
+        return not_applicable("Notebook does not identify a Silver-layer write")
+    ok = bool(_SILVER_QUALITY.search(code))
+    return binary(ok, "Silver write applies cleansing/deduplication/conformance/type standardization" if ok
+                  else "Silver write has no recognizable quality transformation")
+
+
+@check(
+    id="PL-BULK-MOVE", ref="2.6.3",
+    title="Large data movements use bulk/batch patterns, not row-by-row",
+    pillar=Pillar.PERFORMANCE, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
+)
+def pl_bulk_move(ctx: CheckContext) -> Verdict:
+    """Data-moving pipelines use bulk or batch movement rather than row-by-row execution."""
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+    acts = activities(ctx.obj)
+    if not any((a.get("type") or "") in _DATA_MOVE_TYPES for a in acts):
+        return not_applicable("Pipeline has no data-movement activity")
+    blob = json.dumps(ctx.obj)
+    if _ROW_BY_ROW.search(blob) and not _BULK_ACTIVITY.search(blob):
+        return binary(False, "Data movement shows row-by-row or serial execution without a bulk/batch pattern")
+    ok = bool(_BULK_ACTIVITY.search(blob))
+    return binary(ok, "Bulk/batch data-movement pattern detected" if ok
+                  else "No bulk/batch data-movement pattern detected")
+
+
+@check(
+    id="NB-EAM-INGEST", ref="2.6.6",
+    title="JSON ingestion (EAM) is efficient (streaming/partitioned parse, no oversized single-file bottlenecks)",
+    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_eam_ingest(ctx: CheckContext) -> Verdict:
+    """EAM/JSON ingestion uses streaming, partitioning, or bounded-file parsing."""
+    code = executable_code(ctx.obj)
+    if not _EAM_JSON.search(code):
+        return not_applicable("Notebook has no recognizable EAM/JSON ingestion")
+    ok = bool(_EAM_EFFICIENT.search(code))
+    return binary(ok, "EAM/JSON ingestion uses streaming, partitioning, or bounded parsing" if ok
+                  else "EAM/JSON ingestion has no streaming/partitioning/bounded-file pattern")
+
+
+@check(
+    id="NB-SOURCE-METADATA", ref="5.2.8",
+    title="Source metadata captured: ingestion timestamp",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_source_metadata(ctx: CheckContext) -> Verdict:
+    """Notebook writes retain source metadata including an ingestion timestamp."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write data to a table")
+    ok = bool(_SOURCE_METADATA.search(code))
+    return binary(ok, "Source metadata and ingestion timestamp are captured" if ok
+                  else "Writes data without source metadata or an ingestion timestamp")
+
+
+@check(
+    id="NB-DEDUP-VERIFY", ref="5.3.4",
+    title="Deduplication verification: no duplicate business records",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_dedup_verify(ctx: CheckContext) -> Verdict:
+    """Notebook logic verifies that duplicate business records are not loaded."""
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable("Notebook does not write data to a table")
+    ok = bool(_DUPLICATE_VERIFICATION.search(code))
+    return binary(ok, "Duplicate records are verified and handled" if ok
+                  else "Writes data without duplicate-record verification")
+
+
+@check(
+    id="NB-UTF8", ref="5.5.3",
+    title="String / Text: Encoding validated (UTF-8)",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_utf8_encoding(ctx: CheckContext) -> Verdict:
+    """Notebook input handling explicitly validates or declares UTF-8 text encoding."""
+    code = executable_code(ctx.obj)
+    if not _INPUT_READ.search(code):
+        return not_applicable("Notebook has no recognizable incoming file or JSON read")
+    ok = bool(_TEXT_ENCODING.search(code))
+    return binary(ok, "String/text input encoding is explicitly UTF-8" if ok
+                  else "Incoming string/text data has no explicit UTF-8 encoding validation")
+
+
+@check(
+    id="NB-FLAG-DOMAIN", ref="5.5.7",
+    title="Boolean / Flag: Only expected values permitted",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_flag_domain(ctx: CheckContext) -> Verdict:
+    """Notebook logic restricts Boolean and Flag fields to an approved value set."""
+    code = executable_code(ctx.obj)
+    if not _INPUT_READ.search(code):
+        return not_applicable("Notebook has no recognizable incoming file or JSON read")
+    ok = bool(_FLAG_DOMAIN.search(code))
+    return binary(ok, "Boolean/Flag fields are restricted to expected values" if ok
+                  else "Boolean/Flag fields have no explicit allowed-value validation")
+
+
+@check(
+    id="NB-DQ-RULES", ref="5.1.2",
+    title="DQ rules codified in code/config (not ad-hoc manual checks)",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_dq_rules(ctx: CheckContext) -> Verdict:
+    """Notebook data-quality rules are expressed as executable, repeatable logic."""
+    code = executable_code(ctx.obj)
+    if not (_INPUT_READ.search(code) or _WRITE_PATTERN.search(code)):
+        return not_applicable("Notebook has no recognizable data-ingestion or write operation")
+    ok = bool(_DQ_RULE.search(code))
+    return binary(ok, "Data-quality rule logic is codified in notebook code/config" if ok
+                  else "Data movement has no recognizable codified data-quality rules")
+
+
 
 # =============================================================================
 # MLC Cat-1 · ingestion framework (2.1.5, 2.2.2-2.2.4, 2.3.2-2.3.4, 2.5.1, 2.5.3)
@@ -1030,7 +1457,7 @@ _FOREACH = "ForEach"
 
 @check(
     id="PL-PARALLEL", ref="2.1.5",
-    title="Parallel execution used where possible",
+    title="Parallel execution used where possible (no unnecessary sequential execution)",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -1088,7 +1515,7 @@ def _bare_table(name: str) -> str:
 
 @check(
     id="PL-FULLLOAD", ref="2.2.2",
-    title="Full load reserved for small reference/dimension tables",
+    title="Full load reserved only for small reference/dimension tables or initial loads",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -1135,7 +1562,7 @@ _ONGOING = re.compile(
 
 @check(
     id="PL-HIST-SEPARATION", ref="2.2.3",
-    title="Historical load separated from ongoing incremental pattern",
+    title="Adage historical load clearly separated from ongoing incremental patterns",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -1197,7 +1624,7 @@ _WATERMARK_TABLE_READ = re.compile(
 
 @check(
     id="PL-WATERMARK-STORE", ref="2.2.4",
-    title="Watermark / control values persisted reliably",
+    title="Watermark / control values persisted reliably in the Metadata DB (not volatile locations)",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -1248,7 +1675,7 @@ _OP_TYPE_COLUMN = re.compile(
 
 @check(
     id="NB-OPTYPE", ref="2.3.2",
-    title="Operation type column/flag preserved in Bronze",
+    title="Operation type column/flag preserved in Bronze for auditability where the source provides it",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -1285,7 +1712,7 @@ _MERGE_DELETE = re.compile(
 
 @check(
     id="NB-IUD-MERGE", ref="2.3.3",
-    title="All applicable operation types (I/U/D) handled in the merge",
+    title="All applicable operation types (I/U/D) handled correctly in the merge strategy",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -1330,7 +1757,7 @@ _DEDUP_BEFORE_MERGE = re.compile(
 
 @check(
     id="NB-INSERT-UNIQUE", ref="2.3.4",
-    title="Insert records validated for uniqueness before merge",
+    title="Insert records validated for uniqueness / business key before merge into target",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -1364,7 +1791,7 @@ _ITERATES_LOOKUP = re.compile(r"activity\s*\(\s*'[^']+'\s*\)\s*\.output",
 
 @check(
     id="PL-METADATA-DRIVEN", ref="2.5.1",
-    title="Metadata DB drives ingestion (not hardcoded pipelines)",
+    title="Metadata DB drives ingestion (source list, load type, schedule, target mapping) rather than hardcoded pipelines",
     pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
@@ -1420,7 +1847,7 @@ _RUN_CONTROL_ELEMENTS = {
 
 @check(
     id="WS-RUNCONTROL", ref="2.5.3",
-    title="Run control captures batch ID, status, row counts and timestamps",
+    title="Run control tables capture batch ID, status, row counts, start/end timestamps",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS,
     requires=[Resource.PIPELINE_DEFINITIONS, Resource.NOTEBOOK_DEFINITIONS],

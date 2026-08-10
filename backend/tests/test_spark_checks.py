@@ -297,10 +297,17 @@ def test_profile_passes_for_healthy_long_running_application():
     assert v.score == 3
 
 
-def test_profile_fails_for_long_running_application_with_open_issue():
+def test_profile_passes_for_long_running_application_even_when_ui_has_issues():
     v = spark_profile(_ctx(_monitored_nb(
         usage={"duration": 600_000},
         advice=[{"description": "Shuffle skew requires optimization"}], stages=[],
+    )))
+    assert v.score == 3
+
+
+def test_profile_fails_for_long_running_application_without_profiling_evidence():
+    v = spark_profile(_ctx(_monitored_nb(
+        usage={"duration": 600_000},
     )))
     assert v.score == 0
 
