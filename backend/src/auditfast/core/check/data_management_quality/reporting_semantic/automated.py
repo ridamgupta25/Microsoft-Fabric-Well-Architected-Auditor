@@ -20,6 +20,7 @@ from auditfast.core.check._dax import (
     uses_variables,
 )
 from auditfast.core.check._dax import normalised as dax_normalised
+from auditfast.core.check._semantic import is_row_identifier, relationship_columns
 from auditfast.core.check.helpers import Verdict, covered, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
@@ -358,4 +359,347 @@ def complex_measures_use_variables(ctx: CheckContext) -> list[Verdict]:
         note(_measure_detail(names, "break a DAX practice"), obj=model_name)
         for model_name, names in sorted(offenders.items())
     ]
+    return verdicts
+
+
+# ---------------------------------------------------------------------------
+# 14.1.2 — relationship graph: ambiguous filter paths
+# ---------------------------------------------------------------------------
+
+
+def _table_key(value: object) -> str:
+    """A table name reduced to a comparison key ("" when the model named nothing)."""
+    return str(value or "").strip().lower()
+
+
+def _active_edges(model: dict[str, Any]) -> list[tuple[str, str]]:
+    """``(table_a, table_b)`` for every *active* relationship, endpoints sorted.
+
+    Self-relationships (both ends on one table) and relationships missing an
+    endpoint carry no filter path between two tables, so they are dropped rather
+    than guessed at.
+    """
+    edges: list[tuple[str, str]] = []
+    for rel in _relationships(model):
+        if not _is_active(rel):
+            continue
+        left = _table_key(rel.get("from_table") or rel.get("fromTable"))
+        right = _table_key(rel.get("to_table") or rel.get("toTable"))
+        if not left or not right or left == right:
+            continue
+        edges.append((left, right) if left <= right else (right, left))
+    return edges
+
+
+def _redundant_pairs(edges: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Table pairs that a second *active* filter path also connects.
+
+    Union-find over the distinct edges, walked in sorted order so the answer is
+    the same on every run: an edge whose endpoints are *already* connected by the
+    edges accepted before it closes a cycle, and a cycle in a relationship graph
+    means at least two active routes exist between some pair of tables. A pair
+    joined by more than one active relationship is ambiguous outright and is
+    reported too.
+    """
+    duplicates = sorted({pair for pair, n in Counter(edges).items() if n > 1})
+
+    parent: dict[str, str] = {}
+
+    def find(node: str) -> str:
+        parent.setdefault(node, node)
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    closes_cycle: list[tuple[str, str]] = []
+    for left, right in sorted(set(edges)):
+        root_left, root_right = find(left), find(right)
+        if root_left == root_right:
+            closes_cycle.append((left, right))
+        else:
+            parent[root_left] = root_right
+    return sorted(set(duplicates) | set(closes_cycle))
+
+
+@check(
+    id="R-REL-AMBIGUOUS", ref="14.1.2",
+    title="Relationships correctly defined (cardinality, active/inactive) with no ambiguous filter paths",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
+)
+def relationships_have_no_ambiguous_paths(ctx: CheckContext) -> list[Verdict]:
+    """Exactly one active filter path connects any two tables in the model.
+
+    Two or more active routes between the same pair of tables make filter
+    propagation non-deterministic: the engine picks a path, and a measure that
+    looks correct returns a silently different number depending on which one it
+    took. The relationship graph is built per model from the *active*
+    relationships and two defects are named:
+
+    * a pair of tables joined by more than one active relationship;
+    * a cycle in the graph — an edge whose endpoints another chain of active
+      relationships already connects, so a second route exists.
+
+    Inactive relationships are counted and reported alongside, because a
+    modeller who hit ambiguity usually deactivated one leg to escape it: they
+    are the fingerprint of the problem, not a defect in themselves (a
+    ``USERELATIONSHIP`` role-playing dimension is a legitimate use).
+
+    **What it cannot determine.** Cardinality (``fromCardinality`` /
+    ``toCardinality``) is not carried by the parsed TMSL projection, so the
+    "many-to-many without a bridge" half of the point is *not* judged here and
+    the evidence says so; nothing is inferred about it. Whether a particular
+    inactive relationship is deliberate is a modelling judgement and is
+    reported, never scored.
+
+    Distinct from ``R-BIDI-REL`` (ref 14.1.1), which judges only the *direction*
+    of cross-filtering on each relationship in isolation. A model can filter in
+    a single direction everywhere and still carry two active single-direction
+    routes between the same tables — the defect this check finds. Workspace
+    scope (not ``Scope.SEMANTIC_MODEL``) matches the sibling 14.1.x checks, so
+    the reporting workspace gets one scored roll-up plus one named detail row
+    per offending model.
+    """
+    if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
+        return [not_applicable(_UNREADABLE)]
+    models = ctx.workspace.semantic_models
+    if not models:
+        return [not_applicable(_NO_MODELS)]
+
+    judged = clean = 0
+    inactive_total = 0
+    offenders: dict[str, str] = {}
+    for name, defn in models.items():
+        edges = _active_edges(defn)
+        inactive_total += sum(1 for r in _relationships(defn) if not _is_active(r))
+        if len(edges) < 2:
+            # One (or no) active relationship cannot form a second path.
+            continue
+        judged += 1
+        ambiguous = _redundant_pairs(edges)
+        if not ambiguous:
+            clean += 1
+            continue
+        named = ", ".join(f"{left} <-> {right}" for left, right in ambiguous[:10])
+        more = f" (+{len(ambiguous) - 10} more)" if len(ambiguous) > 10 else ""
+        offenders[name] = (
+            f"{len(ambiguous)} table pair(s) reachable by more than one active "
+            f"relationship path: {named}{more}"
+        )
+
+    if not judged:
+        return [not_applicable(
+            "No semantic model defines two or more active relationships, so no "
+            "second filter path can exist"
+        )]
+
+    detail = (
+        f"{clean} of {judged} semantic model(s) have exactly one active filter path "
+        f"between any two tables; {inactive_total} inactive relationship(s) across the "
+        f"workspace. Relationship cardinality is not part of the parsed model "
+        f"definition, so many-to-many without a bridge is not assessed here."
+    )
+    verdicts: list[Verdict] = [covered(clean, judged, detail)]
+    verdicts += [note(reason, obj=model_name) for model_name, reason in sorted(offenders.items())]
+    return verdicts
+
+
+# ---------------------------------------------------------------------------
+# 14.1.7 — columns and tables that nothing in the model references
+# ---------------------------------------------------------------------------
+
+#: How many candidate names one detail row spells out before summarising.
+_MAX_NAMED_COLUMNS = 15
+
+
+def _referenced_columns(model: dict[str, Any]) -> set[tuple[str, str]]:
+    """``(table, column)`` pairs, lower-cased, that the *model* itself uses.
+
+    Two routes count: a relationship endpoint (read via the shared
+    ``relationship_columns`` helper) and a mention in a measure's DAX. DAX names
+    a column as ``[Column]`` or ``'Table'[Column]``; the table qualifier is
+    optional and frequently omitted, so a mention is credited against every
+    table that owns a column of that name. Crediting too generously is the safe
+    direction here — it can only *shrink* the candidate list.
+    """
+    referenced: set[tuple[str, str]] = set(relationship_columns(model))
+
+    expressions = " ".join(_normalised(m.get("expression")) for m in model.get("measures") or [])
+    mentioned = {m.lower() for m in re.findall(r"\[([^\]\[]+)\]", expressions)}
+    if mentioned:
+        for column in model.get("columns") or []:
+            name = str(column.get("name") or "").strip().lower()
+            if name and name in mentioned:
+                referenced.add((str(column.get("table") or "").strip().lower(), name))
+    return referenced
+
+
+@check(
+    id="R-MODEL-UNUSED", ref="14.1.7",
+    title="Unused columns/tables removed from the model to reduce size and confusion",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
+)
+def unused_model_columns(ctx: CheckContext) -> list[Verdict]:
+    """Report the columns and tables nothing *in the model* references.
+
+    A column is a removal **candidate** when no measure expression mentions it
+    and no relationship binds it; a table is a candidate when none of its
+    columns is referenced, it carries no measure, and it takes part in no
+    relationship.
+
+    **The hard limit, stated plainly: report visuals are not fetched.** A column
+    dragged straight onto a visual — the single most common way a column earns
+    its place — is invisible to this check and will appear in the candidate
+    list. That makes the false-positive rate structurally high and unknowable
+    from the data available, which is why this check is **unscored**: it emits
+    ``note`` rows so a modeller can review the candidates, and never a PASS or a
+    FAIL. Scoring it, even generously, would penalise a correct model for a gap
+    in the crawler rather than a defect in the model — the opposite of the
+    N/A-not-FAIL principle this library is built on.
+    """
+    if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
+        return [not_applicable(_UNREADABLE)]
+    models = ctx.workspace.semantic_models
+    if not models:
+        return [not_applicable(_NO_MODELS)]
+
+    total_columns = total_candidates = 0
+    details: dict[str, str] = {}
+    for name, defn in models.items():
+        model_columns = defn.get("columns") or []
+        if not model_columns:
+            continue
+        referenced = _referenced_columns(defn)
+        candidates: list[str] = []
+        used_tables: set[str] = set()
+        for column in model_columns:
+            table = str(column.get("table") or "").strip()
+            column_name = str(column.get("name") or "").strip()
+            if not column_name:
+                continue
+            total_columns += 1
+            if (table.lower(), column_name.lower()) in referenced:
+                used_tables.add(table.lower())
+                continue
+            candidates.append(f"{table}[{column_name}]" if table else column_name)
+        total_candidates += len(candidates)
+
+        measure_tables = {str(m.get("table") or "").strip().lower()
+                          for m in defn.get("measures") or []}
+        related = {t for edge in _active_edges(defn) for t in edge}
+        related |= {_table_key(r.get("from_table")) for r in _relationships(defn)}
+        related |= {_table_key(r.get("to_table")) for r in _relationships(defn)}
+        orphan_tables = sorted(
+            t for t in (defn.get("tables") or [])
+            if t and t.strip().lower() not in (used_tables | measure_tables | related)
+        )
+
+        if not candidates and not orphan_tables:
+            continue
+        shown = ", ".join(candidates[:_MAX_NAMED_COLUMNS])
+        more = (f" (+{len(candidates) - _MAX_NAMED_COLUMNS} more)"
+                if len(candidates) > _MAX_NAMED_COLUMNS else "")
+        parts = []
+        if candidates:
+            parts.append(f"{len(candidates)} of {len(model_columns)} column(s) are "
+                         f"referenced by no measure and no relationship: {shown}{more}")
+        if orphan_tables:
+            parts.append(f"{len(orphan_tables)} table(s) carry no measure, no "
+                         f"relationship and no referenced column: "
+                         f"{', '.join(orphan_tables[:10])}")
+        details[name] = "; ".join(parts)
+
+    if not total_columns:
+        return [not_applicable(
+            "No semantic model carries column declarations, so removal candidates "
+            "cannot be identified"
+        )]
+
+    summary = note(
+        f"{total_candidates} of {total_columns} column(s) across "
+        f"{len(models)} semantic model(s) are referenced by no measure and no "
+        f"relationship. Report visuals are not fetched, so a column used only in "
+        f"a visual is indistinguishable from an unused one — review before "
+        f"removing. Reported, not scored."
+    )
+    return [summary] + [note(reason, obj=name) for name, reason in sorted(details.items())]
+
+
+# ---------------------------------------------------------------------------
+# 14.1.8 — consumer-friendly model: technical keys hidden
+# ---------------------------------------------------------------------------
+
+
+@check(
+    id="R-MODEL-HIDDEN-KEYS", ref="14.1.8",
+    title="Model naming and organization are consumer-friendly (display folders, hidden keys)",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
+)
+def key_columns_are_hidden(ctx: CheckContext) -> list[Verdict]:
+    """Key and technical columns are hidden from the report field list.
+
+    A surrogate key, a GUID, or an ``…ID`` column carries no meaning to a report
+    author: leaving it visible invites someone to drag it onto a visual and
+    aggregate a key. TMSL states ``isHidden`` per column and ``isKey`` where the
+    modeller marked one, so the *hidden-keys* half of this point is directly
+    readable and is what this check scores — the share of key-shaped columns
+    that are hidden.
+
+    **What it cannot determine: display folders.** ``displayFolder`` is present
+    in the raw TMSL but is *not* carried by this project's parsed projection
+    (``clients/tmsl.py``), and extending that parser would invalidate every
+    semantic-model snapshot already in the knowledge base until a re-crawl. So
+    the folder-organisation half of the point is deliberately **not** scored
+    here, and the evidence says so rather than implying a model without folders
+    was assessed and passed.
+
+    Key-shaped is judged by ``is_row_identifier`` — the model's own ``isKey``
+    flag, or a key-shaped name — so it is the same vocabulary the table checks
+    use. A model with no key-shaped column has nothing to hide and is N/A.
+    """
+    if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
+        return [not_applicable(_UNREADABLE)]
+    models = ctx.workspace.semantic_models
+    if not models:
+        return [not_applicable(_NO_MODELS)]
+
+    total = hidden = 0
+    offenders: dict[str, list[str]] = {}
+    for name, defn in models.items():
+        for column in defn.get("columns") or []:
+            if not is_row_identifier(column):
+                continue
+            total += 1
+            if column.get("is_hidden"):
+                hidden += 1
+            else:
+                table = str(column.get("table") or "").strip()
+                column_name = str(column.get("name") or "").strip()
+                offenders.setdefault(name, []).append(
+                    f"{table}[{column_name}]" if table else column_name
+                )
+
+    if not total:
+        return [not_applicable(
+            "No semantic model declares a key-shaped column, so there is no "
+            "technical column to hide from report consumers"
+        )]
+
+    verdicts: list[Verdict] = [covered(
+        hidden, total,
+        f"{hidden} of {total} key-shaped column(s) across {len(models)} semantic "
+        f"model(s) are hidden from the report view. Display folders are not part "
+        f"of the parsed model definition, so folder organisation is not assessed.",
+    )]
+    for model_name, names in sorted(offenders.items()):
+        shown = ", ".join(sorted(names)[:_MAX_NAMED_COLUMNS])
+        more = (f" (+{len(names) - _MAX_NAMED_COLUMNS} more)"
+                if len(names) > _MAX_NAMED_COLUMNS else "")
+        verdicts.append(note(
+            f"{len(names)} key-shaped column(s) visible to report authors: {shown}{more}",
+            obj=model_name,
+        ))
     return verdicts

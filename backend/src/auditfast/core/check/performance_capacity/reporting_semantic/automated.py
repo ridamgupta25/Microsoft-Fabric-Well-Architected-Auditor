@@ -1,14 +1,24 @@
 """Performance & Capacity · Reporting / Semantic — model storage and query cost.
 
 Everything here reads the **parsed TMSL definition** the provider already
-fetches: partition modes, refresh policies, aggregation declarations. That is
-model *metadata* — no table rows, no column statistics, and no query against the
-warehouse. Anything needing actual data volumes (column cardinality, row counts)
-is deliberately out of scope: it would have to be measured at check time against
-the SQL endpoint, not cached into the knowledge base.
+fetches: partition modes, refresh policies, aggregation declarations, column
+declarations. That is model *metadata* — no table rows, no column statistics,
+and no query against the warehouse.
+
+Anything needing actual data volumes stays out of scope: it would have to be
+measured at check time against the SQL endpoint, not cached into the knowledge
+base. ``SM-COLUMN-SHAPE`` (ref 14.2.3) is the deliberate near-miss — it scores a
+*shape* proxy (GUID / full-precision datetime / free-text / unused identity
+columns) and says plainly in its own evidence that it has not measured
+cardinality, because measuring it would need the rows.
 """
 from __future__ import annotations
 
+from auditfast.core.check._semantic import (
+    high_cardinality_shape,
+    is_row_identifier,
+    relationship_columns,
+)
 from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
@@ -145,6 +155,110 @@ def sm_aggregations(ctx: CheckContext) -> Verdict:
                               f"aggregations are not warranted")
     return binary(False, f"Import/DirectQuery model with {len(model.get('tables') or [])} "
                          f"tables and no aggregation tables — every visual scans detail rows")
+
+
+@check(
+    id="SM-COLUMN-SHAPE", ref="14.2.3",
+    title="Model size and column cardinality optimized (reduce high-cardinality columns where possible)",
+    pillar=Pillar.PERFORMANCE, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
+    layers=MODEL_LAYERS, requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
+)
+def sm_column_shape(ctx: CheckContext) -> Verdict:
+    """Columns whose declared shape is one-value-per-row are kept out of the model.
+
+    **This check does not measure cardinality, and cannot.** True cardinality is
+    the number of *distinct values* in a column, which can only be known by
+    reading the rows — and rows are never fetched into the knowledge base. What
+    it scores is a **shape proxy** taken from the TMSL column declarations: types
+    and names that are inherently one-value-per-row (or close to it) whatever
+    data sits behind them. Every verdict says so in its own evidence, so nobody
+    reads this as a measurement.
+
+    **What it can determine.** Four readable shapes, each a well-known VertiPaq
+    dictionary-size problem:
+
+    * *GUID* — a ``uniqueidentifier`` source type, or a name saying guid/uuid.
+      One distinct value per row by construction.
+    * *full-precision datetime* — a temporal column carrying a time of day rather
+      than a date. Split into a date key plus a time key it costs two small
+      dictionaries instead of one enormous one.
+    * *free text* — an unbounded ``varchar(max)``/``text``/``json`` source type,
+      or a name saying description/comment/address/url. Not something a user
+      slices by, and expensive to keep.
+    * *row identifier* — a column the model marks ``isKey``, or whose name is
+      key-shaped, that **no relationship uses**. That is an identity column
+      imported for no modelling reason: the "unnecessary columns imported" half
+      of this point.
+
+    It also reports the model's total column count, the other half of "model
+    size" that is readable without rows.
+
+    **What it cannot.** It cannot say a flagged column is *actually* large (a
+    GUID column on a 40-row dimension costs nothing), nor that an unflagged
+    column is small — a ``string`` column named ``customer_name`` may well have
+    a million distinct values and will never be flagged here. It cannot see
+    memory footprint, dictionary size, or compression, none of which are in any
+    definition. Columns a relationship binds are exempt on every shape rule:
+    those are load-bearing keys, not accidents.
+
+    **Sibling.** ``SM-AGGREGATIONS`` (ref 14.2.4) asks whether the model
+    summarises its detail; this asks whether the detail it keeps is shaped to
+    compress. A model can pass either and fail the other.
+    """
+    model = _model(ctx)
+    if model is None:
+        return not_applicable("Semantic model definitions could not be read from Fabric")
+
+    columns = model.get("columns") or []
+    if not columns:
+        return not_applicable(
+            f"Model '{ctx.obj_name}' has no column declarations in the captured "
+            f"definition ({len(model.get('tables') or [])} table(s) read), so no column "
+            f"shape can be judged. Snapshots taken before column metadata was parsed "
+            f"need a re-crawl before this can be answered"
+        )
+
+    bound = relationship_columns(model)
+
+    def _is_bound(column: dict) -> bool:
+        return (str(column.get("table") or "").lower(),
+                str(column.get("name") or "").lower()) in bound
+
+    # Relationship columns are exempt: the model cannot join without them, so
+    # their shape is a required cost rather than an avoidable one.
+    judged = [c for c in columns if not _is_bound(c)]
+    if not judged:
+        return not_applicable(
+            f"All {len(columns)} column(s) in '{ctx.obj_name}' are bound by a "
+            f"relationship, so every one is a load-bearing key with no discretionary "
+            f"shape to judge"
+        )
+
+    flagged: list[tuple[str, str]] = []
+    for column in judged:
+        label = f"{column.get('table', '')}[{column.get('name', '')}]"
+        reason = high_cardinality_shape(column)
+        if not reason and is_row_identifier(column):
+            reason = "unused row identifier"
+        if reason:
+            flagged.append((label, reason))
+
+    clean = len(judged) - len(flagged)
+    caveat = (
+        " This is a *shape* proxy read from the column declarations — type and name — "
+        "not a measured distinct-value count; rows are never read"
+    )
+    summary = (
+        f"Model '{ctx.obj_name}': {len(model.get('tables') or [])} table(s), "
+        f"{len(columns)} column(s) declared. {clean} of {len(judged)} discretionary "
+        f"column(s) carry no inherently high-cardinality shape "
+        f"({len(columns) - len(judged)} relationship key(s) exempt)"
+    )
+    if flagged:
+        shown = "; ".join(f"{label} ({reason})" for label, reason in flagged[:5])
+        more = f" and {len(flagged) - 5} more" if len(flagged) > 5 else ""
+        summary += f" — flagged: {shown}{more}"
+    return covered(clean, len(judged), summary + "." + caveat)
 
 
 @check(

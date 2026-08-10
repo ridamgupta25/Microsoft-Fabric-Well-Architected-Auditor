@@ -65,6 +65,9 @@ def test_build_questionnaire_scopes_by_pillar_and_layer():
     assert ids == {
         "WS-DOMAIN-FOLDERS", "PL-SLA-MONITORED", "PL-SLA-ALERTS",
         "OPS-INTEGRATION-TESTS", "OPS-DATA-VALIDATION-TESTS",
+        "OPS-GIT-IGNORE", "OPS-GIT-COMMIT-MSG", "OPS-GIT-PR-REVIEW",
+        "OPS-GIT-MIN-REVIEWERS", "OPS-WH-SCHEMA-SCM", "OPS-DEPLOY-RULES",
+        "OPS-ENV-PARITY", "OPS-SLA-HISTORY",
     }
     # Every item is serialized with its question and scored options for the UI.
     for item in q:

@@ -15,8 +15,6 @@ from auditfast.core.enums import Automation, Layer, Pillar, Resource, Scope
 # (id, ref, title, layers, required, requirement)
 _CHECKS: list[tuple[str, str, str, tuple[str, ...], bool, str]] = [
 
-    ("R-8-1-1", "8.1.1", "Fabric lineage view used and accurate for all key data flows", (Layer.OPERATIONS,), True, "ADMIN_SCANNER"),
-    ("R-8-1-2", "8.1.2", "End-to-end lineage visible from source system to Gold/Power BI", (Layer.OPERATIONS,), True, "ADMIN_SCANNER"),
     ("R-8-1-3", "8.1.3", "Microsoft Purview integrated for enterprise cataloging (or equivalent)", (Layer.OPERATIONS,), False, "ADMIN_SCANNER"),
     ("R-8-1-4", "8.1.4", "Data assets tagged with business domain and data owner", (Layer.OPERATIONS,), True, "ADMIN_SCANNER"),
 ]

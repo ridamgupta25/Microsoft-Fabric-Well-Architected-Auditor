@@ -34,6 +34,11 @@ from .tmsl import parse_tmsl
 
 log = logging.getLogger("auditfast.live")
 
+#: How many job-run timestamps are retained per item for the cadence signal.
+#: Enough to establish an interval; small enough that a chatty item cannot bloat
+#: the knowledge-base snapshot.
+_MAX_RETAINED_RUNS = 25
+
 
 class LiveFabricProvider:
     """Reads a live Fabric tenant with a delegated, read-only OAuth2 token."""
@@ -419,6 +424,7 @@ class LiveFabricProvider:
 
         col_attempted = col_read = 0
         sec_attempted = sec_read = 0
+        collisions = 0
         for endpoint in endpoints:
             if want_columns:
                 col_attempted += 1
@@ -427,14 +433,29 @@ class LiveFabricProvider:
                     col_read += 1
                     for table_name, cols in tables.items():
                         existing = ctx.tables.get(table_name)
+                        if existing is not None and existing.get("store"):
+                            # Two stores hold a table of the same name. The flat
+                            # key cannot represent both, so the second is filed
+                            # under "<store>.<table>" and the first keeps the bare
+                            # name that the REST listing established.
+                            collisions += 1
+                            ctx.tables[f"{endpoint.name}.{table_name}"] = {
+                                "type": "Managed", "format": "", "columns": cols,
+                                "store": endpoint.name, "store_kind": endpoint.kind,
+                            }
+                            continue
                         if existing is not None:
                             existing["columns"] = cols
+                            existing["store"] = endpoint.name
+                            existing["store_kind"] = endpoint.kind
                         else:
                             # A table the REST listing did not return (a Warehouse
                             # table, say) is still worth recording.
                             ctx.tables[table_name] = {
                                 "type": "Managed", "format": "",
                                 "columns": cols,
+                                "store": endpoint.name,
+                                "store_kind": endpoint.kind,
                             }
             if want_security and endpoint.kind == "Warehouse":
                 sec_attempted += 1
@@ -448,6 +469,10 @@ class LiveFabricProvider:
         if want_columns:
             self._record_failures(ctx, Resource.TABLE_COLUMNS, col_attempted,
                                   col_read, 0, col_attempted - col_read)
+        if collisions:
+            log.info("fetch %s: %d table name(s) exist in more than one store; "
+                     "the duplicates are keyed '<store>.<table>'",
+                     workspace_id, collisions)
         if want_security and sec_attempted:
             self._record_failures(ctx, Resource.WAREHOUSE_SECURITY, sec_attempted,
                                   sec_read, 0, sec_attempted - sec_read)
@@ -620,20 +645,21 @@ class LiveFabricProvider:
             if read == 0:
                 ctx.unavailable.add(resource)
 
-    def _latest_run(self, workspace_id: str, item_id: str) -> tuple[str | None, str]:
-        """Return one item's most recent job-run time and a failure classifier.
+    def _run_stamps(self, workspace_id: str, item_id: str) -> tuple[list[str], str]:
+        """Return one item's job-run timestamps (newest first) and a failure classifier.
 
-        Reads a single page of the item's job-instance history and returns
-        ``(timestamp, failure)`` where ``timestamp`` is the latest ``endTimeUtc``
-        (falling back to ``startTimeUtc`` for a run still in flight) or ``None``
-        when the item has never run. ``failure`` follows the
-        :meth:`_definition_parts` convention: ``""`` read, ``"forbidden"`` a
-        permission/expired-token denial, ``"transient"`` a throttling/5xx/network
-        error. A 400/404 (the item type keeps no job history) is *not* a failure —
-        it simply yields no timestamp.
+        Reads a single page of the item's job-instance history. Every run on that
+        page contributes its ``endTimeUtc`` (falling back to ``startTimeUtc`` for a
+        run still in flight), so the caller gets both the latest run *and* the
+        intervals between runs from one call — no extra request is made for the
+        cadence signal. ``failure`` follows the :meth:`_definition_parts`
+        convention: ``""`` read, ``"forbidden"`` a permission/expired-token
+        denial, ``"transient"`` a throttling/5xx/network error. A 400/404 (the
+        item type keeps no job history) is *not* a failure — it simply yields no
+        timestamps.
 
-        ISO-8601 UTC (``…Z``) stamps sort lexicographically, so ``max`` over the
-        page is the chronologically latest run without any date parsing.
+        ISO-8601 UTC (``…Z``) stamps sort lexicographically, so a plain reverse
+        sort is chronological without any date parsing.
         """
         path = f"/workspaces/{workspace_id}/items/{item_id}/jobs/instances"
         status, body = self._get(path)
@@ -641,18 +667,90 @@ class LiveFabricProvider:
             status, body = self._get(path)
         if status in (401, 403):
             log.warning("item %s jobs/instances -> HTTP %s (permission denied)", item_id, status)
-            return None, "forbidden"
+            return [], "forbidden"
         if status is None or status == 429 or (isinstance(status, int) and status >= 500):
             log.warning("item %s jobs/instances -> HTTP %s (transient)", item_id, status)
-            return None, "transient"
+            return [], "transient"
         if status != 200 or not isinstance(body, dict):
-            return None, ""  # 400/404 — no job history for this item type
+            return [], ""  # 400/404 — no job history for this item type
         stamps = [
             row.get("endTimeUtc") or row.get("startTimeUtc")
             for row in (body.get("value") or [])
             if isinstance(row, dict) and (row.get("endTimeUtc") or row.get("startTimeUtc"))
         ]
-        return (max(stamps) if stamps else None), ""
+        return sorted((str(s) for s in stamps), reverse=True), ""
+
+    def _latest_run(self, workspace_id: str, item_id: str) -> tuple[str | None, str]:
+        """Return one item's most recent job-run time and a failure classifier.
+
+        A thin wrapper over :meth:`_run_stamps` kept for callers that only need
+        the recency signal.
+        """
+        stamps, failure = self._run_stamps(workspace_id, item_id)
+        return (stamps[0] if stamps else None), failure
+
+    def _warehouse_audit(self, workspace_id: str, item_id: str) -> tuple[dict | None, str]:
+        """Read one Warehouse's SQL audit *configuration*.
+
+        ``GET …/warehouses/{id}/settings/sqlAudit`` returns the audit state, the
+        configured action groups, and the retention. It needs the Audit
+        permission on the Warehouse item — **not** tenant-admin — so it is an
+        ordinary delegated read. Only the configuration is returned; audit rows
+        (``sys.fn_get_audit_file_v2``) are runtime data and are never fetched.
+
+        Returns ``(settings, failure)`` with the same ``failure`` classifiers as
+        :meth:`_definition_parts`. A 400/404 (the Warehouse does not support the
+        setting) yields ``(None, "")`` — readable, simply not offered — which the
+        caller records as unread rather than as "auditing is off".
+        """
+        path = f"/workspaces/{workspace_id}/warehouses/{item_id}/settings/sqlAudit"
+        status, body = self._get(path)
+        if status == 401 and self._try_refresh_token():
+            status, body = self._get(path)
+        if status in (401, 403):
+            log.warning("warehouse %s sqlAudit -> HTTP %s (permission denied)", item_id, status)
+            return None, "forbidden"
+        if status is None or status == 429 or (isinstance(status, int) and status >= 500):
+            log.warning("warehouse %s sqlAudit -> HTTP %s (transient)", item_id, status)
+            return None, "transient"
+        if status != 200 or not isinstance(body, dict):
+            return None, ""
+        return self._sql_audit_settings(body), ""
+
+    @staticmethod
+    def _sql_audit_settings(body: dict) -> dict:
+        """Normalise a ``settings/sqlAudit`` payload into the shape checks read.
+
+        Fabric has spelled the payload more than one way (``state`` vs
+        ``auditState``, ``auditActionsAndGroups`` vs ``auditActionGroups``), and
+        the state arrives as ``Enabled``/``Disabled`` in mixed case. Normalising
+        here keeps every variation out of the check bodies, which must stay pure.
+        """
+        raw = body.get("properties") if isinstance(body.get("properties"), dict) else body
+        state = ""
+        for key in ("state", "auditState", "sqlAuditState", "status"):
+            value = raw.get(key)
+            if value is not None and str(value).strip():
+                state = str(value).strip()
+                break
+        groups: list[str] = []
+        for key in ("auditActionsAndGroups", "auditActionGroups", "actionsAndGroups", "actionGroups"):
+            value = raw.get(key)
+            if isinstance(value, list):
+                groups = [str(g).strip() for g in value if str(g).strip()]
+                break
+        retention = None
+        for key in ("retentionDays", "retentionInDays", "auditRetentionDays"):
+            value = raw.get(key)
+            if isinstance(value, (int, float)):
+                retention = int(value)
+                break
+        return {
+            "state": state,
+            "enabled": state.lower() in {"enabled", "enable", "on", "true"},
+            "action_groups": groups,
+            "retention_days": retention,
+        }
 
     def _powerbi(self):
         """Return a lazily-built Power BI client, or ``None`` without a PBI token.
@@ -687,6 +785,29 @@ class LiveFabricProvider:
             log.warning("semantic model %s refresh history error: %s", item_id, exc)
             return None, "transient"
 
+    def _semantic_model_refresh_schedule(
+        self, workspace_id: str, item_id: str
+    ) -> tuple[dict | None, str]:
+        """Read one semantic model's refresh *schedule configuration*.
+
+        Served only by the Power BI Datasets API, whose audience differs from the
+        Fabric crawl token — so without a Power BI token the schedule is
+        *unknown* (``"forbidden"``), never "not configured". That distinction is
+        what lets the alerting check report N/A instead of failing a workspace
+        whose token simply lacked the scope.
+
+        Returns ``(schedule, failure)``. ``(None, "")`` means the model genuinely
+        has no refresh schedule (Direct Lake / push / pipeline-driven refresh).
+        """
+        pbi = self._powerbi()
+        if pbi is None:
+            return None, "forbidden"
+        try:
+            return pbi.dataset_refresh_schedule(item_id, group_id=workspace_id)
+        except Exception as exc:
+            log.warning("semantic model %s refresh schedule error: %s", item_id, exc)
+            return None, "transient"
+
     def _enrich_run_history(self, ctx: WorkspaceContext, workspace_id: str) -> None:
         """Fill ``Item.last_run_utc`` from each runnable item's run/refresh history.
 
@@ -719,7 +840,13 @@ class LiveFabricProvider:
             if item.type == "SemanticModel":
                 stamp, failure = self._semantic_model_last_refresh(workspace_id, item.id)
             else:
-                stamp, failure = self._latest_run(workspace_id, item.id)
+                stamps, failure = self._run_stamps(workspace_id, item.id)
+                stamp = stamps[0] if stamps else None
+                if not failure and len(stamps) > 1:
+                    # Retained so an *observed cadence* can be derived. Capped:
+                    # the interval only needs a handful of runs, and the snapshot
+                    # should not grow with a chatty item's history.
+                    ctx.run_history[item.id] = stamps[:_MAX_RETAINED_RUNS]
             if failure:
                 failed += 1
                 enriched.append(item)
@@ -807,7 +934,9 @@ class LiveFabricProvider:
             Resource.TABLE_SCHEMAS,
             Resource.SHORTCUTS,
             Resource.SEMANTIC_MODEL_DEFINITIONS,
+            Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE,
             Resource.ITEM_RUN_HISTORY,
+            Resource.WAREHOUSE_AUDIT,
         }:
             rows, known = self._values(f"/workspaces/{workspace_id}/items")
             ctx.items = [Item.from_api(row) for row in rows]
@@ -950,6 +1079,33 @@ class LiveFabricProvider:
         if Resource.TABLE_COLUMNS in wanted or Resource.WAREHOUSE_SECURITY in wanted:
             self._read_sql_endpoints(ctx, workspace_id, wanted)
 
+        # Warehouse SQL audit *configuration* — plain Fabric REST, one call per
+        # Warehouse, gated on the Audit permission of the item (not tenant-admin).
+        # No audit rows are ever read: this is a configuration audit, not a log
+        # pull, so runtime data never enters the knowledge base.
+        if Resource.WAREHOUSE_AUDIT in wanted:
+            warehouses = [i for i in ctx.items if i.type == "Warehouse"]
+            attempted = read = forbidden = transient = empty = 0
+            for item in warehouses:
+                attempted += 1
+                settings, failure = self._warehouse_audit(workspace_id, item.id)
+                if failure == "forbidden":
+                    forbidden += 1
+                elif failure == "transient":
+                    transient += 1
+                elif settings is None:
+                    empty += 1
+                else:
+                    read += 1
+                    key = self._unique_key(
+                        ctx.warehouse_audit, item.display_name or item.id, item.id
+                    )
+                    ctx.warehouse_audit[key] = settings
+            self._record_failures(ctx, Resource.WAREHOUSE_AUDIT,
+                                  attempted, read, forbidden, transient, empty)
+            log.info("fetch %s: sql audit settings read for %d of %d warehouse(s)",
+                     workspace_id, read, attempted)
+
         # OneLake shortcuts per lakehouse (governance/lineage: external references).
         if Resource.SHORTCUTS in wanted:
             total = 0
@@ -994,6 +1150,37 @@ class LiveFabricProvider:
             self._record_failures(ctx, Resource.SEMANTIC_MODEL_DEFINITIONS,
                                   attempted, read, forbidden, transient, empty)
             log.info("fetch %s: %d semantic models parsed", workspace_id, len(ctx.semantic_models))
+
+        # Semantic-model refresh *schedule configuration* — one Power BI Datasets
+        # API GET per model, delegated scope only (no tenant-admin). Carries
+        # ``notifyOption``, which is how "a refresh failure alerts the owning
+        # team" is actually configured. No refresh rows are read.
+        if Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE in wanted:
+            attempted = read = forbidden = transient = 0
+            for item in ctx.items:
+                if item.type != "SemanticModel":
+                    continue
+                attempted += 1
+                schedule, failure = self._semantic_model_refresh_schedule(
+                    workspace_id, item.id
+                )
+                if failure == "forbidden":
+                    forbidden += 1
+                elif failure == "transient":
+                    transient += 1
+                else:
+                    # A model with no schedule read cleanly: absence from the map
+                    # is the finding, so it must not count as a failure.
+                    read += 1
+                    if schedule is not None:
+                        key = self._unique_key(
+                            ctx.refresh_schedules, item.display_name or item.id, item.id
+                        )
+                        ctx.refresh_schedules[key] = schedule
+            self._record_failures(ctx, Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE,
+                                  attempted, read, forbidden, transient)
+            log.info("fetch %s: refresh schedule read for %d of %d semantic model(s)",
+                     workspace_id, read, attempted)
 
         return ctx
 

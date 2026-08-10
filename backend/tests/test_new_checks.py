@@ -46,6 +46,7 @@ from auditfast.core.check.operations_reliability.data_operations.automated impor
     activator_configured,
     branching_strategy,
     environment_isolation,
+    git_covers_every_artifact,
     semantic_model_deployment,
     single_source_of_truth,
     unit_tests_exist,
@@ -1172,3 +1173,44 @@ def test_bi_deploy_is_na_when_git_is_unreadable():
 def test_bi_deploy_is_na_without_items():
     assert bi_content_source_controlled_and_promoted(
         _ws_ctx(id="w", unavailable={Resource.ITEMS})).status is Status.NA
+
+
+# --- 11.1.2 source-control coverage ------------------------------------------
+# Regression for a dedup error: `ref="11.1.2"` appears in the *docstrings* of
+# helpers.py and registry.py as an illustrative example, so a grep for it looks
+# like a hit. The real WS-GIT is ref 11.1.1, and 11.1.2 was genuinely unclaimed.
+
+def test_git_coverage_is_na_without_the_git_state():
+    ctx = _ws_ctx(id="w", items=_items(("Notebook", "NB")), unavailable={Resource.GIT})
+    assert git_covers_every_artifact(ctx).status is Status.NA
+
+
+def test_a_disconnected_workspace_covers_nothing():
+    ctx = _ws_ctx(id="w", items=_items(("Notebook", "NB"), ("DataPipeline", "PL")))
+    verdict = git_covers_every_artifact(ctx)
+    assert verdict.score == 0
+    assert "11.1.1" in verdict.evidence, "must point at the connection check"
+
+
+def test_all_supported_types_are_fully_covered():
+    ctx = _ws_ctx(id="w", git_connected=True, items=_items(
+        ("Notebook", "NB"), ("DataPipeline", "PL"), ("SemanticModel", "SM"),
+        ("Warehouse", "WH")))
+    assert git_covers_every_artifact(ctx).score == 3
+
+
+def test_an_auto_created_sql_endpoint_is_not_a_coverage_gap():
+    """Fabric creates a SQL endpoint per Lakehouse; it has no own definition."""
+    ctx = _ws_ctx(id="w", git_connected=True, items=_items(
+        ("Lakehouse", "LH"), ("SQLEndpoint", "LH")))
+    verdict = git_covers_every_artifact(ctx)
+    assert verdict.score == 3
+    assert "SQLEndpoint" not in verdict.evidence
+
+
+def test_an_unsupported_artifact_type_is_reported_as_uncovered():
+    ctx = _ws_ctx(id="w", git_connected=True, items=_items(
+        ("Notebook", "NB"), ("MountedDataFactory", "ADF")))
+    verdict = git_covers_every_artifact(ctx)
+    assert verdict.score < 3
+    assert "MountedDataFactory" in verdict.evidence

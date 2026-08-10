@@ -168,8 +168,22 @@ class Resource(StrEnum):
     #: Warehouse row-level-security policies (``sys.security_policies``), likewise
     #: only readable over the SQL analytics endpoint.
     WAREHOUSE_SECURITY = "warehouseSecurity"
+    #: Per-Warehouse SQL audit *configuration* — state, action groups and
+    #: retention — from
+    #: ``…/warehouses/{id}/settings/sqlAudit``. Plain Fabric REST: it needs the
+    #: Audit permission on the Warehouse item, **not** tenant-admin. Only the
+    #: configuration is read; audit *rows* (``sys.fn_get_audit_file_v2``) are
+    #: runtime data and are deliberately never fetched.
+    WAREHOUSE_AUDIT = "warehouseAudit"
     SHORTCUTS = "shortcuts"
     SEMANTIC_MODEL_DEFINITIONS = "semanticModelDefinitions"
+    #: Per-semantic-model *refresh schedule configuration* — enabled, days/times
+    #: and ``notifyOption`` — from the Power BI Datasets API
+    #: (``…/datasets/{id}/refreshSchedule``). An ordinary delegated read on the
+    #: Power BI token audience, **not** tenant-admin; without a Power BI token it
+    #: is unreadable and its checks report N/A. Only the configuration is read —
+    #: no refresh rows and no refresh history.
+    SEMANTIC_MODEL_REFRESH_SCHEDULE = "semanticModelRefreshSchedule"
     CONNECTIONS = "connections"
     #: Per-item run/refresh recency, read from the job-scheduler history
     #: (``…/items/{id}/jobs/instances``) — the List Items API carries no

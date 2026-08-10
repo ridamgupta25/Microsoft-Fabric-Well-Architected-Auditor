@@ -13,11 +13,21 @@ from auditfast.core.check._tables import (
     col_names,
     columns,
     has_audit_column,
+    in_warehouse,
+    is_audit_column,
+    is_audit_table,
     is_dimension,
     is_fact,
+    is_key_column,
     is_snake_case,
+    is_text_column,
+    is_timestamp_column,
+    key_referent,
+    purpose_tokens,
+    store_of,
+    tables_by_store,
 )
-from auditfast.core.check.helpers import Verdict, binary, covered, not_applicable
+from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
@@ -402,3 +412,870 @@ def table_scd2(ctx: CheckContext) -> Verdict:
     ok = [n for n, t in scd2.items() if all(col in col_names(t) for col in tracked)]
     return covered(len(ok), len(scd2),
                    f"{len(ok)} of {len(scd2)} SCD2 dimensions track valid_from/valid_to/is_current")
+
+
+# =============================================================================
+# Store-aware table checks (1.2.6, 1.2.8, 4.4.9) and dimensional purity
+# (4.5.3, 4.5.4, 4.5.8).
+#
+# The store-aware ones read ``store``/``store_kind``, which the crawler fills in
+# from the SQL analytics endpoint a table's columns were read through. An empty
+# store means the endpoint could not be read — *unknown*, never a mismatch — so
+# every one of them excludes those tables and reports N/A when nothing is left.
+# =============================================================================
+
+#: N/A reason when no table could be attributed to an owning store.
+_NO_STORE = (
+    "No table could be attributed to an owning Lakehouse/Warehouse — the SQL "
+    "analytics endpoints were not readable, so store membership is unknown"
+)
+
+
+@check(
+    id="TB-WH-MODELED", ref="1.2.6",
+    title="Gold Warehouse is consumption-ready and modeled (star schema) for the semantic layer",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+)
+def warehouse_is_modeled(ctx: CheckContext) -> Verdict:
+    """Each Warehouse holds both fact and dimension tables, so it is modeled, not a dump.
+
+    **What it can determine.** Which tables are *known* to live in a Warehouse
+    (from the SQL endpoint they were read through), and whether each such
+    Warehouse carries both fact-named and dimension-named tables — the readable
+    signature of a star schema.
+
+    **What it cannot.** Whether the semantic layer in a *different* workspace
+    actually binds to this Warehouse: the point's cross-workspace half is not
+    readable from a per-workspace crawl, and is not guessed at here. Nor does it
+    judge relationships or grain.
+
+    Narrower than ``TB-STARSCHEMA`` (ref 4.5.1), which asks the same fact+dim
+    question across *all* tables in the workspace regardless of where they live.
+    This one is Warehouse-scoped: a Lakehouse-only estate makes it N/A, and a
+    star that exists only because facts sit in a Lakehouse and dimensions in a
+    Warehouse does not satisfy it.
+    """
+    tables = ctx.workspace.tables
+    if not tables:
+        return not_applicable(_NO_TABLES)
+
+    warehouse_tables = {n: t for n, t in tables.items() if in_warehouse(t)}
+    if not warehouse_tables:
+        unknown = sum(1 for t in tables.values() if not store_of(t))
+        return not_applicable(
+            f"No table is known to live in a Warehouse ({len(tables)} table(s) read; "
+            f"{unknown} with no readable owning store)"
+        )
+
+    by_store = tables_by_store(warehouse_tables)
+    if not by_store:
+        return not_applicable(_NO_STORE)
+
+    modeled, detail = [], []
+    for store, store_tables in sorted(by_store.items()):
+        facts = [n for n in store_tables if is_fact(n)]
+        dims = [n for n in store_tables if is_dimension(n)]
+        if facts and dims:
+            modeled.append(store)
+            detail.append(f"{store}: {len(facts)} fact / {len(dims)} dimension table(s)")
+        else:
+            detail.append(
+                f"{store}: {len(facts)} fact / {len(dims)} dimension table(s) — not modeled"
+            )
+    return covered(
+        len(modeled), len(by_store),
+        f"{len(modeled)} of {len(by_store)} Warehouse(s) hold both fact and dimension "
+        f"tables — {'; '.join(detail)}. Whether a semantic model in another workspace "
+        f"consumes them is not readable here.",
+    )
+
+
+@check(
+    id="TB-AUDIT-SEPARATED", ref="1.2.8",
+    title="Audit Tables role clearly defined and separated from business data",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=False,
+)
+def audit_tables_separated(ctx: CheckContext) -> Verdict:
+    """Audit/DQ tables live in a store of their own rather than beside business tables.
+
+    **What it can determine.** Which tables are audit-shaped — either their name
+    says so (audit / log / quality / exception / reject) or their columns are
+    dominated by lineage columns — and which store holds each, so it can say
+    whether audit data is concentrated in a dedicated store or scattered through
+    the business stores.
+
+    **What it cannot.** Whether the audit tables are *populated*, or whether the
+    role is documented anywhere. Tables whose owning store could not be read are
+    excluded, never counted as a mismatch.
+    """
+    tables = ctx.workspace.tables
+    if not tables:
+        return not_applicable(_NO_TABLES)
+
+    by_store = tables_by_store(tables)
+    if not by_store:
+        return not_applicable(_NO_STORE)
+
+    audit_by_store = {
+        store: [n for n, t in store_tables.items() if is_audit_table(n, t)]
+        for store, store_tables in by_store.items()
+    }
+    total_audit = sum(len(names) for names in audit_by_store.values())
+    if not total_audit:
+        return not_applicable(
+            f"No audit/log/quality-shaped table found in {len(by_store)} store(s), so "
+            f"there is no audit role to separate"
+        )
+
+    separated, detail = 0, []
+    for store, audit_names in sorted(audit_by_store.items()):
+        if not audit_names:
+            continue
+        business = len(by_store[store]) - len(audit_names)
+        # A store is an audit store when audit tables dominate it — a couple of
+        # reference tables alongside the logs is "few", not a mixed store.
+        dedicated = business <= len(audit_names) // 4
+        if dedicated:
+            separated += len(audit_names)
+        detail.append(
+            f"{store}: {len(audit_names)} audit / {business} business table(s)"
+            f"{'' if dedicated else ' — mixed'}"
+        )
+    return covered(
+        separated, total_audit,
+        f"{separated} of {total_audit} audit table(s) sit in a store dedicated to audit "
+        f"data — {'; '.join(detail)}",
+    )
+
+
+@check(
+    id="TB-CONFORMED-DIM", ref="4.4.9",
+    title="Cross-domain conformed dimensions shared, not duplicated per domain",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
+)
+def conformed_dimensions(ctx: CheckContext) -> Verdict:
+    """One dimension per business concept, shared across stores instead of copied into each.
+
+    **What it can determine.** Dimension names that reduce to the same *purpose*
+    once container, tier and version words are stripped (``DimCustomer``,
+    ``dim_customer_v2``, ``GOLD_dim_customer``). The same purpose materialised in
+    two or more stores is a per-domain copy, not a conformed dimension.
+
+    **What it cannot.** Whether two same-named dimensions actually hold the same
+    rows, or whether a domain copy was a deliberate, documented exception. Names
+    that reduce to nothing but noise are excluded rather than guessed at, and
+    tables with no readable owning store never count as a duplicate.
+    """
+    tables = ctx.workspace.tables
+    if not tables:
+        return not_applicable(_NO_TABLES)
+
+    by_store = tables_by_store(tables)
+    if not by_store:
+        return not_applicable(_NO_STORE)
+    if len(by_store) < 2:
+        return not_applicable(
+            f"Only {len(by_store)} store could be attributed, so no dimension can be "
+            f"duplicated across stores"
+        )
+
+    stores_by_purpose: dict[tuple[str, ...], set[str]] = {}
+    judged = 0
+    for store, store_tables in by_store.items():
+        for name in store_tables:
+            if not is_dimension(name):
+                continue
+            purpose = purpose_tokens(name)
+            if not purpose:
+                continue
+            judged += 1
+            stores_by_purpose.setdefault(purpose, set()).add(store)
+
+    if not judged:
+        return not_applicable(
+            "No dimension table with a comparable name was attributed to a store"
+        )
+
+    duplicated = {p: s for p, s in stores_by_purpose.items() if len(s) > 1}
+    shared = len(stores_by_purpose) - len(duplicated)
+    if not duplicated:
+        return covered(
+            len(stores_by_purpose), len(stores_by_purpose),
+            f"{len(stores_by_purpose)} dimension concept(s) across {len(by_store)} store(s) "
+            f"each exist in exactly one store",
+        )
+    detail = "; ".join(
+        f"'{' '.join(purpose)}' in " + ", ".join(sorted(stores))
+        for purpose, stores in sorted(duplicated.items())[:3]
+    )
+    return covered(
+        shared, len(stores_by_purpose),
+        f"{len(duplicated)} of {len(stores_by_purpose)} dimension concept(s) are "
+        f"materialised in more than one store: {detail}",
+    )
+
+
+@check(
+    id="TB-FACT-PURITY", ref="4.5.3",
+    title="Fact tables contain only foreign keys and measures (no descriptive attributes)",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=False,
+)
+def fact_tables_have_no_descriptive_attributes(ctx: CheckContext) -> Verdict:
+    """Fact tables carry keys, measures and lineage columns — descriptions belong in dimensions.
+
+    **What it can determine.** Text-typed columns on a fact table that are
+    neither a key/identifier nor an audit/lineage column. Those are descriptive
+    attributes that should live on a dimension.
+
+    **What it cannot.** Whether a numeric column is a genuine measure, or whether
+    a denormalised attribute was a deliberate, documented performance choice.
+    Key detection is deliberately generous, so the count under-reports rather
+    than accuses. Facts whose columns could not be read are excluded.
+    """
+    tables = ctx.workspace.tables
+    if not tables:
+        return not_applicable(_NO_TABLES)
+    facts = {n: t for n, t in tables.items()
+             if is_fact(n) and any(c.get("type") for c in columns(t))}
+    if not facts:
+        return not_applicable(
+            "No fact table with readable column types — nothing to judge for "
+            "descriptive attributes"
+        )
+
+    clean, offenders = [], []
+    for name, table in facts.items():
+        descriptive = [
+            c.get("name") or ""
+            for c in columns(table)
+            if c.get("type")
+            and is_text_column(c)
+            and not is_key_column(c.get("name") or "")
+            and not is_audit_column(c.get("name") or "")
+        ]
+        if descriptive:
+            offenders.append(f"{name} ({', '.join(sorted(descriptive)[:4])})")
+        else:
+            clean.append(name)
+    return covered(
+        len(clean), len(facts),
+        f"{len(clean)} of {len(facts)} fact table(s) carry only keys, measures and audit "
+        f"columns" + (f"; descriptive attributes on {'; '.join(sorted(offenders)[:3])}"
+                      if offenders else ""),
+    )
+
+
+@check(
+    id="TB-DIM-DENORM", ref="4.5.4",
+    title="Dimension tables are denormalized appropriately (star over snowflake unless justified)",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=False,
+)
+def dimensions_are_denormalized(ctx: CheckContext) -> Verdict:
+    """A dimension is flat: it does not key out to another dimension table.
+
+    **What it can determine.** A key column on one dimension whose name resolves
+    to *another* dimension table present in the workspace (``dim_product`` with
+    ``category_sk`` beside a ``dim_category``). That is the snowflake shape the
+    point warns about.
+
+    **What it cannot.** Whether a snowflake was justified — a genuinely large,
+    slowly-changing outrigger is a legitimate exception — so the evidence names
+    the links for review rather than asserting they are wrong. A key pointing at
+    a dimension that is not in this workspace is not counted, because it cannot
+    be confirmed.
+    """
+    tables = ctx.workspace.tables
+    if not tables:
+        return not_applicable(_NO_TABLES)
+    dims = {n: t for n, t in tables.items() if is_dimension(n) and columns(t)}
+    if not dims:
+        return not_applicable(_NO_DIMS)
+
+    purposes: dict[tuple[str, ...], str] = {}
+    for name in dims:
+        purpose = purpose_tokens(name)
+        if purpose:
+            purposes.setdefault(purpose, name)
+
+    flat, snowflaked = [], []
+    for name, table in dims.items():
+        own = purpose_tokens(name)
+        links = sorted({
+            purposes[referent]
+            for referent in (key_referent(c.get("name") or "") for c in columns(table))
+            if referent and referent != own and referent in purposes
+        })
+        if links:
+            snowflaked.append(f"{name} -> {', '.join(links)}")
+        else:
+            flat.append(name)
+    return covered(
+        len(flat), len(dims),
+        f"{len(flat)} of {len(dims)} dimension(s) are flat"
+        + (f"; snowflake links: {'; '.join(sorted(snowflaked)[:3])} — confirm each is a "
+           f"justified outrigger" if snowflaked else ""),
+    )
+
+
+#: Column-name markers of a declared SCD strategy. Any one of them means the
+#: dimension's change handling was designed rather than defaulted.
+#:
+#: ``start_date``/``end_date``/``version``/``expiry_date`` are deliberately
+#: **excluded**: they are ordinary business columns (a contract's term, a
+#: promotion window, a product revision), and excluding them keeps this
+#: vocabulary consistent with :func:`is_audit_column`, which rejects the same
+#: words for the same reason. An SCD marker must name *row validity* or *row
+#: change*, never an arbitrary date range.
+#:
+#: ``is_active``/``is_deleted`` are excluded for the same reason — they are
+#: business state flags. A row being active says nothing about whether its
+#: history is versioned.
+_SCD_MARKERS: frozenset[str] = frozenset({
+    "valid_from", "valid_to", "validfrom", "validto", "valid_until", "validuntil",
+    "effective_from", "effective_to", "effectivefrom", "effectiveto",
+    "effective_start_date", "effective_end_date",
+    "row_effective_date", "row_expiry_date", "record_start_date", "record_end_date",
+    "is_current", "iscurrent", "current_flag", "currentflag", "current_ind",
+    "row_hash", "rowhash", "hash_diff", "hashdiff", "row_version", "rowversion",
+    "record_version", "scd_type", "scdtype",
+})
+
+
+@check(
+    id="TB-SCD-STRATEGY", ref="4.5.8",
+    title="SCD strategy defined and implemented per dimension (Type 1 / Type 2 / Hybrid)",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=False,
+)
+def scd_strategy_per_dimension(ctx: CheckContext) -> Verdict:
+    """Each dimension shows a declared change-handling strategy in its schema.
+
+    **What it can determine.** Whether a dimension carries Type-2/hybrid markers
+    (validity dates, a current flag, a row hash, a version) — the only schema
+    evidence that a strategy was *chosen* per dimension.
+
+    **What it cannot.** Whether an overwrite-in-place (Type 1) dimension was a
+    deliberate decision or an unexamined default: both look identical in the
+    schema. Type 1 is a legitimate strategy, so a dimension with no markers is
+    never a hard FAIL. The bands reflect exactly that: **3** when every dimension
+    declares its handling in the schema, **2** when some do (the estate knows the
+    pattern and applied it where needed), and **1** — partial, not zero — when
+    none do, because the tables may all be correctly Type 1 with the decision
+    recorded somewhere this check cannot read.
+
+    Broader than ``TB-SCD2`` (ref 4.5.9), which asks only whether dimensions
+    *already identified as Type 2* carry the full valid_from/valid_to/is_current
+    triple. This one asks whether any strategy is evident at all.
+    """
+    tables = ctx.workspace.tables
+    if not tables:
+        return not_applicable(_NO_TABLES)
+    dims = {n: t for n, t in tables.items() if is_dimension(n) and columns(t)}
+    if not dims:
+        return not_applicable(_NO_DIMS)
+
+    declared = [n for n, t in dims.items()
+                if any(c.replace(" ", "") in _SCD_MARKERS for c in col_names(t))]
+    if len(declared) == len(dims):
+        return graded(
+            3,
+            f"All {len(dims)} dimension(s) declare their change handling in the schema "
+            f"(validity dates, current flag, row hash or version)",
+        )
+    if declared:
+        return graded(
+            2,
+            f"{len(declared)} of {len(dims)} dimension(s) declare an SCD strategy "
+            f"({', '.join(sorted(declared)[:4])}); the rest overwrite in place (Type 1 "
+            f"by default), which may be correct but is not evident in the schema",
+        )
+    return graded(
+        1,
+        f"None of the {len(dims)} dimension(s) carry SCD markers — all are Type 1 by "
+        f"default. That is a legitimate strategy, but no schema evidence shows it was "
+        f"chosen per dimension; confirm and record the decision",
+    )
+
+
+# =============================================================================
+# 4.5.2 — fact grain, and 4.5.11 — degenerate / junk dimension candidates
+#
+# Both points are only *partly* readable, and the two halves are named in each
+# docstring rather than blurred:
+#
+# * 4.5.2 asks for a grain that is "clearly defined **and documented**". No
+#   Fabric REST call and no SQL analytics endpoint query returns a table
+#   description, an extended property or a column comment, so the documented
+#   half is out of reach entirely. Only the "clearly defined" half is scored.
+# * 4.5.11 asks for degenerate/junk dimensions "where appropriate". Whether a
+#   modelling choice is appropriate is a judgement, and the deciding fact
+#   (cardinality) needs row data, which this tool must not fetch. That point is
+#   therefore reported as an unscored note listing candidates for review.
+# =============================================================================
+
+#: A grain needs at least this many independent components to be identifiable
+#: from the schema. One key alone ("one row per order") is as often a surrogate
+#: key on a wide table as a declared grain; two say "one row per X per Y".
+_MIN_GRAIN_COMPONENTS = 2
+
+#: The pseudo-referent used for a fact's time component when that component comes
+#: from a plain timestamp column rather than a date key.
+_TIME_COMPONENT = ("<time>",)
+
+
+def _grain_components(name: str, table: dict) -> set[tuple[str, ...]]:
+    """The distinct things one row of ``table`` is keyed by, as purpose tuples.
+
+    A key column whose referent is the fact's *own* purpose (``sales_sk`` on
+    ``fact_sales``) is the row's surrogate identity, not a grain component, so it
+    is excluded. A timestamp column that is not itself a key adds the time
+    component, because "per day" is part of most fact grains.
+    """
+    own = purpose_tokens(name)
+    components: set[tuple[str, ...]] = set()
+    timed = False
+    for column in columns(table):
+        column_name = column.get("name") or ""
+        referent = key_referent(column_name)
+        if referent and referent != own:
+            components.add(referent)
+        elif not is_key_column(column_name) and is_timestamp_column(column):
+            timed = True
+    if timed:
+        components.add(_TIME_COMPONENT)
+    return components
+
+
+@check(
+    id="TB-FACT-GRAIN", ref="4.5.2",
+    title="Fact table grain clearly defined and documented for each fact table",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=False,
+)
+def fact_grain_is_identifiable(ctx: CheckContext) -> Verdict:
+    """Each fact table's schema shows what one row *is* — the keys that define its grain.
+
+    **What it can determine.** For every fact table with readable columns, the
+    distinct grain components its schema declares: foreign keys resolving to
+    something other than the fact itself (``customer_sk``, ``product_id``,
+    ``date_sk``) plus a time component from a non-key timestamp column. Two or
+    more such components mean the schema states a grain — "one row per customer
+    per day" — that a reviewer can read off the table. Fewer means the grain is
+    not evident from the schema at all.
+
+    **What it cannot — half the checklist point.** *Documented* is not readable.
+    No Fabric REST endpoint and no SQL analytics endpoint query this tool makes
+    returns a table description, an extended property, or a column comment, so
+    whether the grain is written down anywhere is out of reach and is **not**
+    guessed at: this check scores only the "clearly defined" half, and the
+    evidence says so. It also cannot confirm the declared grain is the *intended*
+    one, cannot tell a genuine grain key from a coincidentally key-named column,
+    and never reads a row to check the grain is actually unique.
+
+    **Siblings.** ``TB-FACT-PURITY`` (ref 4.5.3) asks whether a fact carries
+    descriptive text it should not; this asks whether it carries enough keys to
+    say what a row means. ``NB-GRAIN-UNIQUE`` (ref 5.4.9) reads notebook code for
+    a duplicate-grain assertion — code, not schema, and uniqueness, not
+    definition.
+    """
+    tables = ctx.workspace.tables
+    if not tables:
+        return not_applicable(_NO_TABLES)
+    facts = {n: t for n, t in tables.items() if is_fact(n) and columns(t)}
+    if not facts:
+        return not_applicable(
+            "No fact table with readable column metadata — there is no grain to read"
+        )
+
+    defined, undefined = [], []
+    for name, table in sorted(facts.items()):
+        components = _grain_components(name, table)
+        if len(components) >= _MIN_GRAIN_COMPONENTS:
+            defined.append(f"{name} ({len(components)} grain key(s))")
+        else:
+            undefined.append(f"{name} ({len(components)} grain key(s))")
+    return covered(
+        len(defined), len(facts),
+        f"{len(defined)} of {len(facts)} fact table(s) declare a readable grain — at least "
+        f"{_MIN_GRAIN_COMPONENTS} distinct grain key(s) in the schema"
+        + (f"; grain not evident on {'; '.join(undefined[:3])}" if undefined else "")
+        + ". Whether the grain is *documented* is not readable from any Fabric or SQL "
+          "endpoint API, so only the 'clearly defined' half of the point is scored here.",
+    )
+
+
+#: Column names that read as a low-cardinality flag or indicator — the kind of
+#: attribute a junk dimension is built to collapse. Matched on the whole
+#: (lower-cased) name so ``is_active``, ``paid_flag`` and ``order_status`` count
+#: while ``flag_description`` does not.
+_FLAG_COLUMN = re.compile(
+    r"^(?:is|has|can|was|are)_\w+$|"
+    r"^\w+_(?:flag|flg|ind|indicator|status|type|code|category|reason)$|"
+    r"^(?:flag|status|indicator)$",
+    re.IGNORECASE,
+)
+
+#: Below this many flag columns on one fact, collapsing them into a junk
+#: dimension buys nothing — the pattern exists to remove *several* low-value
+#: columns, not one.
+_MIN_JUNK_CANDIDATES = 3
+
+
+@check(
+    id="TB-DEGENERATE-JUNK-DIM", ref="4.5.11",
+    title="Degenerate and junk dimensions used where appropriate",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=False,
+)
+def degenerate_and_junk_dimension_candidates(ctx: CheckContext) -> Verdict:
+    """Report fact columns shaped like a degenerate or junk dimension — unscored, for review.
+
+    **Deliberately unscored (a `note`).** The point says "where appropriate", and
+    appropriateness is a modelling judgement no API can make: a degenerate
+    dimension is *correct* when an order number genuinely has no attributes of
+    its own, and *wrong* when the attributes exist and were simply never
+    modelled. The deciding fact for a junk dimension — column cardinality — needs
+    row data, which this tool must not fetch. Scoring either way would be a
+    guess, so this reports the candidates and names them instead.
+
+    **What it can determine.** *Degenerate candidates*: key-shaped columns on a
+    fact table whose referent matches no dimension table in this workspace and is
+    not the fact's own identity (``order_number`` on ``fact_sales`` with no
+    ``dim_order``) — the exact shape of a degenerate dimension. *Junk
+    candidates*: three or more flag/indicator/status-shaped columns on one fact,
+    the cluster a junk dimension exists to collapse.
+
+    **What it cannot.** Column cardinality (no row data is read), whether the
+    referenced dimension lives in another workspace, whether a degenerate column
+    is intentional, or whether an existing junk dimension is already in use
+    somewhere it cannot see. Every name below is a *candidate for review*, never
+    a finding.
+
+    **Sibling.** ``TB-FACT-PURITY`` (ref 4.5.3) scores *text* attributes on a
+    fact that belong on a dimension. This looks at key- and flag-shaped columns,
+    which that check deliberately ignores, and judges neither.
+    """
+    tables = ctx.workspace.tables
+    if not tables:
+        return not_applicable(_NO_TABLES)
+    facts = {n: t for n, t in tables.items() if is_fact(n) and columns(t)}
+    if not facts:
+        return not_applicable(
+            "No fact table with readable column metadata — no degenerate or junk "
+            "dimension candidate can be identified"
+        )
+
+    dimension_purposes = {
+        purpose_tokens(n) for n in tables if is_dimension(n) and purpose_tokens(n)
+    }
+
+    degenerate: list[str] = []
+    junk: list[str] = []
+    for name, table in sorted(facts.items()):
+        own = purpose_tokens(name)
+        orphan_keys = sorted({
+            column.get("name") or ""
+            for column in columns(table)
+            if (referent := key_referent(column.get("name") or ""))
+            and referent != own
+            and referent not in dimension_purposes
+        })
+        if orphan_keys:
+            degenerate.append(f"{name}: {', '.join(orphan_keys[:4])}")
+        flags = sorted({
+            (column.get("name") or "")
+            for column in columns(table)
+            if _FLAG_COLUMN.match((column.get("name") or "").strip())
+        })
+        if len(flags) >= _MIN_JUNK_CANDIDATES:
+            junk.append(f"{name}: {len(flags)} flag column(s) ({', '.join(flags[:4])})")
+
+    if not degenerate and not junk:
+        return note(
+            f"No degenerate or junk dimension candidate found across {len(facts)} fact "
+            f"table(s): every key column resolves to a dimension in this workspace and no "
+            f"fact carries {_MIN_JUNK_CANDIDATES}+ flag/status columns. Whether the "
+            f"existing model uses the patterns *appropriately* is a modelling judgement "
+            f"this check does not make."
+        )
+    parts = []
+    if degenerate:
+        parts.append(
+            f"{len(degenerate)} fact table(s) carry a key with no matching dimension "
+            f"(degenerate-dimension candidates) — {'; '.join(degenerate[:3])}"
+        )
+    if junk:
+        parts.append(
+            f"{len(junk)} fact table(s) carry {_MIN_JUNK_CANDIDATES}+ flag/status columns "
+            f"(junk-dimension candidates) — {'; '.join(junk[:3])}"
+        )
+    return note(
+        "; ".join(parts)
+        + ". Reported for review, not scored: cardinality is not readable without querying "
+          "rows, and whether each pattern is appropriate here is a modelling judgement."
+    )
+
+
+# =============================================================================
+# 4.4.1 — Warehouse schema organization
+# =============================================================================
+
+#: Words that mark a schema as the *landing / work* area rather than a
+#: presentation schema a consumer queries.
+_STAGING_SCHEMA_WORDS: frozenset[str] = frozenset({
+    "stg", "stage", "staging", "landing", "land", "raw", "bronze", "ingest",
+    "ingestion", "tmp", "temp", "work", "wrk", "etl", "elt", "load", "src",
+})
+
+#: The default schema every Warehouse ships with. A Warehouse whose tables all
+#: sit here has taken no organisational decision at all.
+_DEFAULT_SCHEMA = "dbo"
+
+
+def _schema_qualifier(key: str, table: dict) -> str:
+    """The SQL schema a Warehouse table key declares, or ``""`` when it is bare.
+
+    The crawler keys a table by its name, and prefixes ``"<store>."`` only when
+    two stores hold a table of the same name — so the owning store's name is
+    stripped first, and never mistaken for a schema.
+    """
+    store = store_of(table)
+    rest = key
+    if store and rest.lower().startswith(f"{store.lower()}."):
+        rest = rest[len(store) + 1:]
+    head, separator, tail = rest.partition(".")
+    return head.strip() if separator and tail.strip() and head.strip() else ""
+
+
+def _schema_score(schemas: dict[str, int]) -> int:
+    """0-3 for one Warehouse's schema layout, given ``{schema: table count}``."""
+    named = {s for s in schemas if s and s != _DEFAULT_SCHEMA}
+    has_staging = any(s in _STAGING_SCHEMA_WORDS for s in schemas)
+    presentation = {s for s in named if s not in _STAGING_SCHEMA_WORDS}
+    if not named:
+        return 0                                    # everything in dbo
+    if len(named) == 1 and not has_staging:
+        return 1                                    # one schema, but at least not dbo
+    if not (has_staging and presentation):
+        return 2                                    # domains split, no separate staging
+    return 3
+
+
+@check(
+    id="TB-WH-SCHEMAS", ref="4.4.1",
+    title="Warehouse schema organization is logical (by domain schema, plus staging schema)",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=True,
+)
+def warehouse_schema_organization(ctx: CheckContext) -> Verdict:
+    """Warehouse tables are split across domain schemas, with staging kept separate.
+
+    Judged per Warehouse, from the schema each table name is qualified with:
+    everything in ``dbo`` scores 0 (no organisational decision was taken), a
+    single non-default schema 1, two or more domain schemas 2, and two or more
+    domain schemas *plus* a distinct staging/landing schema 3. The workspace
+    verdict is the floor of the per-Warehouse mean, and the evidence names each
+    Warehouse's schemas.
+
+    Only tables *known* to live in a Warehouse are judged (``in_warehouse``), the
+    same gating the other store-aware checks use — a Lakehouse has no comparable
+    schema concept, and a table whose owning store could not be read is unknown,
+    never a finding.
+
+    **What it cannot determine, and it matters here.** The schema qualifier is
+    read from the table key, and this project's SQL-endpoint reader currently
+    selects ``TABLE_NAME`` from ``INFORMATION_SCHEMA.COLUMNS`` **without**
+    ``TABLE_SCHEMA``, so on a snapshot taken by that reader no Warehouse table
+    carries a schema at all. That is a *gap in what was read*, not a badly
+    organised Warehouse, so the check returns **N/A with that reason** rather
+    than scoring 0 — the N/A-not-FAIL rule. Adding ``TABLE_SCHEMA`` to that one
+    existing query (no new endpoint, no new resource) plus a re-crawl is what
+    turns this check on.
+    """
+    tables = ctx.workspace.tables
+    if not tables:
+        return not_applicable(_NO_TABLES)
+
+    warehouse_tables = {n: t for n, t in tables.items() if in_warehouse(t)}
+    if not warehouse_tables:
+        return not_applicable(
+            "No table in this workspace is known to live in a Warehouse, so there "
+            "is no Warehouse schema layout to judge"
+        )
+
+    by_store: dict[str, dict[str, int]] = {}
+    qualified = 0
+    for name, table in warehouse_tables.items():
+        schema = _schema_qualifier(name, table).lower()
+        if schema:
+            qualified += 1
+        store = store_of(table) or "(unnamed warehouse)"
+        counts = by_store.setdefault(store, {})
+        counts[schema] = counts.get(schema, 0) + 1
+
+    if not qualified:
+        return not_applicable(
+            f"None of the {len(warehouse_tables)} Warehouse table(s) read carries a "
+            f"schema qualifier — the SQL-endpoint reader records the table name "
+            f"without its INFORMATION_SCHEMA.TABLE_SCHEMA — so schema organisation "
+            f"cannot be assessed from this snapshot"
+        )
+
+    scores = {store: _schema_score(counts) for store, counts in by_store.items()}
+    detail = "; ".join(
+        f"'{store}': " + ", ".join(
+            f"{schema or '(unqualified)'} ({count} table(s))"
+            for schema, count in sorted(by_store[store].items())
+        )
+        for store in sorted(by_store)
+    )
+    return graded(
+        sum(scores.values()) // len(scores),
+        f"{len(by_store)} Warehouse(s) judged on schema layout — {detail}. "
+        f"{qualified} of {len(warehouse_tables)} Warehouse table(s) carry a schema "
+        f"qualifier; a Warehouse holding everything in dbo, or with no staging "
+        f"schema separate from its presentation schemas, scores below full.",
+    )
+
+
+# =============================================================================
+# 4.4.2 — Warehouse naming *consistency* (one convention, whichever it is)
+# =============================================================================
+
+#: A name written entirely in one convention. Order matters when matching:
+#: ``customer_id`` is snake before it is anything else, and ``ID`` is UPPER
+#: before it is Pascal.
+_NAMING_STYLES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("snake_case", re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")),
+    ("UPPER_CASE", re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$")),
+    ("PascalCase", re.compile(r"^(?:[A-Z][a-z0-9]*)+$")),
+    ("camelCase", re.compile(r"^[a-z][a-z0-9]*(?:[A-Z][a-z0-9]*)+$")),
+)
+
+
+def naming_style(name: str) -> str:
+    """Which single naming convention ``name`` is written in, or ``"mixed"``.
+
+    ``"mixed"`` covers everything that follows no one convention — a space in
+    the name, ``Customer_ID`` mixing Pascal with underscores, ``LDP Course
+    Name/Domain`` — and is what makes an estate's naming *inconsistent*
+    regardless of which convention it chose.
+    """
+    text = (name or "").strip()
+    if not text:
+        return "mixed"
+    for style, pattern in _NAMING_STYLES:
+        if pattern.match(text):
+            return style
+    return "mixed"
+
+
+def _leaf_name(key: str, table: dict) -> str:
+    """The bare table name, with any store and schema qualifier removed."""
+    rest = _strip_store(key, table)
+    return rest.rpartition(".")[2] if "." in rest else rest
+
+
+def _strip_store(key: str, table: dict) -> str:
+    store = store_of(table)
+    if store and key.lower().startswith(f"{store.lower()}."):
+        return key[len(store) + 1:]
+    return key
+
+
+def _dominant(styles: list[str]) -> tuple[str, int]:
+    """The most common convention in ``styles`` and how many names use it.
+
+    ``mixed`` is never dominant: a name in no convention cannot be the standard
+    the estate follows. Ties break alphabetically so the answer is stable.
+    """
+    counts: dict[str, int] = {}
+    for style in styles:
+        if style != "mixed":
+            counts[style] = counts.get(style, 0) + 1
+    if not counts:
+        return "none", 0
+    best = max(sorted(counts), key=lambda style: counts[style])
+    return best, counts[best]
+
+
+@check(
+    id="TB-WH-NAME-CONSISTENCY", ref="4.4.2",
+    title="Table and column naming conventions are consistent across the Warehouse",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=False,
+)
+def warehouse_naming_is_internally_consistent(ctx: CheckContext) -> Verdict:
+    """Every Warehouse table and column follows *one* convention — whichever one.
+
+    Each name is classified as ``snake_case``, ``UPPER_CASE``, ``PascalCase``,
+    ``camelCase``, or ``mixed`` (no single convention — a space, or Pascal words
+    joined by underscores). The dominant convention is then found separately for
+    table names and for column names, and the score is the share of names that
+    follow their own group's dominant convention. A Warehouse written entirely
+    in PascalCase scores full marks; one that is half snake and half Pascal does
+    not.
+
+    **Deliberately different from ``TB-COL-NAMING`` (ref 4.2.3)**, which scores
+    the share of columns that are specifically ``snake_case``, across *every*
+    table in the workspace. Two differences, both real: this one is scoped to
+    tables known to live in a **Warehouse** (``in_warehouse``), and it mandates
+    **no particular convention** — it measures internal consistency, so an
+    all-PascalCase Warehouse passes here and fails there, which is the intended
+    distinction between "follow the house style" and "follow snake_case".
+
+    Store and schema qualifiers are stripped before judging, so a key like
+    ``Sales.dbo.FactOrders`` is judged on ``FactOrders``. N/A when no table is
+    known to live in a Warehouse; column consistency is skipped (and said so)
+    when no column metadata was read.
+    """
+    tables = ctx.workspace.tables
+    if not tables:
+        return not_applicable(_NO_TABLES)
+
+    warehouse_tables = {n: t for n, t in tables.items() if in_warehouse(t)}
+    if not warehouse_tables:
+        return not_applicable(
+            "No table in this workspace is known to live in a Warehouse, so "
+            "Warehouse naming consistency cannot be judged"
+        )
+
+    table_styles = [naming_style(_leaf_name(n, t)) for n, t in warehouse_tables.items()]
+    column_styles = [
+        naming_style(str(column.get("name") or ""))
+        for table in warehouse_tables.values()
+        for column in columns(table)
+    ]
+
+    table_convention, table_ok = _dominant(table_styles)
+    column_convention, column_ok = _dominant(column_styles)
+
+    compliant = table_ok + column_ok
+    total = len(table_styles) + len(column_styles)
+
+    detail = (
+        f"{table_ok} of {len(table_styles)} Warehouse table name(s) follow the "
+        f"dominant convention ({table_convention})"
+    )
+    if column_styles:
+        detail += (f"; {column_ok} of {len(column_styles)} column name(s) follow "
+                   f"theirs ({column_convention})")
+    else:
+        detail += ("; no column metadata was read, so column naming is not "
+                   "included in this score")
+    detail += (". Consistency is what is scored — any one convention counts, "
+               "provided the Warehouse sticks to it.")
+    return covered(compliant, total, detail)

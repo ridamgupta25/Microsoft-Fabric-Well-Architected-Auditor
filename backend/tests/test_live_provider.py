@@ -48,6 +48,28 @@ class _FakePowerBI:
         return dict(self.created)
 
 
+class _FakeRefreshSchedulePowerBI:
+    """A stand-in for PowerBIClient that serves canned refresh *schedules*.
+
+    Returns ``(schedule, failure)`` per dataset id, so a test can exercise the
+    read / no-schedule / forbidden branches independently of HTTP.
+    """
+
+    def __init__(self, by_dataset: dict):
+        self.by_dataset = by_dataset
+        self.calls: list[tuple] = []
+
+    def dataset_refresh_schedule(self, dataset_id, group_id=None):
+        self.calls.append((dataset_id, group_id))
+        return self.by_dataset.get(dataset_id, (None, ""))
+
+    def dataset_last_refresh(self, dataset_id, group_id=None):
+        return None, ""
+
+    def dataset_created_dates(self, group_id=None):
+        return {}
+
+
 def test_values_follows_continuation_to_the_last_page():
     provider = LiveFabricProvider("token")
     base = provider.BASE
@@ -327,6 +349,121 @@ def test_fetch_run_history_all_forbidden_marks_resource_unavailable():
     assert ctx.read_failures == {}
 
 
+def test_fetch_retains_every_run_stamp_for_the_observed_cadence():
+    """The cadence signal comes from the *same* jobs/instances page, not a new call.
+
+    ``Item.last_run_utc`` keeps only the newest run, which cannot express an
+    interval. The page already contains the rest, so retaining it is a parsing
+    change with no extra HTTP cost - which is what makes ref 10.4.2 answerable.
+    """
+    provider = LiveFabricProvider("token")
+    base = provider.BASE
+    items = {"value": [
+        {"id": "pl-1", "type": "DataPipeline", "displayName": "PL_Monitoring_Refresh"},
+    ]}
+    jobs = {"value": [
+        {"status": "Completed", "startTimeUtc": "2026-03-02T07:00:00Z",
+         "endTimeUtc": "2026-03-02T07:05:00Z"},
+        {"status": "Completed", "startTimeUtc": "2026-03-02T09:00:00Z",
+         "endTimeUtc": "2026-03-02T09:05:00Z"},
+        {"status": "Failed", "startTimeUtc": "2026-03-02T08:00:00Z"},  # still running/failed
+    ]}
+    session = _FakeSession({
+        f"{base}/workspaces/ws-1": _FakeResponse(200, {"displayName": "Logs"}),
+        f"{base}/workspaces/ws-1/items": _FakeResponse(200, items),
+        f"{base}/workspaces/ws-1/items/pl-1/jobs/instances": _FakeResponse(200, jobs),
+    })
+    provider._session = session
+
+    from auditfast.core.enums import Resource
+
+    ctx = provider.fetch("ws-1", resources=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY])
+
+    # Newest first, and a run with no end time contributes its start time.
+    assert ctx.run_history == {"pl-1": [
+        "2026-03-02T09:05:00Z", "2026-03-02T08:00:00Z", "2026-03-02T07:05:00Z",
+    ]}
+    assert ctx.items[0].last_run_utc == "2026-03-02T09:05:00Z"
+    # One call, not two: recency and cadence come from the same page.
+    assert session.calls.count(f"{base}/workspaces/ws-1/items/pl-1/jobs/instances") == 1
+    restored = type(ctx).from_dict(ctx.to_dict())
+    assert restored.run_history == ctx.run_history
+
+
+def test_fetch_reads_warehouse_sql_audit_configuration():
+    """The audit *setting* is plain delegated Fabric REST - no tenant-admin, no rows."""
+    provider = LiveFabricProvider("token")
+    base = provider.BASE
+    items = {"value": [{"id": "wh-1", "type": "Warehouse", "displayName": "Finance"}]}
+    setting = {
+        "state": "Enabled",
+        "auditActionsAndGroups": ["BATCH_COMPLETED_GROUP", "SCHEMA_OBJECT_CHANGE_GROUP"],
+        "retentionDays": 90,
+    }
+    session = _FakeSession({
+        f"{base}/workspaces/ws-1": _FakeResponse(200, {"displayName": "Logs"}),
+        f"{base}/workspaces/ws-1/items": _FakeResponse(200, items),
+        f"{base}/workspaces/ws-1/warehouses/wh-1/settings/sqlAudit": _FakeResponse(200, setting),
+    })
+    provider._session = session
+
+    from auditfast.core.enums import Resource
+
+    ctx = provider.fetch("ws-1", resources=[Resource.ITEMS, Resource.WAREHOUSE_AUDIT])
+
+    assert ctx.warehouse_audit == {"Finance": {
+        "state": "Enabled",
+        "enabled": True,
+        "action_groups": ["BATCH_COMPLETED_GROUP", "SCHEMA_OBJECT_CHANGE_GROUP"],
+        "retention_days": 90,
+    }}
+    assert Resource.WAREHOUSE_AUDIT not in ctx.unavailable
+    restored = type(ctx).from_dict(ctx.to_dict())
+    assert restored.warehouse_audit == ctx.warehouse_audit
+
+
+def test_fetch_warehouse_audit_forbidden_is_unavailable_not_disabled():
+    """Without the Audit permission the setting is unknown - which must read as N/A.
+
+    Recording a 403 as ``enabled=False`` would fail a Warehouse that is in fact
+    audited, purely because the crawl identity could not ask.
+    """
+    provider = LiveFabricProvider("token")
+    base = provider.BASE
+    items = {"value": [{"id": "wh-1", "type": "Warehouse", "displayName": "Finance"}]}
+    session = _FakeSession({
+        f"{base}/workspaces/ws-1": _FakeResponse(200, {"displayName": "Logs"}),
+        f"{base}/workspaces/ws-1/items": _FakeResponse(200, items),
+        f"{base}/workspaces/ws-1/warehouses/wh-1/settings/sqlAudit": _FakeResponse(403, {}),
+    })
+    provider._session = session
+
+    from auditfast.core.enums import Resource
+
+    ctx = provider.fetch("ws-1", resources=[Resource.ITEMS, Resource.WAREHOUSE_AUDIT])
+
+    assert ctx.warehouse_audit == {}
+    assert Resource.WAREHOUSE_AUDIT in ctx.unavailable
+
+
+def test_sql_audit_settings_normalises_the_payload_spellings():
+    """Fabric has spelled this payload more than one way; checks must see one shape."""
+    provider = LiveFabricProvider("token")
+    nested = provider._sql_audit_settings({"properties": {
+        "auditState": "disabled",
+        "auditActionGroups": [" batch_completed_group "],
+        "retentionInDays": 30,
+    }})
+    assert nested == {
+        "state": "disabled",
+        "enabled": False,
+        "action_groups": ["batch_completed_group"],
+        "retention_days": 30,
+    }
+    bare = provider._sql_audit_settings({})
+    assert bare == {"state": "", "enabled": False, "action_groups": [], "retention_days": None}
+
+
 def test_powerbi_dataset_last_refresh_falls_back_to_personal_workspace():
     """My-workspace models 404 on the group form, so the no-group form is used."""
     from auditfast.clients.powerbi import PowerBIClient
@@ -359,6 +496,153 @@ def test_powerbi_dataset_last_refresh_401_is_forbidden_not_never_refreshed():
     client._session = session
 
     assert client.dataset_last_refresh("d1", group_id="ws") == (None, "forbidden")
+
+
+def test_powerbi_dataset_refresh_schedule_reads_notify_option():
+    """notifyOption is an ordinary delegated Datasets read - no tenant-admin scope."""
+    from auditfast.clients.powerbi import PowerBIClient
+
+    client = PowerBIClient("pbi")
+    base = client.BASE
+    payload = {
+        "days": ["Monday", "Tuesday"],
+        "times": ["06:00", "18:00"],
+        "enabled": True,
+        "localTimeZoneId": "UTC",
+        "notifyOption": "MailOnFailure",
+    }
+    session = _FakeSession({
+        f"{base}/groups/ws/datasets/d1/refreshSchedule": _FakeResponse(200, payload),
+    })
+    client._session = session
+
+    schedule, failure = client.dataset_refresh_schedule("d1", group_id="ws")
+    assert failure == ""
+    assert schedule == {
+        "enabled": True,
+        "notify_option": "MailOnFailure",
+        "notifies_on_failure": True,
+        "days": ["Monday", "Tuesday"],
+        "times": ["06:00", "18:00"],
+        "local_time_zone_id": "UTC",
+    }
+
+
+def test_powerbi_refresh_schedule_no_notification_is_read_not_failed():
+    from auditfast.clients.powerbi import PowerBIClient
+
+    client = PowerBIClient("pbi")
+    base = client.BASE
+    session = _FakeSession({
+        f"{base}/groups/ws/datasets/d1/refreshSchedule":
+            _FakeResponse(200, {"enabled": True, "notifyOption": "NoNotification"}),
+    })
+    client._session = session
+
+    schedule, failure = client.dataset_refresh_schedule("d1", group_id="ws")
+    assert failure == ""
+    assert schedule["notifies_on_failure"] is False
+
+
+def test_powerbi_refresh_schedule_404_means_no_schedule_not_a_read_failure():
+    """A Direct Lake / push model has no schedule; that is an answer, not an error."""
+    from auditfast.clients.powerbi import PowerBIClient
+
+    client = PowerBIClient("pbi")
+    base = client.BASE
+    session = _FakeSession({
+        f"{base}/groups/ws/datasets/d1/refreshSchedule": _FakeResponse(404, {}),
+    })
+    client._session = session
+
+    assert client.dataset_refresh_schedule("d1", group_id="ws") == (None, "")
+
+
+def test_powerbi_refresh_schedule_401_is_forbidden_not_no_schedule():
+    from auditfast.clients.powerbi import PowerBIClient
+
+    client = PowerBIClient("pbi")
+    base = client.BASE
+    session = _FakeSession({
+        f"{base}/groups/ws/datasets/d1/refreshSchedule": _FakeResponse(401, {}),
+        f"{base}/datasets/d1/refreshSchedule": _FakeResponse(401, {}),
+    })
+    client._session = session
+
+    assert client.dataset_refresh_schedule("d1", group_id="ws") == (None, "forbidden")
+
+
+def test_fetch_reads_refresh_schedules_and_round_trips_them():
+    provider = LiveFabricProvider("token")
+    base = provider.BASE
+    items = {"value": [{"id": "sm-1", "type": "SemanticModel", "displayName": "Sales"}]}
+    session = _FakeSession({
+        f"{base}/workspaces/ws-1": _FakeResponse(200, {"displayName": "Reporting"}),
+        f"{base}/workspaces/ws-1/items": _FakeResponse(200, items),
+    })
+    provider._session = session
+    provider._powerbi_client = _FakeRefreshSchedulePowerBI({
+        "sm-1": ({"enabled": True, "notify_option": "MailOnFailure",
+                  "notifies_on_failure": True, "days": [], "times": [],
+                  "local_time_zone_id": ""}, ""),
+    })
+
+    from auditfast.core.enums import Resource
+
+    ctx = provider.fetch(
+        "ws-1",
+        resources=[Resource.ITEMS, Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE],
+    )
+
+    assert ctx.refresh_schedules["Sales"]["notifies_on_failure"] is True
+    assert Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE not in ctx.unavailable
+    restored = type(ctx).from_dict(ctx.to_dict())
+    assert restored.refresh_schedules == ctx.refresh_schedules
+
+
+def test_fetch_refresh_schedule_without_powerbi_token_is_unavailable_not_silent():
+    """No Power BI-audience token means unknown; recording it as 'no alert' would be a lie."""
+    provider = LiveFabricProvider("token")  # no powerbi_token
+    base = provider.BASE
+    items = {"value": [{"id": "sm-1", "type": "SemanticModel", "displayName": "Sales"}]}
+    session = _FakeSession({
+        f"{base}/workspaces/ws-1": _FakeResponse(200, {"displayName": "Reporting"}),
+        f"{base}/workspaces/ws-1/items": _FakeResponse(200, items),
+    })
+    provider._session = session
+
+    from auditfast.core.enums import Resource
+
+    ctx = provider.fetch(
+        "ws-1",
+        resources=[Resource.ITEMS, Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE],
+    )
+
+    assert ctx.refresh_schedules == {}
+    assert Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE in ctx.unavailable
+
+
+def test_fetch_model_with_no_schedule_is_read_not_unavailable():
+    """A model that genuinely has no schedule read cleanly - the resource stays available."""
+    provider = LiveFabricProvider("token")
+    base = provider.BASE
+    items = {"value": [{"id": "sm-1", "type": "SemanticModel", "displayName": "Sales"}]}
+    session = _FakeSession({
+        f"{base}/workspaces/ws-1": _FakeResponse(200, {"displayName": "Reporting"}),
+        f"{base}/workspaces/ws-1/items": _FakeResponse(200, items),
+    })
+    provider._session = session
+    provider._powerbi_client = _FakeRefreshSchedulePowerBI({"sm-1": (None, "")})
+
+    from auditfast.core.enums import Resource
+
+    ctx = provider.fetch(
+        "ws-1",
+        resources=[Resource.ITEMS, Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE],
+    )
+
+    assert ctx.refresh_schedules == {}
+    assert Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE not in ctx.unavailable
 
 
 def test_fetch_sets_created_date_even_when_refresh_history_empty():

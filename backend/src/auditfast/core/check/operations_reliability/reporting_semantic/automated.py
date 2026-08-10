@@ -14,7 +14,7 @@ Two concerns share this module:
 from __future__ import annotations
 
 from auditfast.core.check._pipeline import walk_activities
-from auditfast.core.check.helpers import Verdict, binary, graded, not_applicable
+from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
@@ -153,6 +153,156 @@ def sm_refresh_orchestrated(ctx: CheckContext) -> Verdict:
     return binary(False, f"{len(models)} semantic model(s) and {len(pipelines)} pipeline(s), "
                          f"but no pipeline triggers a refresh — the model runs on its own "
                          f"clock with no guarantee the Gold load has finished")
+
+
+#: The Fabric item that watches for a condition and raises an alert.
+_ALERT_ITEM_TYPES: frozenset[str] = frozenset({"Reflex"})
+
+
+@check(
+    id="SM-REFRESH-ALERT", ref="14.5.3",
+    title="Refresh failures alert the owning team",
+    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    layers=(Layer.REPORTING,),
+    requires=[Resource.ITEMS, Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE,
+              Resource.PIPELINE_DEFINITIONS],
+    required=True,
+)
+def sm_refresh_failure_alerts(ctx: CheckContext) -> Verdict:
+    """A failed semantic-model refresh reaches a human rather than failing silently.
+
+    **Why this is automated and not self-assessed.** The setting exists and is
+    readable: a scheduled refresh carries ``notifyOption`` —
+    ``MailOnFailure`` or ``NoNotification`` — on
+    ``GET …/datasets/{id}/refreshSchedule``. That is an ordinary *delegated*
+    Power BI Datasets read (``Dataset.Read.All``), the same shape and token
+    audience as the refresh-history call this tool already makes, and it needs no
+    tenant-admin scope. So the honest answer is to read it rather than ask.
+
+    **What it can determine.** For every semantic model in the workspace with a
+    configured refresh schedule, whether that schedule notifies on failure. Plus
+    two workspace-level alternatives that alert just as well and cost no extra
+    call: a Data Activator (Reflex) item, which is Fabric's own mechanism for
+    watching an item and raising an alert; and a pipeline that refreshes a model
+    and has an on-failure path out of that refresh activity.
+
+    **What it cannot.** It cannot see *who* is notified — ``MailOnFailure`` mails
+    the model's configured contacts, and the contact list is not in this payload,
+    so "the owning team" is taken on trust once a notification exists. It cannot
+    read a subscription, an Azure Monitor rule, or a third-party alerting
+    integration outside Fabric. A Reflex item's *trigger conditions* are not
+    fetched, so its presence is credited as a partial signal, never as proof this
+    particular model is watched. Without a Power BI-audience token the schedules
+    are unreadable and this reports **N/A, never FAIL** — an absent scope is not
+    an absent alert.
+
+    **Sibling.** ``PL-NOTIFY`` (ref 2.4.5) asks whether a *pipeline*
+    failure notifies; this asks about the *model refresh*, which is a separate
+    mechanism with its own setting and fails independently of any pipeline.
+    """
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
+
+    models = [i for i in ctx.workspace.items if i.type == "SemanticModel"]
+    if not models:
+        return not_applicable("Workspace holds no semantic model, so no model refresh "
+                              "here can fail")
+
+    # A Reflex watches items and raises alerts; its trigger conditions are not
+    # fetched, so it is corroborating evidence, never proof on its own.
+    reflexes = [i.display_name or i.id for i in ctx.workspace.items
+                if i.type in _ALERT_ITEM_TYPES]
+    guarded_pipelines = _pipelines_with_guarded_refresh(ctx)
+
+    if not ctx.workspace.has(Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE):
+        fallback = _describe_fallback(reflexes, guarded_pipelines)
+        return not_applicable(
+            f"{len(models)} semantic model(s) present, but the refresh schedule "
+            f"configuration (notifyOption) could not be read — it needs a Power BI-audience "
+            f"token, which this run did not have. Whether refresh failures alert anyone "
+            f"cannot be determined{fallback}"
+        )
+
+    schedules = ctx.workspace.refresh_schedules or {}
+    scheduled = {name: s for name, s in schedules.items() if s.get("enabled")}
+    if not scheduled:
+        # No model runs on its own schedule. The refresh is then driven by a
+        # pipeline (or not at all), so the schedule's notifyOption is the wrong
+        # place to look and its absence is not a finding.
+        if guarded_pipelines:
+            return binary(True, f"No semantic model here refreshes on its own schedule; the "
+                                f"refresh is pipeline-driven and the refresh activity has an "
+                                f"on-failure path in: {', '.join(sorted(guarded_pipelines))}")
+        return not_applicable(
+            f"{len(models)} semantic model(s) present but none has an enabled refresh "
+            f"schedule ({len(schedules)} schedule(s) read), so there is no scheduled "
+            f"refresh whose failure could be notified. A pipeline-driven refresh is "
+            f"judged by SM-REFRESH-ORCHESTRATED (ref 14.5.1)"
+        )
+
+    alerting = sorted(n for n, s in scheduled.items() if s.get("notifies_on_failure"))
+    silent = sorted(n for n in scheduled if n not in set(alerting))
+    evidence = (
+        f"{len(alerting)} of {len(scheduled)} scheduled semantic model refresh(es) notify "
+        f"on failure (notifyOption)"
+    )
+    if silent:
+        evidence += f" — silent: {', '.join(silent[:5])}"
+    if not silent:
+        return covered(len(alerting), len(scheduled), evidence + ". Who receives the mail is "
+                                                      "not readable from this payload")
+
+    fallback = _describe_fallback(reflexes, guarded_pipelines)
+    if fallback:
+        # Something in this workspace does alert, but it cannot be tied to the
+        # silent models, so it lifts the verdict without clearing it.
+        return graded(2, evidence + fallback + ". That alternative cannot be tied to the "
+                                    "silent model(s), so it corroborates rather than clears them")
+    return covered(len(alerting), len(scheduled),
+                   evidence + ", and the workspace has neither a Data Activator (Reflex) item "
+                              "nor a pipeline refresh with an on-failure path — a failed "
+                              "refresh serves stale data with no signal")
+
+
+def _describe_fallback(reflexes: list[str], guarded_pipelines: list[str]) -> str:
+    """Phrase the workspace-level alerting alternatives, or ``""`` when there are none."""
+    parts: list[str] = []
+    if reflexes:
+        parts.append(f"a Data Activator (Reflex) item ({', '.join(sorted(reflexes)[:3])}) "
+                     f"is present, though its trigger conditions are not readable")
+    if guarded_pipelines:
+        parts.append(f"pipeline(s) {', '.join(sorted(guarded_pipelines))} refresh a model "
+                     f"with an on-failure path")
+    return f"; {', and '.join(parts)}" if parts else ""
+
+
+def _pipelines_with_guarded_refresh(ctx: CheckContext) -> list[str]:
+    """Pipelines whose semantic-model refresh activity has an on-failure path.
+
+    A refresh activity with a ``Failed``/``Completed`` dependant is handled: the
+    pipeline notices the failure and runs something because of it. Without
+    pipeline definitions this is simply unknown, and returns nothing.
+    """
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return []
+    found: list[str] = []
+    for name, defn in (ctx.workspace.pipelines or {}).items():
+        acts = walk_activities(defn)
+        refresh_names = {
+            a.get("name") for a in acts
+            if (a.get("type") or "") in _REFRESH_ACTIVITY_TYPES and a.get("name")
+        }
+        if not refresh_names:
+            continue
+        handled = any(
+            dep.get("activity") in refresh_names
+            and bool({"Failed", "Completed"} & set(dep.get("dependencyConditions") or []))
+            for a in acts
+            for dep in (a.get("dependsOn") or [])
+        )
+        if handled:
+            found.append(name)
+    return found
 
 
 @check(

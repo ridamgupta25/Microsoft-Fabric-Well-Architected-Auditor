@@ -183,6 +183,42 @@ class PowerBIClient:
             if isinstance(row, dict) and row.get("id") and row.get("createdDate")
         }
 
+    def dataset_refresh_schedule(
+        self, dataset_id: str, group_id: str | None = None
+    ) -> tuple[dict | None, str]:
+        """Return a semantic model's *refresh schedule configuration* and a failure classifier.
+
+        ``GET /groups/{gid}/datasets/{did}/refreshSchedule`` is an ordinary
+        delegated read (``Dataset.Read.All``) — **no tenant-admin scope**, and the
+        same shape and audience as :meth:`dataset_last_refresh`, which this client
+        already calls. It returns the configured days/times, whether the schedule
+        is enabled, and ``notifyOption``: ``MailOnFailure`` (the model's
+        contacts/owner are mailed when a refresh fails) or ``NoNotification``.
+
+        Returns ``(schedule, failure)`` following the crawl convention: ``""``
+        read; ``"forbidden"`` a 401/403 (wrong-audience or unlicensed token);
+        ``"transient"`` throttling / 5xx / transport error. A **404 is not a
+        failure** — it is how the API says "this model has no refresh schedule"
+        (a Direct Lake or push model), so it yields ``(None, "")`` and the caller
+        records it as *no schedule* rather than as unreadable.
+
+        Only the schedule *configuration* is read. No refresh rows, no history.
+        """
+        paths = []
+        if group_id:
+            paths.append(f"/groups/{group_id}/datasets/{dataset_id}/refreshSchedule")
+        paths.append(f"/datasets/{dataset_id}/refreshSchedule")
+        failure = "transient"
+        for path in paths:
+            status, body = self._get(path)
+            if status == 200 and isinstance(body, dict):
+                return _refresh_schedule(body), ""
+            if status in (400, 404):
+                return None, ""  # no schedule configured for this model — a real answer
+            if status in (401, 403):
+                failure = "forbidden"  # token rejected; the other form will fare no better
+        return None, failure
+
     def execute_queries(
         self, dataset_id: str, dax_queries: list[str], group_id: str | None = None
     ) -> dict:
@@ -227,6 +263,32 @@ class PowerBIClient:
                 if str(dataset.get("id")).lower() == target:
                     return gid, dataset
         return None, None
+
+
+def _refresh_schedule(body: dict) -> dict:
+    """Normalise a ``refreshSchedule`` payload into the shape checks read.
+
+    The Power BI API returns the schedule either bare or wrapped in
+    ``properties``/``value``, and spells the notification setting
+    ``notifyOption``. Normalising here keeps every variation out of the check
+    bodies, which must stay pure. ``notify_option`` is preserved verbatim so a
+    future Fabric spelling is reported rather than silently mapped to "off".
+    """
+    raw = body.get("properties") if isinstance(body.get("properties"), dict) else body
+    days = [str(d) for d in (raw.get("days") or []) if str(d).strip()]
+    times = [str(t) for t in (raw.get("times") or []) if str(t).strip()]
+    notify = str(raw.get("notifyOption") or raw.get("notifyOptions") or "").strip()
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "notify_option": notify,
+        # A refresh failure reaches a human. Anything other than an explicit
+        # "no notification" counts, so a new Fabric spelling is credited rather
+        # than read as silence; a blank value means the API did not say.
+        "notifies_on_failure": bool(notify) and notify.lower() != "nonotification",
+        "days": days,
+        "times": times,
+        "local_time_zone_id": str(raw.get("localTimeZoneId") or ""),
+    }
 
 
 def _error_detail(status: int | None, body: Any) -> tuple[str, int | None, str | None]:

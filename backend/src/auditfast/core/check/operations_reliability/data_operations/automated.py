@@ -10,7 +10,7 @@ import re
 
 from auditfast.core.check._notebook import executable_code
 from auditfast.core.check._pipeline import script_sql, walk_activities
-from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable
+from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
@@ -138,6 +138,75 @@ def deployment_pipeline(ctx: CheckContext) -> Verdict:
     ok = ctx.workspace.deployment_pipeline
     return binary(ok, "Assigned to a deployment pipeline" if ok
                   else "No deployment pipeline assigned")
+
+
+# =============================================================================
+# 11.1.2 — every artifact type is actually covered by source control
+# =============================================================================
+
+#: Item types Fabric Git integration serialises into the connected repository.
+#: A workspace can be Git-connected and still leave artifacts outside version
+#: control, because only supported types are written to the repo.
+GIT_TRACKED_TYPES: frozenset[str] = frozenset({
+    "DataPipeline", "Notebook", "SemanticModel", "Report", "PaginatedReport",
+    "Lakehouse", "Warehouse", "Environment", "SparkJobDefinition", "Dataflow",
+    "KQLDatabase", "KQLQueryset", "KQLDashboard", "Eventhouse", "Eventstream",
+    "MirroredDatabase", "Reflex", "SQLDatabase", "Datamart",
+})
+
+#: Types Fabric creates automatically alongside another item. They carry no
+#: independent definition, so their absence from the repo is not a gap.
+GIT_DERIVED_TYPES: frozenset[str] = frozenset({"SQLEndpoint"})
+
+
+@check(
+    id="WS-GIT-COVERAGE", ref="11.1.2",
+    title="All pipelines, notebooks, semantic models, and Warehouse artifacts source-controlled",
+    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=(Layer.OPERATIONS,), requires=[Resource.GIT, Resource.ITEMS], required=True,
+)
+def git_covers_every_artifact(ctx: CheckContext) -> Verdict:
+    """Source control reaches every artifact, not merely the workspace.
+
+    Distinct from ``WS-GIT`` (11.1.1), which asks only whether a Git connection
+    exists. A workspace can be connected and still leave artifacts unversioned,
+    because Fabric serialises only the item types its Git integration supports —
+    so this compares what the workspace *holds* against what the repository can
+    actually receive.
+
+    Auto-created items (a Lakehouse's SQL endpoint) are excluded: they have no
+    independent definition, so their absence from the repo is not a gap. Whether
+    the repository is *current* is not readable — Fabric reports the connection,
+    not the sync state — and the evidence says so rather than implying it.
+    """
+    if not ctx.workspace.has(Resource.GIT):
+        return not_applicable("Git connection state could not be read from Fabric")
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
+
+    artifacts = [i for i in ctx.workspace.items if i.type not in GIT_DERIVED_TYPES]
+    if not artifacts:
+        return not_applicable(
+            "Workspace holds no artifact that source control could cover"
+        )
+
+    if not ctx.workspace.git_connected:
+        return binary(
+            False,
+            f"Workspace is not connected to Git, so none of its {len(artifacts)} "
+            f"artifact(s) are source-controlled (WS-GIT / 11.1.1 covers the "
+            f"connection itself)",
+        )
+
+    tracked = [i for i in artifacts if i.type in GIT_TRACKED_TYPES]
+    untracked = sorted({i.type for i in artifacts if i.type not in GIT_TRACKED_TYPES})
+    detail = (f"{len(tracked)} of {len(artifacts)} artifact(s) are of a type Fabric "
+              f"Git integration serialises")
+    if untracked:
+        detail += f"; outside source control: {', '.join(untracked)}"
+    detail += (". Fabric reports the connection, not the sync state, so whether the "
+               "repository is up to date is not verified here.")
+    return covered(len(tracked), len(artifacts), detail)
 
 
 # =============================================================================
@@ -763,4 +832,355 @@ def unit_tests_exist(ctx: CheckContext) -> Verdict:
         tests, len(transforming),
         f"{len(test_notebooks)} test notebook(s) and {len(test_activities)} test "
         f"activity(ies) against {len(transforming)} transformation notebook(s): {found}",
+    )
+
+
+# =============================================================================
+# 9.2.4 — critical Gold data has a secondary copy or export
+# =============================================================================
+
+#: Stores whose content is "Gold" in the sense the point means — the modelled,
+#: consumer-facing data whose loss would be felt immediately.
+_GOLD_STORE_TYPES: frozenset[str] = frozenset({"Warehouse", "Lakehouse", "SQLDatabase"})
+
+#: Fabric's own replication: a mirrored database/warehouse *is* a second,
+#: continuously maintained copy.
+_MIRROR_TYPES: frozenset[str] = frozenset(
+    {"MirroredDatabase", "MirroredWarehouse", "MirroredAzureDatabricksCatalog"}
+)
+
+#: Name tokens that mark a store as the Gold/curated layer.
+_GOLD_NAME_TOKENS: frozenset[str] = frozenset({"GOLD", "CURATED", "PRESENTATION", "MART", "DW", "EDW"})
+
+#: A Copy sink that writes *outside* OneLake — a file drop, a blob container, an
+#: object store. These are the sink/store-settings type names Fabric emits.
+_EXTERNAL_SINK_TYPE = re.compile(
+    r"AzureBlobStorage|AzureBlobFS|AzureDataLakeStore|AmazonS3|GoogleCloudStorage|"
+    r"FileServer|Sftp|Ftp|OracleCloudStorage|AzureFileStorage|"
+    r"(?:DelimitedText|Parquet|Json|Avro|Orc|Binary)(?:Sink|WriteSettings)",
+    re.IGNORECASE,
+)
+#: Sinks that stay inside the workspace — matched first so a Lakehouse Parquet
+#: write is not mistaken for an export.
+_INTERNAL_SINK_TYPE = re.compile(r"Lakehouse|Warehouse|DataWarehouse", re.IGNORECASE)
+
+
+def _copy_sink_types(definition: dict) -> set[str]:
+    """The sink type names used by the Copy activities of one pipeline."""
+    found: set[str] = set()
+    for activity in walk_activities(definition):
+        if activity.get("type") != "Copy":
+            continue
+        sink = (activity.get("typeProperties") or {}).get("sink")
+        if not isinstance(sink, dict):
+            continue
+        for value in (sink.get("type"), (sink.get("storeSettings") or {}).get("type")
+                      if isinstance(sink.get("storeSettings"), dict) else None,
+                      (sink.get("formatSettings") or {}).get("type")
+                      if isinstance(sink.get("formatSettings"), dict) else None):
+            if isinstance(value, str) and value:
+                found.add(value)
+    return found
+
+
+@check(
+    id="WS-GOLD-SECONDARY-COPY", ref="9.2.4",
+    title="Critical Gold-layer data has a secondary copy or export mechanism",
+    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    layers=(Layer.OPERATIONS,),
+    requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS, Resource.SHORTCUTS],
+    required=True,
+)
+def gold_data_has_a_secondary_copy(ctx: CheckContext) -> Verdict:
+    """Something other than the primary store holds, or can reproduce, the Gold data.
+
+    Severity is High rather than the checklist's Medium: the whole point is the
+    scenario where the primary store is gone, and a workspace that fails this has
+    no answer to it at all.
+
+    **What it can determine.** Three readable mechanisms, from data already
+    crawled. A **mirrored** database/warehouse item is a maintained second copy.
+    A pipeline **Copy activity whose sink is external** to OneLake (blob / ADLS /
+    S3 / file share, or a file-format sink written through external store
+    settings) is an export. A **shortcut to external storage** means the data
+    also exists — or is referenced — outside this workspace.
+
+    **What it cannot.** Confirm the copy is current, complete, restorable, or
+    that anyone has ever tested restoring it; and it cannot see platform-level
+    backup (OneLake soft delete, capacity-level recovery), which is not exposed
+    per workspace. So a pass means "an export mechanism exists", never "the
+    recovery plan works". A workspace holding no Gold-shaped store is N/A.
+    """
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
+
+    items = ctx.workspace.items
+    stores = [i for i in items if i.type in _GOLD_STORE_TYPES]
+    mirrors = sorted({i.display_name or i.id for i in items if i.type in _MIRROR_TYPES})
+    if not stores and not mirrors:
+        return not_applicable(
+            "Workspace holds no Warehouse, Lakehouse or SQL database, so there is no "
+            "Gold-layer data here to copy or export"
+        )
+
+    gold = sorted({
+        i.display_name or i.id for i in stores
+        if i.type == "Warehouse" or _name_tokens(i.display_name or "") & _GOLD_NAME_TOKENS
+    })
+    described = (f"{len(gold)} Gold/Warehouse store(s) ({', '.join(gold[:3])})" if gold
+                 else f"{len(stores)} store(s)")
+
+    mechanisms: list[str] = []
+    exporter_count = 0
+    if mirrors:
+        mechanisms.append(f"mirrored item(s): {', '.join(mirrors[:3])}")
+
+    if ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        exporters: list[str] = []
+        for name, definition in (ctx.workspace.pipelines or {}).items():
+            sink_types = _copy_sink_types(definition)
+            external = sorted({
+                t for t in sink_types
+                if _EXTERNAL_SINK_TYPE.search(t) and not _INTERNAL_SINK_TYPE.search(t)
+            })
+            if external:
+                exporters.append(f"{name} -> {'/'.join(external[:2])}")
+        if exporters:
+            exporter_count = len(exporters)
+            mechanisms.append(f"{len(exporters)} pipeline(s) copy to external storage: "
+                              f"{'; '.join(sorted(exporters)[:2])}")
+
+    if ctx.workspace.has(Resource.SHORTCUTS):
+        external_shortcuts = sorted({
+            str(s.get("name") or "")
+            for entries in (ctx.workspace.shortcuts or {}).values()
+            for s in entries
+            if isinstance(s, dict)
+            and (s.get("target_type") or "").strip().lower() not in ("", "onelake")
+        })
+        if external_shortcuts:
+            mechanisms.append(f"{len(external_shortcuts)} shortcut(s) to storage outside "
+                              f"this workspace: {', '.join(external_shortcuts[:3])}")
+
+    if mechanisms:
+        # Presence of a mechanism somewhere is not per-store coverage: two mirrored
+        # databases do not protect eighteen unrelated Warehouses. Matching a mirror
+        # to its source is NOT readable — no API reports what a mirror mirrors — so
+        # this counts mechanisms against Gold stores rather than pretending to pair
+        # them. External shortcuts are deliberately excluded from the count: a
+        # workspace can hold hundreds that reference inbound data and protect
+        # nothing, so they are reported as context only.
+        protective = len(mirrors) + exporter_count
+        if gold and protective < len(gold):
+            return covered(
+                protective, len(gold),
+                f"{described}: {protective} export/copy mechanism(s) for {len(gold)} "
+                f"Gold/Warehouse store(s) — {'; '.join(mechanisms)}. Which store each "
+                f"mechanism protects is not readable, so this counts mechanisms, not "
+                f"verified per-store coverage",
+            )
+        return binary(True, f"{described} have a secondary copy/export mechanism — "
+                            f"{'; '.join(mechanisms)}")
+    unread = sorted(
+        resource.value for resource in (Resource.PIPELINE_DEFINITIONS, Resource.SHORTCUTS)
+        if not ctx.workspace.has(resource)
+    )
+    if unread:
+        return not_applicable(
+            f"{described} present, but {', '.join(unread)} could not be read, so an export "
+            f"mechanism cannot be ruled out"
+        )
+    return binary(False, f"{described} with no mirrored item, no pipeline export to storage "
+                         f"outside OneLake, and no external shortcut — the Gold data exists "
+                         f"in exactly one place")
+
+
+# =============================================================================
+# 11.3.1 — Dev / QA / Prod separation, seen from inside one workspace
+# =============================================================================
+
+
+@check(
+    id="WS-TIER-DECLARED", ref="11.3.1",
+    title="Separate workspaces for Dev, QA, and Production per layer",
+    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=(Layer.OPERATIONS,), requires=[Resource.WORKSPACE],
+    required=False,
+)
+def environment_tier_is_declared(ctx: CheckContext) -> Verdict:
+    """Reports the tier this workspace declares — the estate-wide question is not scorable here.
+
+    **Why this is unscored (``note``), on purpose.** The point counts *nine
+    workspaces*: three layers x three tiers. The engine judges one workspace at a
+    time and each audit run targets only the workspaces the reviewer selected, so
+    no check body can see whether the other eight exist. Scoring the readable
+    fragment would be worse than useless: a correctly-named ``…_PROD``
+    workspace would score 3 in an estate that has no Dev at all, and a shared
+    Gold Lakehouse — which legitimately carries no tier — would score 0. Both
+    verdicts would be confidently wrong, so this check reports the fact and
+    leaves the roll-up alone.
+
+    **What it reports.** The environment tier this workspace's name declares
+    (Dev / SIT / QA / Test / UAT / Staging / Pre-Prod / Prod), the layer it is
+    tagged with, and whether it is assigned to a deployment pipeline — the three
+    facts a reviewer needs to assemble the estate-wide picture across the
+    workspaces in the report.
+
+    **Related, and genuinely different.** ``WS-NAME`` (IMPL-24) scores naming
+    style; ``WS-ENV-ISOLATION`` (1.1.3) scores whether this workspace's pipelines
+    reach into another tier; ``WS-DEPLOY`` (11.2.1) scores deployment-pipeline
+    assignment. None of them reports the tier itself, which is what the estate
+    view needs. The gated roadmap entry ``R-11-3-1`` carries the same ref and
+    records what a tenant-admin API would unlock.
+    """
+    name = ctx.workspace.name
+    tokens = _name_tokens(name)
+    tier = next((ENVIRONMENT_TIERS[t] for t in sorted(tokens) if t in ENVIRONMENT_TIERS), None)
+    layer = ctx.workspace.layer.value
+    promotion = ("assigned to a deployment pipeline" if ctx.workspace.deployment_pipeline
+                 else "not assigned to a deployment pipeline")
+    if tier:
+        return note(f"'{name}' declares environment tier '{tier}' (layer: {layer}; "
+                    f"{promotion}). Whether a Dev/QA/Prod set exists for this layer can "
+                    f"only be judged across workspaces, not from inside one")
+    return note(f"'{name}' declares no environment tier in its name (layer: {layer}; "
+                f"{promotion}), so a Dev/QA/Prod separation is not expressible from the "
+                f"name alone — legitimate for a shared store, a gap for a promotable "
+                f"workspace")
+
+
+# =============================================================================
+# 1.1.5 — medallion architecture (Bronze -> Silver -> Gold)
+# =============================================================================
+
+#: Name tokens that place a store in a medallion tier, mapped to the tier. Each
+#: tier lists the words teams actually use for it, so a ``LH_Raw_Landing`` reads
+#: as Bronze and a ``WH_Presentation`` as Gold. Deliberately conservative: a word
+#: that means something else as often as it means a tier (``STAGE``, ``FINAL``)
+#: is left out rather than guessed at.
+MEDALLION_TOKENS: dict[str, str] = {
+    "BRONZE": "Bronze", "RAW": "Bronze", "LANDING": "Bronze", "INGEST": "Bronze",
+    "INGESTION": "Bronze", "SOURCE": "Bronze",
+    "SILVER": "Silver", "CLEANSED": "Silver", "CLEAN": "Silver",
+    "CONFORMED": "Silver", "REFINED": "Silver", "ENRICHED": "Silver",
+    "GOLD": "Gold", "CURATED": "Gold", "MART": "Gold", "DATAMART": "Gold",
+    "PRESENTATION": "Gold", "SERVING": "Gold", "SEMANTIC": "Gold",
+}
+
+#: The tiers in the order the architecture flows.
+MEDALLION_ORDER: tuple[str, ...] = ("Bronze", "Silver", "Gold")
+
+#: The store type the checklist point asks each tier to be built on. Bronze and
+#: Silver are file/Delta workloads (a Lakehouse); Gold is the modelled serving
+#: layer the point names as a Warehouse.
+MEDALLION_EXPECTED_TYPE: dict[str, str] = {
+    "Bronze": "Lakehouse", "Silver": "Lakehouse", "Gold": "Warehouse",
+}
+
+
+def _medallion_tiers(name: str) -> set[str]:
+    """Medallion tiers a store or workspace name declares (empty when none)."""
+    return {MEDALLION_TOKENS[tok] for tok in _name_tokens(name) if tok in MEDALLION_TOKENS}
+
+
+@check(
+    id="WS-MEDALLION", ref="1.1.5",
+    title="Medallion architecture properly implemented (Bronze Lakehouse -> Silver Lakehouse -> Gold Warehouse) with clear layer boundaries",
+    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=(Layer.OPERATIONS,), requires=[Resource.WORKSPACE, Resource.ITEMS], required=True,
+)
+def medallion_architecture(ctx: CheckContext) -> Verdict:
+    """The data stores name their medallion tier, and each tier sits on the right store type.
+
+    Two readable facts, both from the item inventory:
+
+    * **the boundary is declared** — the Lakehouses / Warehouses carry a tier
+      word in their names (Bronze / Raw / Landing, Silver / Cleansed /
+      Conformed, Gold / Curated / Mart / Presentation), so a reader can tell
+      which layer a store belongs to. The workspace's own name counts too: an
+      estate that puts each tier in its own workspace declares the boundary
+      there rather than in the store name;
+    * **the tier sits on the store type the point asks for** — Bronze and
+      Silver on a Lakehouse, Gold on a Warehouse. A "Gold" Lakehouse is called
+      out by name, because the point specifically asks for a Gold Warehouse.
+
+    **Be honest about the signal: names are all there is.** Nothing in the item
+    metadata records which store a pipeline writes to, so a perfectly layered
+    estate whose stores are called ``LH_One`` and ``LH_Two`` reads here as
+    undeclared, and a store called ``Gold`` that in fact holds raw extracts
+    reads as Gold. This scores whether the architecture is *expressed* — which
+    is what "clear layer boundaries" asks for — not whether data physically
+    flows Bronze to Silver to Gold. The evidence says so.
+
+    Reuses the store vocabulary of ``WS-SINGLE-SOURCE`` (ref 1.1.8) — same
+    module, same ``DATA_STORE_TYPES`` and token splitter, no cross-pillar
+    import. N/A when the workspace holds no data store: a prep or reporting
+    workspace has no medallion tier to declare.
+    """
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
+
+    stores = [i for i in ctx.workspace.items if i.type in DATA_STORE_TYPES]
+    if not stores:
+        return not_applicable(
+            "Workspace holds no Lakehouse, Warehouse, or database item, so it "
+            "implements no medallion storage tier"
+        )
+
+    by_tier: dict[str, list[tuple[str, str]]] = {}
+    for item in stores:
+        name = item.display_name or item.id
+        for tier in _medallion_tiers(name):
+            by_tier.setdefault(tier, []).append((name, item.type))
+
+    workspace_tiers = _medallion_tiers(ctx.workspace.name)
+    declared = sorted(set(by_tier) | workspace_tiers,
+                      key=lambda tier: MEDALLION_ORDER.index(tier))
+
+    if not declared:
+        return graded(
+            0,
+            f"None of the {len(stores)} data store(s) — nor the workspace name — "
+            f"names a medallion tier (Bronze/Raw, Silver/Cleansed, Gold/Curated), "
+            f"so the layer boundaries are not expressed anywhere a reader can see "
+            f"them. Names are the only readable signal for layer intent.",
+        )
+
+    misplaced = [
+        f"'{name}' is the {tier} tier on a {item_type}, not a "
+        f"{MEDALLION_EXPECTED_TYPE[tier]}"
+        for tier, entries in by_tier.items()
+        for name, item_type in entries
+        if item_type != MEDALLION_EXPECTED_TYPE[tier]
+        and item_type in {"Lakehouse", "Warehouse"}
+    ]
+
+    where = ", ".join(
+        f"{tier}: " + (", ".join(sorted(n for n, _ in by_tier.get(tier, [])))
+                       or "declared by the workspace name")
+        for tier in declared
+    )
+    caveat = (" Names are the only readable signal for layer intent — no item "
+              "metadata records which store a pipeline writes to.")
+
+    if len(declared) < len(MEDALLION_ORDER):
+        missing = [t for t in MEDALLION_ORDER if t not in declared]
+        return graded(
+            1 if len(declared) == 1 else 2,
+            f"{len(declared)} of 3 medallion tier(s) are named here ({where}); "
+            f"no store or workspace name declares {', '.join(missing)}. A tier held "
+            f"in another workspace is not visible from inside this one.{caveat}",
+        )
+
+    if misplaced:
+        return graded(
+            2,
+            f"All three medallion tiers are named ({where}), but the progression "
+            f"does not land on the store types the standard asks for: "
+            f"{'; '.join(sorted(misplaced)[:3])}.{caveat}",
+        )
+    return graded(
+        3,
+        f"Bronze -> Silver -> Gold are all named and each sits on the expected "
+        f"store type ({where}).{caveat}",
     )

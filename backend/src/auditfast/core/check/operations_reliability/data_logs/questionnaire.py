@@ -1,10 +1,16 @@
 """Operations & Reliability · Data Logs — interactive (self-assessed) checks.
 
 Observability points that live in Power BI report content, Warehouse/Metadata-DB
-schema, or operational access — none of which the read-only crawl can judge. The
+schema, operational access, or the Spark/Warehouse/Eventhouse monitoring and
+admin APIs this tool does not call — none of which the read-only crawl can
+judge. The
 reviewer self-assesses each during the audit and the chosen option's 0-3 score
 rolls into the report, per Data Logs workspace — the Azure Well-Architected
 Review model. Skipping records N/A and does not score.
+
+Two points that used to be asked here are now measured instead: 10.1.5 and 10.4.2
+are answered by ``OPS-WH-LOAD-MONITORED`` / ``OPS-MONITOR-REFRESH`` in
+``automated.py``, both from the job-run history the crawl already reads.
 """
 from __future__ import annotations
 
@@ -92,5 +98,41 @@ questionnaire_check(
     options=_options(
         "Add the uncovered critical pipelines, notebooks, or Warehouse loads to the dashboard.",
         "Expand the dashboard to cover every critical pipeline, notebook, and Warehouse load.",
+    ),
+)
+
+
+questionnaire_check(
+    id="OPS-SPARK-LOGS", ref="10.1.2",
+    title="Spark application logs captured for historical analysis",
+    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    question=(
+        "Are Spark application logs exported and retained so a failure can still be investigated "
+        "after Fabric's own monitoring window has rolled over? (self-assessed: Spark application "
+        "logs come from the monitoring/admin APIs this tool does not call)"
+    ),
+    options=_options(
+        "Extend log capture to the remaining Spark workloads and retain it for the period your "
+        "policy requires.",
+        "Route Spark application logs (e.g. via the environment's diagnostic settings) into a "
+        "retained store so historical analysis is possible.",
+    ),
+)
+
+
+questionnaire_check(
+    id="OPS-EVENTHOUSE-RETENTION", ref="10.3.3",
+    title="Eventhouse retention configured per compliance requirements",
+    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    question=(
+        "Is Eventhouse/KQL database retention set deliberately to match your compliance "
+        "requirement, rather than left at the default? (self-assessed: Eventhouse retention "
+        "policies are served by an API this tool does not call)"
+    ),
+    options=_options(
+        "Set retention explicitly on the databases or tables still running on the default, and "
+        "record the requirement each value is meant to satisfy.",
+        "Configure Eventhouse retention (and cache) policies to the period your compliance "
+        "requirement states, and review them when that requirement changes.",
     ),
 )
