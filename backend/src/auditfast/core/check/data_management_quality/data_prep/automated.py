@@ -299,12 +299,24 @@ def nb_timeout(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_language(ctx: CheckContext) -> Verdict:
-    """One primary language rather than a mix of PySpark and Spark SQL."""
+    """One primary language rather than a mix of PySpark and Spark SQL.
+
+    A notebook using neither — pure Python, pandas, or plain orchestration — has
+    no Spark language choice to be consistent about, so it is N/A rather than a
+    vacuous pass.
+    """
     code = executable_code(ctx.obj)
-    mixed = bool(_SPARK_SQL.search(code)) and bool(_DATAFRAME_OP.search(code))
-    if mixed:
+    sql = bool(_SPARK_SQL.search(code))
+    dataframe = bool(_DATAFRAME_OP.search(code))
+    if not sql and not dataframe:
+        return not_applicable(
+            "Notebook uses neither Spark SQL nor the DataFrame API, so it makes no "
+            "Spark language choice to be consistent about"
+        )
+    if sql and dataframe:
         return graded(1, "Mixes PySpark and Spark SQL — pick one primary approach")
-    return binary(True, "Consistent language approach")
+    return binary(True, f"Consistent language approach "
+                        f"({'Spark SQL' if sql else 'PySpark DataFrame API'} only)")
 
 
 @check(
@@ -325,14 +337,20 @@ def nb_dataframe_api(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_broadcast(ctx: CheckContext) -> Verdict:
-    """Joins carry a broadcast() hint where a small dimension meets a large fact."""
+    """A notebook that joins carries a broadcast() hint somewhere in its code.
+
+    Judged at *notebook* level, not per join: no Fabric API reports table sizes,
+    so which join deserves a hint cannot be determined. The evidence says exactly
+    that rather than implying each join was inspected.
+    """
     code = executable_code(ctx.obj)
     joins = _JOIN_PATTERN.findall(code)
     if not joins:
         return not_applicable("No joins present to evaluate for broadcast hints")
     ok = bool(_BROADCAST.search(code))
-    return binary(ok, "broadcast() hint present on join(s)" if ok
-                  else f"{len(joins)} join(s) without a broadcast() hint")
+    return binary(ok, f"{len(joins)} join(s) and a broadcast() hint is present" if ok
+                  else f"{len(joins)} join(s) present; no broadcast() hint anywhere in the "
+                       f"notebook — confirm none joins a small table to a large one")
 
 
 @check(
@@ -544,6 +562,29 @@ _ORPHAN_DETECT = re.compile(
     r"left_anti|leftanti|\bleft\s+anti\s+join\b|"
     r"orphan|unmatched|no_parent|missing_parent|"
     r"anti.*join.*parent|parent.*anti.*join",
+    re.IGNORECASE,
+)
+
+# -- 5.3.6: reconciliation *across* sources, not just a row-count assertion ----
+#: Comparing one source against another. ``_COUNT_RECONCILE`` alone is not
+#: enough here: it is satisfied by a single ``assert df.count() == 100``, which
+#: validates one dataset against an expectation and reconciles nothing *between*
+#: sources. Each alternative below needs two datasets to be meaningful.
+_CROSS_SOURCE_RECON = re.compile(
+    # Two counts compared against each other in one expression.
+    r"\.count\s*\(\s*\)[^\n]{0,120}?(?:==|!=|<=|>=|<|>)[^\n]{0,120}?\.count\s*\(\s*\)|"
+    # Named per-side counts compared, either way round.
+    r"\b(?:source|src|left|before|expected)_count\b[^\n]{0,60}(?:==|!=|<=|>=|<|>)"
+    r"[^\n]{0,60}\b(?:target|tgt|right|after|actual)_count\b|"
+    r"\b(?:target|tgt|right|after|actual)_count\b[^\n]{0,60}(?:==|!=|<=|>=|<|>)"
+    r"[^\n]{0,60}\b(?:source|src|left|before|expected)_count\b|"
+    # A set difference — the primitive that answers "what is in A but not B".
+    r"\.subtract\s*\(|\.exceptAll\s*\(|\bEXCEPT\s+(?:ALL\s+)?SELECT\b|\bMINUS\s+SELECT\b|"
+    # An anti-join between the two sources, which surfaces the non-matching rows.
+    r"left_anti|leftanti|\bleft\s+anti\s+join\b|"
+    # Explicitly named cross-source reconciliation.
+    r"cross[_\s-]?source[_\s-]?recon|source[_\s-]?to[_\s-]?target|"
+    r"\breconcile_sources\b|\bcompare_sources\b",
     re.IGNORECASE,
 )
 
@@ -804,14 +845,30 @@ def nb_fk_integrity(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_cross_recon(ctx: CheckContext) -> Verdict:
-    """Notebooks reading multiple sources reconcile records across them."""
+    """Notebooks reading multiple sources reconcile records **across** them.
+
+    A single row-count assertion validates one dataset against an expectation; it
+    says nothing about whether two sources agree. This therefore looks for a
+    comparison that needs both sides — two counts compared with each other, a set
+    difference, an anti-join, or an explicitly named cross-source reconciliation.
+
+    A notebook that validates counts but never compares the sources scores in the
+    middle: the discipline is there, the cross-source part is not.
+    """
     code = executable_code(ctx.obj)
     sources = _MULTI_SOURCE.findall(code)
     if len(sources) < 2:
         return not_applicable("Notebook reads from fewer than 2 sources")
-    ok = bool(_COUNT_RECONCILE.search(code))
-    return binary(ok, "Cross-source reconciliation present" if ok
-                  else f"Reads {len(sources)} sources without cross-source reconciliation")
+    if _CROSS_SOURCE_RECON.search(code):
+        return binary(True, f"Reads {len(sources)} sources and reconciles across them")
+    if _COUNT_RECONCILE.search(code):
+        return graded(
+            1,
+            f"Reads {len(sources)} sources and validates a record count, but nothing "
+            f"compares the sources against each other — no count-vs-count check, set "
+            f"difference, or anti-join",
+        )
+    return binary(False, f"Reads {len(sources)} sources without cross-source reconciliation")
 
 
 @check(

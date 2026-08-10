@@ -815,6 +815,31 @@ def test_a_test_activity_in_a_pipeline_counts():
     assert unit_tests_exist(ctx).score == 3
 
 
+def test_a_few_tests_beside_many_transforms_is_partial_not_a_pass():
+    """Presence is not coverage: 1 test against 8 transforms must not score 3.
+
+    Regression for a real workspace where 9 test notebooks covering 61
+    transformation notebooks (15%) reported a clean PASS.
+    """
+    notebooks = {f"NB_Build_{i}": _nb(_WRITES) for i in range(8)}
+    notebooks["NB_Checks"] = _nb("import pytest\n\ndef test_scd2(): assert f(1) == 2\n")
+    ctx = _ws_ctx(id="w", notebooks=notebooks)
+    verdict = unit_tests_exist(ctx)
+    assert verdict.score < 3, "a 1-in-8 coverage ratio is not a passing test posture"
+    assert verdict.coverage == pytest.approx(1 / 8)
+    assert "NB_Checks" in verdict.evidence
+
+
+def test_more_tests_than_transforms_is_fully_covered():
+    """The ratio is clamped, so a test-heavy workspace still passes cleanly."""
+    ctx = _ws_ctx(id="w", notebooks={
+        "NB_Build": _nb(_WRITES),
+        "NB_Checks": _nb("import pytest\n\ndef test_a(): assert 1\n"),
+        "NB_More_Checks": _nb("import pytest\n\ndef test_b(): assert 1\n"),
+    })
+    assert unit_tests_exist(ctx).score == 3
+
+
 def test_unit_tests_is_na_without_notebook_definitions():
     ctx = _ws_ctx(id="w", unavailable={Resource.NOTEBOOK_DEFINITIONS})
     assert unit_tests_exist(ctx).status is Status.NA
@@ -865,6 +890,19 @@ def test_a_batch_only_log_workspace_is_partial_not_a_failure():
 def test_telemetry_store_is_na_without_items():
     ctx = _ws_ctx(id="w", unavailable={Resource.ITEMS})
     assert eventhouse_for_telemetry(ctx).status is Status.NA
+
+
+def test_one_store_seen_under_two_item_types_is_counted_once():
+    """An Eventhouse and the KQLDatabase inside it share a display name.
+
+    Regression for evidence that read "EH_Ops, EH_Ops" and claimed two stores
+    where the workspace holds one.
+    """
+    ctx = _ws_ctx(id="w", git_connected=True, items=_items(
+        ("Eventhouse", "EH_Ops"), ("KQLDatabase", "EH_Ops"),
+        ("KQLQueryset", "QS_Failures")))
+    assert eventhouse_for_telemetry(ctx).evidence.count("EH_Ops") == 1
+    assert "1 store(s)" in kql_queries_version_controlled(ctx).evidence
 
 
 def test_telemetry_store_is_na_when_there_is_no_telemetry_to_place():

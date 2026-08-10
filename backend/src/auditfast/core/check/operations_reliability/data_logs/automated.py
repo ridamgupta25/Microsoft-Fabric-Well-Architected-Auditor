@@ -123,8 +123,14 @@ KQL_QUERY_ASSET_TYPES: frozenset[str] = frozenset({"KQLQueryset", "KQLDashboard"
 
 
 def _named(items, types: frozenset[str]) -> list[str]:
-    """Display names of the items whose type is in ``types``, sorted."""
-    return sorted(i.display_name or i.id for i in items if i.type in types)
+    """Distinct display names of the items whose type is in ``types``, sorted.
+
+    Deduplicated because Fabric surfaces one logical store under several item
+    types that share a display name — an Eventhouse and the KQLDatabase inside it
+    both report ``Telemetry``. Counting the name once keeps the evidence honest:
+    "2 stores" must mean two stores, not one store seen twice.
+    """
+    return sorted({i.display_name or i.id for i in items if i.type in types})
 
 
 @check(
