@@ -178,16 +178,28 @@ def restart_from_failure(ctx: CheckContext) -> Verdict:
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def explicit_timeouts(ctx: CheckContext) -> Verdict:
-    """Activities set a real timeout instead of inheriting the multi-day default."""
-    acts = activities(ctx.obj)
+    """Activities set a *custom* timeout instead of Fabric's multi-day default.
 
-    def bounded(activity: dict) -> bool:
-        timeout = (activity.get("policy") or {}).get("timeout")
-        return bool(timeout) and str(timeout) not in DEFAULT_TIMEOUTS
+    Fabric always writes a timeout, so a value being present is not enough: an
+    activity that keeps the platform default (0.12:00:00 / 7.00:00:00) is a
+    *partial* — a deliberate timeout was not defined — not a failure. Only
+    activities that declare a timeout at all are assessed.
+    """
+    def timeout_of(activity: dict) -> str:
+        return str((activity.get("policy") or {}).get("timeout") or "").strip()
 
-    with_timeout = [a for a in acts if bounded(a)]
-    return covered(len(with_timeout), len(acts),
-                   f"{len(with_timeout)} of {len(acts)} activities set a non-default timeout")
+    timed = [t for a in activities(ctx.obj) if (t := timeout_of(a))]
+    if not timed:
+        return not_applicable("No activity declares a timeout to assess")
+    custom = [t for t in timed if t not in DEFAULT_TIMEOUTS]
+    if len(custom) == len(timed):
+        return graded(3, f"All {len(timed)} activities with a timeout set a custom (non-default) value")
+    defaults = ", ".join(sorted({t for t in timed if t in DEFAULT_TIMEOUTS}))
+    return graded(
+        1,
+        f"{len(timed) - len(custom)} of {len(timed)} activities keep Fabric's default timeout "
+        f"({defaults}) — a custom timeout is not defined",
+    )
 
 
 @check(
@@ -322,6 +334,11 @@ def pipeline_idempotent(ctx: CheckContext) -> Verdict:
     data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
     if not data_acts:
         return not_applicable("No data-movement activity to assess for rerun idempotency")
+    if all((a.get("type") or "") == "TridentNotebook" for a in data_acts):
+        return not_applicable(
+            "Rerun-safety runs inside a notebook — idempotency is not assessable from "
+            "the pipeline definition (assess it in the notebook checks)"
+        )
     blob = json.dumps(ctx.obj)
     explicit_pattern = bool(_IDEMPOTENT_PATTERN.search(blob))
     cleanup_before_write = any(

@@ -69,10 +69,10 @@ def test_result_and_scored_counts_are_unchanged(provider):
 
 def test_status_counts_are_unchanged(provider):
     agg = aggregate(_run(provider))
-    assert agg["counts"][Status.PASS] == 53
-    assert agg["counts"][Status.PARTIAL] == 18
-    assert agg["counts"][Status.FAIL] == 65
-    assert agg["counts"][Status.NA] == 150
+    assert agg["counts"][Status.PASS] == 54
+    assert agg["counts"][Status.PARTIAL] == 17
+    assert agg["counts"][Status.FAIL] == 62
+    assert agg["counts"][Status.NA] == 153
     assert agg["counts"][Status.INFO] == 5
 
 

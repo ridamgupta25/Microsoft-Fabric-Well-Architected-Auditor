@@ -31,6 +31,16 @@ HARDCODED_PATTERNS = [
     re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"),  # bare IPv4
 ]
 
+#: Runtime content that resolves an endpoint/value at execution time instead of
+#: baking it in — a declared-parameter reference, a control-table lookup or
+#: ForEach item (``@activity(...).output`` / ``@item()``), a variable, or a
+#: dataset expression. Their presence, with no hardcoded literal, is evidence the
+#: pipeline is parameterised by design even without a declared ``parameters`` block.
+_DYNAMIC_CONTENT = re.compile(
+    r"@pipeline\(\)\.parameters\.|@activity\(|@item\(|@variables\(|@dataset\(",
+    re.IGNORECASE,
+)
+
 
 @check(
     id="PL-NAME", ref="2.1.1", title="Pipelines follow consistent naming conventions (including domain prefix/folder alignment)",
@@ -42,8 +52,13 @@ def naming_convention(ctx: CheckContext) -> Verdict:
     pattern = ctx.setting("pipeline_naming_convention")
     name = ctx.obj_name
     ok = bool(pattern) and re.match(pattern, name) is not None
-    return binary(ok, f"'{name}' matches convention" if ok
-                  else f"'{name}' does not match {pattern!r}")
+    if ok:
+        return binary(True, f"'{name}' matches convention")
+    evidence = f"'{name}' does not match {pattern!r}"
+    if not activities(ctx.obj):
+        evidence += (" — the pipeline is also empty (no activities) and its name looks like a "
+                     "leftover test pipeline; delete it or rename it to the naming convention")
+    return binary(False, evidence)
 
 
 @check(
@@ -70,16 +85,36 @@ def descriptions(ctx: CheckContext) -> Verdict:
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def parameterized(ctx: CheckContext) -> Verdict:
-    """Endpoints come from parameters rather than being baked into the definition."""
+    """Sources/targets are resolved by design, not baked into the definition.
+
+    A hardcoded endpoint literal fails. Otherwise the pipeline passes when it
+    resolves its endpoints at run time — a declared ``parameters`` block, a
+    control-table lookup or ForEach item (``@activity(...).output`` / ``@item()``),
+    a variable, or a managed connection reference — and is only *partial* when it
+    shows none of those signals (nothing hardcoded, but nothing parameterised
+    either), so a metadata-driven framework is credited rather than penalised.
+    """
     blob = json.dumps(ctx.obj)
     found = [p.pattern for p in HARDCODED_PATTERNS if p.search(blob)]
-    has_parameters = bool((ctx.obj.get("properties") or {}).get("parameters"))
-
     if found:
         return graded(0, f"Hardcoded endpoint/literal(s) detected: {found}")
-    if has_parameters:
+
+    if (ctx.obj.get("properties") or {}).get("parameters"):
         return graded(3, "Uses pipeline parameters; no hardcoded endpoints found")
-    return graded(1, "No parameters defined (though no hardcoded endpoints found)")
+
+    signals = []
+    if _DYNAMIC_CONTENT.search(blob):
+        signals.append("runtime expressions (@pipeline().parameters / @activity / @item / @variables)")
+    if '"externalReferences"' in blob:
+        signals.append("a managed connection reference")
+    if signals:
+        return graded(
+            3,
+            "No declared parameters, but endpoints are not hardcoded — resolved via "
+            + " and ".join(signals),
+        )
+
+    return graded(1, "No parameters or dynamic content (though no hardcoded endpoints found)")
 
 
 # -- notebook checks (scope=NOTEBOOK; read the notebook's code cells) ----------
@@ -192,21 +227,51 @@ def _timeout_value_is_positive(value: object) -> bool:
     return False
 
 
-def _has_positive_timeout(node: object) -> bool:
-    """True when any nested metadata key naming a timeout carries a positive value.
+#: Session-timeout values Fabric stamps on a notebook by default (milliseconds).
+#: A notebook carrying only a default value has not had a runtime cap deliberately
+#: configured, so — like PL-TIMEOUT's default durations — it is treated as "unset":
+#: the default alone is a PARTIAL (tune it to the notebook run), never a PASS.
+_DEFAULT_NB_TIMEOUTS = frozenset({"600000"})
+
+
+def _has_positive_timeout(node: object, defaults: frozenset[str] = frozenset()) -> bool:
+    """True when any nested metadata key naming a timeout carries a positive,
+    *non-default* value.
 
     Only dict *keys* named like a timeout are inspected (not free-text values), so
-    the word "timeout" appearing in a cell's output or a traceback cannot satisfy it.
+    the word "timeout" appearing in a cell's output or a traceback cannot satisfy
+    it. A value equal to a known Fabric default (``defaults``) is treated as
+    "unset", so the default session timeout Fabric stamps on every notebook is not
+    mistaken for a deliberately configured cap.
     """
     if isinstance(node, dict):
         for key, value in node.items():
             if (isinstance(key, str) and "timeout" in key.lower()
-                    and _timeout_value_is_positive(value)):
+                    and _timeout_value_is_positive(value)
+                    and str(value).strip() not in defaults):
                 return True
-            if _has_positive_timeout(value):
+            if _has_positive_timeout(value, defaults):
                 return True
     elif isinstance(node, list):
-        return any(_has_positive_timeout(item) for item in node)
+        return any(_has_positive_timeout(item, defaults) for item in node)
+    return False
+
+
+def _has_default_timeout(node: object, defaults: frozenset[str]) -> bool:
+    """True when a timeout key carries exactly a known Fabric default value.
+
+    Lets NB-TIMEOUT tell "only Fabric's stamped default" (a PARTIAL to tune) apart
+    from "no timeout at all" (N/A).
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if (isinstance(key, str) and "timeout" in key.lower()
+                    and str(value).strip() in defaults):
+                return True
+            if _has_default_timeout(value, defaults):
+                return True
+    elif isinstance(node, list):
+        return any(_has_default_timeout(item, defaults) for item in node)
     return False
 
 
@@ -216,16 +281,36 @@ def _has_positive_timeout(node: object) -> bool:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_structure(ctx: CheckContext) -> Verdict:
-    """Parameters, documentation, and imports up front — not one undifferentiated cell."""
-    code = notebook_code(ctx.obj)
-    signals = sum([
-        has_parameters_cell(ctx.obj),
-        bool(markdown_sources(ctx.obj)),
-        bool(_IMPORT_STMT.search(code)),
-    ])
-    return covered(
-        signals, 3,
-        f"{signals}/3 structure signals present (parameters cell, markdown docs, explicit imports)",
+    """Documentation and imports up front — a parameters cell only when the notebook takes inputs."""
+    # Import detection runs on executable code (comments stripped) so a
+    # commented-out ``import`` never counts as structure.
+    has_imports = bool(_IMPORT_STMT.search(executable_code(ctx.obj)))
+    has_markdown = bool(markdown_sources(ctx.obj))
+    has_params = has_parameters_cell(ctx.obj)
+
+    # Markdown documentation and explicit imports up front are the structure every
+    # notebook should have, so they are scored. A tagged ``parameters`` cell is
+    # only expected when the notebook takes inputs, so it is advised, not scored.
+    core = {"markdown documentation": has_markdown, "explicit imports": has_imports}
+    present = [label for label, ok in core.items() if ok]
+    missing = [label for label, ok in core.items() if not ok]
+
+    params_note = (
+        "a `parameters` cell is present"
+        if has_params
+        else "no `parameters` cell — add one at the top (tag a cell 'parameters') if the "
+        "notebook takes inputs, otherwise it can be skipped"
+    )
+    if missing:
+        detail = f" ({', '.join(present)})" if present else ""
+        return graded(
+            1 if present else 0,
+            f"{len(present)}/2 core structure signals present{detail}; "
+            f"missing {', '.join(missing)}; {params_note}",
+        )
+    return graded(
+        3,
+        f"Core structure present (markdown documentation, explicit imports); {params_note}",
     )
 
 
@@ -277,19 +362,28 @@ def nb_name(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_timeout(ctx: CheckContext) -> Verdict:
-    """An explicit, positive execution/session timeout guards runaway Spark sessions.
+    """An explicit, *non-default* execution/session timeout guards runaway Spark sessions.
 
-    Fabric always emits ``sessionKeepAliveTimeout`` in notebook metadata and
-    applies a *default* session timeout that the definition does not expose, so a
-    missing or ``0`` value is neither demonstrably compliant nor a failure — it is
-    reported N/A. Only an explicit positive timeout in the metadata is a PASS.
+    Fabric stamps a default session timeout on every notebook
+    (``spark.synapse.nbs.session.timeout`` = 600000 ms / 10 min). A notebook that
+    carries only that default has not had a cap deliberately set, so it is a
+    PARTIAL: the reviewer should replace it with a value tuned to the notebook's
+    actual run time. A positive, non-default timeout is a PASS; no timeout at all
+    (or ``0``) is N/A.
     """
     metadata = (ctx.obj or {}).get("metadata") or {}
-    if _has_positive_timeout(metadata):
-        return binary(True, "Explicit positive execution/session timeout configured")
+    if _has_positive_timeout(metadata, _DEFAULT_NB_TIMEOUTS):
+        return binary(True, "Explicit non-default execution/session timeout configured")
+    if _has_default_timeout(metadata, _DEFAULT_NB_TIMEOUTS):
+        return graded(
+            1,
+            "Fabric's default notebook session timeout is set "
+            "(spark.synapse.nbs.session.timeout = 600000 ms / 10 min) — replace it "
+            "with an explicit timeout tuned to the notebook's actual run time",
+        )
     return not_applicable(
-        "No explicit positive execution timeout in the notebook definition; "
-        "Fabric's default session timeout applies and cannot be verified from code"
+        "No execution/session timeout in the notebook definition; "
+        "Fabric's default applies and cannot be verified from code"
     )
 
 
@@ -410,6 +504,11 @@ _INCREMENTAL = re.compile(
     re.IGNORECASE,
 )
 _LOAD_MODE = re.compile(r"load_?type|load_?mode|is_?initial|full_?load|incremental", re.IGNORECASE)
+#: A pipeline whose *name* declares its load mode is a dedicated full-load /
+#: incremental pipeline, so the two modes are separated at the pipeline level
+#: rather than by an in-pipeline parameter or branch.
+_FULL_LOAD_NAME = re.compile(r"full[_ ]?load", re.IGNORECASE)
+_LOAD_MODE_NAME = re.compile(r"full[_ ]?load|incr\w*load|incremental|initial[_ ]?load", re.IGNORECASE)
 _LATE_ARRIVAL = re.compile(
     r"late[_ -]?arriv|out[_ -]?of[_ -]?order|event[_ -]?time|watermark|lookback|"
     r"sequence[_ -]?(?:number|no|id)|version[_ -]?(?:number|no|id)|effective[_ -]?date",
@@ -452,14 +551,30 @@ def pl_orchestration(ctx: CheckContext) -> Verdict:
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def pl_incremental(ctx: CheckContext) -> Verdict:
-    """A watermark / CDC / upsert pattern rather than an unconditional full reload."""
+    """A watermark / CDC / upsert pattern rather than an unconditional full reload.
+
+    Two cases are N/A rather than FAIL: a dedicated *full-load* pipeline (the name
+    declares it, and full-vs-incremental is a design choice on data volume the
+    audit cannot read), and a pipeline whose only data-movement is a *notebook*
+    (the load logic lives in code this pipeline-scoped check cannot see).
+    """
     acts = activities(ctx.obj)
     data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
     if not data_acts:
         return not_applicable("No data-movement activity to assess for incremental load")
-    ok = bool(_INCREMENTAL.search(json.dumps(ctx.obj)))
-    return binary(ok, "Incremental-load pattern detected (watermark / CDC / merge)" if ok
-                  else "No incremental-load pattern detected — full-reload risk")
+    if _INCREMENTAL.search(json.dumps(ctx.obj)):
+        return binary(True, "Incremental-load pattern detected (watermark / CDC / merge)")
+    if _FULL_LOAD_NAME.search(ctx.obj_name):
+        return not_applicable(
+            "Dedicated full-load pipeline (name declares full load) — incremental not "
+            "applicable; confirm the source table's volume warrants a full reload"
+        )
+    if all((a.get("type") or "") == "TridentNotebook" for a in data_acts):
+        return not_applicable(
+            "Load runs inside a notebook — the incremental pattern is not visible from "
+            "the pipeline definition (assess it in the notebook checks)"
+        )
+    return binary(False, "No incremental-load pattern detected — full-reload risk")
 
 
 @check(
@@ -468,7 +583,8 @@ def pl_incremental(ctx: CheckContext) -> Verdict:
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def pl_load_mode(ctx: CheckContext) -> Verdict:
-    """A load-mode parameter or a branch keeps first-load and incremental logic apart."""
+    """A dedicated per-mode pipeline, a load-mode parameter, or a branch keeps
+    first-load and incremental logic apart."""
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
     props = ctx.obj.get("properties") or {}
@@ -476,6 +592,14 @@ def pl_load_mode(ctx: CheckContext) -> Verdict:
     data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
     if not data_acts:
         return not_applicable("No data-movement activity to assess for load-mode separation")
+    if _LOAD_MODE_NAME.search(ctx.obj_name):
+        return binary(True, "Load mode is separated at the pipeline level — the name "
+                            "declares a dedicated full-load / incremental pipeline")
+    if all((a.get("type") or "") == "TridentNotebook" for a in data_acts):
+        return not_applicable(
+            "Load runs inside a notebook — initial-vs-incremental separation is not "
+            "assessable from the pipeline definition (assess it in the notebook checks)"
+        )
     param_mode = any(_LOAD_MODE.search(p) for p in (props.get("parameters") or {}))
     # A bare Switch/If proves nothing — a condition on file existence or row count
     # is not load-mode separation. The branch must itself mention the load mode.

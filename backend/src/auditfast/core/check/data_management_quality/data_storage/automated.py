@@ -63,6 +63,31 @@ _BUSINESS_KEY_HINT = re.compile(
     re.IGNORECASE,
 )
 
+#: How many table names to list in evidence before truncating — keeps the
+#: star-schema finding readable on workspaces with hundreds of tables.
+_SAMPLE_LIMIT = 8
+
+
+def _table_stores(ctx: CheckContext) -> str:
+    """Name the lakehouse/warehouse(s) whose tables a workspace check inspected.
+
+    Workspace-scoped table checks aggregate over every store's tables, so the
+    engine leaves their object blank. Naming the store(s) here points the finding
+    at what was judged — the analogue of a pipeline check naming its pipeline.
+    Falls back to a generic label when the item list was not read.
+    """
+    names = sorted({
+        i.display_name or i.id
+        for i in ctx.workspace.items
+        if (i.type or "") in ("Lakehouse", "Warehouse")
+    })
+    if not names:
+        return "lakehouse/warehouse tables"
+    joined = ", ".join(names[:_SAMPLE_LIMIT])
+    if len(names) > _SAMPLE_LIMIT:
+        joined += f", \u2026(+{len(names) - _SAMPLE_LIMIT} more)"
+    return joined
+
 
 @check(
     id="TB-NAMING", ref="4.2.1", title="Tables use meaningful, consistent naming conventions (agreed standard)",
@@ -119,37 +144,66 @@ def table_audit_columns(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-STARSCHEMA", ref="4.5.1", title="Star schema design implemented (fact + dimension tables, not flat wide tables)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.ITEMS], required=True,
 )
 def table_star_schema(ctx: CheckContext) -> Verdict:
     """The model separates fact tables from dimension tables (not flat wide tables)."""
     tables = ctx.workspace.tables
     if not tables:
         return not_applicable(_NO_TABLES)
+    stores = _table_stores(ctx)
     has_fact = any(is_fact(n) for n in tables)
     has_dim = any(is_dimension(n) for n in tables)
-    return binary(has_fact and has_dim,
-                  "Both fact and dimension tables present" if has_fact and has_dim
-                  else f"fact tables present: {has_fact}; dimension tables present: {has_dim}")
+    if has_fact and has_dim:
+        return binary(True, "Both fact (fact*/fct*) and dimension (dim*) tables are present", obj=stores)
+    reasons = []
+    if not has_fact:
+        reasons.append("no fact tables (named fact*/fct*)")
+    if not has_dim:
+        reasons.append("no dimension tables (named dim*)")
+    names = sorted(tables)
+    sample = ", ".join(names[:_SAMPLE_LIMIT])
+    if len(names) > _SAMPLE_LIMIT:
+        sample += f", \u2026(+{len(names) - _SAMPLE_LIMIT} more)"
+    return binary(
+        False,
+        f"Star-schema naming not detected across {len(names)} table(s): "
+        f"{' and '.join(reasons)}. Rename modelled tables with fact_/dim_ prefixes "
+        f"(e.g. fact_sales, dim_customer). Tables seen: {sample}",
+        obj=stores,
+    )
 
 
 @check(
     id="TB-DATEDIM", ref="4.5.7", title="Date/Time dimension exists with all required attributes (fiscal periods, quarter, holidays)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.ITEMS], required=False,
 )
 def table_date_dimension(ctx: CheckContext) -> Verdict:
     """A dedicated date/calendar dimension backs time-based analytics."""
     tables = ctx.workspace.tables
     if not tables:
         return not_applicable(_NO_TABLES)
+    stores = _table_stores(ctx)
     found = any(
         ("date" in n.lower() or "calendar" in n.lower())
         and (is_dimension(n) or "dim" in n.lower() or "calendar" in n.lower())
         for n in tables
     )
-    return binary(found, "A date/time dimension table exists" if found
-                  else "No date/time dimension table found")
+    if found:
+        return binary(True, "A date/time dimension table exists", obj=stores)
+    names = sorted(tables)
+    sample = ", ".join(names[:_SAMPLE_LIMIT])
+    if len(names) > _SAMPLE_LIMIT:
+        sample += f", \u2026(+{len(names) - _SAMPLE_LIMIT} more)"
+    return binary(
+        False,
+        f"No date/time dimension detected across {len(names)} table(s): expected a "
+        f"table named like dim_date, date_dim or calendar. Add a dedicated date "
+        f"dimension (e.g. dim_date) with fiscal periods, quarter and holiday "
+        f"attributes. Tables seen: {sample}",
+        obj=stores,
+    )
 
 
 @check(
