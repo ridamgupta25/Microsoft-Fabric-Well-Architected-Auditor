@@ -61,6 +61,11 @@ class CheckSpecOut(BaseModel):
         default_factory=list,
         description="The scored answers for an interactive check; empty otherwise.",
     )
+    validated: bool = Field(
+        default=False,
+        description="True once the check has completed Phase 1 validation; False "
+        "while it is still pending validation for the next phase.",
+    )
     description: str = ""
 
 

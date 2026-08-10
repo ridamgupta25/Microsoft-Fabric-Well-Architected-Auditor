@@ -161,6 +161,13 @@ class Resource(StrEnum):
     NOTEBOOK_DEFINITIONS = "notebookDefinitions"
     ENVIRONMENT_DEFINITIONS = "environmentDefinitions"
     TABLE_SCHEMAS = "tableSchemas"
+    #: Column names and types, read over TDS from the SQL analytics endpoint - the
+    #: Fabric REST API does not expose them. Separate from TABLE_SCHEMAS so a run
+    #: whose selected checks never look at a column pays no SQL round trip.
+    TABLE_COLUMNS = "tableColumns"
+    #: Warehouse row-level-security policies (``sys.security_policies``), likewise
+    #: only readable over the SQL analytics endpoint.
+    WAREHOUSE_SECURITY = "warehouseSecurity"
     SHORTCUTS = "shortcuts"
     SEMANTIC_MODEL_DEFINITIONS = "semanticModelDefinitions"
     CONNECTIONS = "connections"

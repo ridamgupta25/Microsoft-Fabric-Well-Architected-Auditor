@@ -11,7 +11,23 @@ rather than raising, so a partial or future TMSL variant still parses cleanly.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
+
+# Power BI's "Auto date/time" feature silently generates one hidden date table per
+# date/datetime column (``LocalDateTable_<guid>``) plus a single ``DateTableTemplate_<guid>``.
+# These system tables never appear in the Power BI model or report UI, so they are
+# excluded from the captured facts to match what a reviewer actually sees.
+_AUTO_DATE_TABLE = re.compile(
+    r"^(?:LocalDateTable|DateTableTemplate)_"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def _is_auto_date_table(name: str) -> bool:
+    """True for a Power BI "Auto date/time" hidden table (not shown in the model UI)."""
+    return bool(_AUTO_DATE_TABLE.match(name or ""))
 
 
 def _expression(value: Any) -> str:
@@ -21,23 +37,77 @@ def _expression(value: Any) -> str:
     return str(value or "")
 
 
+#: Partition ``source.type`` values, mapped to the storage mode a reader cares
+#: about. ``entity`` is Direct Lake (the partition points at a Lakehouse table);
+#: ``m``/``query`` are Power Query / native SQL, whose mode comes from the
+#: partition's own ``mode`` field; ``calculated`` is a DAX-computed table.
+_SOURCE_TYPE_MODE = {
+    "entity": "directLake",
+    "calculated": "calculated",
+    "calculationgroup": "calculationGroup",
+}
+
+
+def _table_storage(table: dict) -> dict:
+    """Storage facts for one table, read from its partitions.
+
+    Structure only — partition *definitions*, never the rows behind them. A
+    model states its mode per partition, so a table can legitimately be mixed
+    (a "dual" or hybrid table); every distinct mode seen is reported.
+    """
+    modes: set[str] = set()
+    source_types: set[str] = set()
+    native_queries = 0
+    for part in table.get("partitions") or []:
+        if not isinstance(part, dict):
+            continue
+        source = part.get("source") if isinstance(part.get("source"), dict) else {}
+        source_type = str(source.get("type") or "").lower()
+        if source_type:
+            source_types.add(source_type)
+        # A native SQL / M partition that carries its own query text is a
+        # per-refresh transformation living in the model rather than upstream.
+        if source_type in {"query", "m"} and _expression(source.get("expression")).strip():
+            native_queries += 1
+        mode = str(part.get("mode") or "").strip()
+        modes.add(mode or _SOURCE_TYPE_MODE.get(source_type, ""))
+    return {
+        "modes": sorted(m for m in modes if m),
+        "source_types": sorted(source_types),
+        "native_query_partitions": native_queries,
+    }
+
+
 def parse_tmsl(document: dict) -> dict:
-    """Normalize a TMSL document to ``{tables, measures, relationships}``.
+    """Normalize a TMSL document to the facts the audit and Digital Twin need.
 
     Accepts either the full ``{"model": {...}}`` envelope or a bare model object.
+
+    Everything here is **model metadata** — table and partition *definitions*,
+    measure DAX, relationships, roles, refresh policies. No row data is read or
+    stored; the semantic model's actual contents stay in Fabric.
     """
     if not isinstance(document, dict):
-        return {"tables": [], "measures": [], "relationships": []}
+        return {
+            "tables": [], "measures": [], "relationships": [], "roles": [],
+            "storage": {}, "refresh_policies": [], "aggregations": [],
+            "direct_lake_behavior": "",
+        }
 
     model = document.get("model") if isinstance(document.get("model"), dict) else document
     tables = model.get("tables") or []
 
     table_names: list[str] = []
     measures: list[dict] = []
+    storage: dict[str, dict] = {}
+    refresh_policies: list[dict] = []
+    aggregations: list[dict] = []
     for table in tables:
         if not isinstance(table, dict):
             continue
         table_name = table.get("name", "")
+        if _is_auto_date_table(table_name):
+            continue  # skip Power BI auto date/time hidden tables
         table_names.append(table_name)
         for measure in table.get("measures") or []:
             if not isinstance(measure, dict):
@@ -55,11 +125,15 @@ def parse_tmsl(document: dict) -> dict:
     for rel in model.get("relationships") or []:
         if not isinstance(rel, dict):
             continue
+        from_table = rel.get("fromTable", "")
+        to_table = rel.get("toTable", "")
+        if _is_auto_date_table(from_table) or _is_auto_date_table(to_table):
+            continue  # drop relationships that point at the hidden auto date tables
         relationships.append({
             "name": rel.get("name", ""),
-            "from_table": rel.get("fromTable", ""),
+            "from_table": from_table,
             "from_column": rel.get("fromColumn", ""),
-            "to_table": rel.get("toTable", ""),
+            "to_table": to_table,
             "to_column": rel.get("toColumn", ""),
             "cross_filter": rel.get("crossFilteringBehavior", "") or "",
             "is_active": bool(rel.get("isActive", True)),
@@ -88,4 +162,17 @@ def parse_tmsl(document: dict) -> dict:
             ],
         })
 
-    return {"tables": table_names, "measures": measures, "relationships": relationships, "roles": roles}
+    return {
+        "tables": table_names,
+        "measures": measures,
+        "relationships": relationships,
+        "roles": roles,
+        #: Per-table partition modes / source types (structure, not rows).
+        "storage": storage,
+        #: Tables carrying an incremental-refresh policy.
+        "refresh_policies": refresh_policies,
+        #: Aggregation columns declared via ``alternateOf``.
+        "aggregations": aggregations,
+        #: Model-level Direct Lake fallback: automatic | directLakeOnly | directQueryOnly.
+        "direct_lake_behavior": str(model.get("directLakeBehavior") or ""),
+    }

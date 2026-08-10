@@ -19,7 +19,6 @@ _CHECKS: list[tuple[str, str, str, tuple[str, ...], bool, str]] = [
     ("R-9-1-2", "9.1.2", "Transient failure handling: retries with exponential backoff", (Layer.OPERATIONS,), True, "ITEM_DEFINITION"),
     ("R-9-1-4", "9.1.4", "Schema drift between environments is detectable and reconciled", (Layer.OPERATIONS,), True, "SQL_ENDPOINT"),
     ("R-10-4-1", "10.4.1", "Data Activator triggers configured for critical events", (Layer.OPERATIONS,), True, "ADMIN_ACTIVITY"),
-    ("R-11-1-4", "11.1.4", "Branching strategy defined (feature branches, main, release)", (Layer.OPERATIONS,), True, "GIT_REPO"),
     ("R-11-1-6", "11.1.6", "Pull request reviews required before merge to main branch", (Layer.OPERATIONS,), True, "GIT_REPO"),
     ("R-11-1-7", "11.1.7", "Minimum reviewer count enforced via branch policies", (Layer.OPERATIONS,), True, "GIT_REPO"),
     ("R-11-1-8", "11.1.8", "Secret-scanning / credential-detection enabled on the source repository (ADO / GitHub)", (Layer.OPERATIONS,), True, "GIT_REPO"),

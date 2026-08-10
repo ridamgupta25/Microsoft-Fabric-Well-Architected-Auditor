@@ -92,7 +92,7 @@ def client(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> TestClient:
         return FAKE_TOKEN if session_id == AUTHENTICATED_SESSION else None
 
     def fake_build_provider(config, token=None, *, refresh=False, token_refresher=None,
-                            powerbi_token=None):
+                            powerbi_token=None, sql_token=None):
         return RecordedProvider(FIXTURE_FILE)
 
     monkeypatch.setattr(auth_service, "token_for", fake_token_for)
