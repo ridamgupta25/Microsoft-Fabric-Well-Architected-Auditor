@@ -111,12 +111,33 @@ class WorkspaceContext:
     tables: dict[str, dict] = field(default_factory=dict)
     shortcuts: dict[str, list] = field(default_factory=dict)
     semantic_models: dict[str, dict] = field(default_factory=dict)
+    #: Per-semantic-model refresh *schedule configuration*, keyed by model display
+    #: name: ``{"enabled": bool, "notify_option": str, "notifies_on_failure": bool,
+    #: "days": [str], "times": [str], "local_time_zone_id": str}``. A model absent
+    #: from the map has no configured schedule (Direct Lake, push, or refresh
+    #: driven entirely by a pipeline) — which is a real, readable answer, not a
+    #: read failure. Read failures mark the resource unavailable instead.
+    refresh_schedules: dict[str, dict] = field(default_factory=dict)
     #: Warehouse row-level-security policies, keyed by warehouse name. Read over the
     #: SQL analytics endpoint (``sys.security_policies``) because the Fabric REST
     #: API does not expose them. An empty list for a warehouse is a real finding
     #: ("defines no policy"); the warehouse being absent from the map means it could
     #: not be read, which is N/A.
     warehouse_security: dict[str, list] = field(default_factory=dict)
+    #: Per-Warehouse SQL audit *configuration*, keyed by warehouse display name.
+    #: Each value is the normalised ``settings/sqlAudit`` payload:
+    #: ``{"state": str, "enabled": bool, "action_groups": [str], "retention_days": int|None}``.
+    #: A warehouse missing from the map could not be read (N/A); a warehouse
+    #: present with ``enabled=False`` is a real finding. Audit *rows* are never
+    #: fetched — only the configuration.
+    warehouse_audit: dict[str, dict] = field(default_factory=dict)
+    #: Per-item job-run timestamps (ISO-8601 UTC, newest first), keyed by item id.
+    #: Read from the same ``…/jobs/instances`` page that yields
+    #: :attr:`Item.last_run_utc` — no extra call — but retained in full so an
+    #: *observed cadence* (the interval between consecutive runs) can be derived.
+    #: Semantic models are absent: their refresh history is read one row at a time
+    #: from the Power BI API, so no interval is derivable for them.
+    run_history: dict[str, list[str]] = field(default_factory=dict)
     #: Tenant-level Fabric connection metadata. Credentials and secrets are
     #: never stored; TLS version and health remain unknown unless a provider
     #: supplies explicit evidence for them.
@@ -208,7 +229,10 @@ class WorkspaceContext:
             "tables": self.tables,
             "shortcuts": self.shortcuts,
             "semantic_models": self.semantic_models,
+            "refresh_schedules": self.refresh_schedules,
             "warehouse_security": self.warehouse_security,
+            "warehouse_audit": self.warehouse_audit,
+            "run_history": self.run_history,
             "connections": self.connections,
             "git_details": self.git_details,
             "unavailable": sorted(r.value for r in self.unavailable),
@@ -233,7 +257,10 @@ class WorkspaceContext:
             tables=dict(data.get("tables", {})),
             shortcuts=dict(data.get("shortcuts", {})),
             semantic_models=dict(data.get("semantic_models", {})),
+            refresh_schedules=dict(data.get("refresh_schedules", {})),
             warehouse_security=dict(data.get("warehouse_security", {})),
+            warehouse_audit=dict(data.get("warehouse_audit", {})),
+            run_history=dict(data.get("run_history", {})),
             connections=list(data.get("connections", [])),
             git_details=dict(data.get("git_details", {})),
             unavailable={Resource(v) for v in data.get("unavailable", [])},

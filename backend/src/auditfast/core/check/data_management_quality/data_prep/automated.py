@@ -16,7 +16,15 @@ from auditfast.core.check._notebook import (
     notebook_code,
 )
 from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities, script_sql, walk_activities
-from auditfast.core.check._tables import is_dimension, is_fact
+from auditfast.core.check._tables import (
+    columns,
+    has_timestamp_column,
+    is_audit_table,
+    is_dimension,
+    is_fact,
+    is_key_column,
+    name_words,
+)
 from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
@@ -1975,3 +1983,1296 @@ def ws_runtime_baseline(ctx: CheckContext) -> Verdict:
     return graded(2, f"Run duration is measured in {where}, but is never compared "
                      f"against a baseline, SLA or expected value — the number is "
                      f"recorded, not monitored")
+
+
+# =============================================================================
+# 5.1.4 — DQ scores computed per table/dataset and trended over time
+# =============================================================================
+
+#: Column words that name a *measurement* of quality rather than the data itself.
+_DQ_METRIC_WORDS: frozenset[str] = frozenset({
+    "score", "scores", "metric", "metrics", "pct", "percent", "percentage",
+    "ratio", "rate", "quality", "completeness", "accuracy", "validity",
+    "conformity", "consistency", "freshness", "dqscore", "qualityscore",
+    "passrate", "failrate", "nullpct", "nullpercent", "threshold",
+})
+
+
+def _has_dq_metric_column(table: dict) -> bool:
+    """True when a column names a quality measurement (score / rate / % / metric)."""
+    return any(name_words(c.get("name") or "") & _DQ_METRIC_WORDS for c in columns(table))
+
+
+@check(
+    id="TB-DQ-TREND", ref="5.1.4",
+    title="DQ scores computed per table/dataset and trended over time (via Audit Lakehouse)",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=(Layer.PREP,), requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=False,
+)
+def dq_scores_are_trended(ctx: CheckContext) -> Verdict:
+    """A DQ/audit table stores a quality measurement alongside the run timestamp.
+
+    **What it can determine.** Whether any audit/DQ-shaped table carries both a
+    score/metric-shaped column *and* a date or run-timestamp column. The
+    timestamp is the whole point: a score column on its own records the latest
+    reading and overwrites the trend, so it cannot answer "is quality getting
+    worse".
+
+    **What it cannot.** Whether rows are actually written, whether the score is
+    computed per table or per dataset, or whether anyone looks at the trend.
+    Column metadata is all this reads — no row data is fetched.
+    """
+    tables = ctx.workspace.tables
+    if not tables:
+        return not_applicable("No lakehouse/warehouse tables were read for this workspace")
+    audit = {n: t for n, t in tables.items() if is_audit_table(n, t) and columns(t)}
+    if not audit:
+        return not_applicable(
+            "No audit/DQ-shaped table with readable column metadata was found, so there "
+            "is nowhere for a DQ score to be stored"
+        )
+
+    trended = sorted(n for n, t in audit.items()
+                     if _has_dq_metric_column(t) and has_timestamp_column(t))
+    if trended:
+        return binary(
+            True,
+            f"DQ scores are stored with a timestamp in {len(trended)} of {len(audit)} audit "
+            f"table(s): {', '.join(trended[:4])}",
+        )
+
+    scored_only = sorted(n for n, t in audit.items() if _has_dq_metric_column(t))
+    if scored_only:
+        return graded(
+            1,
+            f"{len(scored_only)} audit table(s) carry a DQ score/metric column "
+            f"({', '.join(scored_only[:4])}) but no date/run timestamp — a point-in-time "
+            f"reading that cannot be trended",
+        )
+    return binary(
+        False,
+        f"None of the {len(audit)} audit table(s) carries a DQ score/metric column, so no "
+        f"quality score is computed per table or trended over time",
+    )
+
+
+# =============================================================================
+# 5.1.7 — one DQ tool/library across the solution
+# =============================================================================
+#
+# A consistency question, so it cannot be judged one notebook at a time: a
+# notebook using pandera is not wrong on its own; it is wrong when the notebook
+# next to it uses great_expectations. Hence Scope.WORKSPACE.
+
+#: The DQ frameworks a Fabric notebook realistically uses, each matched by an
+#: import *or* by an API call that only that framework has — a bare mention of
+#: the name in prose cannot satisfy it because the code is read with
+#: ``executable_code``.
+_DQ_LIBRARY_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
+    ("great_expectations", re.compile(
+        r"\b(?:import|from)\s+great_expectations\b|great_expectations\s*\.|"
+        r"\bgx\s*\.\s*(?:get_context|DataContext)\b|\bexpect_[a-z_]+\s*\(")),
+    ("soda", re.compile(
+        r"\b(?:import|from)\s+soda(?:core)?\b|\bsodacl\b|\badd_sodacl_yaml_str\s*\(")),
+    ("pydeequ/deequ", re.compile(
+        r"\b(?:import|from)\s+pydeequ\b|\bVerificationSuite\s*\(|com\.amazon\.deequ")),
+    ("pandera", re.compile(
+        r"\b(?:import|from)\s+pandera\b|\bDataFrameSchema\s*\(")),
+    ("cuallee", re.compile(
+        r"\b(?:import|from)\s+cuallee\b|\bCheckLevel\s*\.")),
+    ("chispa", re.compile(
+        r"\b(?:import|from)\s+chispa\b|\bassert_df_equality\s*\(")),
+)
+
+#: No framework at all — the rules are written by hand. Still a DQ *approach*,
+#: and the one most likely to differ from notebook to notebook.
+_HAND_ROLLED_DQ = re.compile(
+    r"^\s*assert\s+\w|\braise\s+(?:ValueError|AssertionError|Exception|RuntimeError)\s*\(",
+    re.MULTILINE,
+)
+
+
+def _dq_approach(code: str) -> str | None:
+    """Which DQ library this notebook uses, or ``None`` when it does no DQ.
+
+    One approach per notebook, chosen in a fixed order so the answer does not
+    depend on dict iteration. A notebook that imports a framework *and* also
+    writes bare asserts is counted as using the framework — the asserts are how
+    people use these libraries, not a second tool.
+    """
+    for name, pattern in _DQ_LIBRARY_PATTERNS:
+        if pattern.search(code):
+            return name
+    return "hand-rolled asserts" if _HAND_ROLLED_DQ.search(code) else None
+
+
+@check(
+    id="WS-DQ-LIBRARY", ref="5.1.7",
+    title="DQ tool/library standardized across the solution",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=(Layer.PREP,), requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
+)
+def dq_library_is_standardized(ctx: CheckContext) -> Verdict:
+    """Every notebook that does data quality does it with the same library.
+
+    **What it can determine.** Which DQ framework each notebook uses —
+    great_expectations, Soda, (py)deequ, pandera, cuallee, chispa, or
+    hand-rolled asserts — and whether the notebooks that do DQ agree on one.
+    Three notebooks with three frameworks is the defect: three rule dialects,
+    three failure formats, and no shared DQ report.
+
+    **What it cannot.** Judge which library is the right one, or read the
+    library list of a Fabric **Spark Environment**: the Environment definition
+    returns only ``Sparkcompute.yml``, so a framework installed there but never
+    imported is invisible. It also says nothing about rule *coverage* — that is
+    ``NB-DQ-RULES`` (ref 5.1.2), which asks whether a notebook codifies rules at
+    all, one notebook at a time.
+
+    N/A when fewer than two notebooks perform DQ: one notebook cannot be
+    inconsistent with itself.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    notebooks = ctx.workspace.notebooks or {}
+    if not notebooks:
+        return not_applicable("Workspace has no notebook definitions to inspect")
+
+    approaches: dict[str, str] = {}
+    for name, definition in notebooks.items():
+        approach = _dq_approach(executable_code(definition))
+        if approach:
+            approaches[name] = approach
+
+    if len(approaches) < 2:
+        return not_applicable(
+            f"{len(approaches)} of {len(notebooks)} notebook(s) perform data quality — "
+            f"fewer than two, so there is no cross-notebook standard to judge"
+        )
+
+    used: dict[str, list[str]] = {}
+    for notebook, approach in approaches.items():
+        used.setdefault(approach, []).append(notebook)
+    standard, users = max(used.items(), key=lambda kv: (len(kv[1]), kv[0]))
+    detail = "; ".join(f"{lib}: {len(names)}" for lib, names in sorted(used.items()))
+
+    if len(used) == 1:
+        return covered(
+            len(users), len(approaches),
+            f"All {len(approaches)} DQ-performing notebook(s) use one approach — {standard}",
+        )
+    return covered(
+        len(users), len(approaches),
+        f"{len(approaches)} DQ-performing notebook(s) use {len(used)} different "
+        f"approaches ({detail}); the most common is {standard}",
+    )
+
+
+# =============================================================================
+# 5.1.9 — a DQ failure has to stop the run
+# =============================================================================
+
+#: An activity whose *name* says it validates something. Bare "check" is
+#: deliberately excluded — "Check Watermark" and "Check File Exists" are
+#: control-flow lookups, not data quality — so ``check`` counts only when it is
+#: qualified (``row_count_check``, ``schema check``).
+_DQ_ACTIVITY_NAME = re.compile(
+    r"\bdq\b|data[_\s-]?quality|\bvalidat\w*|\bverif(?:y|ies|ication)\w*|\bassert\w*|"
+    r"\breconcil\w*|\bintegrity\b|\bsanity\b|"
+    r"(?:quality|null|count|row|record|schema|duplicate)[_\s-]?check",
+    re.IGNORECASE,
+)
+
+
+def _dependents(acts: list[dict]) -> dict[str, list[tuple[dict, set[str]]]]:
+    """Map activity name -> the activities that depend on it, with their conditions."""
+    out: dict[str, list[tuple[dict, set[str]]]] = {}
+    for act in acts:
+        for dep in act.get("dependsOn") or []:
+            if not isinstance(dep, dict):
+                continue
+            upstream = dep.get("activity")
+            if not isinstance(upstream, str):
+                continue
+            conditions = {str(c) for c in (dep.get("dependencyConditions") or [])}
+            out.setdefault(upstream, []).append((act, conditions))
+    return out
+
+
+@check(
+    id="PL-DQ-GATE", ref="5.1.9",
+    title="DQ failures halt pipeline progression where critical (bad data does not silently flow downstream)",
+    pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
+)
+def pipeline_dq_failure_halts_run(ctx: CheckContext) -> Verdict:
+    """A validation activity's failure actually stops what runs after it.
+
+    Severity is High rather than the checklist's Medium because the failure mode
+    is silent: the run goes green and bad data reaches the consumers, so nobody
+    is told to look.
+
+    **What it can determine.** Which activities validate (by name), and how each
+    is wired: a downstream activity depending on it with ``Succeeded`` — or a
+    ``Fail`` activity on its ``Failed`` edge — means a DQ failure stops
+    progression. A dependent wired on ``Completed`` or ``Skipped`` explicitly
+    does *not*: the load runs whether validation passed or failed. Activities
+    nested in ForEach / If / Switch are included (``walk_activities``).
+
+    **What it cannot.** Judge whether the validation is any good, or whether an
+    unnamed activity is secretly a validation — the name is the only readable
+    signal of intent. A pipeline with no validation activity is N/A, not a
+    failure: whether this pipeline *should* validate is ``NB-DQ-RULES`` /
+    ``PL-DEADLETTER`` territory, not this point's.
+    """
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    acts = walk_activities(ctx.obj)
+    if not acts:
+        return not_applicable("Pipeline has no activities to evaluate")
+
+    dq_acts = [a for a in acts if _DQ_ACTIVITY_NAME.search(str(a.get("name") or ""))]
+    if not dq_acts:
+        return not_applicable(
+            f"None of the {len(acts)} activity(ies) is a validation/DQ step, so there is "
+            f"no DQ outcome to gate progression on"
+        )
+
+    dependents = _dependents(acts)
+    gating: list[str] = []
+    ungated: list[str] = []
+    for act in dq_acts:
+        name = str(act.get("name") or "")
+        downstream = dependents.get(name, [])
+        halts = any(
+            "Succeeded" in conditions
+            or (child.get("type") == "Fail" and "Failed" in conditions)
+            for child, conditions in downstream
+        )
+        if halts:
+            gating.append(name)
+        elif not downstream:
+            ungated.append(f"'{name}' (nothing depends on it)")
+        else:
+            wiring = sorted({c for _, conds in downstream for c in conds}) or ["no condition"]
+            ungated.append(f"'{name}' (downstream runs on {'/'.join(wiring)})")
+
+    return covered(
+        len(gating), len(dq_acts),
+        f"{len(gating)} of {len(dq_acts)} validation activity(ies) gate progression on success"
+        + (f"; not gating: {'; '.join(ungated[:3])}" if ungated else ""),
+    )
+
+
+#: A notebook has actually *evaluated* data quality — it holds a count of bad
+#: rows, an expectation result, or a comparison — rather than merely mentioning
+#: quality.
+_DQ_EVALUATION = re.compile(
+    r"\b(?:invalid|bad|error|reject|rejected|failed|violation|mismatch|orphan|duplicate|null)"
+    r"[_\s]?(?:count|cnt|rows?|records?|df)\b|"
+    r"^\s*assert\s+\w|\bexpect_[a-z_]+\s*\(|\bVerificationSuite\s*\(|"
+    r"\b(?:validate|validation|dq)_\w*\s*[\(=]|"
+    r"\.count\s*\(\s*\)\s*(?:==|!=|>=|<=|>|<)",
+    re.IGNORECASE | re.MULTILINE,
+)
+#: The notebook stops. ``raise``/``assert``/``sys.exit`` fail the notebook, and
+#: therefore the pipeline activity that ran it.
+_DQ_HARD_STOP = re.compile(
+    r"^\s*assert\s+\w|\braise\s+\w+|\bsys\.exit\s*\(",
+    re.MULTILINE,
+)
+#: ``notebookutils.notebook.exit(...)`` ends the notebook *successfully* and
+#: returns a value, so it only halts the pipeline if the caller inspects that
+#: value — credited, but not as a full stop.
+_DQ_SOFT_EXIT = re.compile(
+    r"(?:notebookutils|mssparkutils|dbutils)\s*\.\s*notebook\s*\.\s*exit\s*\(",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-DQ-HALT", ref="5.1.9",
+    title="DQ failures halt pipeline progression where critical (bad data does not silently flow downstream)",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def notebook_dq_failure_halts_run(ctx: CheckContext) -> Verdict:
+    """A notebook that finds bad data stops, rather than printing and carrying on.
+
+    The sibling of ``PL-DQ-GATE`` under the same ref, and a different signal:
+    the pipeline check reads *wiring*, this one reads what the notebook does
+    with its own result. A notebook that computes ``invalid_count`` and only
+    prints it returns success, so the orchestrator has nothing to gate on — the
+    pipeline can be wired perfectly and bad data still flows.
+
+    **What it can determine.** Whether a notebook that evaluates data quality
+    also raises, asserts, or exits on the result. ``raise``/``assert``/
+    ``sys.exit`` fail the run; ``notebookutils.notebook.exit`` ends it
+    *successfully* with a value, which only halts the caller if the caller looks
+    — so it scores 2, not 3.
+
+    **What it cannot.** Tell whether the stop is on the right condition, or
+    whether the caller inspects an exit value. Distinct from ``NB-DQ-RULES``
+    (5.1.2), which asks whether rules exist, and from ``NB-DEADLETTER`` (5.1.10),
+    which asks whether rejects are retained — retaining rejects and halting are
+    different controls, and a solution can want both.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = executable_code(ctx.obj)
+    if not _DQ_EVALUATION.search(code):
+        return not_applicable(
+            "Notebook evaluates no data-quality result (no bad-row count, expectation, "
+            "or assertion), so there is nothing here to halt on"
+        )
+    if _DQ_HARD_STOP.search(code):
+        return graded(3, "Data-quality failure raises/asserts and fails the notebook, "
+                         "so the calling pipeline cannot continue")
+    if _DQ_SOFT_EXIT.search(code):
+        return graded(2, "Data-quality result ends the notebook through notebook.exit() — "
+                         "the run still reports success, so progression stops only if the "
+                         "caller inspects the returned value")
+    return graded(0, "Data-quality result is computed but never raised on — the notebook "
+                     "succeeds regardless, so bad data flows downstream silently")
+
+
+# =============================================================================
+# 5.2.7 — nulls in the columns 5.5.6 does not look at
+# =============================================================================
+#
+# ``NB-KEY-QUALITY`` (ref 5.5.6) already covers nulls in *key* columns. This
+# point is about the rest of the row: which attributes are allowed to be null,
+# and whether an unexpected null anywhere else is noticed. The detector is
+# therefore built the other way round — it resolves the *column name* each null
+# construct refers to and keeps only the non-key ones, so evidence that satisfies
+# 5.5.6 cannot satisfy this check as well.
+
+#: Null constructs that name the column(s) they act on. Group 1 is either a
+#: single column name or a list/dict fragment holding several.
+_NULL_COLUMN_PATTERNS: tuple[re.Pattern, ...] = (
+    re.compile(r"fillna\s*\(\s*\{([^}]{0,400})\}", re.IGNORECASE),
+    re.compile(r"(?:fillna|dropna|fill)\s*\([^)]{0,200}?subset\s*=\s*[\[\(]([^\]\)]{0,400})",
+               re.IGNORECASE),
+    re.compile(r"\.na\s*\.\s*(?:fill|drop)\s*\([^)]{0,200}?\{([^}]{0,400})\}", re.IGNORECASE),
+    re.compile(r"(?:col|column)\s*\(\s*[\"']([\w.$]+)[\"']\s*\)\s*\.\s*is(?:Not)?Null\s*\(",
+               re.IGNORECASE),
+    re.compile(r"[\"']([\w.$]+)[\"']\s*\]\s*\.\s*is(?:Not)?Null\s*\(", re.IGNORECASE),
+    re.compile(r"\b([\w$]+)\s+IS\s+(?:NOT\s+)?NULL\b", re.IGNORECASE),
+    re.compile(r"COALESCE\s*\(\s*[`\"\[]?([\w.$]+)", re.IGNORECASE),
+    # An explicit schema declares, per column, whether null is expected — the
+    # "known nullable fields documented" half of the point.
+    re.compile(r"StructField\s*\(\s*[\"']([\w.$]+)[\"'][^)]{0,80}?,\s*(?:True|False)\s*\)"),
+)
+
+#: Profiling every column at once — by construction this covers the non-key
+#: columns, so no name has to be resolved.
+_NULL_PROFILE_ALL = re.compile(
+    r"for\s+\w+\s+in\s+\w+\.columns[\s\S]{0,240}?is(?:Not)?Null|"
+    r"is(?:Not)?Null[\s\S]{0,240}?for\s+\w+\s+in\s+\w+\.columns|"
+    r"\bnull[_\s]?(?:count|counts|profile|profiling|summary)\b|"
+    r"\bcount[_\s]?nulls?\b",
+    re.IGNORECASE,
+)
+
+_QUOTED_NAME = re.compile(r"[\"']([\w.$]+)[\"']")
+#: A quoted dict *key* — ``fillna({"region": "UNKNOWN"})`` names one column and
+#: one replacement value; only the key is a column.
+_QUOTED_KEY = re.compile(r"[\"']([\w.$]+)[\"']\s*:")
+
+
+def _null_handled_columns(code: str) -> set[str]:
+    """Column names that some null construct explicitly names."""
+    names: set[str] = set()
+    for pattern in _NULL_COLUMN_PATTERNS:
+        for match in pattern.finditer(code):
+            fragment = match.group(1) or ""
+            found = _QUOTED_KEY.findall(fragment) or _QUOTED_NAME.findall(fragment)
+            names.update(found or [fragment])
+    return {n.rsplit(".", 1)[-1] for n in names if n}
+
+
+@check(
+    id="NB-NULL-HANDLING", ref="5.2.7",
+    title="Null/empty handling: known nullable fields documented; unexpected nulls flagged",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def notebook_handles_non_key_nulls(ctx: CheckContext) -> Verdict:
+    """Nulls in ordinary attributes are declared, filled, or flagged — not just tolerated.
+
+    **Deliberately not the same evidence as ``NB-KEY-QUALITY`` (ref 5.5.6).**
+    That check passes on a null test against a *key* column. This one resolves
+    the column name each null construct names and keeps only the columns
+    ``is_key_column`` rejects, so a notebook whose only null handling is
+    ``df.filter(col("customer_id").isNotNull())`` scores 1 here, not 3 — the
+    business attributes are still unexamined.
+
+    **What it can determine.** Whether the notebook names non-key columns in a
+    ``fillna`` / ``dropna(subset=…)`` / ``isNull`` / ``COALESCE`` / explicit
+    ``StructField(..., nullable)`` construct, or profiles nulls across every
+    column at once (a loop over ``df.columns``, a ``null_count``).
+
+    **What it cannot.** Tell whether the nullable fields were documented
+    *correctly*, or resolve a column name held in a variable — an unresolvable
+    name is simply not counted, never counted against.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = executable_code(ctx.obj)
+    if not (_WRITE_PATTERN.search(code) or _INPUT_READ.search(code)):
+        return not_applicable("Notebook neither reads nor writes data, so it handles no nulls")
+
+    if _NULL_PROFILE_ALL.search(code):
+        return graded(3, "Nulls are profiled across every column (column loop / null-count "
+                         "summary), so unexpected nulls in non-key fields are visible")
+
+    named = _null_handled_columns(code)
+    non_key = sorted(n for n in named if not is_key_column(n))
+    if non_key:
+        return graded(3, f"Null handling names {len(non_key)} non-key column(s): "
+                         f"{', '.join(non_key[:5])}")
+    if named:
+        return graded(1, f"Null handling covers only key column(s) "
+                         f"({', '.join(sorted(named)[:5])}) — already credited by "
+                         f"NB-KEY-QUALITY (5.5.6); nulls in business attributes are "
+                         f"neither declared nor flagged")
+    return graded(0, "No null handling names any column and no null profiling is performed — "
+                     "an unexpected null in a business attribute passes through unnoticed")
+
+
+# =============================================================================
+# 5.5.1 — dates: ranges validated, timezones handled deliberately
+# =============================================================================
+
+#: The notebook works with dates at all. ``\bdate\b`` is word-bounded so
+#: ``validate`` and ``update`` (both of which contain "date") do not match.
+_DATE_HANDLING = re.compile(
+    r"to_date\s*\(|to_timestamp\s*\(|DateType\s*\(|TimestampType\s*\(|"
+    r"current_date\s*\(|current_timestamp\s*\(|date_format\s*\(|datediff\s*\(|"
+    r"\bCAST\s*\([^)]{0,60}\bAS\s+(?:DATE|TIMESTAMP|DATETIME)\b|"
+    r"\b(?:date|dates|datetime|timestamp)\b|_date\b|_dt\b|\bdob\b",
+    re.IGNORECASE,
+)
+#: A date is held against a bound — a literal, another date, or "now". The
+#: comparison may be separated from the column by a closing quote/paren, which is
+#: why a short run of ``")]`` characters is allowed before the operator.
+_DATE_RANGE_CHECK = re.compile(
+    r"\.between\s*\(|\bBETWEEN\b[^\n]{0,80}\bAND\b|"
+    r"(?:date|timestamp|dt)\w*[\"'\)\]\s]{0,6}(?:<=|>=|<|>)|"
+    r"(?:<=|>=|<|>)[\s\(]{0,6}(?:current_date|current_timestamp|to_date|to_timestamp|"
+    r"lit\s*\(|[\"']\d{4}-\d{2})|"
+    r"\bfuture[_\s]?date\w*|\bmin_date\b|\bmax_date\b|\bdate_range\b|"
+    r"\bvalid_(?:from|to|date)\b|\bdate[_\s]?(?:range|bounds?)[_\s]?(?:check|validation)\b",
+    re.IGNORECASE,
+)
+#: The timezone is a decision rather than whatever the session happened to use.
+_TIMEZONE_AWARE = re.compile(
+    r"to_utc_timestamp\s*\(|from_utc_timestamp\s*\(|"
+    r"spark\.sql\.session\.timeZone|session\.timeZone|"
+    r"\btz\s*=|\btimezone\s*=|ZoneInfo\s*\(|\bpytz\b|\btzinfo\b|astimezone\s*\(|"
+    r"\bAT\s+TIME\s+ZONE\b|utcnow\s*\(|timezone\.utc|\butc\b",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-DATE-QUALITY", ref="5.5.1",
+    title="**Dates**: Valid date ranges; consistent timezone handling; no invalid future dates where prohibited",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def notebook_date_quality(ctx: CheckContext) -> Verdict:
+    """Dates are bounded and their timezone is chosen, not inherited.
+
+    **What it can determine.** Two independent halves. *Range*: a date is
+    compared against a bound — a literal, ``current_date()``, a min/max, or a
+    ``between`` — which is what catches a 1900 default or a date in the future.
+    *Timezone*: ``to_utc_timestamp`` / ``from_utc_timestamp`` / an explicit
+    ``tz=`` / ``ZoneInfo`` / a session timezone setting / a UTC-suffixed column,
+    rather than parsing into whatever the Spark session's timezone happens to be
+    — the source of the classic one-day-off defect across regions.
+
+    **What it cannot.** Tell whether the bound is the *right* bound, or which
+    dates a business prohibits from being in the future. It also cannot see
+    dates handled entirely inside a stored procedure. Distinct from
+    ``NB-TYPE-CAST`` (5.3.1), which only asks that a date be cast to a date at
+    all; casting correctly and bounding sensibly are different failures.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = executable_code(ctx.obj)
+    if not _DATE_HANDLING.search(code):
+        return not_applicable("Notebook handles no date or timestamp data")
+
+    ranged = bool(_DATE_RANGE_CHECK.search(code))
+    zoned = bool(_TIMEZONE_AWARE.search(code))
+    if ranged and zoned:
+        return graded(3, "Date values are held against a range/bound and timezone handling "
+                         "is explicit (UTC conversion or a declared timezone)")
+    if ranged:
+        return graded(2, "Date values are held against a range/bound, but timezone handling "
+                         "is implicit — parsing inherits the Spark session timezone, which "
+                         "differs between environments")
+    if zoned:
+        return graded(1, "Timezone handling is explicit, but no date is validated against a "
+                         "range or bound — an out-of-range or future date is loaded as-is")
+    return graded(0, "Dates are parsed with neither a range/bound validation nor explicit "
+                     "timezone handling")
+
+
+# =============================================================================
+# 5.5.2 — money keeps its precision, and currency codes are real
+# =============================================================================
+
+#: Column-name words that mean money. ``total`` and ``rate`` are excluded on
+#: purpose: ``total_rows`` and ``error_rate`` are counters, not currency.
+_MONEY_WORD = (
+    r"(?:amount|amt|price|unitprice|cost|revenue|salary|payment|balance|invoice|"
+    r"fee|charge|tax|discount|margin|profit|currency|money)"
+)
+_MONEY_CONTEXT = re.compile(r"\w*" + _MONEY_WORD + r"\w*", re.IGNORECASE)
+#: Precision preserved: a fixed-point type, in any of its spellings.
+_DECIMAL_TYPING = re.compile(
+    r"DecimalType\s*\(|\bDecimal\s*\(|"
+    r"cast\s*\(\s*[\"']decimal|\bAS\s+(?:DECIMAL|NUMERIC|MONEY)\b|"
+    r"\bdecimal\s*\(\s*\d+\s*,\s*\d+\s*\)",
+    re.IGNORECASE,
+)
+#: Binary floating point applied to a money-named value — the classic defect:
+#: 0.1 + 0.2 never equals 0.3, and the error compounds over a sum.
+_FLOAT_FOR_MONEY = re.compile(
+    r"\w*" + _MONEY_WORD + r"\w*[\"']?[^\n]{0,80}?"
+    r"(?:DoubleType\s*\(|FloatType\s*\(|cast\s*\(\s*[\"'](?:double|float)|"
+    r"\bAS\s+(?:FLOAT|DOUBLE|REAL)\b|\bfloat\s*\()|"
+    r"(?:DoubleType\s*\(|FloatType\s*\(|cast\s*\(\s*[\"'](?:double|float)|"
+    r"\bAS\s+(?:FLOAT|DOUBLE|REAL)\b)[^\n]{0,80}?\w*" + _MONEY_WORD,
+    re.IGNORECASE,
+)
+_CURRENCY_COLUMN = re.compile(r"\bcurrency\w*\b|\bcurr[_\s]?cd\b|\biso[_\s]?currency\b",
+                              re.IGNORECASE)
+_CURRENCY_VALIDATED = re.compile(
+    r"currency\w*[\"']?[^\n]{0,120}?(?:\.isin\s*\(|\brlike\s*\(|\bIN\s*\(\s*[\"'][A-Za-z]{3}[\"']|"
+    r"\bjoin\s*\()|"
+    r"(?:allowed|valid|expected|known)[_\s]?currenc\w*|"
+    r"[\"']\^?\[A-Z\]\{3\}\$?[\"']",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-MONEY-PRECISION", ref="5.5.2",
+    title="**Numeric / Financial**: Precision preserved; no rounding errors; currency codes valid",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def notebook_money_precision(ctx: CheckContext) -> Verdict:
+    """Monetary values are fixed-point, and currency codes are checked against a set.
+
+    **What it can determine.** Whether a notebook that handles money-named
+    values (amount / price / cost / revenue / invoice / tax …) types them as
+    ``DecimalType`` — or instead casts them to ``double``/``float``, where
+    binary floating point loses cents and the error compounds across a sum — and
+    whether a currency column is validated against an allowed set or an ISO
+    3-letter pattern.
+
+    **What it cannot.** See the precision of a column it never casts (the source
+    type is not in the notebook), judge whether the chosen scale is right, or
+    detect rounding done inside a stored procedure or the Warehouse. Distinct
+    from ``NB-TYPE-CAST`` (5.3.1), which is satisfied by *any* explicit cast:
+    ``cast("double")`` passes there and fails here, which is exactly the point.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = executable_code(ctx.obj)
+    if not _MONEY_CONTEXT.search(code):
+        return not_applicable("Notebook handles no monetary or financial value")
+
+    decimal = bool(_DECIMAL_TYPING.search(code))
+    floating = bool(_FLOAT_FOR_MONEY.search(code))
+    has_currency = bool(_CURRENCY_COLUMN.search(code))
+    currency_ok = bool(_CURRENCY_VALIDATED.search(code))
+
+    if floating and not decimal:
+        return graded(0, "Monetary values are cast to float/double — binary floating point "
+                         "cannot hold a decimal amount exactly, so cents are lost and the "
+                         "error compounds across sums; use DecimalType(p, s)")
+    if not decimal:
+        return graded(1, "No explicit numeric typing for monetary values — precision is "
+                         "whatever the source or inference produced, so it is neither "
+                         "chosen nor guaranteed")
+    if has_currency and not currency_ok:
+        return graded(2, "Monetary values use fixed-point decimal typing, but the currency "
+                         "code is never validated against an allowed set or ISO pattern")
+    if has_currency:
+        return graded(3, "Monetary values use fixed-point decimal typing and currency codes "
+                         "are validated against an allowed set/pattern")
+    return graded(3, "Monetary values use fixed-point decimal typing (no currency-code "
+                     "column is handled in this notebook)")
+
+
+# =============================================================================
+# 5.2.2 — completeness control, and 5.2.3 — timeliness control
+#
+# Both points describe a *runtime outcome*: whether every expected batch arrived,
+# and whether it arrived on time. Neither is a property of the code, and neither
+# can be answered without row data or run telemetry this tool must not fetch.
+#
+# What a notebook definition *does* answer is whether the safeguard exists — the
+# code that would notice a missing partition, or notice data that is too old.
+# Both checks below score exactly that and say so in their evidence, so nobody
+# reads a PASS as "today's load was complete / on time".
+# =============================================================================
+
+#: Reading a source: files, a table, or a directory listing. The gate for both
+#: checks — a notebook that reads nothing has no arrival to police.
+_SOURCE_READ = re.compile(
+    r"spark\.read\b|\.read\.(?:csv|json|parquet|text|format|table|load)|spark\.table\s*\(|"
+    r"spark\.sql\s*\(|"
+    r"read_csv\s*\(|read_json\s*\(|read_parquet\s*\(|"
+    r"(?:notebookutils|mssparkutils)\s*\.\s*fs\s*\.\s*ls\s*\(|"
+    r"\bdbutils\s*\.\s*fs\s*\.\s*ls\s*\(",
+    re.IGNORECASE,
+)
+
+#: An *expectation* about the set of inputs: a named list/count of the files,
+#: partitions, batches or source tables that should be there, or the manifest /
+#: control file that carries it.
+_EXPECTED_INPUT_SET = re.compile(
+    r"\bexpected[_\s-]?(?:file|files|filename|filenames|file_?count|partition|partitions|"
+    r"batch|batches|batch_?count|table|tables|source|sources|date|dates|day|days|list|set|"
+    r"count)\b|"
+    r"\b(?:file|partition|batch|source)[_\s-]?manifest\b|\bmanifest[_\s-]?(?:file|df|list)\b|"
+    r"\bcontrol[_\s-]?file\b|\brequired[_\s-]?(?:files?|partitions?|tables?|sources?)\b",
+    re.IGNORECASE,
+)
+
+#: The *unmatched* half, named directly. On its own this is already a
+#: completeness control: nothing computes ``missing_partitions`` by accident.
+_MISSING_INPUT_SET = re.compile(
+    r"\bmissing[_\s-]?(?:file|files|partition|partitions|batch|batches|table|tables|"
+    r"source|sources|date|dates|day|days)\b|"
+    r"\b(?:absent|unreceived|not_?received)[_\s-]?(?:file|files|batch|batches|"
+    r"partition|partitions)\b",
+    re.IGNORECASE,
+)
+
+#: Acting on the expectation: differencing the two sets, or failing/raising when
+#: they disagree. Alone these mean nothing — they are only consulted alongside
+#: ``_EXPECTED_INPUT_SET``, so a bare ``assert`` cannot satisfy the check.
+_COMPLETENESS_ACTION = re.compile(
+    r"\.difference\s*\(|\bset\s*\([^\n]{0,120}?\)\s*-\s*set\s*\(|"
+    r"\.subtract\s*\(|\.exceptAll\s*\(|\bEXCEPT\s+(?:ALL\s+)?SELECT\b|"
+    r"left_anti|leftanti|\bleft\s+anti\s+join\b|"
+    r"\bnot\s+in\b|\bnotin\s*\(|~\w+\.isin\s*\(|"
+    r"\braise\b|\bassert\b|\bFail\b|"
+    r"(?:notebookutils|mssparkutils)\s*\.\s*notebook\s*\.\s*exit\s*\(|sys\s*\.\s*exit\s*\(",
+    re.IGNORECASE,
+)
+
+
+@check(
+    id="NB-COMPLETENESS-CONTROL", ref="5.2.2",
+    title="Completeness: all expected source files/batches received (no missing partitions or source tables)",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def notebook_has_an_arrival_completeness_control(ctx: CheckContext) -> Verdict:
+    """The notebook implements a control that would notice a missing file, partition or source.
+
+    **What it verifies: the safeguard, not the outcome.** Whether *this run's*
+    batches all arrived is a runtime fact — it lives in the data and in the run
+    log, not in the code, and this tool reads neither row data nor run telemetry.
+    A PASS here means "the notebook would notice an absent input", never "the
+    load was complete". A FAIL means nothing in the code would notice.
+
+    **What it can determine.** Two readable shapes of the control. Either the
+    unmatched set is named outright (``missing_partitions``, ``missing_files``),
+    or an expectation about the inputs is declared (``expected_files``,
+    ``expected_partitions``, a manifest or control file) **and** something acts
+    on it: a set difference, an anti-join, a ``not in``, or a raise/assert/exit.
+    An expectation with nothing acting on it scores in the middle — the list is
+    there, but nothing fails when reality differs from it.
+
+    **What it cannot.** Resolve an expectation that lives in a config table or a
+    pipeline parameter rather than the notebook, see a completeness gate
+    implemented in a stored procedure, or judge whether the expected set is the
+    *right* one. Read with ``executable_code`` so a commented-out check cannot
+    pass.
+
+    **Siblings.** ``NB-RECON-COUNT`` (5.2.5) compares *row* counts of what was
+    written against a source count; this is about the set of *inputs* that should
+    have arrived. ``NB-UNKNOWN-MONITOR`` (5.4.4) is completeness of dimension
+    *members*, inside data already loaded.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = executable_code(ctx.obj)
+    if not _SOURCE_READ.search(code):
+        return not_applicable(
+            "Notebook reads no source files, partitions or tables, so there is no "
+            "arrival completeness to control here"
+        )
+
+    if _MISSING_INPUT_SET.search(code):
+        return graded(
+            3,
+            "Notebook computes the missing/unreceived inputs explicitly — a completeness "
+            "control is present. Whether any particular load was complete is a runtime "
+            "outcome this check does not read.",
+        )
+    expectation = bool(_EXPECTED_INPUT_SET.search(code))
+    if expectation and _COMPLETENESS_ACTION.search(code):
+        return graded(
+            3,
+            "Notebook declares the expected set/count of inputs and compares or asserts "
+            "against it — a completeness control is present. Whether any particular load "
+            "was complete is a runtime outcome this check does not read.",
+        )
+    if expectation:
+        return graded(
+            1,
+            "Notebook names an expected set/count of inputs but nothing compares or "
+            "asserts against it — a missing file, partition or source table would pass "
+            "through unnoticed",
+        )
+    return graded(
+        0,
+        "Notebook reads source data with no completeness control — nothing declares which "
+        "files/partitions/source tables were expected, and nothing computes what is "
+        "missing, so an absent batch would be silently loaded as a short one",
+    )
+
+
+# -- 5.2.3 --------------------------------------------------------------------
+#
+# The trap here is the watermark. A watermark makes an *incremental read*
+# efficient (that is refs 2.2.1 / 2.2.4); it becomes a *timeliness* control only
+# when the code compares it against a bound and reacts. So the subject and the
+# bound must appear together, within one window, alongside a comparison.
+
+#: The subject of a freshness judgement: how old the data is, or the timestamp
+#: that says so.
+_FRESHNESS_SUBJECT = re.compile(
+    r"\bfreshness\b|\bstale(?:ness)?\b|\blateness\b|\bdata[_\s-]?age\b|"
+    r"\bsla(?![a-z])|\blag[_\s-]?(?:minutes|hours|days|seconds)\b|"
+    r"\b(?:max|latest|last)[_\s-]?(?:load|loaded|ingest|ingested|ingestion|event|update|"
+    r"updated|modified|refresh|refreshed|arrival|watermark)[_\s-]?"
+    r"(?:ts|time|timestamp|date|datetime|dt)\b|"
+    r"\bwatermark\b|\bage[_\s-]?(?:in[_\s-]?)?(?:minutes|hours|days)\b",
+    re.IGNORECASE,
+)
+
+#: The bound it is judged against: a clock, an interval, or a named threshold.
+_FRESHNESS_BOUND = re.compile(
+    r"current_timestamp\s*\(|current_date\s*\(|\bnow\s*\(|utcnow\s*\(|"
+    r"\bdatediff\s*\(|\bdate_diff\s*\(|\btimestampdiff\s*\(|\bmonths_between\s*\(|"
+    r"\btimedelta\s*\(|\bdate_sub\s*\(|\bdate_add\s*\(|\bINTERVAL\s+\d+|"
+    r"\b(?:max|sla|freshness|staleness|lateness|threshold|tolerance|expected)[_\s-]?"
+    r"(?:age|lag|delay|hours|minutes|days|seconds|window|threshold)\b",
+    re.IGNORECASE,
+)
+
+#: An actual comparison. Assignment alone records a value; it judges nothing.
+_FRESHNESS_COMPARISON = re.compile(r"(?:<=|>=|<|>|==|!=)|\bbetween\b", re.IGNORECASE)
+
+#: An explicitly named freshness control, as a *call or assignment* — a bare word
+#: also matches a comment or a column name.
+_NAMED_FRESHNESS_CONTROL = re.compile(
+    r"\b(?:freshness_check|check_freshness|assert_fresh\w*|staleness_check|check_staleness|"
+    r"sla_check|check_sla|timeliness_check|check_timeliness)\s*[\(=]",
+    re.IGNORECASE,
+)
+
+#: How far either side of the subject the bound and comparison may sit. One
+#: statement, pretty-printed across a couple of lines — not the whole notebook.
+_FRESHNESS_WINDOW = 200
+
+
+def _freshness_control(code: str) -> bool:
+    """True when a freshness/lateness subject is compared against a bound nearby.
+
+    Windowed on purpose: a ``watermark`` read at the top of the notebook and an
+    unrelated ``current_timestamp()`` three cells later are two facts, not one
+    control. Requiring them in the same window is what keeps incremental-load
+    bookkeeping from reading as a timeliness check.
+    """
+    if _NAMED_FRESHNESS_CONTROL.search(code):
+        return True
+    for match in _FRESHNESS_SUBJECT.finditer(code):
+        window = code[max(0, match.start() - _FRESHNESS_WINDOW):
+                      match.end() + _FRESHNESS_WINDOW]
+        if _FRESHNESS_BOUND.search(window) and _FRESHNESS_COMPARISON.search(window):
+            return True
+    return False
+
+
+@check(
+    id="NB-TIMELINESS-CONTROL", ref="5.2.3",
+    title="Timeliness: data arrives within expected SLA window",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def notebook_has_a_timeliness_control(ctx: CheckContext) -> Verdict:
+    """The notebook implements a freshness/lateness control — data age judged against a bound.
+
+    **What it verifies: the safeguard, not the outcome.** When data actually
+    arrived is a runtime fact, and the SLA window itself is a business agreement
+    this tool does not hold. A PASS means "the code would notice data that is too
+    old", never "the data arrived within its SLA".
+
+    **What it can determine.** Whether a freshness subject — a max/last
+    load/event/ingestion timestamp, a watermark, a named freshness/staleness/lag
+    value — is compared, *within the same statement window*, against a bound: a
+    clock (``current_timestamp()``, ``now()``), a date difference, an interval,
+    or a named threshold (``max_age_hours``, ``sla_hours``). A named control
+    (``freshness_check(...)``, ``assert_fresh...``) counts on its own.
+
+    **What it cannot.** Read the SLA value or judge whether the threshold is the
+    agreed one; see a freshness rule enforced by a Data Activator rule, a
+    pipeline, or a stored procedure; or confirm anything is alerted when the
+    bound is breached. Read with ``executable_code`` so a comment cannot pass.
+
+    **Siblings — deliberately not satisfied by these.** ``PL-INCREMENTAL``
+    (2.2.1) and ``PL-WATERMARK-STORE`` (2.2.4) are about a watermark used to read
+    *less*; a stored watermark with nothing compared against a bound scores in
+    the middle here, not a pass. ``WS-RUNTIME-BASELINE`` (2.6.1) judges how long
+    a *run* took, not how old the *data* is. ``NB-LATE-ARRIVAL`` (2.3.8) is about
+    applying out-of-order records safely once they do arrive.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = executable_code(ctx.obj)
+    if not (_SOURCE_READ.search(code) or _WRITE_PATTERN.search(code)):
+        return not_applicable(
+            "Notebook neither reads nor writes data, so there is no arrival timeliness "
+            "to control here"
+        )
+
+    if _freshness_control(code):
+        return graded(
+            3,
+            "Notebook compares a data-age / load-timestamp value against a bound "
+            "(clock, interval or named threshold) — a timeliness control is present. "
+            "Whether any particular load met its SLA is a runtime outcome this check "
+            "does not read, and the SLA value itself is not held by this tool.",
+        )
+    if _FRESHNESS_SUBJECT.search(code):
+        return graded(
+            1,
+            "Notebook records a load/event timestamp or watermark but never compares it "
+            "against a bound — that is incremental-load bookkeeping, not a timeliness "
+            "control: data arriving hours late would be processed without comment",
+        )
+    return graded(
+        0,
+        "Notebook has no freshness or lateness control — no data-age value is computed and "
+        "nothing is compared against a threshold, so late or absent data is indistinguishable "
+        "from data that arrived on time",
+    )
+
+
+# =============================================================================
+# 5.3.3 — business rules: two fields of the same row held against each other
+# =============================================================================
+
+#: One column reference in the DataFrame API: ``col("x")``, ``F.col("x")``,
+#: ``sf.col("x")``.
+_COL_REF = r"(?:[A-Za-z_]\w*\s*\.\s*)?col\s*\(\s*[\"'][\w.$ ]+[\"']\s*\)"
+#: A relational operator. Two-character forms are listed first so ``<=`` is never
+#: consumed as a bare ``<``.
+_REL_OP = r"(?:<=|>=|==|!=|<>|<|>)"
+
+#: A comparison whose **both** sides are columns of the same row — the shape a
+#: business rule takes (``start_date <= end_date``, ``net <= gross``). A column
+#: compared to a *literal* is deliberately absent: that is a range check and
+#: belongs to ``NB-DATE-QUALITY`` (5.5.1).
+_COLUMN_PAIR_COMPARISON = re.compile(
+    # col("start_date") <= col("end_date")
+    rf"{_COL_REF}\s*{_REL_OP}\s*{_COL_REF}|"
+    # df.start_date <= df.end_date. Neither side may be a call, so
+    # ``df.count() > other.count()`` (a reconciliation, ref 5.2.5) does not match.
+    rf"\b[A-Za-z_]\w*\s*\.\s*[A-Za-z_]\w*(?!\s*\()\s*{_REL_OP}\s*"
+    rf"[A-Za-z_]\w*\s*\.\s*[A-Za-z_]\w*(?!\s*\()",
+    re.IGNORECASE,
+)
+
+#: A SQL identifier, optionally backtick/bracket-quoted and optionally
+#: table-qualified. Double quotes are **not** accepted: in Spark SQL they delimit
+#: a string literal, and a column compared to a literal is a range check
+#: (ref 5.5.1), not a cross-field business rule.
+_SQL_COL = r"[`\[]?[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?[`\]]?"
+#: Values that look like an identifier but are not another column of the row, so
+#: comparing against them is a range/null check rather than a business rule.
+_SQL_NOT_A_COLUMN = r"(?:NULL|CURRENT_DATE|CURRENT_TIMESTAMP|GETDATE|SYSDATE|NOW|TRUE|FALSE)\b"
+
+#: The SQL spelling of the same shape: two column identifiers compared inside a
+#: ``WHERE`` / ``CASE WHEN`` / ``CHECK`` / ``HAVING``. ``AND`` and ``OR`` are not
+#: accepted as the leading keyword on purpose — Python's own ``and``/``or`` would
+#: then turn any two-variable comparison into a "business rule". Neither side may
+#: sit inside a quoted literal.
+_SQL_COLUMN_PAIR = re.compile(
+    rf"\b(?:WHERE|WHEN|CHECK|HAVING)\b[^\n]{{0,120}}?"
+    rf"(?<![\w'\"`]){_SQL_COL}\s*{_REL_OP}\s*"
+    rf"(?!{_SQL_NOT_A_COLUMN})(?!['\"]){_SQL_COL}(?!\s*\()",
+    re.IGNORECASE,
+)
+
+#: A rule expressed through a named construct rather than an inline comparison.
+#: Each must be a call or an assignment: a bare word also matches a comment or a
+#: column called ``rule_id``.
+_NAMED_BUSINESS_RULE = re.compile(
+    r"\b(?:business_rules?|rule_check\w*|check_rules?|validate_rules?|rule_set|ruleset|"
+    r"rule_engine)\s*[\(=\[]|"
+    r"expect_column_pair_values\w*\s*\(|expect_multicolumn\w*\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _business_rule_present(code: str) -> bool:
+    """True when the code holds two fields of the same row against each other."""
+    return bool(
+        _COLUMN_PAIR_COMPARISON.search(code)
+        or _SQL_COLUMN_PAIR.search(code)
+        or _NAMED_BUSINESS_RULE.search(code)
+    )
+
+
+@check(
+    id="NB-BUSINESS-RULE", ref="5.3.3",
+    title="Business rule validation: domain-specific rules applied (e.g., start_date <= end_date)",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def notebook_applies_business_rules(ctx: CheckContext) -> Verdict:
+    """A domain rule relates two fields of the same row — not one field to a constant.
+
+    **What it verifies: the safeguard, not the data.** Whether any row actually
+    violates a rule is a runtime fact held in the rows, which this tool never
+    reads. A PASS means "the notebook applies at least one cross-field rule",
+    never "the data obeys the business rules".
+
+    **What it can determine.** That a comparison exists whose *both* sides are
+    columns of the same row — ``col("start_date") <= col("end_date")``,
+    ``df.net <= df.gross``, a SQL ``WHERE``/``CASE WHEN``/``CHECK`` comparing two
+    column identifiers — or that a named rule construct is invoked
+    (``business_rules(...)``, ``rule_check(...)``, ``validate_rule(...)``,
+    ``expect_column_pair_values_*``).
+
+    **What it cannot.** Tell whether these are the *right* rules for the domain,
+    how many of the domain's rules are covered, or read a rule that lives in a
+    config table, a stored procedure or a downstream constraint. It also cannot
+    resolve a rule assembled from variables. Read with ``executable_code`` so a
+    commented-out rule cannot satisfy it.
+
+    **Siblings — deliberately different evidence.** ``NB-TYPE-CAST`` (5.3.1) asks
+    whether a column has the right *type*; ``NB-NULL-HANDLING`` (5.2.7) whether
+    it is *null*; ``NB-DATE-QUALITY`` (5.5.1) whether a value falls in a valid
+    *range* — a column against a literal or against ``current_date()``. A
+    literal-sided comparison is excluded here on purpose, so a pure range check
+    such as ``col("d") > "2020-01-01"`` scores 0 here and is credited only by
+    5.5.1. ``NB-DQ-RULES`` (5.1.2) asks the broader question of whether *any* DQ
+    logic is codified at all.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = executable_code(ctx.obj)
+    if not (_SOURCE_READ.search(code) or _WRITE_PATTERN.search(code)):
+        return not_applicable(
+            "Notebook neither reads nor writes data, so it carries no business data to "
+            "apply domain rules to"
+        )
+    ok = _business_rule_present(code)
+    return binary(
+        ok,
+        "Notebook applies at least one cross-field business rule (two columns of the same "
+        "row compared, or a named rule construct invoked). Whether these are the right "
+        "rules for the domain is not readable from code."
+        if ok else
+        "No cross-field business rule found — no comparison relates two columns of the "
+        "same row and no named rule construct is invoked, so a row whose end_date "
+        "precedes its start_date would load unremarked",
+    )
+
+
+# =============================================================================
+# 5.3.10 — nulls introduced *by* a join or a cast, checked where they appear
+# =============================================================================
+
+#: A construct that probes for, fills, or drops nulls.
+_NULL_PROBE = re.compile(
+    r"\.is(?:Not)?Null\s*\(|\bIS\s+(?:NOT\s+)?NULL\b|"
+    r"\.fillna\s*\(|\.na\s*\.\s*(?:fill|drop)\s*\(|\.dropna\s*\(|\bCOALESCE\s*\(|"
+    r"\bnull[_\s]?(?:count|counts|check|checks|profile)\b|\bcount[_\s]?nulls?\b|"
+    r"\bnullif\s*\(",
+    re.IGNORECASE,
+)
+#: Counting the nulls that an operation produced, rather than merely testing one
+#: value — evidence that the *result* of the operation is what is being examined.
+_NULL_COUNT = re.compile(
+    r"is(?:Not)?Null[^\n]{0,120}\.count\s*\(|"
+    r"\bnull[_\s]?counts?\b|\bcount[_\s]?nulls?\b|"
+    r"\bIS\s+NULL\b[^\n]{0,120}\bcount\s*\(",
+    re.IGNORECASE,
+)
+#: The control named outright. Nothing computes ``post_join_nulls`` by accident.
+_NULL_PROPAGATION_NAMED = re.compile(
+    r"\bnull[_\s]?propagation\b|\bpost[_\s-]?(?:join|cast)[_\s-]?null\w*|"
+    r"\b(?:unmatched|failed)[_\s-]?(?:join|cast)\w*|"
+    r"\bcast[_\s]?(?:failure|failures|error|errors)\b",
+    re.IGNORECASE,
+)
+
+#: How far after a join/cast a null check still counts as checking *that*
+#: operation. Wide enough to span the statement and the few that follow it,
+#: narrow enough that a fillna in a later section of the notebook is not credited.
+_NULL_PROP_WINDOW = 400
+
+#: Words that appear in almost every join/cast statement, so sharing one with a
+#: later null check proves no connection between them.
+_GENERIC_CODE_WORDS = frozenset({
+    "join", "left", "right", "outer", "inner", "anti", "semi", "cross", "cast",
+    "select", "selectexpr", "filter", "where", "when", "otherwise", "with",
+    "withcolumn", "withcolumnrenamed", "alias", "spark", "read", "table", "load",
+    "from", "into", "using", "true", "false", "none", "null", "lit", "expr",
+    "string", "integer", "bigint", "double", "float", "boolean", "decimal",
+    "date", "timestamp", "struct", "structtype", "structfield", "to_date",
+    "to_timestamp", "count", "show", "display", "print", "data", "temp",
+})
+_CODE_IDENTIFIER = re.compile(r"[A-Za-z_]\w{3,}")
+
+
+def _null_introducing_ops(code: str) -> list[re.Match]:
+    """Every join and every cast, in source order — the two null producers."""
+    found = list(_JOIN_PATTERN.finditer(code)) + list(_TYPE_CAST.finditer(code))
+    return sorted(found, key=lambda m: m.start())
+
+
+def _statement_words(code: str, match: re.Match) -> set[str]:
+    """Distinctive identifiers on the source line the match sits on."""
+    start = code.rfind("\n", 0, match.start()) + 1
+    end = code.find("\n", match.end())
+    stmt = code[start:end if end != -1 else len(code)]
+    return {w.lower() for w in _CODE_IDENTIFIER.findall(stmt)} - _GENERIC_CODE_WORDS
+
+
+def _null_check_after_null_introducing_op(code: str) -> tuple[bool, bool]:
+    """``(a null check follows a join/cast, that check is bound to the operation)``.
+
+    *Positional* means a null construct appears in the window **after** a join or
+    a cast — the point of ref 5.3.10, and what a ``fillna`` at the top of the
+    notebook (which satisfies ref 5.2.7) can never be.
+
+    *Bound* additionally means the check names something from the operation's own
+    statement — the joined frame, the cast column — or counts the nulls in its
+    result.
+    """
+    positional = bound = False
+    for match in _null_introducing_ops(code):
+        window = code[match.end():match.end() + _NULL_PROP_WINDOW]
+        probe = _NULL_PROBE.search(window)
+        if not probe:
+            continue
+        positional = True
+        # The remainder of the operation's *own* line is excluded from the
+        # name test: every join statement names its own frames, so matching a
+        # word there would bind every join to whatever null check follows it.
+        line_end = code.find("\n", match.end())
+        after_line = code[line_end if line_end != -1 else len(code):
+                          match.end() + _NULL_PROP_WINDOW]
+        probe_context = window[max(0, probe.start() - 120):probe.end() + 120]
+        words = _statement_words(code, match)
+        names_the_subject = any(
+            re.search(rf"\b{re.escape(w)}\b", after_line, re.IGNORECASE) for w in words
+        )
+        bound = bound or names_the_subject or bool(_NULL_COUNT.search(probe_context))
+    return positional, bound
+
+
+@check(
+    id="NB-NULL-PROPAGATION", ref="5.3.10",
+    title="Null propagation check: no nulls introduced by failed joins or type casts",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def notebook_checks_null_propagation(ctx: CheckContext) -> Verdict:
+    """Nulls are looked for *where they can appear* — right after a join or a cast.
+
+    **What it verifies: the guard, not the data.** Whether nulls actually
+    appeared is a property of the rows, which this tool never reads (the source
+    checklist lists a SQL-endpoint read for this point; proving nulls *exist*
+    would need rows, proving the *code guards* against them needs only the
+    notebook, and it is the guard that is scored here).
+
+    **What it can determine.** That the notebook performs a null-producing
+    operation — a DataFrame/SQL join, or a cast — and that a null construct
+    (``isNull``, ``IS NULL``, ``fillna``, ``dropna``, ``COALESCE``, a null count)
+    appears **after** it, within the same window. It scores highest when that
+    check is *bound* to the operation: it names the joined frame or the cast
+    column, or counts the nulls in the operation's result.
+
+    **What it cannot.** Tell whether the check covers every column the join or
+    cast could null, whether the handling is correct, or see a guard applied in a
+    stored procedure or a downstream constraint. A frame name held only in a
+    variable it cannot resolve is simply not credited, never counted against.
+
+    **Sibling — deliberately narrower than ``NB-NULL-HANDLING`` (ref 5.2.7).**
+    That check asks whether nulls are handled *anywhere* in the notebook, across
+    non-key columns. This one is **positional**: a notebook whose only null
+    handling is a ``df.fillna(0)`` at the top, followed later by a join, scores 0
+    here — the nulls the join introduces are never looked at — while still
+    passing 5.2.7. The two therefore never score off one line of code.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = executable_code(ctx.obj)
+    if not (_JOIN_PATTERN.search(code) or _TYPE_CAST.search(code)):
+        return not_applicable(
+            "Notebook performs neither a join nor a cast, so there is no null propagation "
+            "to guard against"
+        )
+
+    positional, bound = _null_check_after_null_introducing_op(code)
+    if _NULL_PROPAGATION_NAMED.search(code):
+        return graded(
+            3,
+            "Notebook runs a named null-propagation control (post-join / failed-cast null "
+            "check) over the operations that can introduce nulls",
+        )
+    if bound:
+        return graded(
+            3,
+            "A null check follows a join/cast and is bound to it — it names the joined or "
+            "cast subject, or counts the nulls in the result, so a non-matching join key or "
+            "a failed cast would be noticed",
+        )
+    if positional:
+        return graded(
+            2,
+            "A null construct appears after a join/cast but is not tied to it — it names "
+            "neither the joined frame nor the cast column and counts no nulls in the "
+            "result, so it is unclear that the introduced nulls are the ones examined",
+        )
+    return graded(
+        0,
+        "Notebook joins or casts but no null check follows either operation — a join key "
+        "that does not match and a cast that fails both produce nulls that pass through "
+        "unnoticed. Null handling elsewhere in the notebook (credited by NB-NULL-HANDLING, "
+        "5.2.7) does not cover the nulls these operations introduce.",
+    )
+
+
+# =============================================================================
+# 5.5.8 — EAM/JSON ingestion: structure, required elements, coerced types
+# =============================================================================
+
+#: The JSON structure is *declared* rather than inferred. ``inferSchema`` is not
+#: accepted — ``\bschema\s*=`` cannot match inside ``inferSchema=True``.
+_JSON_EXPLICIT_SCHEMA = re.compile(
+    r"StructType\s*\(|StructField\s*\(|MapType\s*\(|ArrayType\s*\(|"
+    r"\.schema\s*\(|\bschema\s*=\s*(?!True\b|False\b|None\b)[A-Za-z_]\w*|"
+    r"from_json\s*\([^,()\n]{0,80},|schema_of_json\s*\(|\bDDL\b|"
+    r"\bexpected[_\s]?schema\b",
+    re.IGNORECASE,
+)
+
+#: The expected keys/fields are asserted to be present.
+_JSON_REQUIRED_ELEMENTS = re.compile(
+    r"\b(?:required|expected|mandatory)[_\s]?"
+    r"(?:field|fields|column|columns|key|keys|element|elements|attribute|attributes)\b|"
+    r"\bmissing[_\s]?(?:field|fields|column|columns|key|keys|element|elements)\b|"
+    r"\bset\s*\([^\n]{0,120}?\)\s*-\s*set\s*\(|\.issubset\s*\(|\.issuperset\s*\(|"
+    r"\bin\s+\w+\s*\.\s*columns\b|\bnot\s+in\s+\w+\s*\.\s*columns\b|"
+    r"assert[^\n]{0,100}\b(?:columns|keys|fields)\b|"
+    r"\bhasField\s*\(|\.has_key\s*\(",
+    re.IGNORECASE,
+)
+
+#: The coercion is *checked* rather than assumed: a parser mode that surfaces bad
+#: records, a corrupt-record column, or a quarantine path for malformed input.
+_JSON_COERCION_GUARD = re.compile(
+    r"badRecordsPath|columnNameOfCorruptRecord|_corrupt_record|"
+    r"\bmode\s*[=,]\s*[\"'](?:FAILFAST|PERMISSIVE|DROPMALFORMED)[\"']|"
+    r"[\"']mode[\"']\s*,\s*[\"'](?:FAILFAST|PERMISSIVE|DROPMALFORMED)[\"']",
+    re.IGNORECASE,
+)
+#: A coercion wrapped in exception handling — the Python spelling of the same
+#: guard.
+_TRY_AROUND_COERCION = re.compile(
+    r"\btry\s*:[\s\S]{0,400}?"
+    r"(?:\.cast\s*\(|to_date\s*\(|to_timestamp\s*\(|from_json\s*\(|json\.loads\s*\()"
+    r"[\s\S]{0,400}?\bexcept\b"
+)
+
+
+def _coercion_is_verified(code: str) -> bool:
+    """True when a cast/parse is checked rather than assumed."""
+    if _JSON_COERCION_GUARD.search(code) or _TRY_AROUND_COERCION.search(code):
+        return True
+    for match in _TYPE_CAST.finditer(code):
+        if _NULL_PROBE.search(code[match.end():match.end() + _NULL_PROP_WINDOW]):
+            return True
+    return False
+
+
+@check(
+    id="NB-JSON-VALIDATION", ref="5.5.8",
+    title="**JSON (EAM)**: Structure validated; required elements present; type coercion verified",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def notebook_validates_json_payloads(ctx: CheckContext) -> Verdict:
+    """EAM/JSON ingestion declares its structure, asserts required elements, and checks coercion.
+
+    **What it verifies: the guard, not the payload.** Whether any incoming
+    document is actually malformed is a runtime fact in the data (the source
+    checklist lists a SQL-endpoint read for this point; that would only show the
+    landed result). What is scored here is whether the *code* would notice —
+    readable from the notebook alone.
+
+    **What it can determine.** Three sub-practices, each scored independently:
+    *structure* — an explicit schema on the JSON read (``StructType``,
+    ``.schema(...)``, a schema passed to ``from_json``) rather than inference;
+    *required elements* — an expected/required field list, a column-presence
+    assertion, or a set difference against ``df.columns``; *type coercion
+    verified* — a parser mode that surfaces bad records, a corrupt-record column,
+    a ``try``/``except`` around the coercion, or a cast followed by a null check.
+
+    **What it cannot.** Tell whether the declared schema matches the contract,
+    whether the required-field list is complete, or validate a payload shape
+    enforced outside the notebook.
+
+    **Sibling — same population, different question.** ``NB-EAM-INGEST``
+    (ref 2.6.6) gates on the same ``_EAM_JSON`` detector, deliberately reused
+    here so the two agree on what counts as EAM/JSON ingestion, and asks whether
+    that ingestion is *efficient* (streaming, partitioned, bounded parsing). This
+    check asks whether it is *correct*.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = executable_code(ctx.obj)
+    if not _EAM_JSON.search(code):
+        return not_applicable("Notebook has no recognizable EAM/JSON ingestion")
+
+    facets = {
+        "an explicit schema on the JSON read": bool(_JSON_EXPLICIT_SCHEMA.search(code)),
+        "a required-element presence check": bool(_JSON_REQUIRED_ELEMENTS.search(code)),
+        "verification that type coercion succeeded": _coercion_is_verified(code),
+    }
+    present = [name for name, ok in facets.items() if ok]
+    missing = [name for name, ok in facets.items() if not ok]
+    if not present:
+        return graded(
+            0,
+            "EAM/JSON ingestion validates nothing: no explicit schema, no required-element "
+            "check and no verification that type coercion succeeded — a renamed element or "
+            "an uncoercible value lands silently as null",
+        )
+    return graded(
+        len(present),
+        f"EAM/JSON validation covers {len(present)} of 3 sub-practices "
+        f"({'; '.join(present)})"
+        + (f"; missing: {'; '.join(missing)}" if missing else "")
+        + ". Whether the declared structure matches the source contract is not readable "
+          "from code.",
+    )

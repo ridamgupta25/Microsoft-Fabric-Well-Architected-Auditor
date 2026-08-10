@@ -9,7 +9,12 @@ import json
 import re
 
 from auditfast.core.check._notebook import NOTEBOOK_LAYERS, executable_code, notebook_code
-from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities, walk_activities
+from auditfast.core.check._pipeline import (
+    PIPELINE_LAYERS,
+    activities,
+    script_sql,
+    walk_activities,
+)
 from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Pillar, Resource, Scope, Severity
@@ -654,3 +659,239 @@ def nb_post_failure_integrity(ctx: CheckContext) -> Verdict:
                   if ok else
                   "Recovery/replay path reprocesses across layers but never asserts the "
                   "layers agree — a partially-written layer is trusted as complete")
+
+
+# -- 9.3.2 — the write itself is a keyed upsert --------------------------------
+#
+# This is deliberately NARROWER than its two siblings, and the distinction is the
+# whole reason it exists as a separate check:
+#
+#   * ``PL-IDEMPOTENT`` (ref 2.4.6) and ``NB-IDEMPOTENT`` (ref 9.3.1) ask whether
+#     a rerun is safe *by any mechanism at all* — their ``_IDEMPOTENT_PATTERN``
+#     is satisfied by the word ``overwrite``, by a ``batch_id`` variable, by a
+#     ``watermark``, or by a cleanup activity ordered before a write.
+#   * This check asks the specific question the point asks: does the **write**
+#     use a MERGE/upsert **keyed on a business key**, rather than a blind append?
+#
+# A notebook containing ``batch_id = run_id`` and ``df.write.mode("append")``
+# passes 9.3.1 and must score 0 here. That gap is the defect this check exists to
+# find, and ``tests/test_mlc_batch_checks.py`` pins it in
+# ``test_9_3_2_is_strictly_narrower_than_9_3_1``.
+
+#: A keyed upsert in SQL: ``MERGE INTO t USING s ON <predicate>``. The ``ON`` is
+#: required — a MERGE without a match predicate is not keyed on anything.
+_MERGE_SQL_KEYED = re.compile(
+    r"\bMERGE\s+INTO\b[\s\S]{0,600}?\bUSING\b[\s\S]{0,600}?\bON\b",
+    re.IGNORECASE,
+)
+#: A keyed upsert in the Delta Python/Scala API: ``.merge(source, condition)``
+#: followed by a matched/not-matched clause. The clause is what makes it an
+#: upsert rather than a bare join.
+_MERGE_DELTA_KEYED = re.compile(
+    r"\.merge\s*\([\s\S]{0,600}?\)[\s\S]{0,600}?\.when(?:Matched|NotMatched)",
+    re.IGNORECASE,
+)
+#: Spark's keyed overwrite: rewrite exactly the partition/predicate this run
+#: owns. Keyed on a value, so a rerun replaces rather than appends.
+_KEYED_REPLACE = re.compile(
+    r"replaceWhere|partitionOverwriteMode|\bINSERT\s+OVERWRITE\b|"
+    r"\bON\s+CONFLICT\b|\bON\s+DUPLICATE\s+KEY\b",
+    re.IGNORECASE,
+)
+#: A write that appends rows with no key handling — the defect.
+_BLIND_APPEND = re.compile(
+    r"""\.mode\s*\(\s*["']append["']\s*\)|"""
+    r"""\.option\s*\(\s*["']mode["']\s*,\s*["']append["']\s*\)|"""
+    r"\.insertInto\s*\(|\bINSERT\s+INTO\b",
+    re.IGNORECASE,
+)
+#: A full-table overwrite. It does prevent duplicates on a rerun, but it is not
+#: a keyed upsert and it cannot express an incremental load.
+_FULL_OVERWRITE = re.compile(
+    r"""\.mode\s*\(\s*["']overwrite["']\s*\)|"""
+    r"\bCREATE\s+OR\s+REPLACE\s+TABLE\b|\bTRUNCATE\s+TABLE\b",
+    re.IGNORECASE,
+)
+#: Deduplication applied on named key columns. Weaker than an upsert — it cleans
+#: up after the duplicate rather than never creating it — but it is key-aware.
+_KEYED_DEDUP = re.compile(
+    r"dropDuplicates\s*\(\s*\[|drop_duplicates\s*\(\s*(?:subset\s*=\s*)?\[|"
+    r"\bROW_NUMBER\s*\(\s*\)\s*OVER\s*\(\s*PARTITION\s+BY\b|"
+    r"\bGROUP\s+BY\b[\s\S]{0,200}?\bHAVING\s+COUNT\b",
+    re.IGNORECASE,
+)
+
+#: Does this artifact write to a table at all? Deliberately wider than
+#: ``_WRITE_SIGNAL`` (which 9.3.1 uses): the Delta ``.merge(...).execute()`` API
+#: writes without ever touching ``.write`` or ``saveAsTable``, and gating on
+#: ``_WRITE_SIGNAL`` would send exactly the compliant notebooks to N/A.
+_ANY_TABLE_WRITE = re.compile(
+    r"\.write\b|\.writeStream\b|saveAsTable\s*\(|\.save\s*\(|\.insertInto\s*\(|"
+    r"\.merge\s*\(|\bINSERT\s+(?:INTO|OVERWRITE)\b|\bMERGE\s+INTO\b|"
+    r"\bCREATE\s+OR\s+REPLACE\s+TABLE\b|\bTRUNCATE\s+TABLE\b|\bCOPY\s+INTO\b",
+    re.IGNORECASE,
+)
+
+#: Copy-activity sinks are judged structurally (``writeBehavior`` +
+#: ``upsertSettings.keys``) rather than by pattern, so they need no regex.
+
+
+def _merge_grade(text: str, subject: str) -> Verdict:
+    """Grade one artifact's write pattern against the keyed-upsert claim.
+
+    Shared by the pipeline and the notebook check so the two cannot drift apart
+    while both carry ref 9.3.2. ``subject`` names the artifact for the evidence.
+    """
+    keyed = bool(_MERGE_SQL_KEYED.search(text)) or bool(_MERGE_DELTA_KEYED.search(text))
+    replace = bool(_KEYED_REPLACE.search(text))
+    appends = bool(_BLIND_APPEND.search(text))
+    overwrites = bool(_FULL_OVERWRITE.search(text))
+    dedups = bool(_KEYED_DEDUP.search(text))
+
+    if keyed:
+        return binary(True, f"{subject} writes through a keyed MERGE/upsert (a match "
+                            f"predicate binds source to target), so a re-execution updates "
+                            f"the matched rows instead of appending duplicates")
+    if replace:
+        return graded(3, f"{subject} writes with a keyed replace (replaceWhere / dynamic "
+                         f"partition overwrite / INSERT OVERWRITE / ON CONFLICT) — a "
+                         f"re-execution rewrites exactly the rows this run owns rather "
+                         f"than appending them again")
+    if overwrites and not appends:
+        return graded(2, f"{subject} fully overwrites its target instead of merging. That "
+                         f"does prevent duplicates on a re-run, but it is not a keyed "
+                         f"upsert: it cannot load incrementally, and it rewrites rows the "
+                         f"run did not touch")
+    if appends and dedups:
+        return graded(1, f"{subject} appends and then deduplicates on named key columns. "
+                         f"The duplicates are created and cleaned up rather than never "
+                         f"written, so a run that fails between the two leaves them behind")
+    if appends:
+        return graded(0, f"{subject} appends rows with no key handling — no MERGE/upsert, "
+                         f"no keyed replace, no deduplication on a key. Re-executing it "
+                         f"writes the same rows again")
+    return not_applicable(f"{subject} performs no recognisable table write, so there is no "
+                          f"write pattern to judge for duplicate-on-rerun safety")
+
+
+@check(
+    id="NB-MERGE-KEYED", ref="9.3.2",
+    title="Merge/upsert patterns prevent duplicates on re-execution",
+    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def notebook_merge_keyed(ctx: CheckContext) -> Verdict:
+    """The notebook's write is a keyed MERGE/upsert, not a blind append.
+
+    **How this differs from its siblings — read this before calling it a
+    duplicate.** ``NB-IDEMPOTENT`` (ref 9.3.1) and ``PL-IDEMPOTENT`` (ref 2.4.6)
+    ask the general question: is *any* rerun-safety mechanism present? Their
+    detector is satisfied by the word ``overwrite``, a ``batch_id`` variable, a
+    ``watermark``, or a cleanup step ordered before a write. This check asks the
+    specific one this point asks: is the **write itself** keyed? A notebook doing
+    ``batch_id = run_id`` and ``df.write.mode("append").saveAsTable(...)``
+    satisfies 9.3.1 and scores **0** here, which is the correct reading of both
+    points.
+
+    **What it can determine.** Which of five write shapes the notebook's code
+    uses: a keyed MERGE (SQL ``MERGE INTO … USING … ON``, or the Delta
+    ``.merge(...).whenMatched…`` API); a keyed replace (``replaceWhere``,
+    dynamic partition overwrite, ``INSERT OVERWRITE``, ``ON CONFLICT``); a full
+    overwrite; append-then-deduplicate on named key columns; or a bare append.
+    Read through :func:`executable_code`, so a comment describing a MERGE — or a
+    commented-out one — cannot satisfy it.
+
+    **What it cannot.** It cannot tell whether the merge predicate names the
+    *right* business key, only that a predicate exists; a MERGE keyed on a
+    surrogate that changes every load would read as compliant here. It cannot
+    follow a write performed inside an imported helper module, since only this
+    notebook's own cells are fetched. A notebook that performs no recognisable
+    write is N/A, as is an unreadable definition — never FAIL.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    # executable_code, not notebook_code: this detects a *technique*, so a
+    # comment mentioning MERGE must not satisfy it.
+    code = executable_code(ctx.obj)
+    if not _ANY_TABLE_WRITE.search(code):
+        return not_applicable("Notebook has no write operation, so it cannot create "
+                              "duplicates on re-execution")
+    return _merge_grade(code, "Notebook")
+
+
+@check(
+    id="PL-MERGE-KEYED", ref="9.3.2",
+    title="Merge/upsert patterns prevent duplicates on re-execution",
+    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
+)
+def pipeline_merge_keyed(ctx: CheckContext) -> Verdict:
+    """The pipeline's load is a keyed upsert, not a blind insert.
+
+    **How this differs from its sibling.** ``PL-IDEMPOTENT`` (ref 2.4.6) asks
+    whether *any* rerun-safety mechanism is present anywhere in the pipeline
+    JSON, and a stray ``batch_id`` parameter name satisfies it. This check reads
+    only what the pipeline actually *writes with*: the T-SQL its Script
+    activities carry, and its Copy activities' sink settings. A Copy whose sink
+    has no ``upsertSettings`` and a Script that only ``INSERT``s score 0 here
+    while passing 2.4.6.
+
+    **What it can determine.** Whether a Copy sink is configured with
+    ``writeBehavior: upsert`` plus ``upsertSettings.keys`` (a keyed upsert), and
+    which write shape the inline Script SQL uses — the same five shapes the
+    notebook check grades, over :func:`script_sql` rather than notebook cells.
+
+    **What it cannot.** It cannot see inside a stored procedure a
+    ``SqlServerStoredProcedure`` activity calls: Fabric does not expose the
+    procedure body, so a pipeline whose upsert lives there is judged only on what
+    is visible and may be understated — which is why an unrecognisable write is
+    N/A rather than a failure. It cannot see a write performed by a notebook the
+    pipeline invokes; that notebook is judged separately by ``NB-MERGE-KEYED``.
+    A pipeline with no Copy sink and no Script SQL is N/A.
+    """
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    acts = walk_activities(ctx.obj)
+    copy_sinks = [
+        (a.get("name") or "Copy", (a.get("typeProperties") or {}).get("sink") or {})
+        for a in acts if (a.get("type") or "") == "Copy"
+    ]
+    upserting = [
+        name for name, sink in copy_sinks
+        if isinstance(sink, dict)
+        and str(sink.get("writeBehavior") or "").lower() == "upsert"
+        and (sink.get("upsertSettings") or {}).get("keys")
+    ]
+    sql = script_sql(ctx.obj)
+
+    if not copy_sinks and not sql.strip():
+        return not_applicable("Pipeline has no Copy activity sink and no inline Script SQL, "
+                              "so it performs no write this check can judge")
+
+    if upserting and len(upserting) == len(copy_sinks) and not sql.strip():
+        return binary(True, f"All {len(copy_sinks)} Copy activit(y/ies) write with "
+                            f"writeBehavior 'upsert' keyed on explicit upsertSettings.keys "
+                            f"({', '.join(sorted(upserting))}), so a re-execution updates "
+                            f"matched rows instead of inserting duplicates")
+
+    if sql.strip():
+        verdict = _merge_grade(sql, "Pipeline Script SQL")
+        if verdict.score is not None:
+            suffix = (f" ({len(upserting)} of {len(copy_sinks)} Copy sink(s) also upsert on "
+                      f"explicit keys)") if copy_sinks else ""
+            if upserting and verdict.score < 3:
+                # Some of the load is keyed even though the SQL is not; say so
+                # rather than reporting the pipeline as uniformly unkeyed.
+                return graded(max(verdict.score, 1), verdict.evidence + suffix)
+            return graded(verdict.score, verdict.evidence + suffix)
+
+    if copy_sinks:
+        return covered(
+            len(upserting), len(copy_sinks),
+            f"{len(upserting)} of {len(copy_sinks)} Copy activit(y/ies) write with a keyed "
+            f"upsert (writeBehavior 'upsert' plus upsertSettings.keys); the rest insert "
+            f"rows, so a re-execution appends them again. Writes inside a stored procedure "
+            f"are not visible to this check",
+        )
+    return not_applicable("Pipeline performs no write this check can judge")

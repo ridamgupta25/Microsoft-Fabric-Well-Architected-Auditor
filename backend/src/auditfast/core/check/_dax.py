@@ -48,9 +48,45 @@ _SIMPLE_FILTER = re.compile(
 )
 
 
+#: DAX time-intelligence functions — the mechanics a measure needs to compare a
+#: period against another period. Their *presence* is what makes trend analysis
+#: possible; whether any report actually plots the result is not readable from
+#: the model, so callers must not claim more than "the model can do this".
+TIME_INTELLIGENCE_FUNCTIONS = (
+    "DATEADD", "SAMEPERIODLASTYEAR", "PARALLELPERIOD", "DATESINPERIOD", "DATESBETWEEN",
+    "TOTALYTD", "TOTALQTD", "TOTALMTD", "DATESYTD", "DATESQTD", "DATESMTD",
+    "PREVIOUSDAY", "PREVIOUSMONTH", "PREVIOUSQUARTER", "PREVIOUSYEAR",
+    "NEXTDAY", "NEXTMONTH", "NEXTQUARTER", "NEXTYEAR",
+    "STARTOFYEAR", "STARTOFQUARTER", "STARTOFMONTH",
+    "ENDOFYEAR", "ENDOFQUARTER", "ENDOFMONTH",
+    "OPENINGBALANCEMONTH", "OPENINGBALANCEQUARTER", "OPENINGBALANCEYEAR",
+    "CLOSINGBALANCEMONTH", "CLOSINGBALANCEQUARTER", "CLOSINGBALANCEYEAR",
+)
+#: A *call* to one of them. The bare name also appears in a measure name
+#: ("Sales SAMEPERIODLASTYEAR"), which computes nothing.
+_TIME_INTELLIGENCE_CALL = re.compile(
+    r"\b(" + "|".join(re.escape(name) for name in TIME_INTELLIGENCE_FUNCTIONS) + r")\s*\(",
+    re.IGNORECASE,
+)
+
+
 def normalised(expression: object) -> str:
     """Expression with runs of whitespace collapsed, so pretty-printing adds no length."""
     return _WHITESPACE.sub(" ", str(expression or "")).strip()
+
+
+def uses_time_intelligence(expression: str) -> bool:
+    """True when the expression *calls* a DAX time-intelligence function.
+
+    Only the call form counts: a measure merely *named* after a period comparison
+    shifts no date filter.
+    """
+    return bool(_TIME_INTELLIGENCE_CALL.search(expression or ""))
+
+
+def time_intelligence_calls(expression: str) -> set[str]:
+    """The upper-cased time-intelligence function names called in ``expression``."""
+    return {match.group(1).upper() for match in _TIME_INTELLIGENCE_CALL.finditer(expression or "")}
 
 
 def uses_variables(expression: str) -> bool:

@@ -127,7 +127,16 @@ def test_report_endpoint_returns_the_full_scorecard(client):
     assert report["overall"] == EXPECTED_OVERALL
     assert report["total_scored"] == EXPECTED_SCORED_CHECKS
     assert len(report["results"]) == EXPECTED_RESULT_ROWS
-    assert report["by_pillar"]["Governance & Compliance"]["pct"] is None
+    # "Not assessed" must survive the API boundary as null rather than 0 — the
+    # two mean different things to a reader. Asserted over whichever pillars
+    # actually scored nothing, because naming one makes the test a hostage to
+    # coverage (this previously named Governance & Compliance and broke when
+    # that pillar gained its first automated check).
+    for pillar, facts in report["by_pillar"].items():
+        if facts["count"] == 0:
+            assert facts["pct"] is None, f"{pillar} scored nothing but reports a percentage"
+        else:
+            assert facts["pct"] is not None, f"{pillar} scored checks but reports no percentage"
 
 
 def test_report_includes_the_pillar_by_layer_matrix(client):

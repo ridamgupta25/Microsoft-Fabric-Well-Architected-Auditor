@@ -47,10 +47,24 @@ def test_rating_labels():
 
 
 def test_not_assessed_is_not_zero(provider):
-    """A pillar with no checks scores None, never 0.0 — they mean different things."""
+    """A pillar with no scored checks reports None, never 0.0 — they differ.
+
+    Asserted as an invariant over every pillar rather than naming one, because
+    naming a pillar makes the test a hostage to coverage: this previously pinned
+    Governance & Compliance, and broke the moment that pillar gained its first
+    automated check. The rule being protected is "no data" ≠ "scored zero".
+    """
     agg = aggregate(_run(provider))
-    assert agg["by_pillar"][Pillar.GOVERNANCE]["pct"] is None
-    assert agg["by_pillar"][Pillar.GOVERNANCE]["count"] == 0
+    unassessed = [p for p, facts in agg["by_pillar"].items() if facts["count"] == 0]
+    for pillar in unassessed:
+        assert agg["by_pillar"][pillar]["pct"] is None, (
+            f"{pillar} has no scored checks, so its percentage must be None, not "
+            f"{agg['by_pillar'][pillar]['pct']}"
+        )
+    # …and the converse: a pillar that did score must report a number.
+    for facts in agg["by_pillar"].values():
+        if facts["count"] > 0:
+            assert facts["pct"] is not None
 
 
 # -- parity with the pre-refactor implementation -------------------------------
@@ -69,11 +83,11 @@ def test_result_and_scored_counts_are_unchanged(provider):
 
 def test_status_counts_are_unchanged(provider):
     agg = aggregate(_run(provider))
-    assert agg["counts"][Status.PASS] == 51
-    assert agg["counts"][Status.PARTIAL] == 18
-    assert agg["counts"][Status.FAIL] == 63
-    assert agg["counts"][Status.NA] == 150
-    assert agg["counts"][Status.INFO] == 5
+    assert agg["counts"][Status.PASS] == 57
+    assert agg["counts"][Status.PARTIAL] == 21
+    assert agg["counts"][Status.FAIL] == 70
+    assert agg["counts"][Status.NA] == 187
+    assert agg["counts"][Status.INFO] == 8
 
 
 def test_mixed_layer_runs_every_layers_checks():
@@ -271,16 +285,16 @@ def test_progress_callback_fires_per_workspace(provider):
 
 
 def test_registry_is_fully_populated():
-    """143 checks are evaluated; remaining roadmap checks are not loaded."""
+    """203 checks are evaluated; remaining roadmap checks are not loaded."""
     evaluated = [s for s in REGISTRY if s.automation is Automation.AUTOMATED]
-    assert len(evaluated) == 151
-    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 49
-    assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 27
-    assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 69
+    assert len(evaluated) == 203
+    assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 85
+    assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 30
+    assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 81
     # Roadmap (gated N/A) checks are intentionally not registered — see
     # auditfast.core.check.__init__._CHECK_MODULES — so none remain in the registry.
     assert len([s for s in REGISTRY if s.automation is Automation.ROADMAP]) == 0
-    assert len([s for s in REGISTRY if s.automation is Automation.INTERACTIVE]) == 11
+    assert len([s for s in REGISTRY if s.automation is Automation.INTERACTIVE]) == 25
     assert all(
         s.automation is Automation.INTERACTIVE for s in REGISTRY if s.manual
     )
@@ -335,7 +349,7 @@ def test_explicit_registry_is_isolated_from_the_global_one():
     assert registry.get("X-ISOLATED") is not None
     assert REGISTRY.get("X-ISOLATED") is None, "test check leaked into the global registry"
     before = len([s for s in REGISTRY if s.automation is Automation.AUTOMATED])
-    assert before == 151
+    assert before == 203
 
 # -- selection and dispatch ----------------------------------------------------
 

@@ -12,12 +12,13 @@ guidance from the vendored ``fabric-skills``.
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 
 from auditfast.core.check._notebook import notebook_code
 from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities, walk_activities
 from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable
 from auditfast.core.check.registry import check
-from auditfast.core.enums import Pillar, Resource, Scope, Severity
+from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
 
 from . import _spark
@@ -542,3 +543,154 @@ def sql_ingestion_tuned(ctx: CheckContext) -> Verdict:
     if gaps:
         detail += f" — untuned on {', '.join(gaps)}"
     return covered(met, total * 3, detail)
+
+
+# -- 2.6.4 — scheduling spread across the capacity -----------------------------
+#
+# Read entirely from ``Resource.ITEM_RUN_HISTORY``, which retains up to 25 run
+# stamps per runnable item. No schedule API is called and no row data is touched.
+
+#: Runnable item types whose starts compete for the same capacity.
+_SCHEDULED_TYPES: frozenset[str] = frozenset({
+    "DataPipeline", "Notebook", "Dataflow", "SparkJobDefinition",
+})
+
+#: The window inside which two runs count as "at the same time". Five minutes is
+#: deliberately coarse: a job scheduled on the hour does not fire at exactly
+#: :00:00, and a tighter window would score clock jitter instead of contention.
+_WINDOW_MINUTES = 5
+
+#: Below this many distinct items, a workspace cannot demonstrate contention no
+#: matter how it is scheduled — two items overlapping is a coincidence.
+_MIN_ITEMS = 3
+#: …and below this many stamps overall there is not enough history to judge.
+_MIN_STAMPS = 6
+
+#: Share of items allowed to share the busiest window before it reads as a pile-up.
+_SPREAD_GOOD = 0.34
+_SPREAD_FAIR = 0.50
+_SPREAD_POOR = 0.75
+
+
+def _run_moment(stamp: str) -> datetime | None:
+    """Parse an ISO-8601 UTC run stamp, or ``None`` when it is unreadable."""
+    try:
+        parsed = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+@check(
+    id="WS-SCHEDULE-STAGGER", ref="2.6.4",
+    title="Pipeline scheduling avoids capacity contention (staggered across domains, not all at once)",
+    pillar=Pillar.PERFORMANCE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=(Layer.PREP, Layer.MIXED),
+    requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=True,
+)
+def schedule_stagger(ctx: CheckContext) -> Verdict:
+    """Runnable items do not all pile into the same few minutes of the clock.
+
+    **What it can determine.** How the workspace's runs are spread over the
+    clock, from the job-run stamps the scheduler history already returns — up to
+    25 per item, so no extra call is made. Runs are bucketed into
+    5-minute windows; the score is driven by the *busiest* window, measured as
+    the share of distinct runnable items that appear in it. A third or fewer is a
+    well-staggered estate; more than three quarters of the items landing in one
+    window is everything firing at once and competing for the same capacity. The
+    classic "everything on the hour" shape is reported alongside, as the share of
+    stamps falling within two minutes of the top of an hour.
+
+    **What it cannot — read this before acting on it.**
+
+    * These are **observed run stamps, not the configured schedule.** The Fabric
+      job-schedule API is not called. A job whose trigger is staggered but which
+      queues behind a busy capacity still shows up clustered here, and that is
+      arguably the more useful answer — but it is not the same claim as "the
+      schedule is misconfigured".
+    * The stamps are each run's **end time**, falling back to its start time for
+      a run still in flight, because that is what ``jobs/instances`` yields for
+      the one page already fetched. Clustered *completions* are strong evidence
+      of concurrent capacity use, but they are a proxy for clustered starts, not
+      a measurement of them.
+    * It sees **one workspace at a time**. "Staggered across domains" in the
+      point's sense — different domains in different workspaces — is only
+      partially visible; contention created by a *sibling* workspace on the same
+      capacity is invisible here.
+    * A workspace with fewer than three runnable items with history, or fewer
+      than six readable stamps in total, is **N/A**: it cannot demonstrate
+      contention either way. Unreadable run history is N/A, never FAIL.
+    """
+    if not ctx.workspace.has(Resource.ITEM_RUN_HISTORY):
+        return not_applicable(
+            "Per-item run history (jobs/instances) could not be read from Fabric, so the "
+            "spread of run times over the clock cannot be derived"
+        )
+    history = ctx.workspace.run_history or {}
+    if not history:
+        return not_applicable(
+            "No item in this workspace has a recorded run history, so there is no "
+            "observed schedule to judge for contention"
+        )
+
+    by_id = {i.id: i for i in ctx.workspace.items if i.id}
+
+    def _name(item_id: str) -> str:
+        item = by_id.get(item_id)
+        return (item.display_name or item.id) if item else item_id
+
+    # Only the item types that actually consume capacity when they run.
+    moments: dict[str, list[datetime]] = {}
+    for item_id, stamps in history.items():
+        item = by_id.get(item_id)
+        if item is not None and item.type and item.type not in _SCHEDULED_TYPES:
+            continue
+        parsed = [m for m in (_run_moment(s) for s in stamps) if m is not None]
+        if parsed:
+            moments[item_id] = parsed
+
+    total_stamps = sum(len(v) for v in moments.values())
+    if len(moments) < _MIN_ITEMS or total_stamps < _MIN_STAMPS:
+        return not_applicable(
+            f"Only {len(moments)} runnable item(s) with {total_stamps} readable run "
+            f"stamp(s) — fewer than the {_MIN_ITEMS} items and {_MIN_STAMPS} stamps needed "
+            f"before a pile-up can be told apart from coincidence"
+        )
+
+    # Bucket every run into a fixed 5-minute window of absolute time, recording
+    # which *items* landed there. Counting items rather than runs stops one
+    # chatty item's retry storm reading as an estate-wide pile-up.
+    windows: dict[int, set[str]] = {}
+    on_the_hour = 0
+    for item_id, runs in moments.items():
+        for moment in runs:
+            bucket = int(moment.timestamp()) // (_WINDOW_MINUTES * 60)
+            windows.setdefault(bucket, set()).add(item_id)
+            if moment.minute <= 2 or moment.minute >= 58:
+                on_the_hour += 1
+
+    busiest = max(windows.values(), key=len)
+    peak = len(busiest)
+    share = peak / len(moments)
+    hour_share = on_the_hour / total_stamps
+
+    detail = (
+        f"{len(moments)} runnable item(s), {total_stamps} observed run stamp(s): the busiest "
+        f"{_WINDOW_MINUTES}-minute window holds {peak} of them ({share:.0%}), across "
+        f"{len(windows)} distinct window(s); {hour_share:.0%} of runs land within two "
+        f"minutes of the top of an hour"
+    )
+    if peak > 1:
+        detail += f" — concurrent in the busiest window: {', '.join(sorted(_name(i) for i in busiest)[:5])}"
+    detail += (
+        ". Derived from observed run stamps (each run's end time, or its start time while "
+        "still running), not from the configured schedule, and from this workspace only"
+    )
+
+    if share <= _SPREAD_GOOD:
+        return graded(3, detail + " — well staggered")
+    if share <= _SPREAD_FAIR:
+        return graded(2, detail + " — partly staggered; a sizeable group still overlaps")
+    if share <= _SPREAD_POOR:
+        return graded(1, detail + " — most items run in one window and compete for capacity")
+    return graded(0, detail + " — effectively everything runs at once")

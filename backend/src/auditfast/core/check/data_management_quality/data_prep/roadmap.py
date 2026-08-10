@@ -15,7 +15,6 @@ from auditfast.core.enums import Automation, Layer, Pillar, Resource, Scope
 # (id, ref, title, layers, required, requirement)
 _CHECKS: list[tuple[str, str, str, tuple[str, ...], bool, str]] = [
 
-    ("R-1-2-1", "1.2.1", "Data flow lineage is traceable end-to-end from source to Gold layer", (Layer.PREP, Layer.STORAGE, Layer.LOGS), True, "ADMIN_SCANNER"),
     ("R-1-3-3", "1.3.3", "API ingestion has proper authentication, pagination, throttling, and error handling", (Layer.PREP,), True, "ITEM_DEFINITION"),
     ("R-2-1-5", "2.1.5", "Parallel execution used where possible (no unnecessary sequential execution)", (Layer.PREP,), True, "ITEM_DEFINITION"),
     ("R-2-2-2", "2.2.2", "Full load reserved only for small reference/dimension tables or initial loads", (Layer.PREP,), True, "ITEM_DEFINITION"),
