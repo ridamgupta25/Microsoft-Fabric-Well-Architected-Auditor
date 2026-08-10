@@ -331,10 +331,11 @@ def test_copy_with_parallelism_passes():
     assert v.score == 3
 
 
-def test_copy_without_parallelism_fails():
+def test_single_copy_without_parallelism_is_na():
+    # A lone untuned Copy relies on Auto DIU/parallelCopies — N/A, not a finding.
     pipe = _pipeline({"type": "Copy", "typeProperties": {}})
     v = copy_parallelism(_ctx(pipe))
-    assert v.score == 0
+    assert v.status is Status.NA
 
 
 def test_no_copy_activity_is_na():

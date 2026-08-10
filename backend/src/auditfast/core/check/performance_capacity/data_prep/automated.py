@@ -407,15 +407,26 @@ def spark_profile(ctx: CheckContext) -> Verdict:
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def copy_parallelism(ctx: CheckContext) -> Verdict:
-    """Copy activities set ``parallelCopies`` or ``dataIntegrationUnits``."""
+    """Copy activities set ``parallelCopies`` or ``dataIntegrationUnits``.
+
+    A lone Copy activity with no explicit parallelism is N/A, not a finding: DIU
+    and parallelCopies default to Auto, and tuning them is only material across
+    multiple copies or at a data volume the audit cannot see. An explicitly-tuned
+    single copy is still credited.
+    """
     copies = [a for a in activities(ctx.obj) if a.get("type") == "Copy"]
     if not copies:
         return not_applicable("Pipeline has no Copy activities")
-    tuned = 0
-    for activity in copies:
-        props = activity.get("typeProperties") or {}
-        if props.get("parallelCopies") or props.get("dataIntegrationUnits"):
-            tuned += 1
+    tuned = sum(
+        1 for a in copies
+        if (a.get("typeProperties") or {}).get("parallelCopies")
+        or (a.get("typeProperties") or {}).get("dataIntegrationUnits")
+    )
+    if len(copies) == 1 and tuned == 0:
+        return not_applicable(
+            "Only 1 Copy activity with no explicit parallelism — DIU / parallelCopies "
+            "default to Auto; tuning is material mainly across multiple or large copies"
+        )
     return covered(
         tuned, len(copies),
         f"{tuned} of {len(copies)} Copy activities set parallelCopies/DIU",
