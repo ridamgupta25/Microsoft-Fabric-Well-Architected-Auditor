@@ -138,6 +138,22 @@ VALIDATED_CHECKLIST: dict[str, str] = {
     "9.1.1":  "Failed pipelines can be restarted from point of failure (not full re-run)",
     "10.1.4": "Alerting on pipeline failure (Data Activator or equivalent)",
     "11.5.1": "Unit tests exist for critical transformation logic",
+    "2.2.1":  "Incremental load implemented where applicable (watermark, CDC, delta detection) for IFS/EAM/LIMS",
+    "3.3.7":  "Delta table history / log retention configured and monitored",
+    "3.1.7":  "All notebooks have meaningful, consistent names aligned to domain/layer",
+    "2.1.3":  "Master/orchestrator pipeline pattern used for coordinating dependent domain pipelines",
+    "3.3.2":  "OPTIMIZE (bin-compaction) scheduled appropriately (not after every micro-batch)",
+    "3.5.3":  "Caching (persist/cache) used judiciously, not indiscriminately",
+    "3.1.8":  "Notebook execution timeout / max runtime configured to prevent runaway Spark sessions",
+    "3.2.6":  "Schema explicitly defined at read time for external sources (not inferred on CSV/JSON)",
+    "3.4.2":  "Custom library versions pinned (not latest/floating)",
+    "3.4.1":  "Fabric Environments used to manage Spark dependencies",
+    "3.3.6":  "Table properties set appropriately (optimizeWrite, autoCompaction)",
+    "3.4.4":  "Spark configuration tuned from defaults where justified (shuffle partitions, memory)",
+    "3.5.8":  "Unnecessary columns eliminated in reads (explicit select, not SELECT *)",
+    "3.3.5":  "V-Order enabled where Fabric recommends for read-optimized workloads",
+    "3.5.4":  "Write operations use appropriate partition strategy (coalesce vs repartition; right-sized files)",
+    "IMPL-20": "Workspace item inventory captured (informational - enumerates all items; never fails) [WS-INVENTORY]",
 }
 
 #: The set of validated refs, derived from the checklist above — what the flag
