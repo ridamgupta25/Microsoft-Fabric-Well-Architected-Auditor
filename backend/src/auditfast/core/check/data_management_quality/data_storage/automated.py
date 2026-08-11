@@ -789,7 +789,7 @@ def table_star_schema(ctx: CheckContext) -> Verdict:
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=True,
 )
-def table_datatype_sizing(ctx: CheckContext) -> Verdict:
+def table_type_sizing(ctx: CheckContext) -> Verdict:
     """Declared text widths and decimal precision/scale are within sane bounds."""
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
