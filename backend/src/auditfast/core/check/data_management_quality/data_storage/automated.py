@@ -807,85 +807,94 @@ def table_type_sizing(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="TB-SURROGATE-PATTERN", ref="4.4.4",
-    title="Dimension surrogate keys use a generated-key pattern",
+    id="TB-SURROGATE-GEN", ref="4.4.4",
+    title="Surrogate keys are implemented for dimensions with a generated-key pattern",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=True,
 )
-def table_surrogate_pattern(ctx: CheckContext) -> Verdict:
-    """Dimensions should expose surrogate key columns consistent with generated-key patterns."""
+def table_surrogate_generated(ctx: CheckContext) -> Verdict:
+    """Dimension schemas include surrogate keys with generation-oriented naming hints.
+
+    This is a schema-level proxy for generated-key patterns. It cannot inspect ETL
+    code paths (hash/window/key-table logic), so it looks for surrogate-key columns
+    plus a generation hint in the declared column names.
+    """
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
     dims = {n: t for n, t in ctx.workspace.tables.items() if is_dimension(n) and columns(t)}
     if not dims:
-        return not_applicable("No dimension tables with column metadata")
+        return not_applicable(_NO_DIMS)
 
-    inspectable = 0
-    patterned = 0
-    missing: list[str] = []
-    for name, table_meta in dims.items():
-        if "." not in name:
-            continue
-        names = col_names(table_meta)
-        if not names:
-            continue
-        inspectable += 1
-        has_pattern = any(_SURROGATE_KEY_NAME.search(col) or col.endswith(("_sk", "_key")) for col in names)
-        if has_pattern:
-            patterned += 1
-        else:
-            missing.append(name)
-
-    if inspectable == 0:
-        return not_applicable("No dimension columns were inspectable for surrogate key pattern checks")
+    compliant = 0
+    for table in dims.values():
+        names = col_names(table)
+        has_surrogate = any(
+            n.endswith(("_sk", "_key")) or n in {"surrogate_key", "surrogate_id"}
+            for n in names
+        )
+        has_generated_hint = any(_GENERATED_KEY_HINT.search(n) for n in names)
+        has_business_hint = any(_BUSINESS_KEY_HINT.search(n) for n in names)
+        if has_surrogate and (has_generated_hint or has_business_hint):
+            compliant += 1
 
     return covered(
-        patterned,
-        inspectable,
-        f"{patterned} of {inspectable} dimension table(s) expose surrogate key naming patterns"
-        + (f"; missing: {', '.join(missing[:5])}" if missing else ""),
+        compliant, len(dims),
+        f"{compliant} of {len(dims)} dimension table(s) include surrogate keys with "
+        "generation-oriented naming evidence",
     )
 
 
 @check(
-    id="TB-PKFK-DECLARED", ref="4.4.5",
-    title="Primary and foreign key constraints are declared where supported",
+    id="TB-REL-DECLARED", ref="4.4.5",
+    title="Primary/foreign key relationships are declared where supported",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+    layers=TABLE_LAYERS,
+    requires=[Resource.TABLE_SCHEMAS, Resource.SEMANTIC_MODEL_DEFINITIONS],
+    required=True,
 )
-def table_pkfk_declared(ctx: CheckContext) -> Verdict:
-    """Use structural metadata hints for declared PK/FK patterns; Fabric Warehouse enforcement is documented separately."""
-    tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
-    if not tables:
-        return not_applicable("No table column metadata available")
+def table_relationships_declared(ctx: CheckContext) -> Verdict:
+    """Fact tables are represented in declared semantic-model relationships.
 
-    inspectable = 0
-    hinted = 0
-    missing: list[str] = []
-    for name, table_meta in tables.items():
-        if "." not in name:
-            continue
-        names = col_names(table_meta)
-        if not names:
-            continue
-        inspectable += 1
-        has_hint = any(
-            _PK_FK_NAME_HINT.search(col)
-            or col.endswith(("_id", "_sk", "_fk", "_key"))
-            for col in names
+    Fabric Warehouse PK/FK constraints are metadata (not enforced), and direct
+    constraint metadata is not available in ``WorkspaceContext``. This check uses
+    semantic-model relationships as the machine-readable declaration of PK/FK
+    structure for workspace storage tables.
+    """
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
+    if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
+        return not_applicable("Semantic model definitions could not be read from Fabric")
+    models = ctx.workspace.semantic_models
+    if not models:
+        return not_applicable("No semantic models were read for this workspace")
+
+    facts = [name for name in ctx.workspace.tables if is_fact(name)]
+    if not facts:
+        return not_applicable("No fact-like tables found to assess for declared FK relationships")
+
+    table_names = {_norm_name(name) for name in ctx.workspace.tables}
+    linked_tables: set[str] = set()
+    for model in models.values():
+        for rel in model.get("relationships") or []:
+            from_table = _norm_name(str(rel.get("from_table") or rel.get("fromTable") or ""))
+            to_table = _norm_name(str(rel.get("to_table") or rel.get("toTable") or ""))
+            if from_table in table_names:
+                linked_tables.add(from_table)
+            if to_table in table_names:
+                linked_tables.add(to_table)
+
+    if not linked_tables:
+        return covered(
+            0, len(facts),
+            "No semantic-model relationships reference workspace storage tables"
         )
-        if has_hint:
-            hinted += 1
-        else:
-            missing.append(name)
 
-    if inspectable == 0:
-        return not_applicable("No tables were inspectable for PK/FK declaration hints")
-
+    linked_facts = [name for name in facts if _norm_name(name) in linked_tables]
     return covered(
-        hinted,
-        inspectable,
-        f"{hinted} of {inspectable} table(s) include PK/FK structural naming hints"
-        + (f"; no hints: {', '.join(missing[:5])}" if missing else "")
-        + "; note: Fabric Warehouse constraints are declarative and not enforced",
+        len(linked_facts), len(facts),
+        f"{len(linked_facts)} of {len(facts)} fact-like table(s) participate in declared "
+        "semantic-model relationships",
     )
 
 

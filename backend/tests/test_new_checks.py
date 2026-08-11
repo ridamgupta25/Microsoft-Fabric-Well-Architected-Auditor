@@ -30,7 +30,7 @@ from auditfast.core.check.data_management_quality.data_prep.automated import (
 from auditfast.core.check.data_management_quality.data_storage.automated import (
     _shadow_reason,
     shortcut_scope,
-    table_datatype_sizing,
+    table_type_sizing,
     table_partition_strategy,
     table_relationships_declared,
     table_surrogate_generated,
@@ -1013,7 +1013,7 @@ def test_datatype_sizing_flags_oversized_text_and_invalid_decimal_precision():
             ]),
         },
     )
-    verdict = table_datatype_sizing(ctx)
+    verdict = table_type_sizing(ctx)
     assert verdict.score == 1
     assert "oversized text" in verdict.evidence
 
