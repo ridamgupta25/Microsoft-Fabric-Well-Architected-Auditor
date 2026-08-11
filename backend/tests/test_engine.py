@@ -294,7 +294,7 @@ def test_registry_is_fully_populated():
     # Roadmap (gated N/A) checks are intentionally not registered — see
     # auditfast.core.check.__init__._CHECK_MODULES — so none remain in the registry.
     assert len([s for s in REGISTRY if s.automation is Automation.ROADMAP]) == 0
-    assert len([s for s in REGISTRY if s.automation is Automation.INTERACTIVE]) == 25
+    assert len([s for s in REGISTRY if s.automation is Automation.INTERACTIVE]) == 40
     assert all(
         s.automation is Automation.INTERACTIVE for s in REGISTRY if s.manual
     )
