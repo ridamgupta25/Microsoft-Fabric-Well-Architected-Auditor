@@ -40,13 +40,19 @@ log = logging.getLogger("auditfast.live")
 _MAX_RETAINED_RUNS = 25
 
 
+def _any_table_columns(ctx: WorkspaceContext) -> bool:
+    """True when at least one captured table already carries a column schema."""
+    return any(t.get("columns") for t in ctx.tables.values())
+
+
 class LiveFabricProvider:
     """Reads a live Fabric tenant with a delegated, read-only OAuth2 token."""
 
     BASE = "https://api.fabric.microsoft.com/v1"
 
     def __init__(self, token: str, timeout: int = 60, token_refresher=None,
-                 powerbi_token: str | None = None, sql_token: str | None = None):
+                 powerbi_token: str | None = None, sql_token: str | None = None,
+                 onelake_token: str | None = None):
         import requests  # imported lazily so offline mode needs no HTTP stack
 
         self._session = requests.Session()
@@ -67,6 +73,12 @@ class LiveFabricProvider:
         #: exactly as they did before the endpoint was wired in.
         self._sql_token = sql_token
         self._sql_reader = None
+        #: A OneLake *Storage*-audience token (``https://storage.azure.com``) - a
+        #: fourth audience. Lakehouse table **column schemas** are served by the
+        #: OneLake Table (Unity-Catalog) API, which rejects the Fabric token above
+        #: and accepts only a Storage-audience token. Absent, columns fall back to
+        #: the SQL/TDS endpoint, or the affected checks report N/A.
+        self._onelake_token = onelake_token
 
     # -- transport -------------------------------------------------------------
     def _get(self, path: str) -> tuple[int | None, Any]:
@@ -88,6 +100,27 @@ class LiveFabricProvider:
         """GET an absolute URL (used to follow a pagination continuation link)."""
         try:
             response = self._session.get(url, timeout=self._timeout)
+        except Exception:
+            return None, None
+        try:
+            return response.status_code, response.json()
+        except ValueError:
+            return response.status_code, None
+
+    def _get_onelake(self, url: str) -> tuple[int | None, Any]:
+        """GET an absolute OneLake Table URL with the *Storage*-audience token.
+
+        OneLake only accepts tokens in the ``https://storage.azure.com`` audience
+        - a different audience from the Fabric token ``self._session`` carries -
+        so this issues the request with its own Authorization header rather than
+        reusing the crawl session.
+        """
+        import requests
+
+        try:
+            response = requests.get(
+                url, headers={"Authorization": f"Bearer {self._onelake_token}"},
+                timeout=self._timeout)
         except Exception:
             return None, None
         try:
@@ -376,6 +409,50 @@ class LiveFabricProvider:
                 monitoring[key] = metric
         return monitoring
 
+    def _read_onelake_columns(self, ctx: WorkspaceContext, workspace_id: str) -> None:
+        """Fill lakehouse table column schemas from the OneLake Table API.
+
+        The primary column source: plain HTTPS with the OneLake *Storage*-audience
+        token (``https://storage.azure.com``), so no ODBC driver or open port 1433
+        is needed. No token, a rejected token, a non-schema-enabled lakehouse or a
+        network error simply leaves the columns absent — the SQL/TDS fallback in
+        :meth:`_read_sql_endpoints` runs next, and the column checks report N/A
+        rather than failing.
+        """
+        if not self._onelake_token:
+            log.info("fetch %s: no OneLake Storage token; columns via TDS fallback only",
+                     workspace_id)
+            return
+        from .onelake import OneLakeTableReader
+
+        lakehouses = [i for i in ctx.items if i.type == "Lakehouse"]
+        if not lakehouses:
+            return
+        reader = OneLakeTableReader(self._get_onelake)
+        read = 0
+        for item in lakehouses:
+            name = item.display_name or item.id
+            tables = reader.columns(workspace_id, item.id, name)
+            if not tables:
+                continue
+            read += 1
+            for table_name, cols in tables.items():
+                existing = ctx.tables.get(table_name)
+                if existing is not None:
+                    existing["columns"] = cols
+                    existing.setdefault("store", name)
+                    existing.setdefault("store_kind", "Lakehouse")
+                else:
+                    ctx.tables[table_name] = {
+                        "type": "Managed", "format": "delta", "columns": cols,
+                        "store": name, "store_kind": "Lakehouse",
+                    }
+        for lh, reason in reader.failures.items():
+            log.info("fetch %s: OneLake columns for lakehouse %s skipped - %s",
+                     workspace_id, lh, reason)
+        log.info("fetch %s: OneLake columns read for %d/%d lakehouse(s)",
+                 workspace_id, read, len(lakehouses))
+
     def _read_sql_endpoints(self, ctx: WorkspaceContext, workspace_id: str,
                             wanted: set) -> None:
         """Enrich the context with column schemas and Warehouse RLS over TDS.
@@ -389,7 +466,10 @@ class LiveFabricProvider:
         """
         from .sqlendpoint import MAX_ENDPOINTS_PER_WORKSPACE, SqlEndpointReader, discover_endpoints
 
-        want_columns = Resource.TABLE_COLUMNS in wanted
+        # Columns come from OneLake first (see _read_onelake_columns); only fall
+        # back to TDS for them when OneLake produced nothing, so a snapshot that
+        # OneLake already populated is never re-marked unavailable by the fallback.
+        want_columns = Resource.TABLE_COLUMNS in wanted and not _any_table_columns(ctx)
         want_security = Resource.WAREHOUSE_SECURITY in wanted
 
         def get_json(path: str):
@@ -1071,11 +1151,12 @@ class LiveFabricProvider:
             log.info("fetch %s: %d lakehouses, %d tables read",
                      workspace_id, len(lakehouses), len(ctx.tables))
 
-        # Column schemas + Warehouse RLS, over the SQL analytics endpoint. Not in
-        # the Fabric REST API at all - only reachable over TDS (port 1433). Every
-        # failure here leaves the data absent, which the checks already report as
-        # N/A, so a blocked port degrades to the pre-SQL behaviour rather than
-        # failing the crawl.
+        # Column schemas — the OneLake Table API first (plain HTTPS, a OneLake
+        # Storage-audience token, no ODBC/port 1433), then the SQL/TDS endpoint as
+        # a fallback and for the SQL type widths and Warehouse RLS OneLake does not
+        # expose. Every failure leaves the data absent, which the checks report N/A.
+        if Resource.TABLE_COLUMNS in wanted:
+            self._read_onelake_columns(ctx, workspace_id)
         if Resource.TABLE_COLUMNS in wanted or Resource.WAREHOUSE_SECURITY in wanted:
             self._read_sql_endpoints(ctx, workspace_id, wanted)
 
