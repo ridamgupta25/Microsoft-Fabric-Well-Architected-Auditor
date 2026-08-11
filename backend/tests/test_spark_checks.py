@@ -51,6 +51,22 @@ def test_merge_absent_is_na():
     assert v.status is Status.NA
 
 
+def test_merge_ignores_sql_commented_delete():
+    # A real one-time INSERT plus a SQL ``--`` commented-out DELETE is not the
+    # sequential DELETE+INSERT upsert anti-pattern — the DELETE is disabled.
+    v = delta_merge(_ctx(_nb(
+        "spark.sql('''\nINSERT INTO ctl SELECT * FROM src;\n-- DELETE from ctl;\n''')"
+    )))
+    assert v.status is Status.NA
+
+
+def test_merge_ignores_python_commented_dml():
+    v = delta_merge(_ctx(_nb(
+        "# spark.sql('DELETE FROM t')\n# spark.sql('INSERT INTO t SELECT * FROM s')"
+    )))
+    assert v.status is Status.NA
+
+
 # -- DELTA-OPTIMIZE ------------------------------------------------------------
 
 def test_optimize_after_write_passes():
