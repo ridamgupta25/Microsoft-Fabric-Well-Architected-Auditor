@@ -7,7 +7,11 @@ model. Each check is workspace-scoped and aggregates across every table found.
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 
+from auditfast.core.check._notebook import executable_code
+from auditfast.core.check._pipeline import script_sql
+from auditfast.core.check._recency import parse_stamp
 from auditfast.core.check._tables import (
     TABLE_LAYERS,
     col_names,
@@ -23,6 +27,7 @@ from auditfast.core.check._tables import (
     is_text_column,
     is_timestamp_column,
     key_referent,
+    name_words,
     purpose_tokens,
     store_of,
     tables_by_store,
@@ -30,7 +35,7 @@ from auditfast.core.check._tables import (
 from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Pillar, Resource, Scope, Severity
-from auditfast.core.models import CheckContext
+from auditfast.core.models import CheckContext, Item
 
 _NO_TABLES = "No lakehouse/warehouse tables were read for this workspace"
 
@@ -700,7 +705,7 @@ def table_scd2(ctx: CheckContext) -> Verdict:
 
 
 # =============================================================================
-# Store-aware table checks (1.2.6, 1.2.8, 4.4.9) and dimensional purity
+# Store-aware table checks and dimensional purity checks.
 # (4.5.3, 4.5.4, 4.5.8).
 #
 # The store-aware ones read ``store``/``store_kind``, which the crawler fills in
@@ -1564,3 +1569,270 @@ def warehouse_naming_is_internally_consistent(ctx: CheckContext) -> Verdict:
     detail += (". Consistency is what is scored — any one convention counts, "
                "provided the Warehouse sticks to it.")
     return covered(compliant, total, detail)
+
+
+# =============================================================================
+# View/procedure abstraction between the physical tables and the
+# semantic layer
+# =============================================================================
+
+#: A view definition in T-SQL or Spark SQL. ``CREATE OR ALTER VIEW`` and
+#: ``CREATE OR REPLACE VIEW`` are both spelled by the optional middle group.
+_VIEW_DDL = re.compile(
+    r"\bCREATE\s+(?:OR\s+(?:ALTER|REPLACE)\s+)?(?:MATERIALIZED\s+)?VIEW\b|"
+    r"\bALTER\s+VIEW\b",
+    re.IGNORECASE,
+)
+
+#: A stored procedure or a user-defined function — abstraction over the physical
+#: tables for *writes* and reusable logic, but not the semantic-facing read
+#: surface a view provides.
+_PROC_DDL = re.compile(
+    r"\bCREATE\s+(?:OR\s+(?:ALTER|REPLACE)\s+)?PROC(?:EDURE)?\b|\bALTER\s+PROC(?:EDURE)?\b|"
+    r"\bCREATE\s+(?:OR\s+(?:ALTER|REPLACE)\s+)?FUNCTION\b",
+    re.IGNORECASE,
+)
+
+#: How many defining items to name in the evidence before summarising.
+_MAX_NAMED_SOURCES = 5
+
+
+@check(
+    id="WS-VIEW-ABSTRACTION", ref="4.4.7",
+    title="Views/stored procedures used to abstract the semantic-facing layer from physical tables",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS,
+    requires=[Resource.TABLE_SCHEMAS, Resource.PIPELINE_DEFINITIONS,
+              Resource.NOTEBOOK_DEFINITIONS],
+    required=False,
+)
+def workspace_defines_a_view_layer_over_its_tables(ctx: CheckContext) -> Verdict:
+    """Reports use a view/procedure layer, so a physical table can change without breaking them.
+
+    **What it can determine.** ``CREATE VIEW`` / ``CREATE OR ALTER VIEW`` /
+    ``CREATE PROCEDURE`` / ``CREATE FUNCTION`` statements in the T-SQL a pipeline
+    runs through its Script activities, and in notebook SQL. Those are
+    definitions the estate keeps *in code*, which is also the only form that can
+    be reviewed and promoted.
+
+    **What it cannot — and this is a real limit on the finding.** The crawl reads
+    table metadata from ``INFORMATION_SCHEMA.COLUMNS``, which returns view
+    columns alongside table columns but carries no ``TABLE_TYPE``, so a view
+    cannot be told from a table in the workspace's table map. Consequently a view
+    created interactively in the SQL editor and never expressed in code is
+    invisible to this check. A 0 therefore means "no abstraction layer is defined
+    in any readable pipeline or notebook", not "no views exist" — the evidence
+    says so, and a reviewer should confirm in the SQL editor before acting.
+    """
+    if not ctx.workspace.has(Resource.TABLE_SCHEMAS):
+        return not_applicable(_NO_TABLES)
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
+
+    readable = [r for r in (Resource.PIPELINE_DEFINITIONS, Resource.NOTEBOOK_DEFINITIONS)
+                if ctx.workspace.has(r)]
+    if not readable:
+        return not_applicable(
+            "Neither pipeline nor notebook definitions could be read, and view metadata is "
+            "not fetched, so no abstraction layer is observable"
+        )
+
+    pipelines = ctx.workspace.pipelines or {}
+    notebooks = ctx.workspace.notebooks or {}
+    if not pipelines and not notebooks:
+        return not_applicable(
+            "Workspace holds no pipeline or notebook definitions, and view metadata is not "
+            "fetched, so no view or procedure definition is observable"
+        )
+
+    view_sources: list[str] = []
+    proc_sources: list[str] = []
+    for name, defn in sorted(pipelines.items()):
+        sql = script_sql(defn)
+        if _VIEW_DDL.search(sql):
+            view_sources.append(name)
+        if _PROC_DDL.search(sql):
+            proc_sources.append(name)
+    for name, defn in sorted(notebooks.items()):
+        code = executable_code(defn)
+        if _VIEW_DDL.search(code):
+            view_sources.append(name)
+        if _PROC_DDL.search(code):
+            proc_sources.append(name)
+
+    caveat = (
+        " View metadata itself is not fetched (INFORMATION_SCHEMA.COLUMNS returns view "
+        "columns but no TABLE_TYPE), so this counts only definitions found in pipeline "
+        "Script activities and notebook SQL."
+    )
+    tables = len(ctx.workspace.tables)
+    if view_sources:
+        return graded(
+            3,
+            f"{len(view_sources)} pipeline(s)/notebook(s) define a view over the "
+            f"workspace's {tables} table(s): "
+            f"{', '.join(view_sources[:_MAX_NAMED_SOURCES])}." + caveat,
+        )
+    if proc_sources:
+        return graded(
+            2,
+            f"No view definition found, but {len(proc_sources)} pipeline(s)/notebook(s) "
+            f"define a stored procedure or function over the workspace's {tables} table(s): "
+            f"{', '.join(proc_sources[:_MAX_NAMED_SOURCES])} — logic is abstracted, but "
+            f"consumers still read the physical tables directly." + caveat,
+        )
+    return graded(
+        0,
+        f"No CREATE VIEW / CREATE PROCEDURE / CREATE FUNCTION statement appears in any of "
+        f"the {len(pipelines)} pipeline(s) and {len(notebooks)} notebook(s) read, so the "
+        f"semantic layer binds straight to the {tables} physical table(s) and any rename or "
+        f"retype breaks it." + caveat,
+    )
+
+
+# =============================================================================
+# The serving (Gold) items were actually refreshed inside their SLA.
+# =============================================================================
+
+#: Words in an *item* name that mark it as serving/Gold rather than an
+#: ingestion or staging store. Matched with :func:`name_words`, the shared
+#: name-token splitter, so ``LH_Sales_Gold``, ``lh-sales-gold`` and
+#: ``SalesGoldMart`` all yield the same tokens. A Warehouse needs no name match
+#: at all (see the check docstring) — this list only promotes a *Lakehouse* or a
+#: *SemanticModel* into the serving population.
+_SERVING_ITEM_WORDS: frozenset[str] = frozenset({
+    "gold", "serving", "serve", "curated", "mart", "marts", "datamart",
+    "presentation", "published", "publish", "consumption", "semantic",
+})
+
+#: Item types whose name is consulted for the serving vocabulary above.
+_NAME_MARKED_SERVING_TYPES = ("Lakehouse", "SemanticModel")
+
+#: Default freshness SLA, in hours. Deliberately **48**, not 24: the readable
+#: signal is a *run/refresh* timestamp, so a perfectly healthy daily batch that
+#: ran 25 hours before the audit would fail a 24-hour window purely on when the
+#: audit happened to be run. 48 hours still catches the real defect — a serving
+#: item that has not refreshed for days — without failing an estate for clock
+#: jitter. Tune per project with ``gold_freshness_sla_hours``.
+_DEFAULT_SLA_HOURS = 48
+
+#: How many stale item names to name in the evidence before summarising.
+_MAX_NAMED_STALE = 5
+
+def _serving_items(ctx: CheckContext) -> list[Item]:
+    """The workspace's Gold/serving items.
+
+    Every **Warehouse** qualifies by type: a Fabric Warehouse exists to be
+    queried by reports, so it *is* the serving surface regardless of what it is
+    called. A **Lakehouse** or **SemanticModel** qualifies only when its name
+    carries a serving token — a Bronze/Silver lakehouse is not Gold, and nothing
+    else in the item list distinguishes them.
+    """
+    serving: list[Item] = []
+    for item in ctx.workspace.items:
+        item_type = item.type or ""
+        if item_type == "Warehouse" or (
+            item_type in _NAME_MARKED_SERVING_TYPES
+            and name_words(item.display_name or "") & _SERVING_ITEM_WORDS
+        ):
+            serving.append(item)
+    return serving
+
+
+@check(
+    id="WS-GOLD-FRESHNESS", ref="5.4.7",
+    title="Freshness validation: Gold tables updated within defined SLA",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS,
+    requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=True,
+)
+def gold_items_refreshed_within_sla(ctx: CheckContext) -> Verdict:
+    """The Gold/serving items refreshed within the freshness SLA window.
+
+    **What it measures — an actual elapsed time, not a coded control.** Each
+    serving item's last run/refresh (``Item.last_run_utc``, filled from the
+    job-scheduler history and, for semantic models, the Power BI refresh
+    history) is compared against a window read from
+    ``gold_freshness_sla_hours`` (default 48 hours — long enough that a healthy
+    daily batch is not failed for the hour the audit happened to run).
+
+    **What counts as Gold.** Every Warehouse, because a Fabric Warehouse exists
+    to be queried by reports; plus any Lakehouse or SemanticModel whose name
+    carries a serving token (gold / serving / curated / mart / presentation /
+    published / consumption / semantic), matched with the shared
+    :func:`name_words` splitter.
+
+    **What it cannot determine.** This is the item's **last run/refresh**, which
+    is the closest readable proxy for "the Gold *table* was updated" — Delta
+    table commit times are not fetched, so a run that succeeded while writing
+    nothing still reads as fresh, and a table updated by a pipeline in another
+    workspace reads as stale here. It also cannot read the *agreed* SLA: the
+    window is a project setting, not something the tenant publishes.
+
+    **Missing timestamps are excluded, never counted stale.** An item with no
+    readable last-run stamp leaves the denominator entirely — "we could not read
+    when it last ran" is not "it is out of SLA". When no serving item exists, or
+    none of them has a readable stamp, the check is N/A.
+
+    **Sibling — ``NB-TIMELINESS-CONTROL`` (5.2.3), and the difference matters.**
+    That check reads notebook *code* and asks whether an arrival-lateness control
+    is implemented — does the code know how old its input is. This check reads no
+    code at all: it asks whether the serving items were in fact refreshed
+    recently. A workspace can pass 5.2.3 with a beautifully written staleness
+    guard and fail this one because nothing has run for a week, and vice versa.
+    """
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
+    if not ctx.workspace.has(Resource.ITEM_RUN_HISTORY):
+        return not_applicable(
+            "Per-item run/refresh history could not be read from Fabric "
+            "(jobs/instances was forbidden or unavailable), so Gold freshness "
+            "cannot be measured"
+        )
+
+    serving = _serving_items(ctx)
+    if not serving:
+        return not_applicable(
+            f"No Gold/serving item found among the {len(ctx.workspace.items)} item(s): no "
+            "Warehouse, and no Lakehouse or semantic model whose name marks it as gold / "
+            "serving / curated / mart / presentation"
+        )
+
+    dated = [(i, parse_stamp(i.last_run_utc)) for i in serving]
+    readable = [(i, stamp) for i, stamp in dated if stamp is not None]
+    if not readable:
+        return not_applicable(
+            f"None of the {len(serving)} Gold/serving item(s) carries a readable last "
+            "run/refresh timestamp, so how recently they were updated cannot be measured "
+            "— unknown recency is never reported as stale"
+        )
+
+    try:
+        sla_hours = int(ctx.setting("gold_freshness_sla_hours", _DEFAULT_SLA_HOURS))
+    except (TypeError, ValueError):
+        sla_hours = _DEFAULT_SLA_HOURS
+    if sla_hours <= 0:
+        sla_hours = _DEFAULT_SLA_HOURS
+    now = datetime.now(timezone.utc)
+    stale = sorted(
+        item.display_name or item.id
+        for item, stamp in readable
+        if (now - stamp).total_seconds() > sla_hours * 3600
+    )
+    excluded = len(serving) - len(readable)
+
+    detail = (
+        f"{len(readable) - len(stale)} of {len(readable)} Gold/serving item(s) with a "
+        f"readable last run/refresh were updated within the {sla_hours}h SLA "
+        f"(gold_freshness_sla_hours)"
+    )
+    if stale:
+        detail += (f"; stale: {', '.join(stale[:_MAX_NAMED_STALE])}"
+                   + (f", …(+{len(stale) - _MAX_NAMED_STALE} more)"
+                      if len(stale) > _MAX_NAMED_STALE else ""))
+    if excluded:
+        detail += (f". {excluded} further serving item(s) had no readable timestamp and are "
+                   "excluded rather than counted stale")
+    detail += (". This is the item's last run/refresh — the closest readable proxy for "
+               "\"the Gold table was updated\"; Delta commit times are not fetched.")
+    return covered(len(readable) - len(stale), len(readable), detail)

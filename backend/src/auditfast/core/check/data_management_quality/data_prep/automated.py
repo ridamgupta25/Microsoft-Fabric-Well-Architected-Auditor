@@ -930,6 +930,48 @@ _FLAG_DOMAIN = re.compile(
     r"BooleanType\s*\(\)|when\s*\([^\n]{0,120}?\)\.otherwise\s*\(",
     re.IGNORECASE,
 )
+#: A *categorical* domain restriction - 5.5.5. Deliberately distinct from
+#: ``_FLAG_DOMAIN`` (5.5.7), which covers the two-valued boolean/flag case: a
+#: membership test whose literals are ``Y``/``N``/``true``/``false``/``0``/``1``
+#: is a flag test and is excluded below, so the two checks cannot both claim the
+#: same line of code.
+#:
+#: Three shapes count, because they are the three ways a team actually pins a
+#: code list in Spark:
+#:   * a membership test against a named allow-list or literal code set;
+#:   * an anti/semi join against a reference, lookup or dimension table - the
+#:     standard "reject codes absent from the dimension" pattern;
+#:   * a declared allowed-value collection (``VALID_STATUSES = {...}``).
+_CATEGORICAL_DOMAIN = re.compile(
+    # .isin(...) / ~col.isin(...) on a non-boolean literal set of >= 2 codes
+    r"\.isin\s*\(\s*\[?\s*[\"'][A-Za-z0-9_\- ]{2,}[\"']\s*,",
+    re.IGNORECASE,
+)
+
+#: A membership test naming a *variable* allow-list rather than inline literals.
+_CATEGORICAL_ALLOWLIST = re.compile(
+    r"\.isin\s*\(\s*(?:\*\s*)?[A-Za-z_][A-Za-z0-9_]*\s*\)|"
+    r"\b(?:allowed|valid|expected|permitted|accepted|reference|master)[_ ]?"
+    r"(?:codes?|categories|category|statuses|status|types?|values|list|set|domain)\b|"
+    r"\b(?:code|category|status|type)[_ ]?(?:list|set|domain|lookup|allowlist|whitelist)\b",
+    re.IGNORECASE,
+)
+
+#: Validation by joining to a reference/lookup/dimension table - the codes that
+#: do not match are the invalid ones.
+_CATEGORICAL_REFERENCE_JOIN = re.compile(
+    r"left_anti|leftanti|left_semi|leftsemi|"
+    r"join\s*\([^\n]{0,160}?(?:ref|reference|lookup|dim|dimension|master|codes?)"
+    r"[A-Za-z0-9_]*[^\n]{0,80}?\)",
+    re.IGNORECASE,
+)
+
+#: A boolean/flag membership test - 5.5.7's territory, never 5.5.5's.
+_BOOLEAN_LITERALS = re.compile(
+    r"\.isin\s*\(\s*\[?\s*(?:True|False|[\"'](?:Y|N|yes|no|true|false|0|1)[\"'])",
+    re.IGNORECASE,
+)
+
 _DQ_RULE = re.compile(
     r"assert\b|validation|validate|quality|quarantine|reject|invalid|"
     r"dropDuplicates|drop_duplicates|left_anti|isNull|isin\s*\(|"
@@ -1560,6 +1602,77 @@ def nb_flag_domain(ctx: CheckContext) -> Verdict:
     ok = bool(_FLAG_DOMAIN.search(code))
     return binary(ok, "Boolean/Flag fields are restricted to expected values" if ok
                   else "Boolean/Flag fields have no explicit allowed-value validation")
+
+
+@check(
+    id="NB-CATEGORICAL-DOMAIN", ref="5.5.5",
+    title="**Categorical / Enum**: Values within expected domain; no invalid codes flowing to Gold",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_categorical_domain(ctx: CheckContext) -> Verdict:
+    """The notebook pins categorical/code columns to an expected set of values.
+
+    **What it verifies: the control, not the data.** Whether any particular row
+    carries a valid code is a runtime fact in the data, which this tool never
+    reads. A PASS means "an invalid code would be caught", never "every code is
+    valid".
+
+    **What it can determine.** Three shapes, because they are the three ways a
+    team actually pins a code list in Spark: a membership test against literal
+    codes or a named allow-list (``status.isin(VALID_STATUSES)``), an anti/semi
+    join against a reference, lookup or dimension table (the standard "reject
+    codes absent from the dimension" pattern), or a declared allowed-value
+    collection. Read with ``executable_code`` so a commented-out validation
+    cannot pass.
+
+    **What it cannot.** Confirm the code list is the *correct* one, see a domain
+    enforced by a Delta ``CHECK`` constraint or a warehouse foreign key, or see a
+    rule applied downstream in a pipeline. A notebook that writes no table has no
+    codes flowing to Gold and is N/A.
+
+    **Sibling - deliberately not satisfied by it.** ``NB-FLAG-DOMAIN`` (5.5.7)
+    covers the two-valued boolean/flag case. A membership test whose literals are
+    ``Y``/``N``/``true``/``false``/``0``/``1`` is a *flag* test and is excluded
+    here, so one line of code cannot satisfy both points.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable(
+            "Notebook writes no table, so there is no categorical value flowing "
+            "onward to constrain"
+        )
+
+    if _CATEGORICAL_REFERENCE_JOIN.search(code):
+        return binary(True, (
+            "Categorical values are validated against a reference/lookup table - a "
+            "code absent from the reference is separated rather than written on. "
+            "Whether any given run's codes were valid is a runtime outcome this "
+            "check does not read."
+        ))
+    literal_set = _CATEGORICAL_DOMAIN.search(code)
+    allow_list = _CATEGORICAL_ALLOWLIST.search(code)
+    if literal_set or allow_list:
+        how = ("an explicit code list" if literal_set
+               else "a named allowed-value set")
+        return binary(True, (
+            f"Categorical/enum columns are restricted to {how}, so an unexpected "
+            f"code is detectable before it reaches Gold. Whether the list itself is "
+            f"correct is not machine-checkable."
+        ))
+    if _BOOLEAN_LITERALS.search(code):
+        return binary(False, (
+            "The only value restriction found is a boolean/flag test (Y/N, true/false), "
+            "which is scored by 5.5.7 - no categorical or code column is pinned to an "
+            "expected domain, so an invalid code would flow through unchallenged"
+        ))
+    return binary(False, (
+        "Notebook writes data with no categorical domain validation - no allowed-value "
+        "test and no reference/lookup join appears, so an invalid or retired code is "
+        "indistinguishable from a valid one"
+    ))
 
 
 @check(
@@ -3399,4 +3512,262 @@ def notebook_validates_json_payloads(ctx: CheckContext) -> Verdict:
         + (f"; missing: {'; '.join(missing)}" if missing else "")
         + ". Whether the declared structure matches the source contract is not readable "
           "from code.",
+    )
+
+
+# =============================================================================
+# 5.3.8 — historical consistency: this run's volume held against a previous run
+#
+# The point describes a *runtime outcome* — did the row count move as expected.
+# Row data and run telemetry are never fetched, so what is scored is whether the
+# code carries the run-over-run control that would notice an unexplained
+# shrinkage. The evidence says so, exactly as 5.2.2 / 5.2.3 do.
+# =============================================================================
+
+#: A count belonging to an **earlier run**. This is the whole distinction from
+#: ``NB-RECON-COUNT`` (5.2.5), which compares this run's output against *this
+#: run's source*: ``source_count``, ``expected_count`` and a bare
+#: ``df.count() == src.count()`` are all same-run reconciliation and must not
+#: match here. Only a token that names a *prior* run does.
+_PREVIOUS_RUN_COUNT = re.compile(
+    r"\b(?:prev|previous|prior|last|lastrun|yester(?:day)?|historic(?:al)?|baseline|"
+    r"benchmark)[_\s-]?(?:run[_\s-]?)?(?:row[_\s-]?|record[_\s-]?)?"
+    r"(?:count|rowcount|rowcounts|rows|volume)\b|"
+    r"\b(?:row|record)[_\s-]?count[_\s-]?"
+    r"(?:prev|previous|prior|last|yesterday|baseline|history|historical)\b",
+    re.IGNORECASE,
+)
+
+#: The run-over-run *movement* named directly — a delta, a percentage change, or
+#: a shrinkage. Nothing computes ``pct_change`` on a row count by accident.
+_VOLUME_MOVEMENT = re.compile(
+    r"\b(?:row|record|count|volume)[_\s-]?"
+    r"(?:delta|diff|difference|change|drop|variance|swing)\b|"
+    r"\b(?:delta|diff|difference|change|drop|variance)[_\s-]?"
+    r"(?:row|record|count|volume)s?\b|"
+    r"\bpct[_\s-]?(?:change|diff|drop|delta|variance)\b|"
+    r"\bpercent(?:age)?[_\s-]?(?:change|diff|drop|delta|variance)\b|"
+    r"\bshrink(?:age|ing)?\b|\bunexpected[_\s-]?drop\b|\bvolume[_\s-]?drop\b",
+    re.IGNORECASE,
+)
+
+#: An explicitly named run-over-run guard, as a *call or assignment* — a bare
+#: word also matches a comment or a column name.
+_NAMED_TREND_GUARD = re.compile(
+    r"\b(?:volume_check|check_volume|trend_check|check_trend|shrinkage_check|"
+    r"check_shrinkage|variance_check|check_variance|count_trend|row_count_trend|"
+    r"historical_check|check_historical|drift_check|check_drift)\s*[\(=]",
+    re.IGNORECASE,
+)
+
+#: A relational comparison. A previous count merely *read* judges nothing.
+_TREND_COMPARISON = re.compile(r"(?:<=|>=|==|!=|<|>)|\bbetween\b", re.IGNORECASE)
+
+#: A row count is persisted somewhere a later run could read it back. That is the
+#: raw material for a trend, without the trend itself.
+#: The separator deliberately excludes whitespace: ``row_count`` / ``rowcount``
+#: is an identifier or a column, while ``"row count mismatch"`` is prose inside
+#: an assertion message. Allowing a space made a same-run reconciliation whose
+#: *error text* mentioned a row count read as a persisted count.
+_COUNT_PERSISTED = re.compile(
+    r"(?:row|record)[_-]?count[\s\S]{0,200}?"
+    r"(?:INSERT\s+INTO|\.saveAsTable\s*\(|\.write\b)|"
+    r"(?:INSERT\s+INTO|\.saveAsTable\s*\(|\.write\b)[\s\S]{0,200}?"
+    r"(?:row|record)[_-]?count",
+    re.IGNORECASE,
+)
+
+#: How far from the previous-run token the comparison may sit: one statement,
+#: pretty-printed over a couple of lines — not the whole notebook.
+_TREND_WINDOW = 200
+
+
+def _run_over_run_control(code: str) -> bool:
+    """True when a previous-run count or a volume movement is actually compared."""
+    if _NAMED_TREND_GUARD.search(code):
+        return True
+    for pattern in (_PREVIOUS_RUN_COUNT, _VOLUME_MOVEMENT):
+        for match in pattern.finditer(code):
+            window = code[max(0, match.start() - _TREND_WINDOW):match.end() + _TREND_WINDOW]
+            if _TREND_COMPARISON.search(window):
+                return True
+    return False
+
+
+@check(
+    id="NB-VOLUME-TREND", ref="5.3.8",
+    title="Historical consistency: row counts change as expected (no unexplained shrinkage)",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def notebook_has_a_run_over_run_volume_control(ctx: CheckContext) -> Verdict:
+    """The notebook holds this load's row count against a **previous run's**.
+
+    **What it verifies: the control, not the outcome.** Whether today's count
+    actually moved as expected is a runtime fact that lives in the data and the
+    run history; this tool reads neither. A PASS means "the code would notice an
+    unexplained shrinkage", never "the volume was correct".
+
+    **What it can determine.** A comparison against a count from an *earlier
+    run* — a ``previous_count`` / ``last_run_row_count`` / ``baseline_count``
+    read back and compared, a named movement (``row_delta``, ``pct_change``,
+    ``shrinkage``) held against a bound, or a named guard
+    (``volume_check(...)``, ``check_drift(...)``). A row count that is merely
+    *persisted* for a later run to read scores in the middle: the history is
+    being accumulated, but nothing compares it.
+
+    **What it cannot.** Resolve a threshold that lives in a config table, see a
+    volume rule enforced by a Data Activator alert or a monitoring dashboard, or
+    judge whether the tolerance is the right one. Read with ``executable_code``
+    so a commented-out check cannot pass.
+
+    **Sibling — deliberately not satisfied by it.** ``NB-RECON-COUNT`` (5.2.5)
+    compares this run's output against *this run's source* (``source_count``,
+    ``expected_count``, ``df.count() == src.count()``). That is reconciliation
+    across a hop, in one moment. This point is reconciliation across **time**, so
+    none of those tokens match here; only a count naming a prior run does.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable(
+            "Notebook writes no table, so there is no load volume to compare against "
+            "a previous run"
+        )
+
+    if _run_over_run_control(code):
+        return graded(
+            3,
+            "Notebook compares its row count against a previous run's count or against a "
+            "named delta / percentage-change bound — a run-over-run consistency control is "
+            "present. Whether any particular run's volume was correct is a runtime outcome "
+            "this check does not read.",
+        )
+    if _COUNT_PERSISTED.search(code):
+        return graded(
+            1,
+            "Notebook records its row count to a table, so the history exists, but nothing "
+            "reads a previous run's count back and compares it — a load that silently "
+            "halves would still be written and logged as normal",
+        )
+    return graded(
+        0,
+        "Notebook writes data with no run-over-run volume control — no previous-run count, "
+        "delta or percentage-change test appears anywhere, so an unexplained shrinkage is "
+        "indistinguishable from a normal load",
+    )
+
+
+# =============================================================================
+# 2.1.4 — activities are logically grouped and self-documenting
+# =============================================================================
+
+#: A name Fabric generates when an activity is dropped on the canvas — the
+#: activity type, optionally with a trailing number. It documents nothing.
+#: ``Copy Sales To Bronze`` does not match: the tail after the type word must be
+#: empty or a number.
+_DEFAULT_ACTIVITY_NAME = re.compile(
+    r"^(?:copy(?:\s*data)?|notebook|script|lookup|get\s*metadata|for\s*each|foreach|"
+    r"if\s*condition|switch|until|wait|web(?:hook)?|set\s*variable|append\s*variable|"
+    r"execute\s*pipeline|invoke\s*pipeline|fail|filter|delete(?:\s*data)?|"
+    r"stored\s*procedure|dataflow|activity|new\s*activity|untitled|test|temp|tmp|"
+    r"office\s*365\s*outlook|teams|semantic\s*model\s*refresh|refresh|new)"
+    r"[\s_-]*\d*$",
+    re.IGNORECASE,
+)
+
+#: Activity types that *group* work: their children are a labelled unit rather
+#: than one more row in a flat list.
+_CONTAINER_TYPES = frozenset({"ForEach", "IfCondition", "Switch", "Until"})
+
+#: Above this many top-level activities with no container at all, the pipeline is
+#: a flat wall of steps — readable as a list, not as a structure.
+_FLAT_ACTIVITY_LIMIT = 10
+
+#: Shortest name that can carry a subject and a verb.
+_MIN_NAME_CHARS = 8
+
+_NAME_WORD_SPLIT = re.compile(r"[\s_\-]+|(?<=[a-z0-9])(?=[A-Z])")
+
+
+def _is_self_documenting(name: str) -> bool:
+    """True when an activity name says what the step does, not what type it is.
+
+    Two conditions, both cheap and both stable across tenants: the name is not a
+    Fabric-generated default (``Copy data1``, ``Notebook3``, ``Untitled``), and
+    it carries at least two words — ``LoadDimCustomer`` and ``Copy Sales To
+    Bronze`` qualify, ``Stage`` does not.
+    """
+    text = (name or "").strip()
+    if not text or _DEFAULT_ACTIVITY_NAME.match(text):
+        return False
+    words = [w for w in _NAME_WORD_SPLIT.split(text) if w]
+    return len(words) >= 2 and len(text) >= _MIN_NAME_CHARS
+
+
+@check(
+    id="PL-ACTIVITY-SELFDOC", ref="2.1.4",
+    title="Pipeline activities are logically grouped, annotated, and self-documenting",
+    pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.LOW,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
+)
+def pipeline_activities_are_self_documenting(ctx: CheckContext) -> Verdict:
+    """Activity *names* say what each step does, and related steps sit inside a container.
+
+    **What it can determine.** Two readable properties of the definition. First,
+    naming: a Fabric-generated default (``Copy data1``, ``Notebook3``,
+    ``Untitled``, or a bare type word) documents nothing, while a name with two
+    or more words (``Copy Sales To Bronze``, ``LoadDimCustomer``) does. Second,
+    grouping: whether the pipeline uses container activities — ForEach, If
+    Condition, Switch, Until — or presents more than
+    ``10`` steps as one flat top-level list. A flat, uncontained wall of steps
+    costs one band.
+
+    **What it cannot.** Judge whether a well-formed name is *accurate*, see
+    logical grouping expressed by a naming prefix rather than a container, or
+    know that a short pipeline was deliberately kept flat.
+
+    **Sibling — deliberately disjoint.** ``PL-DESC`` (2.1.6) scores whether the
+    ``description`` fields are populated. This check never reads a description:
+    a pipeline whose every activity carries a description but is still called
+    ``Copy data1`` passes 2.1.6 and fails here, which is the whole point — an
+    annotation you have to open the properties pane to see is not the same thing
+    as a canvas that reads itself.
+    """
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+    every = walk_activities(ctx.obj)
+    if not every:
+        return not_applicable("Pipeline has no activities to name or group")
+
+    named, defaults = [], []
+    for activity in every:
+        name = str(activity.get("name") or "")
+        (named if _is_self_documenting(name) else defaults).append(name or "?")
+    defaults = sorted(defaults)
+    top_level = activities(ctx.obj)
+    containers = [a for a in every if a.get("type") in _CONTAINER_TYPES]
+    flat = not containers and len(top_level) > _FLAT_ACTIVITY_LIMIT
+
+    detail = (
+        f"{len(named)} of {len(every)} activity name(s) are self-documenting "
+        f"(two or more words, not a Fabric default)"
+    )
+    if defaults:
+        detail += f"; default/one-word names: {', '.join(defaults[:5])}"
+    detail += (
+        f". {len(containers)} container activity(ies) (ForEach/If/Switch/Until) group "
+        f"{len(top_level)} top-level step(s)."
+        if containers else
+        f". No container activity groups the {len(top_level)} top-level step(s)."
+    )
+
+    verdict = covered(len(named), len(every), detail)
+    if not flat:
+        return verdict
+    return graded(
+        max(0, (verdict.score or 0) - 1),
+        detail + f" More than {_FLAT_ACTIVITY_LIMIT} steps sit in one flat list with no "
+                 f"grouping container, which costs a band.",
     )
