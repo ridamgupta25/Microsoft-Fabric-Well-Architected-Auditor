@@ -14,7 +14,11 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
-from auditfast.core.check._notebook import notebook_code
+from auditfast.core.check._notebook import (
+    executable_code,
+    notebook_code,
+    strip_sql_comments,
+)
 from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities, walk_activities
 from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable
 from auditfast.core.check.registry import check
@@ -35,7 +39,9 @@ import re
 )
 def delta_merge(ctx: CheckContext) -> Verdict:
     """A single ``MERGE INTO`` handles insert/update/delete, not sequential DML."""
-    code = notebook_code(ctx.obj)
+    # Ignore commented-out DML: strip Python "#" and SQL "--" / "/* */" comments so
+    # a disabled DELETE/INSERT does not count as a real sequential-DML upsert.
+    code = strip_sql_comments(executable_code(ctx.obj))
     if _spark.MERGE.search(code):
         return binary(True, "Uses MERGE INTO for atomic upserts")
     if _spark.SEQ_DELETE.search(code) and _spark.SEQ_INSERT.search(code):
