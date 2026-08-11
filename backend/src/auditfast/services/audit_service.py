@@ -51,7 +51,7 @@ class AuditRun:
 
 def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: bool = False,
                    token_refresher=None, powerbi_token: str | None = None,
-                   sql_token: str | None = None):
+                   sql_token: str | None = None, onelake_token: str | None = None):
     """Create the provider for a run.
 
     Every run reads the live tenant, but through the on-disk **knowledge base**:
@@ -69,13 +69,19 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
     Without it - or with ``AUDITFAST_SQL_ENDPOINT_ENABLED=false``, or with port
     1433 blocked - those reads are skipped and the column-level checks report N/A,
     exactly as they did before the endpoint was wired in.
+
+    ``onelake_token`` is an optional OneLake *Storage*-audience token
+    (``https://storage.azure.com``) used to read Lakehouse table **column
+    schemas** over the OneLake Table API - the primary column source, tried before
+    the SQL endpoint. Without it, columns fall back to TDS or report N/A.
     """
     if not token:
         raise AuditError("A sign-in token is required to run an audit.")
     settings = get_settings()
     live = LiveFabricProvider(token, token_refresher=token_refresher,
                               powerbi_token=powerbi_token,
-                              sql_token=sql_token if settings.sql_endpoint_enabled else None)
+                              sql_token=sql_token if settings.sql_endpoint_enabled else None,
+                              onelake_token=onelake_token)
     provider = live
     if settings.cache_enabled:
         from .context_store import CachingProvider, ContextStore
@@ -215,6 +221,7 @@ def run_audit(
     token_refresher=None,
     powerbi_token: str | None = None,
     sql_token: str | None = None,
+    onelake_token: str | None = None,
 ) -> AuditRun:
     """Run an audit and, when ``out_dir`` is given, write the report files.
 
@@ -226,7 +233,8 @@ def run_audit(
     """
     config = load_project(project_path)
     provider = build_provider(config, token, refresh=refresh, token_refresher=token_refresher,
-                              powerbi_token=powerbi_token, sql_token=sql_token)
+                              powerbi_token=powerbi_token, sql_token=sql_token,
+                              onelake_token=onelake_token)
     remediation: RemediationBook = load_remediation(config)
 
     def _progress(partial: list[CheckResult]) -> None:

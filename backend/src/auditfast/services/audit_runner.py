@@ -112,6 +112,7 @@ class AuditRunner:
         token_refresher = auth_service.make_token_refresher(auth_session)
         powerbi_token = auth_service.powerbi_token_for(auth_session)
         sql_token = auth_service.sql_token_for(auth_session)
+        onelake_token = auth_service.onelake_token_for(auth_session)
 
         async with self._semaphore:
             job.mark_running()
@@ -137,6 +138,7 @@ class AuditRunner:
                     token_refresher=token_refresher,
                     powerbi_token=powerbi_token,
                     sql_token=sql_token,
+                    onelake_token=onelake_token,
                 )
                 report: dict[str, Any] = audit_service.to_json(run)
                 report["audit_id"] = job.id
@@ -198,6 +200,7 @@ class AuditRunner:
         token_refresher = auth_service.make_token_refresher(auth_session)
         powerbi_token = auth_service.powerbi_token_for(auth_session)
         sql_token = auth_service.sql_token_for(auth_session)
+        onelake_token = auth_service.onelake_token_for(auth_session)
         async with self._semaphore:
             try:
                 run = await asyncio.to_thread(
@@ -212,6 +215,7 @@ class AuditRunner:
                         token_refresher=token_refresher,
                         powerbi_token=powerbi_token,
                         sql_token=sql_token,
+                        onelake_token=onelake_token,
                     )
                 )
                 report = audit_service.to_json(run)

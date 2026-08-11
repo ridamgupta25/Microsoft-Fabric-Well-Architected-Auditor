@@ -44,6 +44,13 @@ _POWERBI_DEFAULT_SCOPE = ["https://analysis.windows.net/powerbi/api/.default"]
 #: CLI public client is pre-authorized for it, so the SQL token comes silently
 #: from the refresh token minted at sign-in - the user is never prompted twice.
 _SQL_DEFAULT_SCOPE = ["https://database.windows.net/.default"]
+#: The OneLake data plane (DFS / Blob / Table). OneLake only accepts tokens in the
+#: *Storage* audience ``https://storage.azure.com`` - a fourth audience alongside
+#: Fabric, Power BI and SQL. Reading Lakehouse table *column schemas* over the
+#: OneLake Table (Unity-Catalog) API needs this token, not the Fabric one; the
+#: Azure CLI public client is pre-authorized for it, so it too is minted silently
+#: from the sign-in refresh token.
+_ONELAKE_DEFAULT_SCOPE = ["https://storage.azure.com/.default"]
 #: The Fabric API, requested as .default so the built-in Azure CLI client's full
 #: set of pre-authorized Fabric permissions (including the item read/write needed
 #: for getDefinition) is included. Power BI .default did not carry them.
@@ -159,6 +166,35 @@ def sql_token_for(session_id: str | None) -> str | None:
             pass
     if sess.get("_azcli"):
         return _azcli_token("https://database.windows.net")
+    return None
+
+
+def onelake_token_for(session_id: str | None) -> str | None:
+    """Mint a OneLake *Storage*-audience token for a signed-in session, or ``None``.
+
+    Lakehouse table **column schemas** are served by the OneLake Table
+    (Unity-Catalog) API, whose host ``onelake.table.fabric.microsoft.com`` only
+    accepts tokens in the ``https://storage.azure.com`` audience - a different
+    audience from the Fabric token the crawl uses. This acquires that token
+    *silently* from the session's existing MSAL cache, or, for an az-cli session,
+    by re-invoking ``az`` for the storage resource. It never prompts; on any
+    failure it returns ``None`` and the crawl falls back to the SQL endpoint (or
+    leaves column schemas empty), never guessing.
+    """
+    sess = _SESSIONS.get(session_id or "")
+    if not sess:
+        return None
+    app = sess.get("_msal_app")
+    account = sess.get("_msal_account")
+    if app and account:
+        try:
+            res = app.acquire_token_silent(_ONELAKE_DEFAULT_SCOPE, account=account)
+            if res and "access_token" in res:
+                return res["access_token"]
+        except Exception:
+            pass
+    if sess.get("_azcli"):
+        return _azcli_token("https://storage.azure.com")
     return None
 
 
