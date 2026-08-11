@@ -82,10 +82,21 @@ class PowerBIClient:
 
     def _values(self, path: str) -> list[dict]:
         """GET a Power BI collection endpoint and return its ``value`` array."""
+        return self._values_known(path)[0]
+
+    def _values_known(self, path: str) -> tuple[list[dict], bool]:
+        """GET a collection endpoint, returning ``(rows, readable)``.
+
+        ``readable`` is what tells an *empty workspace* apart from a *forbidden
+        or failed* listing. :meth:`_values` throws that distinction away, which is
+        fine for the FabricIQ tools but not for an auditor: a check must report
+        N/A when the listing could not be read and a real finding when the
+        workspace genuinely holds none.
+        """
         status, body = self._get(path)
         if status != 200 or not isinstance(body, dict):
-            return []
-        return list(body.get("value") or [])
+            return [], False
+        return list(body.get("value") or []), True
 
     # -- workspaces / items ----------------------------------------------------
     def list_groups(self) -> list[dict]:
@@ -101,6 +112,17 @@ class PowerBIClient:
     def list_reports(self, group_id: str) -> list[dict]:
         """List the reports in one workspace."""
         return self._values(f"/groups/{group_id}/reports")
+
+    def list_reports_known(self, group_id: str) -> tuple[list[dict], bool]:
+        """List the reports in one workspace, plus whether the listing was readable.
+
+        Same call as :meth:`list_reports`; the second element distinguishes "this
+        workspace has no report" from "the report list could not be read", which
+        is what lets the report-reuse checks report N/A instead of a false
+        finding. Each row carries ``datasetId`` — the report's semantic-model
+        binding — except for paginated (RDL) reports, which bind to none.
+        """
+        return self._values_known(f"/groups/{group_id}/reports")
 
     def get_report(self, report_id: str, group_id: str | None = None) -> dict | None:
         """Fetch one report's properties, or ``None`` if it is not accessible."""

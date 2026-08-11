@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from auditfast.core.check._recency import parse_stamp
 from auditfast.core.check.helpers import (
     Verdict,
     binary,
@@ -34,16 +35,13 @@ def _is_stale(item: Item, *, cutoff_days: int, now: datetime) -> bool:
     Only called for items that carry a timestamp; a present-but-unparseable stamp
     is treated as stale (a value we cannot read is suspect). A *missing* timestamp
     is handled by the caller as N/A, not stale — unknown is not the same as unused.
+
+    The stamp is parsed by the shared :func:`parse_stamp`, so a timestamp one
+    recency check can read is never one another silently drops.
     """
-    stamp = item.last_run_utc
-    if not stamp:
+    parsed = parse_stamp(item.last_run_utc)
+    if parsed is None:
         return True
-    try:
-        parsed = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
-    except ValueError:
-        return True
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
     return (now - parsed).days > cutoff_days
 
 
@@ -326,4 +324,3 @@ def cu_consumption_alerts(ctx: CheckContext) -> Verdict:
         f"'{ctx.workspace.capacity_id}' — nothing in the workspace can raise a "
         f"proactive alert before the capacity throttles.",
     )
-
