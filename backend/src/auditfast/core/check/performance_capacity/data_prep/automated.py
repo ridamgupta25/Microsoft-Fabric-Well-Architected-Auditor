@@ -24,6 +24,7 @@ from . import _spark
 from ._spark import NOTEBOOK_LAYERS, pip_targets, unpinned_targets, writes_delta
 import re
 import re
+import re
 
 # -- Delta table maintenance (3.3.x) ------------------------------------------
 
@@ -402,6 +403,39 @@ def spark_profile(ctx: CheckContext) -> Verdict:
     return binary(not issues, f"Profiled {int(duration)} ms application; no open performance issue"
                   if not issues else f"Profiled {int(duration)} ms application; open issues: {', '.join(issues)}")
 
+@check(
+    id="NB-PUSHDOWN",
+    ref="3.5.7",
+    title="Predicate pushdown verified for shortcut/external reads",
+    pillar=Pillar.PERFORMANCE,
+    scope=Scope.NOTEBOOK,
+    severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS,
+    requires=[Resource.NOTEBOOK_DEFINITIONS],
+    required=True,
+)
+def nb_pushdown(ctx: CheckContext) -> Verdict:
+    """Notebooks reading shortcut or external data apply filter predicates early."""
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+
+    code = notebook_code(ctx.obj)
+    lines = code.splitlines()
+
+    read_idxs = [i for i, l in enumerate(lines) if _spark.EXTERNAL_READ.search(l)]
+    if not read_idxs:
+        return not_applicable("Notebook does not read from shortcut or external data sources")
+
+    for i in read_idxs:
+        window = "\n".join(lines[i : i + 12])  # include read line + next ~11 lines
+        if re.search(r"\.filter\s*\(|\.where\s*\(", window, re.IGNORECASE):
+            return binary(True, "Filter predicates applied to external/shortcut reads")
+
+    return graded(
+        1,
+        "Reads from shortcut or external source without applying filter predicates — "
+        "all rows are scanned before any selection, preventing predicate pushdown",
+    )
 @check(
     id="NB-PUSHDOWN",
     ref="3.5.7",

@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 
 from auditfast.core.check._pipeline import activities as pipeline_activities
+from auditfast.core.check._pipeline import activities as pipeline_activities
 from auditfast.core.check._tables import (
     TABLE_LAYERS,
     col_names,
@@ -18,6 +19,15 @@ from auditfast.core.check._tables import (
     is_fact,
     is_snake_case,
 )
+from auditfast.core.check.helpers import (
+    Verdict,
+    binary,
+    covered,
+    graded,
+    not_applicable,
+    note
+)
+from auditfast.core.check._notebook import notebook_code
 from auditfast.core.check.helpers import (
     Verdict,
     binary,
@@ -53,6 +63,400 @@ _DECLARED_WIDTH = re.compile(r"^n?(?:varchar|char)\s*\(\s*(max|\d+)\s*\)", re.IG
 #: Widths above this are treated as oversized — they defeat statistics and inflate row size.
 _MAX_TEXT_WIDTH = 4000
 
+# T-SQL cursor and pandas row-by-row iteration anti-patterns (3.6.7).
+# Note: .collect()/.toPandas() are separately caught by NB-COLLECT; this
+# targets explicit SQL cursor syntax and pandas row iterators that are
+# semantically cursor-equivalent.
+_CURSOR = re.compile(
+    r"\bDECLARE\s+\w+\s+CURSOR\b"    # T-SQL cursor declaration
+    r"|\bFETCH\s+NEXT\b"               # T-SQL cursor fetch
+    r"|\bWHILE\s+@@FETCH_STATUS\b"     # T-SQL cursor loop
+    r"|\.iterrows\s*\(\s*\)"           # pandas row-by-row iteration
+    r"|\.itertuples\s*\(\s*\)",        # pandas tuple-by-tuple iteration
+    re.IGNORECASE,
+)
+
+#: Table/schema name patterns that indicate a staging area.
+#: Keys in ctx.workspace.tables are either plain lakehouse names ("StagingTemp")
+#: or "WarehouseName.schema.table" for warehouse tables.  The pattern must
+#: match the schema segment that follows the first dot, so it correctly detects
+#: "DataflowsStagingWarehouse.stg.sales" (schema = stg) and
+#: "AnyWarehouse.staging.orders" (schema = staging), but NOT
+#: "DataflowsStagingWarehouse.dbo.customers" where only the warehouse name
+#: contains "Staging" while the actual schema is dbo.
+_STAGING_NAME = re.compile(
+    # Lakehouse: plain name contains staging (e.g. StagingTemp)
+    r"(?:^|[_.\-])staging(?:[_.\-]|$)"
+    r"|^stg[_.]|[_.]stg$"
+    r"|^stage[_.]|[_.]stage$"
+    # Warehouse: schema segment (after the first dot) is stg/staging/stage
+    r"|\.[_]?(?:stg|staging|stage)[_.]",
+    re.IGNORECASE,
+)
+
+_WAREHOUSE_SQL_LOAD = re.compile(
+    r"\bMERGE\s+INTO\b|\bINSERT\s+INTO\b|\bCOPY\s+INTO\b|"
+    r"\bCREATE\s+TABLE\b|\bCTAS\b|\bTRUNCATE\s+TABLE\b|\bDELETE\s+FROM\b",
+    re.IGNORECASE,
+)
+_INCREMENTAL_SQL = re.compile(
+    r"\bMERGE\s+INTO\b|\bupsert\b|\bwatermark\b|\bcdc\b|"
+    r"change[_\s]?tracking|change[_\s]?data|last_?modified|high_?water|"
+    r"incremental",
+    re.IGNORECASE,
+)
+_TRY_CATCH_SQL = re.compile(
+    r"\bBEGIN\s+TRY\b.*?\bEND\s+TRY\b.*?\bBEGIN\s+CATCH\b.*?\bEND\s+CATCH\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_TXN_SQL = re.compile(
+    r"\bBEGIN\s+TRAN(?:SACTION)?\b|\bCOMMIT\s+TRAN(?:SACTION)?\b|\bROLLBACK\s+TRAN(?:SACTION)?\b",
+    re.IGNORECASE,
+)
+_STATS_UPDATE_SQL = re.compile(
+    r"\bUPDATE\s+STATISTICS\b|\bsp_updatestats\b|\bANALYZE\s+TABLE\b.*\bCOMPUTE\s+STATISTICS\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_TABLES_PATH = re.compile(r"(?:^|/)tables(?:/|$)", re.IGNORECASE)
+_SHORTCUTS_PATH = re.compile(r"(?:^|/)shortcuts(?:/|$)", re.IGNORECASE)
+_BRONZE_TOKEN = re.compile(r"(?:^|[/_\-.])bronze(?:[/_\-.]|$)", re.IGNORECASE)
+_SILVER_TOKEN = re.compile(r"(?:^|[/_\-.])silver(?:[/_\-.]|$)", re.IGNORECASE)
+
+_PARTITION_HINT_COLUMNS = (
+    "event_date", "business_date", "partition_date", "load_date",
+    "event_dt", "load_dt", "year", "month", "day",
+)
+_STRATEGY_METADATA_KEYS = (
+    "partitionBy", "partitionColumns", "partition_keys",
+    "clusterBy", "clusteredBy", "clusteringColumns", "zOrderBy",
+)
+_DECIMAL_TYPE = re.compile(r"^decimal\s*\((\d+)\s*,\s*(\d+)\)$", re.IGNORECASE)
+_OVERSIZED_VARCHAR = re.compile(r"^varchar\s*\((\d+)\)$", re.IGNORECASE)
+_SURROGATE_KEY_NAME = re.compile(r"(?:^|_)(?:sk|surrogate|hash(?:_?key)?)(?:$|_)", re.IGNORECASE)
+_PK_FK_NAME_HINT = re.compile(r"(?:^|_)(?:pk|fk|primary|foreign)(?:$|_)", re.IGNORECASE)
+_VIEW_PROC_HINT = re.compile(r"(?:^|_)(?:vw|view|sp|proc|procedure)(?:$|_)", re.IGNORECASE)
+_LOGIC_HINT = re.compile(r"(?:merge|join|window|row_number|dedup|rule|calc|business|transform)", re.IGNORECASE)
+
+_SQL_PERMISSION_HINT = (
+    "Request workspace Viewer role (CONNECT + ReadData on Warehouse/SQL analytics endpoint and Metadata/Audit DBs) "
+    "plus client approval for schema/catalog and row-level verification queries; this consumes capacity CU"
+)
+_ONELAKE_PERMISSION_HINT = (
+    "Request Workspace.Read.All + OneLake.Read.All (delegated, read-only). "
+    "Reads lakehouse table/column structure, Files hierarchy and shortcuts (structure only, never row data)"
+)
+
+
+def _to_text(value: object) -> str:
+    """Flatten a nested activity/script payload into plain text for regex checks."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for key in ("text", "query", "commandText", "sqlText", "value"):
+            item = value.get(key)
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, (dict, list)):
+                parts.append(_to_text(item))
+        return " ".join(part for part in parts if part) or str(value)
+    if isinstance(value, list):
+        return " ".join(_to_text(item) for item in value)
+    return str(value)
+
+
+def _shortcut_path_tokens(path: str) -> list[str]:
+    norm = (path or "").replace("\\", "/").strip("/").lower()
+    return [part for part in norm.split("/") if part]
+
+
+def _domain_from_path(path: str) -> tuple[str | None, str | None]:
+    """Infer (layer, domain) from a shortcut path when present."""
+    tokens = _shortcut_path_tokens(path)
+    for idx, token in enumerate(tokens):
+        if token in {"bronze", "silver"}:
+            if idx + 1 < len(tokens):
+                return token, tokens[idx + 1]
+            return token, None
+    return None, None
+
+@check(
+    id="WS-WH-LOAD", ref="3.6.1",
+    title="Gold Warehouse load pattern is defined and consistent",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
+    required=True,
+)
+def wh_load_pattern(ctx: CheckContext) -> Verdict:
+    """Warehouse tables are populated via a defined pattern: COPY INTO, CTAS, Copy activity, or stored procedure."""
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
+
+    warehouses = [i for i in ctx.workspace.items if i.type == "Warehouse"]
+    if not warehouses:
+        return not_applicable("No Warehouse items found in this workspace")
+
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    pipelines = ctx.workspace.pipelines
+    if not pipelines:
+        return graded(
+            1,
+            f"{len(warehouses)} Warehouse item(s) found but no pipelines defined — "
+            "a load pattern (COPY INTO / CTAS / Copy activity / stored procedure) should be established",
+        )
+
+    load_acts: list[str] = []
+
+    for pl_name, pl_def in pipelines.items():
+        for act in pipeline_activities(pl_def):
+            act_type = str(act.get("type", "") or "")
+            props = act.get("typeProperties") or {}
+            act_name = act.get("name", act_type) or act_type
+
+            # Copy activity
+            if act_type == "Copy":
+                load_acts.append(f"{pl_name}/{act_name}")
+                continue
+
+            if act_type == "Script":
+                scripts = props.get("scripts") or []
+                text = _to_text(scripts).upper()
+                if any(kw in text for kw in ("COPY INTO", "CREATE TABLE", "INSERT INTO", "CTAS")):
+                    load_acts.append(f"{pl_name}/{act_name}")
+                    continue
+
+            if act_type in ("SqlServerStoredProcedure", "StoredProcedure"):
+                load_acts.append(f"{pl_name}/{act_name}")
+                continue
+
+    if not load_acts:
+        return graded(
+            1,
+            f"{len(warehouses)} Warehouse item(s) found across {len(pipelines)} pipeline(s) "
+            "but no activity uses a defined load pattern (COPY INTO / CTAS / Copy / stored procedure)",
+        )
+
+    return binary(
+        True,
+        f"{len(load_acts)} load-pattern activity/activities across {len(pipelines)} pipeline(s): "
+        + ", ".join(load_acts[:5]),
+    )
+
+@check(
+    id="NB-NO-CURSOR", ref="3.6.2",
+    title="Silver-to-Gold transformations are set-based (no row-by-row cursors)",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_no_cursor(ctx: CheckContext) -> Verdict:
+    """Set-based SQL and DataFrame operations rather than T-SQL cursors or pandas row iteration."""
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = notebook_code(ctx.obj)
+    hits = _CURSOR.findall(code)
+    return binary(
+        not hits,
+        f"{len(hits)} cursor/row-iteration pattern(s) detected "
+        "(T-SQL CURSOR / .iterrows() / .itertuples())" if hits
+        else "No T-SQL cursors or row-by-row iteration patterns — set-based transformations",
+    )
+
+
+@check(
+    id="WS-STAGING", ref="3.6.3",
+    title="Staging tables/schema used for Warehouse loads before merge into final tables",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+)
+def wh_staging_pattern(ctx: CheckContext) -> Verdict:
+    """A staging layer (stg_*/staging_* tables or schema) buffers loads before the final merge."""
+    tables = ctx.workspace.tables
+    if not tables:
+        return not_applicable(_NO_TABLES)
+    staging = [n for n in tables if _STAGING_NAME.search(n)]
+    if staging:
+        return binary(
+            True,
+            f"{len(staging)} staging table(s) found: {', '.join(staging[:5])}",
+        )
+    return graded(
+        1,
+        f"{len(tables)} table(s) found but none follow a staging naming pattern "
+        "(stg_* / staging_* / stage_*) — a staging schema buffers loads before the final merge",
+    )
+
+@check(
+    id="WS-WH-TRYCATCH", ref="3.6.5",
+    title="Warehouse/lakehouse load SQL uses TRY...CATCH with transaction handling",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
+    required=True,
+)
+def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
+    """Inspectable SQL load logic wraps transactional changes in TRY...CATCH."""
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
+
+    storage_items = [
+        item for item in ctx.workspace.items
+        if item.type in {"Warehouse", "Lakehouse"}
+    ]
+    if not storage_items:
+        return not_applicable("No Warehouse/Lakehouse items found in this workspace")
+
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    inspected: list[tuple[str, bool]] = []
+    opaque_loads: list[str] = []
+
+    for pipeline_name, pipeline_def in ctx.workspace.pipelines.items():
+        for activity in pipeline_activities(pipeline_def):
+            activity_type = str(activity.get("type", "") or "")
+            activity_name = activity.get("name", activity_type) or activity_type
+            marker = f"{pipeline_name}/{activity_name}"
+
+            if activity_type == "Script":
+                text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
+                if not _WAREHOUSE_SQL_LOAD.search(text):
+                    continue
+                has_try_catch = bool(_TRY_CATCH_SQL.search(text))
+                has_transaction = bool(_TXN_SQL.search(text))
+                inspected.append((marker, has_try_catch and has_transaction))
+                continue
+
+            if activity_type in ("SqlServerStoredProcedure", "StoredProcedure", "Copy"):
+                opaque_loads.append(marker)
+
+    if not inspected:
+        if opaque_loads:
+            return not_applicable(
+                "Load logic is present but SQL bodies are not inspectable in this snapshot; "
+                "cannot verify TRY...CATCH transaction handling. " + _SQL_PERMISSION_HINT
+            )
+        return not_applicable("No inspectable scripted SQL load activity was found")
+
+    compliant = [name for name, ok in inspected if ok]
+    return covered(
+        len(compliant),
+        len(inspected),
+        f"{len(compliant)} of {len(inspected)} inspectable SQL load activity/activities use "
+        "TRY...CATCH and BEGIN/COMMIT/ROLLBACK transaction handling"
+        + (f"; compliant: {', '.join(compliant[:5])}" if compliant else ""),
+    )
+
+@check(
+    id="WS-WH-INCREMENTAL", ref="3.6.6",
+    title="Warehouse loads avoid unnecessary full reloads",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
+    required=True,
+)
+def wh_incremental_loads(ctx: CheckContext) -> Verdict:
+    """Inspectable warehouse SQL loads favor incremental patterns over full reloads."""
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
+    warehouses = [item for item in ctx.workspace.items if item.type == "Warehouse"]
+    if not warehouses:
+        return not_applicable("No Warehouse items found in this workspace")
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    inspected: list[tuple[str, bool]] = []
+    for pipeline_name, pipeline_def in ctx.workspace.pipelines.items():
+        for activity in pipeline_activities(pipeline_def):
+            if str(activity.get("type", "") or "") != "Script":
+                continue
+            text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
+            if not _WAREHOUSE_SQL_LOAD.search(text):
+                continue
+            inspected.append((
+                f"{pipeline_name}/{activity.get('name', 'Script')}",
+                bool(_INCREMENTAL_SQL.search(text)),
+            ))
+
+    if not inspected:
+        return not_applicable(
+            "No inspectable scripted warehouse load was found; Copy/stored-procedure "
+            "loads do not expose enough logic in the snapshot to judge incremental vs full reload"
+        )
+
+    incremental = [name for name, is_incremental in inspected if is_incremental]
+    return covered(
+        len(incremental), len(inspected),
+        f"{len(incremental)} of {len(inspected)} inspectable warehouse load activity/activities "
+        f"use incremental signals (MERGE / watermark / CDC)"
+        + (f"; incremental: {', '.join(incremental[:5])}" if incremental else ""),
+    )
+
+
+@check(
+    id="WS-WH-STATS", ref="3.6.7",
+    title="Statistics are updated after significant Warehouse loads",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
+    required=True,
+)
+def wh_stats_updated_after_loads(ctx: CheckContext) -> Verdict:
+    """Significant inspectable SQL loads are paired with statistics maintenance."""
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
+
+    storage_items = [
+        item for item in ctx.workspace.items
+        if item.type in {"Warehouse", "Lakehouse"}
+    ]
+    if not storage_items:
+        return not_applicable("No Warehouse/Lakehouse items found in this workspace")
+
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    pipeline_loads: dict[str, list[str]] = {}
+    pipeline_stats: dict[str, list[str]] = {}
+    opaque_loads: list[str] = []
+
+    for pipeline_name, pipeline_def in ctx.workspace.pipelines.items():
+        for activity in pipeline_activities(pipeline_def):
+            activity_type = str(activity.get("type", "") or "")
+            activity_name = activity.get("name", activity_type) or activity_type
+            marker = f"{pipeline_name}/{activity_name}"
+
+            if activity_type == "Script":
+                text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
+                if _WAREHOUSE_SQL_LOAD.search(text):
+                    pipeline_loads.setdefault(pipeline_name, []).append(marker)
+                if _STATS_UPDATE_SQL.search(text):
+                    pipeline_stats.setdefault(pipeline_name, []).append(marker)
+                continue
+
+            if activity_type in ("Copy", "SqlServerStoredProcedure", "StoredProcedure"):
+                opaque_loads.append(marker)
+
+    inspectable_pipelines = sorted(pipeline_loads)
+    if not inspectable_pipelines:
+        if opaque_loads:
+            return not_applicable(
+                "Significant loads are present but SQL bodies are not inspectable in this snapshot; "
+                "cannot verify post-load statistics maintenance. " + _SQL_PERMISSION_HINT
+            )
+        return not_applicable("No significant inspectable SQL warehouse/lakehouse load was found")
+
+    compliant = [name for name in inspectable_pipelines if pipeline_stats.get(name)]
+    evidence = (
+        f"{len(compliant)} of {len(inspectable_pipelines)} pipeline(s) with significant inspectable SQL loads "
+        "also run statistics maintenance (UPDATE STATISTICS / sp_updatestats / ANALYZE TABLE)"
+    )
+    if opaque_loads:
+        evidence += f"; {len(opaque_loads)} load activity/activities remain non-inspectable"
+    if compliant:
+        evidence += f"; compliant pipelines: {', '.join(compliant[:5])}"
+
+    return covered(len(compliant), len(inspectable_pipelines), evidence)
 # T-SQL cursor and pandas row-by-row iteration anti-patterns (3.6.7).
 # Note: .collect()/.toPandas() are separately caught by NB-COLLECT; this
 # targets explicit SQL cursor syntax and pandas row iterators that are
@@ -730,6 +1134,203 @@ def table_star_schema(ctx: CheckContext) -> Verdict:
                   "Both fact and dimension tables present" if has_fact and has_dim
                   else f"fact tables present: {has_fact}; dimension tables present: {has_dim}")
 
+
+
+@check(
+    id="TB-TYPE-SIZING", ref="4.4.3",
+    title="Data types are appropriate and sized for analytical use",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+)
+def table_type_sizing(ctx: CheckContext) -> Verdict:
+    """Check numeric precision validity and oversized varchar declarations where available."""
+    tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
+    if not tables:
+        return not_applicable("No table column metadata available")
+
+    inspectable = 0
+    sized_ok = 0
+    flagged: list[str] = []
+
+    for table_name, table_meta in tables.items():
+        # SQL-endpoint sizing checks require warehouse-style typed metadata.
+        if "." not in table_name:
+            continue
+        for column in columns(table_meta):
+            col_name = str(column.get("name", "") or "")
+            col_type = str(column.get("type", "") or "").strip().lower()
+            if not col_type:
+                continue
+
+            decimal = _DECIMAL_TYPE.match(col_type)
+            varchar = _OVERSIZED_VARCHAR.match(col_type)
+            if not decimal and not varchar:
+                continue
+
+            inspectable += 1
+            if decimal:
+                precision = int(decimal.group(1))
+                scale = int(decimal.group(2))
+                if 0 < precision <= 38 and 0 <= scale <= precision:
+                    sized_ok += 1
+                else:
+                    flagged.append(f"{table_name}.{col_name}={col_type}")
+                continue
+
+            width = int(varchar.group(1))
+            if width <= 2000:
+                sized_ok += 1
+            else:
+                flagged.append(f"{table_name}.{col_name}=varchar({width})")
+
+    if inspectable == 0:
+        return not_applicable(
+            "No inspectable decimal(v,s) or varchar(n) declarations were available in metadata to validate sizing. "
+            + _SQL_PERMISSION_HINT
+        )
+
+    return covered(
+        sized_ok,
+        inspectable,
+        f"{sized_ok} of {inspectable} inspectable column type declaration(s) meet sizing/precision rules"
+        + (f"; flagged: {', '.join(flagged[:5])}" if flagged else ""),
+    )
+
+
+@check(
+    id="TB-SURROGATE-PATTERN", ref="4.4.4",
+    title="Dimension surrogate keys use a generated-key pattern",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+)
+def table_surrogate_pattern(ctx: CheckContext) -> Verdict:
+    """Dimensions should expose surrogate key columns consistent with generated-key patterns."""
+    dims = {n: t for n, t in ctx.workspace.tables.items() if is_dimension(n) and columns(t)}
+    if not dims:
+        return not_applicable("No dimension tables with column metadata")
+
+    inspectable = 0
+    patterned = 0
+    missing: list[str] = []
+    for name, table_meta in dims.items():
+        if "." not in name:
+            continue
+        names = col_names(table_meta)
+        if not names:
+            continue
+        inspectable += 1
+        has_pattern = any(_SURROGATE_KEY_NAME.search(col) or col.endswith(("_sk", "_key")) for col in names)
+        if has_pattern:
+            patterned += 1
+        else:
+            missing.append(name)
+
+    if inspectable == 0:
+        return not_applicable("No dimension columns were inspectable for surrogate key pattern checks")
+
+    return covered(
+        patterned,
+        inspectable,
+        f"{patterned} of {inspectable} dimension table(s) expose surrogate key naming patterns"
+        + (f"; missing: {', '.join(missing[:5])}" if missing else ""),
+    )
+
+
+@check(
+    id="TB-PKFK-DECLARED", ref="4.4.5",
+    title="Primary and foreign key constraints are declared where supported",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+)
+def table_pkfk_declared(ctx: CheckContext) -> Verdict:
+    """Use structural metadata hints for declared PK/FK patterns; Fabric Warehouse enforcement is documented separately."""
+    tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
+    if not tables:
+        return not_applicable("No table column metadata available")
+
+    inspectable = 0
+    hinted = 0
+    missing: list[str] = []
+    for name, table_meta in tables.items():
+        if "." not in name:
+            continue
+        names = col_names(table_meta)
+        if not names:
+            continue
+        inspectable += 1
+        has_hint = any(
+            _PK_FK_NAME_HINT.search(col)
+            or col.endswith(("_id", "_sk", "_fk", "_key"))
+            for col in names
+        )
+        if has_hint:
+            hinted += 1
+        else:
+            missing.append(name)
+
+    if inspectable == 0:
+        return not_applicable("No tables were inspectable for PK/FK declaration hints")
+
+    return covered(
+        hinted,
+        inspectable,
+        f"{hinted} of {inspectable} table(s) include PK/FK structural naming hints"
+        + (f"; no hints: {', '.join(missing[:5])}" if missing else "")
+        + "; note: Fabric Warehouse constraints are declarative and not enforced",
+    )
+
+
+@check(
+    id="WS-STATS-STRATEGY", ref="4.4.6",
+    title="Statistics maintenance strategy is defined and automated",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS], required=True,
+)
+def stats_strategy_defined(ctx: CheckContext) -> Verdict:
+    """Inspect pipeline SQL automation for recurring stats maintenance patterns."""
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
+
+    storage_items = [item for item in ctx.workspace.items if item.type in {"Warehouse", "Lakehouse"}]
+    if not storage_items:
+        return not_applicable("No Warehouse/Lakehouse items found in this workspace")
+
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    inspectable = 0
+    automated = 0
+    opaque = 0
+
+    for _, pipeline_def in (ctx.workspace.pipelines or {}).items():
+        for activity in pipeline_activities(pipeline_def):
+            activity_type = str(activity.get("type", "") or "")
+            if activity_type == "Script":
+                text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
+                if _STATS_UPDATE_SQL.search(text):
+                    inspectable += 1
+                    automated += 1
+                elif _WAREHOUSE_SQL_LOAD.search(text):
+                    inspectable += 1
+                continue
+
+            if activity_type in ("Copy", "SqlServerStoredProcedure", "StoredProcedure"):
+                opaque += 1
+
+    if inspectable == 0:
+        if opaque:
+            return not_applicable(
+                "Storage load automation is present but SQL bodies are not inspectable, so statistics strategy cannot be verified. "
+                + _SQL_PERMISSION_HINT
+            )
+        return not_applicable("No inspectable storage-load automation was found to evaluate statistics strategy")
+
+    return covered(
+        automated,
+        inspectable,
+        f"{automated} of {inspectable} inspectable load automation step(s) include statistics maintenance",
+        obj="inspectable load automation steps",
+    )
 
 
 @check(
