@@ -1295,6 +1295,7 @@ def nb_fact_dim_ri(ctx: CheckContext) -> Verdict:
     if not _JOIN_PATTERN.search(code):
         return not_applicable("Notebook performs no fact-to-dimension join")
     ok = bool(_RI_PATTERN.search(code))
+    ok = bool(_RI_PATTERN.search(code))
     return binary(ok, "Fact FKs are validated against the dimension (anti-join / "
                       "null check)" if ok
                   else "Joins facts to dimensions without validating that every FK "
