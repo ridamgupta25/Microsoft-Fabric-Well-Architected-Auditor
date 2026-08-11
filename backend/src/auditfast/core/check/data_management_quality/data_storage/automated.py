@@ -1157,6 +1157,220 @@ def table_partition_strategy(ctx: CheckContext) -> Verdict:
     )
 
 @check(
+    id="WS-SHORTCUT-GOVERNANCE", ref="4.1.3",
+    title="Shortcuts avoid circular and ungoverned access paths",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS], required=True,
+)
+def shortcut_governance(ctx: CheckContext) -> Verdict:
+    """Shortcut paths are structurally governed and avoid loop-prone patterns."""
+    if not ctx.workspace.has(Resource.SHORTCUTS):
+        return not_applicable(
+            "Shortcut metadata could not be read. Request Workspace.Read.All + OneLake.Read.All "
+            "(delegated, read-only) to inspect lakehouse files hierarchy and shortcuts"
+        )
+
+    if not ctx.workspace.shortcuts:
+        return not_applicable("No lakehouse shortcuts found in this workspace")
+
+    total = 0
+    risky: list[str] = []
+
+    for lakehouse_name, shortcuts in (ctx.workspace.shortcuts or {}).items():
+        seen_paths: set[str] = set()
+        for row in (shortcuts or []):
+            total += 1
+            name = str((row or {}).get("name") or "")
+            path = str((row or {}).get("path") or "")
+            target_type = str((row or {}).get("target_type") or "")
+            normalized = path.replace("\\", "/").strip().strip("/")
+            normalized_low = normalized.lower()
+
+            issues: list[str] = []
+            if not target_type.strip():
+                issues.append("missing target type")
+            if ".." in normalized_low:
+                issues.append("path traversal segment '..'")
+            if _TABLES_PATH.search(normalized_low):
+                issues.append("shortcut rooted under Tables path")
+            if _SHORTCUTS_PATH.search(normalized_low):
+                issues.append("nested Shortcut path (loop-prone)")
+            if normalized_low in seen_paths and normalized_low:
+                issues.append("duplicate shortcut path")
+            seen_paths.add(normalized_low)
+
+            if issues:
+                risky.append(
+                    f"{lakehouse_name}/{name or '<unnamed>'}: " + ", ".join(issues)
+                )
+
+    if total == 0:
+        return not_applicable("No shortcut entries were returned from the lakehouse metadata")
+
+    safe = total - len(risky)
+    return covered(
+        safe,
+        total,
+        f"{safe} of {total} shortcut(s) passed governance path checks"
+        + (f"; flagged: {', '.join(risky[:5])}" if risky else ""),
+    )
+
+@check(
+    id="WS-LH-BRONZE-SILVER-SEP", ref="4.1.4",
+    title="Bronze and Silver lakehouse responsibilities are clearly separated per domain",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS, Resource.TABLE_SCHEMAS], required=True,
+)
+def bronze_silver_separation(ctx: CheckContext) -> Verdict:
+    """Domain paths should map cleanly to either Bronze or Silver, not both in one route."""
+    domain_layers: dict[str, set[str]] = {}
+    unknown: list[str] = []
+
+    if ctx.workspace.has(Resource.SHORTCUTS):
+        for lakehouse_name, shortcuts in (ctx.workspace.shortcuts or {}).items():
+            for row in (shortcuts or []):
+                path = str((row or {}).get("path") or "")
+                shortcut_name = str((row or {}).get("name") or "<unnamed>")
+                layer, domain = _domain_from_path(path)
+                if not layer or not domain:
+                    unknown.append(f"{lakehouse_name}/{shortcut_name}")
+                    continue
+                domain_layers.setdefault(domain, set()).add(layer)
+
+    # Fallback: infer from table naming when shortcuts are absent/empty.
+    if not domain_layers and ctx.workspace.has(Resource.TABLE_SCHEMAS):
+        for table_name in (ctx.workspace.tables or {}):
+            tokens = [t for t in re.split(r"[._-]+", str(table_name).lower()) if t]
+            for idx, token in enumerate(tokens):
+                if token in {"bronze", "silver"} and idx + 1 < len(tokens):
+                    domain_layers.setdefault(tokens[idx + 1], set()).add(token)
+                    break
+
+    if not domain_layers:
+        if not ctx.workspace.has(Resource.SHORTCUTS) and not ctx.workspace.has(Resource.TABLE_SCHEMAS):
+            return not_applicable("Shortcut/table structure metadata could not be read. " + _ONELAKE_PERMISSION_HINT)
+        return not_applicable("No Bronze/Silver domain pattern was found in shortcuts or table names to assess separation")
+
+    mixed_domains = sorted([d for d, layers in domain_layers.items() if len(layers) > 1])
+    separated = len(domain_layers) - len(mixed_domains)
+    return covered(
+        separated,
+        len(domain_layers),
+        f"{separated} of {len(domain_layers)} domain(s) map to a single layer responsibility"
+        + (f"; mixed domains: {', '.join(mixed_domains[:5])}" if mixed_domains else "")
+        + (f"; {len(unknown)} shortcut(s) had no parseable Bronze/Silver domain path" if unknown else ""),
+    )
+
+
+@check(
+    id="WS-LH-TAXONOMY", ref="4.1.5",
+    title="Bronze/Silver domain folders follow a consistent workspace taxonomy",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS, Resource.TABLE_SCHEMAS], required=True,
+)
+def bronze_silver_taxonomy(ctx: CheckContext) -> Verdict:
+    """Paths should consistently follow bronze/<domain>/... or silver/<domain>/..."""
+    assessed = 0
+    good = 0
+    bad_examples: list[str] = []
+
+    if ctx.workspace.has(Resource.SHORTCUTS):
+        for lakehouse_name, shortcuts in (ctx.workspace.shortcuts or {}).items():
+            for row in (shortcuts or []):
+                path = str((row or {}).get("path") or "")
+                name = str((row or {}).get("name") or "<unnamed>")
+                path_low = path.lower()
+                if not (_BRONZE_TOKEN.search(path_low) or _SILVER_TOKEN.search(path_low)):
+                    continue
+                assessed += 1
+                layer, domain = _domain_from_path(path)
+                if layer and domain and re.fullmatch(r"[a-z0-9_\-]+", domain):
+                    good += 1
+                else:
+                    bad_examples.append(f"{lakehouse_name}/{name}")
+
+    # Fallback: use table naming taxonomy when shortcuts are absent/empty.
+    if assessed == 0 and ctx.workspace.has(Resource.TABLE_SCHEMAS):
+        for table_name in (ctx.workspace.tables or {}):
+            name = str(table_name)
+            low = name.lower()
+            if not (_BRONZE_TOKEN.search(low) or _SILVER_TOKEN.search(low)):
+                continue
+            assessed += 1
+            tokens = [t for t in re.split(r"[._-]+", low) if t]
+            ok = False
+            for idx, token in enumerate(tokens):
+                if token in {"bronze", "silver"} and idx + 1 < len(tokens):
+                    domain = tokens[idx + 1]
+                    ok = bool(re.fullmatch(r"[a-z0-9_\-]+", domain))
+                    break
+            if ok:
+                good += 1
+            else:
+                bad_examples.append(name)
+
+    if assessed == 0:
+        if not ctx.workspace.has(Resource.SHORTCUTS) and not ctx.workspace.has(Resource.TABLE_SCHEMAS):
+            return not_applicable("Shortcut/table structure metadata could not be read. " + _ONELAKE_PERMISSION_HINT)
+        return not_applicable("No Bronze/Silver folder/table naming pattern was found to validate taxonomy")
+
+    return covered(
+        good,
+        assessed,
+        f"{good} of {assessed} Bronze/Silver shortcut/table path(s) match the expected taxonomy"
+        + (f"; inconsistent: {', '.join(bad_examples[:5])}" if bad_examples else ""),
+    )
+
+@check(
+    id="TB-PARTITION-STRATEGY", ref="4.2.2",
+    title="Partitioning or clustering strategy is defined for large tables",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+)
+def table_partition_strategy(ctx: CheckContext) -> Verdict:
+    """Large-table candidates should expose explicit partition/clustering metadata."""
+    tables = ctx.workspace.tables
+    if not tables:
+        return not_applicable(_NO_TABLES)
+
+    large_candidates = {
+        name: meta
+        for name, meta in tables.items()
+        if any(token in name.lower() for token in ("fact", "fct", "event", "txn", "sales", "orders"))
+    }
+    if not large_candidates:
+        return not_applicable("No large-table naming candidates found to assess partition/clustering strategy")
+
+    with_strategy: list[str] = []
+    inspectable = 0
+    hint_only: list[str] = []
+
+    for name, meta in large_candidates.items():
+        table_meta = meta or {}
+        cols = [str(c.get("name", "")).lower() for c in columns(table_meta)]
+        explicit = any(table_meta.get(key) for key in _STRATEGY_METADATA_KEYS)
+        hinted = any(col in _PARTITION_HINT_COLUMNS or col.endswith(("_date", "_dt", "_month", "_year")) for col in cols)
+
+        if explicit:
+            inspectable += 1
+            with_strategy.append(name)
+        elif hinted:
+            hint_only.append(name)
+
+    if inspectable == 0:
+        return not_applicable(
+            "Large-table candidates were found but no partition/clustering metadata was available to verify strategy. "
+            + _ONELAKE_PERMISSION_HINT
+        )
+
+    return covered(
+        len(with_strategy),
+        inspectable,
+        f"{len(with_strategy)} of {inspectable} large-table candidate(s) expose explicit partition/clustering strategy"
+        + (f"; explicit strategy: {', '.join(with_strategy[:5])}" if with_strategy else ""),
+    )
+
+@check(
     id="TB-AUDITCOLS", ref="4.2.5", title="Audit columns present (created_date, modified_date, source_system, batch_id)",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
