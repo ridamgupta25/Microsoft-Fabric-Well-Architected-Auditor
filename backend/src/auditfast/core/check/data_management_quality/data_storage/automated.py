@@ -28,7 +28,7 @@ from auditfast.core.check._tables import (
     store_of,
     tables_by_store,
 )
-from auditfast.core.check.helpers import Verdict, binary, covered, not_applicable
+from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
