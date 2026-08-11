@@ -98,6 +98,7 @@ def _measure_detail(names: list[str], verb: str) -> str:
 
 @check(
     id="SM-FK-SURROGATE",
+   
     ref="5.4.1",
     title="Fact-dimension referential integrity: all FKs in fact tables match dimension surrogate keys",
     pillar=Pillar.DATA,
@@ -117,12 +118,7 @@ def sm_fk_surrogate(ctx: CheckContext) -> Verdict:
         table_count = len(model.get("tables") or [])
         if table_count <= 1:
             return not_applicable("Single-table model — no relationships to define")
-        return covered(
-            0,
-            1,
-            f"Model has {table_count} tables but no relationships defined — "
-            f"facts are not wired to dimensions",
-        )
+        return covered(0, 1, f"Model has {table_count} tables but no relationships defined — facts are not wired to dimensions",)
 
     on_keys: list[dict[str, Any]] = []
     inactive_names: list[str] = []
@@ -137,10 +133,7 @@ def sm_fk_surrogate(ctx: CheckContext) -> Verdict:
         if not _is_active(rel):
             inactive_names.append(str(rel.get("name") or rel.get("id") or "?"))
 
-    detail = (
-        f"{len(on_keys)} of {len(relationships)} relationships join on a "
-        f"surrogate-key-shaped column"
-    )
+    detail = f"{len(on_keys)} of {len(relationships)} relationships join on a surrogate-key-shaped column"
     if inactive_names:
         detail += f"; {len(inactive_names)} inactive ({', '.join(sorted(inactive_names))})"
 
@@ -150,7 +143,7 @@ def sm_fk_surrogate(ctx: CheckContext) -> Verdict:
 @check(
     id="SM-FK-RI-DATA",
     ref="5.4.1",
-    title="Fact-dimension referential integrity: all FKs in fact tables match dimension surrogate keys",
+    title="Fact FK values resolve to dimension surrogate keys (no orphans)",
     pillar=Pillar.DATA,
     scope=Scope.WORKSPACE,
     severity=Severity.HIGH,

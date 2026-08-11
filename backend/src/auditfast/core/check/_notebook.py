@@ -48,6 +48,24 @@ def executable_code(definition: dict) -> str:
     )
 
 
+#: SQL ``/* ... */`` block comment and ``--`` line comment. Spark SQL embedded in
+#: ``spark.sql("...")`` strings uses these, which :func:`executable_code` keeps
+#: (it only strips Python ``#`` comments and preserves string literals).
+_SQL_BLOCK_COMMENT = re.compile(r"/\*[\s\S]*?\*/")
+_SQL_LINE_COMMENT = re.compile(r"--[^\n]*")
+
+
+def strip_sql_comments(code: str) -> str:
+    """Remove SQL ``--`` line and ``/* ... */`` block comments from ``code``.
+
+    A detector scanning the SQL inside ``spark.sql("...")`` for a technique (e.g.
+    ``DELETE FROM``) must not be satisfied by a *commented-out* statement. Compose
+    with :func:`executable_code` — ``strip_sql_comments(executable_code(defn))`` —
+    to ignore both Python ``#`` and SQL ``--`` / ``/* */`` commented-out code.
+    """
+    return _SQL_LINE_COMMENT.sub("", _SQL_BLOCK_COMMENT.sub("", code))
+
+
 def has_parameters_cell(definition: dict) -> bool:
     """True when any cell is tagged ``parameters`` (papermill / Fabric convention)."""
     for cell in (definition or {}).get("cells") or []:
