@@ -532,6 +532,33 @@ _LATE_SAFE_WRITE = re.compile(
     r"latest[_ -]?version|newer[_ -]?version|when[_ -]?matched",
     re.IGNORECASE,
 )
+#: Human-readable roll-up of the duplicate-safe writes ``_LATE_SAFE_WRITE`` accepts,
+#: listed in a FAIL so the reviewer sees exactly what was searched for.
+_SAFE_WRITE_NAMES = (
+    "MERGE, upsert, dropDuplicates, row_number(), dedup, "
+    "latest/newer-version, or when-matched"
+)
+
+
+def _matched_tokens(pattern: re.Pattern[str], blob: str, limit: int = 6) -> list[str]:
+    """Distinct literal substrings ``pattern`` matched in ``blob`` (order-preserving)."""
+    seen: list[str] = []
+    for m in pattern.finditer(blob):
+        tok = re.sub(r"\s+", " ", m.group(0)).strip().lower()
+        if tok and tok not in seen:
+            seen.append(tok)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
+def _data_move_summary(acts: list[dict]) -> str:
+    """A short '1 Copy, 2 Script' tally of the data-movement activities present."""
+    tally: dict[str, int] = {}
+    for a in acts:
+        t = a.get("type") or "?"
+        tally[t] = tally.get(t, 0) + 1
+    return ", ".join(f"{n} {t}" for t, n in tally.items())
 
 
 @check(
@@ -647,13 +674,6 @@ _COUNT_RECONCILE = re.compile(
     r"reconcil|\bcount_check\b|validate[^\n]*count|expect_table_row_count",
     re.IGNORECASE,
 )
-# A DataFrame ``.join(`` or a SQL ``JOIN <table>``. ``path.join`` and ``"x".join``
-# are not table joins.
-_JOIN_PATTERN = re.compile(
-    r"(?<!['\",])(?<!path)\.join\s*\(\s*(?![\[\]'\"])"
-    r"|\bjoin\s+[\w`\"\[]",
-    re.IGNORECASE,
-)
 _RI_PATTERN = re.compile(
     r"""(?isx)
     (?:\.join\s*\(.*?["']left_anti["'])
@@ -665,6 +685,7 @@ _RI_PATTERN = re.compile(
     \b(?:referential|integrity|fk_check|integrity_check|orphan|unmatched|missing_parent|no_parent)\b
     """
 )
+_JOIN_PATTERN = re.compile(r"(?is)\.join\s*\(|\bleft\s+join\b|\binner\s+join\b|\bright\s+join\b|\bfull\s+join\b", re.IGNORECASE)
 _FK_INTEGRITY = re.compile(
     # An anti-join - the standard way to isolate FK values with no parent row.
     # ``"anti"`` is quoted so the join-type argument matches but the English word
@@ -1012,6 +1033,99 @@ def nb_fk_integrity(ctx: CheckContext) -> Verdict:
                   else "Joins tables without FK/referential integrity validation")
 
 
+# -- 5.3.6 evidence helpers: name *what* was found, not only how many ----------
+#: The reconciliation techniques 5.3.6 accepts, split out so the evidence can name
+#: the one(s) actually present. The verdict still comes from ``_CROSS_SOURCE_RECON``;
+#: these regexes only enrich the message and never change which branch is taken.
+_RECON_TECHNIQUES = (
+    (re.compile(
+        r"\.count\s*\(\s*\)[^\n]{0,120}?(?:==|!=|<=|>=|<|>)[^\n]{0,120}?\.count\s*\(\s*\)|"
+        r"\b(?:source|src|left|before|expected)_count\b[^\n]{0,60}"
+        r"(?:==|!=|<=|>=|<|>)[^\n]{0,60}\b(?:target|tgt|right|after|actual)_count\b|"
+        r"\b(?:target|tgt|right|after|actual)_count\b[^\n]{0,60}"
+        r"(?:==|!=|<=|>=|<|>)[^\n]{0,60}\b(?:source|src|left|before|expected)_count\b",
+        re.IGNORECASE), "a count-vs-count comparison"),
+    (re.compile(
+        r"\.subtract\s*\(|\.exceptAll\s*\(|\bEXCEPT\s+(?:ALL\s+)?SELECT\b|\bMINUS\s+SELECT\b",
+        re.IGNORECASE), "a set difference (EXCEPT / subtract / exceptAll)"),
+    (re.compile(r"left_anti|leftanti|\bleft\s+anti\s+join\b", re.IGNORECASE), "an anti-join"),
+    (re.compile(
+        r"cross[_\s-]?source[_\s-]?recon|source[_\s-]?to[_\s-]?target|"
+        r"\breconcile_sources\b|\bcompare_sources\b",
+        re.IGNORECASE), "an explicitly named source-to-target reconciliation"),
+)
+
+
+def _summarize_sources(matches: list[str]) -> str:
+    """Tally the read call-sites the multi-source detector matched, grouped by kind."""
+    tally: dict[str, int] = {}
+    for raw in matches:
+        text = raw.strip().lower()
+        if "spark.read" in text and "load" in text:
+            kind = "spark.read().load()"
+        elif "spark.read" in text:
+            kind = "spark.read"
+        elif "spark.table" in text:
+            kind = "spark.table()"
+        else:
+            kind = ".load()"
+        tally[kind] = tally.get(kind, 0) + 1
+    return ", ".join(f"{n}\u00d7 {kind}" for kind, n in tally.items())
+
+
+def _recon_techniques(code: str) -> str:
+    """Name the cross-source reconciliation technique(s) actually present in ``code``."""
+    found = [label for pattern, label in _RECON_TECHNIQUES if pattern.search(code)]
+    return ", ".join(found) if found else "a cross-source comparison"
+
+
+def _count_reconcile_evidence(code: str) -> str:
+    """Name the single-dataset record-count idiom the notebook does have."""
+    if re.search(r"\bassert\b[^\n]*\.count\s*\(", code, re.IGNORECASE):
+        return "an asserted record count"
+    if re.search(r"reconcil|\bcount_check\b|expect_table_row_count", code, re.IGNORECASE):
+        return "a named row-count validation"
+    if re.search(r"\.count\s*\(\s*\)\s*(?:==|!=|<=|>=|<|>)", code):
+        return "a record-count comparison"
+    return "a record-count validation"
+
+
+#: Python-level loaders the bare ``.load(`` arm of ``_MULTI_SOURCE`` also matches.
+#: Named so the evidence can say *which* non-Spark loader was seen.
+_PY_LOADERS = (
+    ("json.load()", re.compile(r"\bjson\s*\.\s*loads?\s*\(", re.IGNORECASE)),
+    ("yaml.load()", re.compile(r"\byaml\s*\.\s*(?:safe_load|load)\s*\(", re.IGNORECASE)),
+    ("pickle.load()",
+     re.compile(r"\b(?:pickle|cpickle|cloudpickle)\s*\.\s*loads?\s*\(", re.IGNORECASE)),
+    ("numpy.load()", re.compile(r"\b(?:np|numpy)\s*\.\s*load\s*\(", re.IGNORECASE)),
+    ("joblib.load()", re.compile(r"\bjoblib\s*\.\s*load\s*\(", re.IGNORECASE)),
+    ("torch.load()", re.compile(r"\btorch\s*\.\s*load\s*\(", re.IGNORECASE)),
+)
+#: A genuine Spark data-source read. Its absence is what turns a ``.load(`` match
+#: into a false "source".
+_SPARK_READ = re.compile(r"spark\.read\b|spark\.table\s*\(", re.IGNORECASE)
+
+
+def _nonspark_load_note(code: str, matches: list[str]) -> str:
+    """Caveat when the detected reads are Python ``.load()`` calls, not Spark reads.
+
+    The 5.3.6 source detector also matches a bare ``.load(``, which catches Python
+    loaders such as ``json.load()``. When no ``spark.read`` / ``spark.table`` appears
+    anywhere, the counted 'sources' are almost certainly configuration/file reads,
+    not data - so the finding is flagged as such instead of silently over-counting.
+    """
+    if _SPARK_READ.search(code):
+        return ""
+    if not any(".load(" in m.replace(" ", "").lower() for m in matches):
+        return ""
+    named = [label for label, pattern in _PY_LOADERS if pattern.search(code)]
+    which = ", ".join(named) if named else "bare .load()"
+    return (
+        " \u2014 note: no Spark read (spark.read / spark.table) is present, so these are "
+        f"Python {which} calls (configuration/file reads), not Spark data-source reads"
+    )
+
+
 @check(
     id="NB-CROSS-RECON", ref="5.3.6",
     title="Cross-source reconciliation: records from multiple sources reconciled correctly",
@@ -1031,18 +1145,37 @@ def nb_cross_recon(ctx: CheckContext) -> Verdict:
     """
     code = executable_code(ctx.obj)
     sources = _MULTI_SOURCE.findall(code)
+    note = _nonspark_load_note(code, sources)
     if len(sources) < 2:
-        return not_applicable("Notebook reads from fewer than 2 sources")
+        seen = _summarize_sources(sources)
+        detail = f" ({seen})" if seen else ""
+        return not_applicable(
+            f"Reads from {len(sources)} data-source call-site(s){detail} — cross-source "
+            "reconciliation applies only when 2 or more sources are combined in one notebook"
+            + note
+        )
+    breakdown = _summarize_sources(sources)
     if _CROSS_SOURCE_RECON.search(code):
-        return binary(True, f"Reads {len(sources)} sources and reconciles across them")
+        return binary(
+            True,
+            f"Reads {len(sources)} source call-sites ({breakdown}) and reconciles "
+            f"across them via {_recon_techniques(code)}" + note,
+        )
     if _COUNT_RECONCILE.search(code):
         return graded(
             1,
-            f"Reads {len(sources)} sources and validates a record count, but nothing "
-            f"compares the sources against each other — no count-vs-count check, set "
-            f"difference, or anti-join",
+            f"Reads {len(sources)} source call-sites ({breakdown}) and validates a "
+            f"single dataset ({_count_reconcile_evidence(code)}), but nothing compares "
+            f"the sources against each other — no count-vs-count check, set difference "
+            f"(EXCEPT / subtract / exceptAll), or anti-join spanning the sources" + note,
         )
-    return binary(False, f"Reads {len(sources)} sources without cross-source reconciliation")
+    return binary(
+        False,
+        f"Reads {len(sources)} source call-sites ({breakdown}) without cross-source "
+        f"reconciliation — none of a count-vs-count comparison, set difference "
+        f"(EXCEPT / subtract / exceptAll), anti-join, or explicitly named "
+        f"source-to-target reconciliation was found across the sources" + note,
+    )
 
 
 @check(
@@ -1343,6 +1476,7 @@ def nb_fact_dim_ri(ctx: CheckContext) -> Verdict:
     if not _JOIN_PATTERN.search(code):
         return not_applicable("Notebook performs no fact-to-dimension join")
     ok = bool(_RI_PATTERN.search(code))
+    ok = bool(_RI_PATTERN.search(code))
     return binary(ok, "Fact FKs are validated against the dimension (anti-join / "
                       "null check)" if ok
                   else "Joins facts to dimensions without validating that every FK "
@@ -1407,17 +1541,32 @@ def pl_late_arrival(ctx: CheckContext) -> Verdict:
     acts = walk_activities(ctx.obj)
     data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
     if not data_acts:
-        return not_applicable("No data-movement activity to assess for late changes")
+        return not_applicable(
+            "No data-movement activity (Copy / Script / Notebook / Stored-proc / Lookup) "
+            "to assess for late-arriving changes"
+        )
     blob = json.dumps(ctx.obj)
-    late_signal = bool(_LATE_ARRIVAL.search(blob))
-    safe_write = bool(_LATE_SAFE_WRITE.search(blob))
-    if not late_signal:
-        return not_applicable("No late-arrival or out-of-order handling signal found")
+    signals = _matched_tokens(_LATE_ARRIVAL, blob)
+    writes = _matched_tokens(_LATE_SAFE_WRITE, blob)
+    moved = _data_move_summary(data_acts)
+    if not signals:
+        return not_applicable(
+            f"{moved} present, but no late-arrival / out-of-order signal (watermark, "
+            f"event-time, sequence/version id, effective-date, lookback) is referenced, so "
+            f"late-change handling does not apply to this pipeline"
+        )
+    if writes:
+        return binary(
+            True,
+            f"{moved} with a late-arrival signal ({', '.join(signals)}) and a version-aware "
+            f"/ duplicate-safe write ({', '.join(writes)}), so out-of-order changes cannot "
+            f"corrupt the target",
+        )
     return binary(
-        safe_write,
-        "Late/out-of-order handling uses a version-aware or duplicate-safe write pattern"
-        if safe_write else
-        "Late/out-of-order handling is indicated but no version-aware duplicate-safe write was found",
+        False,
+        f"{moved} references a late-arrival signal ({', '.join(signals)}) but NO version-aware "
+        f"/ duplicate-safe write was found \u2014 none of {_SAFE_WRITE_NAMES} appears, so a "
+        f"re-sent or out-of-order record can insert a duplicate or overwrite a newer row",
     )
 
 

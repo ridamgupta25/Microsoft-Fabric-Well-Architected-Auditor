@@ -14,7 +14,11 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
-from auditfast.core.check._notebook import notebook_code
+from auditfast.core.check._notebook import (
+    executable_code,
+    notebook_code,
+    strip_sql_comments,
+)
 from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities, walk_activities
 from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable
 from auditfast.core.check.registry import check
@@ -23,6 +27,8 @@ from auditfast.core.models import CheckContext
 
 from . import _spark
 from ._spark import NOTEBOOK_LAYERS, pip_targets, unpinned_targets, writes_delta
+import re
+import re
 
 # -- Delta table maintenance (3.3.x) ------------------------------------------
 
@@ -33,7 +39,9 @@ from ._spark import NOTEBOOK_LAYERS, pip_targets, unpinned_targets, writes_delta
 )
 def delta_merge(ctx: CheckContext) -> Verdict:
     """A single ``MERGE INTO`` handles insert/update/delete, not sequential DML."""
-    code = notebook_code(ctx.obj)
+    # Ignore commented-out DML: strip Python "#" and SQL "--" / "/* */" comments so
+    # a disabled DELETE/INSERT does not count as a real sequential-DML upsert.
+    code = strip_sql_comments(executable_code(ctx.obj))
     if _spark.MERGE.search(code):
         return binary(True, "Uses MERGE INTO for atomic upserts")
     if _spark.SEQ_DELETE.search(code) and _spark.SEQ_INSERT.search(code):
@@ -396,12 +404,51 @@ def spark_profile(ctx: CheckContext) -> Verdict:
             f"Latest Spark application ran for {int(duration)} ms; below {threshold} ms threshold"
         )
     if "advice" not in evidence and "stages" not in evidence:
-        return binary(False, "Long-running application has no Advisor or stage profiling metrics")
-    return binary(True, f"Profiled {int(duration)} ms application; Advisor or stage metrics captured")
+        return not_applicable("Long-running application has no Advisor or stage profiling metrics")
+    shuffle_threshold = int(
+        _spark.number(ctx.setting("heavy_shuffle_bytes", 1_073_741_824), -1)
+    )
+    if shuffle_threshold < 0:
+        return not_applicable("Project heavy_shuffle_bytes threshold is invalid")
+    issues = _spark.performance_issues(ctx.obj, shuffle_threshold)
+    return binary(not issues, f"Profiled {int(duration)} ms application; no open performance issue"
+                  if not issues else f"Profiled {int(duration)} ms application; open issues: {', '.join(issues)}")
 
+@check(
+    id="NB-PUSHDOWN",
+    ref="3.5.7",
+    title="Predicate pushdown verified for shortcut/external reads",
+    pillar=Pillar.PERFORMANCE,
+    scope=Scope.NOTEBOOK,
+    severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS,
+    requires=[Resource.NOTEBOOK_DEFINITIONS],
+    required=True,
+)
+def nb_pushdown(ctx: CheckContext) -> Verdict:
+    """Notebooks reading shortcut or external data apply filter predicates early."""
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+
+    code = notebook_code(ctx.obj)
+    lines = code.splitlines()
+
+    read_idxs = [i for i, l in enumerate(lines) if _spark.EXTERNAL_READ.search(l)]
+    if not read_idxs:
+        return not_applicable("Notebook does not read from shortcut or external data sources")
+
+    for i in read_idxs:
+        window = "\n".join(lines[i : i + 12])  # include read line + next ~11 lines
+        if re.search(r"\.filter\s*\(|\.where\s*\(", window, re.IGNORECASE):
+            return binary(True, "Filter predicates applied to external/shortcut reads")
+
+    return graded(
+        1,
+        "Reads from shortcut or external source without applying filter predicates — "
+        "all rows are scanned before any selection, preventing predicate pushdown",
+    )
 
 # -- Copy activity parallelism (2.6.2) ----------------------------------------
-
 @check(
     id="PL-COPY-PARALLEL", ref="2.6.2", title="Copy activities use appropriate parallelism (DIU, degree of copy parallelism)",
     pillar=Pillar.PERFORMANCE, scope=Scope.PIPELINE, severity=Severity.LOW,
