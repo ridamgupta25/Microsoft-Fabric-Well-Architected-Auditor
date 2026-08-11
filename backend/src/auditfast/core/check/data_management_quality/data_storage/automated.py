@@ -124,6 +124,23 @@ _PK_FK_NAME_HINT = re.compile(r"(?:^|_)(?:pk|fk|primary|foreign)(?:$|_)", re.IGN
 _VIEW_PROC_HINT = re.compile(r"(?:^|_)(?:vw|view|sp|proc|procedure)(?:$|_)", re.IGNORECASE)
 _LOGIC_HINT = re.compile(r"(?:merge|join|window|row_number|dedup|rule|calc|business|transform)", re.IGNORECASE)
 
+_DECLARED_WIDTH = re.compile(r"^n?(?:varchar|char)\s*\(\s*(max|\d+)\s*\)", re.IGNORECASE)
+
+#: Widths above this are treated as oversized — they defeat statistics and inflate row size.
+_MAX_TEXT_WIDTH = 4000
+_DECIMAL_PRECISION = re.compile(r"^(?:decimal|numeric)\((\d+)\s*,\s*(\d+)\)$", re.IGNORECASE)
+
+
+_GENERATED_KEY_HINT = re.compile(
+    r"(?:hash|row_?number|row_?num|sequence|seq|surrogate)",
+    re.IGNORECASE,
+)
+_SAMPLE_LIMIT = 8
+_BUSINESS_KEY_HINT = re.compile(
+    r"(?:business|natural|code|number|_bk$)",
+    re.IGNORECASE,
+)
+
 _SQL_PERMISSION_HINT = (
     "Request workspace Viewer role (CONNECT + ReadData on Warehouse/SQL analytics endpoint and Metadata/Audit DBs) "
     "plus client approval for schema/catalog and row-level verification queries; this consumes capacity CU"
@@ -711,6 +728,26 @@ def table_audit_columns(ctx: CheckContext) -> Verdict:
     ok = [n for n, t in tables.items() if has_audit_column(t)]
     return covered(len(ok), len(tables), f"{len(ok)} of {len(tables)} tables have audit columns")
 
+def _table_stores(ctx: CheckContext) -> str:
+    """Name the lakehouse/warehouse(s) whose tables a workspace check inspected.
+
+    Workspace-scoped table checks aggregate over every store's tables, so the
+    engine leaves their object blank. Naming the store(s) here points the finding
+    at what was judged — the analogue of a pipeline check naming its pipeline.
+    Falls back to a generic label when the item list was not read.
+    """
+    names = sorted({
+        i.display_name or i.id
+        for i in ctx.workspace.items
+        if (i.type or "") in ("Lakehouse", "Warehouse")
+    })
+    if not names:
+        return "lakehouse/warehouse tables"
+    joined = ", ".join(names[:_SAMPLE_LIMIT])
+    if len(names) > _SAMPLE_LIMIT:
+        joined += f", \u2026(+{len(names) - _SAMPLE_LIMIT} more)"
+    return joined
+
 
 @check(
     id="TB-STARSCHEMA", ref="4.5.1", title="Star schema design implemented (fact + dimension tables, not flat wide tables)",
@@ -746,63 +783,65 @@ def table_star_schema(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="TB-TYPE-SIZING", ref="4.4.3",
-    title="Data types are appropriate and sized for analytical use",
+    id="TB-DATATYPE-SIZING", ref="4.4.3",
+    title="Data types are appropriate and sized correctly",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=True,
 )
-def table_type_sizing(ctx: CheckContext) -> Verdict:
-    """Check numeric precision validity and oversized varchar declarations where available."""
+def table_datatype_sizing(ctx: CheckContext) -> Verdict:
+    """Declared text widths and decimal precision/scale are within sane bounds."""
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
     tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
     if not tables:
-        return not_applicable("No table column metadata available")
+        return not_applicable(_NO_COLS)
 
-    inspectable = 0
-    sized_ok = 0
-    flagged: list[str] = []
+    assessed = compliant = oversized_text = imprecise_numeric = 0
+    lakehouse_defaults = 0
 
-    for table_name, table_meta in tables.items():
-        # SQL-endpoint sizing checks require warehouse-style typed metadata.
-        if "." not in table_name:
-            continue
-        for column in columns(table_meta):
-            col_name = str(column.get("name", "") or "")
-            col_type = str(column.get("type", "") or "").strip().lower()
-            if not col_type:
+    for table in tables.values():
+        for col in columns(table):
+            ctype = (col.get("type", "") or "").lower()
+            if not ctype:
                 continue
 
-            decimal = _DECIMAL_TYPE.match(col_type)
-            varchar = _OVERSIZED_VARCHAR.match(col_type)
-            if not decimal and not varchar:
+            if _is_lakehouse_default_text(col, ctype):
+                lakehouse_defaults += 1
                 continue
 
-            inspectable += 1
-            if decimal:
-                precision = int(decimal.group(1))
-                scale = int(decimal.group(2))
-                if 0 < precision <= 38 and 0 <= scale <= precision:
-                    sized_ok += 1
+            text_sizing = _too_wide(ctype)
+            if text_sizing is not None:
+                assessed += 1
+                if text_sizing:
+                    oversized_text += 1
                 else:
-                    flagged.append(f"{table_name}.{col_name}={col_type}")
+                    compliant += 1
                 continue
 
-            width = int(varchar.group(1))
-            if width <= 2000:
-                sized_ok += 1
-            else:
-                flagged.append(f"{table_name}.{col_name}=varchar({width})")
+            numeric_sizing = _decimal_is_reasonable(ctype)
+            if numeric_sizing is not None:
+                assessed += 1
+                if numeric_sizing:
+                    compliant += 1
+                else:
+                    imprecise_numeric += 1
 
-    if inspectable == 0:
+    if not assessed:
         return not_applicable(
-            "No inspectable decimal(v,s) or varchar(n) declarations were available in metadata to validate sizing. "
-            + _SQL_PERMISSION_HINT
+            "No assessable declared text widths or decimal/numeric precision "
+            "metadata"
+            + (f"; {lakehouse_defaults} Lakehouse default varchar("
+               f"{_LAKEHOUSE_TEXT_WIDTH}) column(s) excluded" if lakehouse_defaults else "")
         )
 
     return covered(
-        sized_ok,
-        inspectable,
-        f"{sized_ok} of {inspectable} inspectable column type declaration(s) meet sizing/precision rules"
-        + (f"; flagged: {', '.join(flagged[:5])}" if flagged else ""),
+        compliant, assessed,
+        f"{compliant} of {assessed} assessable columns have appropriate sizing — "
+        f"{oversized_text} oversized text column(s), {imprecise_numeric} "
+        "decimal/numeric column(s) with invalid precision/scale"
+        + (f"; {lakehouse_defaults} Lakehouse default varchar({_LAKEHOUSE_TEXT_WIDTH}) "
+           "column(s) excluded" if lakehouse_defaults else ""),
     )
 
 
