@@ -17,11 +17,38 @@ from auditfast.core.models import CheckContext
     requires=[Resource.ITEMS], required=True,
 )
 def sensitivity_labels(ctx: CheckContext) -> Verdict:
-    """Every item carries a sensitivity label, especially those holding PII."""
+    """Every item carries a sensitivity label, especially those holding PII.
+
+    **What it can determine.** The Fabric Core items API documents a
+    ``sensitivityLabel`` on each item and returns it to any caller with a viewer
+    workspace role, so this needs no admin access.
+
+    **What it cannot determine - and why a bare zero is not reported.** When the
+    response carries a label for *no* item at all, two very different situations
+    look identical from here: nothing in the workspace is labelled, or labels
+    were not returned to this caller (the tenant does not use MIP labelling, the
+    information-protection tenant setting is off, or the sign-in did not surface
+    them). On a real 1,076-item workspace every item came back with no label,
+    which the old ratio scored as ``0 of 1076`` - a confident FAIL built on
+    unreadable data. "We could not determine this" is not "this is
+    misconfigured", so that case is now N/A.
+
+    Once *any* item carries a label, labelling is demonstrably in use here and
+    the ratio becomes meaningful - so the unlabelled remainder is scored.
+    """
     if not ctx.workspace.has(Resource.ITEMS):
         return not_applicable("Workspace items could not be read from Fabric")
     items = ctx.workspace.items
+    if not items:
+        return not_applicable("Workspace holds no items to label")
     labeled = [i for i in items if i.sensitivity_label]
+    if not labeled:
+        return not_applicable(
+            f"No sensitivity label was returned for any of the {len(items)} item(s). "
+            "That reads the same whether nothing is labelled or labels are not "
+            "exposed to this sign-in (information-protection settings), so labelling "
+            "is reported as unassessed rather than failed - confirm in the Fabric portal"
+        )
     return covered(
         len(labeled), len(items),
         f"{len(labeled)} of {len(items)} items carry a sensitivity label",

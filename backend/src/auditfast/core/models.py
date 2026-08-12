@@ -41,9 +41,13 @@ class Item:
 
     @classmethod
     def from_api(cls, raw: dict) -> Item:
+        # Two spellings are real: the Fabric Core items API documents
+        # ``sensitivityLabel.id``, while the Power BI admin/scanner API returns
+        # ``sensitivityLabel.labelId``. Accepting both means a label read through
+        # either route lands in the same field.
         label = raw.get("sensitivityLabel")
         if isinstance(label, dict):
-            label = label.get("labelId")
+            label = label.get("id") or label.get("labelId")
         return cls(
             id=raw.get("id") or "",
             type=raw.get("type") or "",

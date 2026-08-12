@@ -91,7 +91,7 @@ def discover_twin(
     name_to_id: dict[str, str] | None = None,
     enrich: bool = True,
     llm=None,
-    store: "GraphStore | None" = None,
+    store: GraphStore | None = None,
 ):
     """Build a twin from *every* available source, then AI-enrich it (Phase 2).
 
