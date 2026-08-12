@@ -91,6 +91,33 @@ def _measure_detail(names: list[str], verb: str) -> str:
     return f"{len(names)} measure(s) {verb}: {shown}{more}"
 
 
+def _name_list(names: list[str], limit: int = _MAX_NAMED_MEASURES) -> str:
+    """Comma-joined names, capped so a large estate cannot fill the evidence."""
+    shown = ", ".join(names[:limit])
+    more = f" (+{len(names) - limit} more)" if len(names) > limit else ""
+    return f"{shown}{more}"
+
+
+def _offender_breakdown(offenders: dict[str, list[str]], limit: int = _MAX_NAMED_MEASURES) -> str:
+    """``Model: m1 (fault), m2 (fault); Model2: m3 (fault)`` — the offending measures
+    grouped under the model they belong to, capped at ``limit`` measures total so one
+    workspace cannot flood the scored row's evidence.
+    """
+    total_named = sum(len(names) for names in offenders.values())
+    parts: list[str] = []
+    shown = 0
+    for model_name, names in sorted(offenders.items()):
+        if shown >= limit:
+            break
+        picked = names[: limit - shown]
+        shown += len(picked)
+        parts.append(f"{model_name}: {', '.join(picked)}")
+    text = "; ".join(parts)
+    if total_named > limit:
+        text += f" (+{total_named - limit} more)"
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Structure checks — referential integrity
 # ---------------------------------------------------------------------------
@@ -304,8 +331,9 @@ def complex_measures_use_variables(ctx: CheckContext) -> list[Verdict]:
 
     Whether a *particular* iterator is truly avoidable is a modelling judgement,
     so only the two unambiguous anti-patterns above count against a measure. The
-    scored workspace verdict is followed by one unscored detail row per model,
-    naming the offending measures and which practice each breaks.
+    scored workspace verdict names every model it assessed and the measures that
+    break a practice, and is followed by one unscored detail row per model
+    repeating that model's offenders.
     """
     if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
         return [not_applicable(_UNREADABLE)]
@@ -315,13 +343,16 @@ def complex_measures_use_variables(ctx: CheckContext) -> list[Verdict]:
 
     total = compliant = 0
     no_var = repeated = iterators = 0
+    assessed_models: list[str] = []
     offenders: dict[str, list[str]] = {}
     for model_name, defn in models.items():
+        model_assessed = False
         for measure in defn.get("measures") or []:
             expr = _normalised(measure.get("expression"))
             if len(expr) <= _MIN_MEASURE_CHARS:
                 continue
             total += 1
+            model_assessed = True
             faults = []
             if len(expr) > _COMPLEX_MEASURE_CHARS and not uses_variables(expr):
                 faults.append("no VAR")
@@ -337,17 +368,23 @@ def complex_measures_use_variables(ctx: CheckContext) -> list[Verdict]:
                 offenders.setdefault(model_name, []).append(f"{name} ({', '.join(faults)})")
             else:
                 compliant += 1
+        if model_assessed:
+            assessed_models.append(model_name)
 
     if not total:
         return [not_applicable("No semantic model measures substantial enough to assess")]
 
-    verdicts = [covered(
-        compliant, total,
-        f"{compliant} of {total} substantial measures follow all three DAX practices — "
+    headline = (
+        f"{compliant} of {total} substantial measure(s) follow all three DAX practices "
+        f"across {len(assessed_models)} semantic model(s) "
+        f"({_name_list(assessed_models)}) — "
         f"{no_var} measure(s) longer than {_COMPLEX_MEASURE_CHARS} characters declare no VAR, "
         f"{repeated} repeat a substantial sub-expression, "
-        f"{iterators} use an iterator pattern with a cheaper equivalent",
-    )]
+        f"{iterators} use an iterator pattern with a cheaper equivalent"
+    )
+    if offenders:
+        headline += ". Measures needing attention — " + _offender_breakdown(offenders)
+    verdicts = [covered(compliant, total, headline)]
     verdicts += [
         note(_measure_detail(names, "break a DAX practice"), obj=model_name)
         for model_name, names in sorted(offenders.items())

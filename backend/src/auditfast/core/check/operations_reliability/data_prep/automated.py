@@ -8,7 +8,12 @@ from __future__ import annotations
 import json
 import re
 
-from auditfast.core.check._notebook import NOTEBOOK_LAYERS, executable_code, notebook_code
+from auditfast.core.check._notebook import (
+    NOTEBOOK_LAYERS,
+    executable_code,
+    notebook_code,
+    strip_sql_comments,
+)
 from auditfast.core.check._pipeline import (
     PIPELINE_LAYERS,
     activities,
@@ -414,6 +419,31 @@ def pl_deadletter(ctx: CheckContext) -> Verdict:
     )
 
 
+#: A *genuine* dead-letter sink names its target, so keyword co-occurrence alone
+#: can no longer score a pass. Three real forms — a PySpark write to an
+#: error-named literal target (``saveAsTable``/``insertInto``/``.save``), a SQL
+#: ``INSERT``/``INSERT OVERWRITE`` into an error-named table, and an error-named
+#: DataFrame being written (``rejected_df.write``, ``exclusions_df.write``).
+_ERR_SINK = (
+    r"(?:reject|invalid|quarantin|dead[_ -]?letter|error|bad[_ -]?rec|"
+    r"fail(?:ed|ure)|corrupt|discard|exclus|violation|exception)"
+)
+_ERR_TABLE_WRITE = re.compile(
+    r"""(?:saveastable|insertinto|\.save)\s*\(\s*[fr]?["'`][^"'`)]*""" + _ERR_SINK + r"|"
+    r"""insert\s+(?:into|overwrite)\s+(?:table\s+)?[\w.`"']*""" + _ERR_SINK + r"|"
+    r"\b\w*" + _ERR_SINK + r"\w*\.\s*write\b",
+    re.IGNORECASE,
+)
+#: Any persist — a table write, insert, or file write. Distinguishes "wrote the
+#: failed rows *somewhere*" (unverifiable sink → PARTIAL) from "detected errors
+#: and wrote nothing" (dropped → FAIL).
+_ANY_WRITE = re.compile(
+    r"\.write\b|saveastable|insertinto|insert\s+(?:into|overwrite)|"
+    r"create\s+or\s+replace|\.save\s*\(",
+    re.IGNORECASE,
+)
+
+
 @check(
     id="NB-DEADLETTER", ref="5.1.10",
     title="DQ quarantine pattern: failed records routed to error tables with failure reason",
@@ -421,21 +451,65 @@ def pl_deadletter(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_deadletter(ctx: CheckContext) -> Verdict:
-    """Invalid records are retained in a dead-letter or quarantine output."""
+    """Failed records are retained in a distinctly-named dead-letter / quarantine table.
+
+    Tiered so keyword co-occurrence can no longer score a pass — the old check
+    matched any ``write``/``reject``/``invalid`` token, including ones sitting in a
+    comment, so a notebook that merely *mentioned* "invalid" passed:
+
+      * **PASS** — the *executable* code writes to a distinctly error / quarantine /
+        reject / exclusion-named sink (an error-named ``saveAsTable`` / ``INSERT
+        INTO`` target, or an error-named DataFrame being written).
+      * **PARTIAL** — either the quarantine intent is only in **comments** (documented,
+        not implemented), or the notebook flags record errors and writes to *some*
+        table but no recognisably error-named sink could be confirmed (the target is
+        often a runtime variable) — flagged for a human to verify.
+      * **FAIL** — the executable code flags record errors but performs no write at
+        all: the failed rows are detected and then dropped, nothing retained.
+      * **N/A** — no record-error vocabulary anywhere (not a DQ notebook).
+    """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
-    code = notebook_code(ctx.obj)
-    if not _RECORD_ERROR.search(code):
+    raw = notebook_code(ctx.obj)
+    if not _RECORD_ERROR.search(raw):
         return not_applicable("Notebook has no record-validation or error-routing pattern")
-    ok = bool(re.search(
-        r"(?:write|save|insert|append|quarantine|dead[_ -]?letter|reject|invalid)",
-        code,
-        re.IGNORECASE,
-    ))
+    # Judge only uncommented code (strip Python ``#`` and SQL ``--`` / ``/* */``);
+    # string literals are kept so a table name or embedded SQL still counts.
+    code = strip_sql_comments(executable_code(ctx.obj))
+
+    hit = _ERR_TABLE_WRITE.search(code)
+    if hit:
+        return binary(
+            True,
+            "Executable code writes failed/invalid records to a distinctly-named "
+            f"error / quarantine / reject sink (matched: {hit.group(0).strip()[:80]})",
+        )
+
+    if not _RECORD_ERROR.search(code):
+        found = ", ".join(sorted({m.lower() for m in _RECORD_ERROR.findall(raw)}))
+        return graded(
+            1,
+            f"Dead-letter / quarantine references ({found}) were found only in comments, "
+            "not in the executable code. Looked for an actual write to a distinct error / "
+            "quarantine / reject table (saveAsTable / INSERT INTO an error-named target) in "
+            "the uncommented code and SQL queries but found none — the quarantine pattern "
+            "is documented but not implemented",
+        )
+
+    if _ANY_WRITE.search(code):
+        return graded(
+            1,
+            "Executable code flags record errors (validation / reject) and writes to a "
+            "table, but no distinctly error / quarantine / reject-named sink could be "
+            "confirmed — the write target is a runtime variable, so it is not provable "
+            "from the code that the failed records are retained with a failure reason "
+            "rather than merged into the main output; verify manually",
+        )
+
     return binary(
-        ok,
-        "Notebook routes failed/invalid records to a retained output" if ok
-        else "Notebook detects record errors but does not retain a failed-record output",
+        False,
+        "Executable code flags record errors (validation / reject) but performs no write "
+        "at all — the failed/invalid records are detected and then dropped, not retained",
     )
 
 

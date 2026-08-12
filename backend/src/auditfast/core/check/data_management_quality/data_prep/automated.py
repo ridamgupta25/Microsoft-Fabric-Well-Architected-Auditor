@@ -14,6 +14,7 @@ from auditfast.core.check._notebook import (
     has_parameters_cell,
     markdown_sources,
     notebook_code,
+    strip_sql_comments,
 )
 from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities, script_sql, walk_activities
 from auditfast.core.check._tables import (
@@ -911,7 +912,7 @@ _BULK_ACTIVITY = re.compile(
 )
 _ROW_BY_ROW = re.compile(
     r"ForEach|foreach|row[_ -]?by[_ -]?row|insert\s+into|execute\s+query|"
-    r"SqlServerStoredProcedure|Script",
+    r"SqlServerStoredProcedure|\bScript\b",
     re.IGNORECASE,
 )
 _EAM_JSON = re.compile(r"EAM|JSON|json\.loads|from_json\s*\(|spark\.read\.json", re.IGNORECASE)
@@ -1343,7 +1344,27 @@ _UNKNOWN_MONITORED = re.compile(
 _SILVER_REF = re.compile(r"\bsilver\b", re.IGNORECASE)
 _GOLD_REF = re.compile(r"\bgold\b", re.IGNORECASE)
 
+#: A genuine fact→dimension lookup, distinct from a Python ``str.join``. A Spark
+#: DataFrame join (``df.join(``) is never written ``"literal".join(``, so a
+#: ``.join(`` preceded by a quote is excluded; a SQL ``… JOIN … ON`` also counts.
+#: Without this, ``", ".join(cols)`` would read as a fact-to-dimension lookup.
+_FACT_DIM_JOIN = re.compile(
+    r"(?<![\"'])\.join\s*\(|"
+    r"\b(?:left|right|full|inner|cross)?\s*join\b[^\n;]{0,200}?\bon\b",
+    re.IGNORECASE | re.DOTALL,
+)
+#: A dimension is being *built* (SCD upsert / MERGE), not looked up by a fact —
+#: the inferred-member fallback belongs in the fact load, so such a notebook is
+#: N/A rather than FAIL when it never references a fact.
+_DIM_UPSERT = re.compile(r"\bmerge\b|\bupsert\b|when\s+matched|whenmatched", re.IGNORECASE)
+_FACT_REF = re.compile(r"\bfact[_\s.]|\bfct[_\s.]", re.IGNORECASE)
 
+
+# NB-LATE-ARRIVING (4.5.10): flags a fact→dimension load with no unknown/inferred-member
+# fallback. Was: raw code + any ``.join(`` gate → false-FAILed metadata/DQ notebooks whose
+# only "join" was a Python ``str.join`` or whose ``dim``/``fact`` sat in a comment.
+# Updated 2026-08-12: strip comments, require a real DataFrame/SQL join (``_FACT_DIM_JOIN``),
+# and N/A a dimension-build/upsert that never references a fact (``_DIM_UPSERT`` w/o ``_FACT_REF``).
 @check(
     id="NB-LATE-ARRIVING", ref="4.5.10",
     title="Late-arriving dimensions and facts handled (unknown/inferred member pattern)",
@@ -1353,16 +1374,30 @@ _GOLD_REF = re.compile(r"\bgold\b", re.IGNORECASE)
 def nb_late_arriving(ctx: CheckContext) -> Verdict:
     """A fact arriving before its dimension gets an inferred member, not dropped.
 
-    Without the pattern the load either discards the fact — silent data loss —
-    or fails outright. The evidence is a stub/unknown member: an ``is_inferred``
-    flag, an explicit "unknown" member, or the conventional ``-1`` surrogate key
-    substituted when the lookup misses.
+    Commented-out code is ignored and only a genuine fact→dimension join counts
+    (a Spark ``df.join(`` or SQL ``… JOIN … ON`` — never a Python ``str.join``),
+    so a metadata/DQ notebook whose only "join" builds a string, or whose only
+    ``dim``/``fact`` mention sits in a comment, is N/A rather than FAIL. A notebook
+    that merely *builds* a dimension (an SCD upsert) is also N/A — the fallback
+    belongs in the fact load. Without the pattern the load either discards the
+    fact (silent data loss) or fails outright; the evidence is a stub/unknown
+    member: an ``is_inferred`` flag, an explicit "unknown" member, or the
+    conventional ``-1`` surrogate key substituted when the lookup misses.
     """
-    code = notebook_code(ctx.obj)
+    code = strip_sql_comments(executable_code(ctx.obj))
     if not _DIM_CONTEXT.search(code):
         return not_applicable("Notebook does not load or join dimensional tables")
-    if not _JOIN_PATTERN.search(code):
-        return not_applicable("Notebook performs no fact-to-dimension lookup")
+    if not _FACT_DIM_JOIN.search(code):
+        return not_applicable(
+            "Notebook performs no fact-to-dimension lookup — no DataFrame or SQL "
+            "join is present (a Python string join does not count)"
+        )
+    if _DIM_UPSERT.search(code) and not _FACT_REF.search(code):
+        return not_applicable(
+            "Notebook builds/updates a dimension table (SCD upsert/merge), not a "
+            "fact-to-dimension lookup — the inferred-member fallback belongs in the "
+            "fact load"
+        )
     ok = bool(_LATE_ARRIVING.search(code))
     return binary(ok, "Late-arriving rows get an inferred/unknown member" if ok
                   else "Joins dimensions with no inferred/unknown member fallback — "
@@ -1383,7 +1418,7 @@ def nb_unknown_monitored(ctx: CheckContext) -> Verdict:
     that actually use an unknown/inferred member are judged — creating one is
     NB-LATE-ARRIVING's job.
     """
-    code = notebook_code(ctx.obj)
+    code = strip_sql_comments(executable_code(ctx.obj))
     if not _LATE_ARRIVING.search(code):
         return not_applicable("Notebook uses no unknown/inferred member to monitor")
     ok = bool(_UNKNOWN_MONITORED.search(code))
@@ -1652,6 +1687,14 @@ def nb_silver_quality(ctx: CheckContext) -> Verdict:
                   else "Silver write has no recognizable quality transformation")
 
 
+#: Activity types that actually move or transform *bulk data inside the pipeline*.
+#: A notebook run (``TridentNotebook``), a control-table ``Lookup``, or an
+#: ``ExecutePipeline`` orchestration moves no bulk data itself — any movement
+#: happens in the notebook or child pipeline and is judged there — so a pipeline
+#: built only from those is N/A for this check rather than a failure.
+_BULK_MOVE_TYPES = {"Copy", "Script", "SqlServerStoredProcedure"}
+
+
 @check(
     id="PL-BULK-MOVE", ref="2.6.3",
     title="Large data movements use bulk/batch patterns, not row-by-row",
@@ -1659,18 +1702,48 @@ def nb_silver_quality(ctx: CheckContext) -> Verdict:
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def pl_bulk_move(ctx: CheckContext) -> Verdict:
-    """Data-moving pipelines use bulk or batch movement rather than row-by-row execution."""
+    """A data-moving pipeline uses a bulk/batch pattern, not row-by-row execution.
+
+    Only an in-pipeline data mover — a Copy activity, a Script, or a stored
+    procedure — is judged. A pipeline that merely runs a notebook, reads a
+    control table with a Lookup, or invokes child pipelines moves no bulk data
+    itself, so it is N/A here (the movement, if any, is judged where it happens).
+    The evidence names the data-movement activities found and the exact
+    bulk-pattern or row-by-row signals that decided the verdict.
+    """
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
-    acts = activities(ctx.obj)
-    if not any((a.get("type") or "") in _DATA_MOVE_TYPES for a in acts):
-        return not_applicable("Pipeline has no data-movement activity")
+    movers = [a for a in walk_activities(ctx.obj)
+              if (a.get("type") or "") in _BULK_MOVE_TYPES]
+    if not movers:
+        return not_applicable(
+            "Pipeline moves no bulk data itself — it only runs notebooks, reads "
+            "control tables (Lookup), or invokes child pipelines, so any data "
+            "movement is judged where it happens, not in this pipeline"
+        )
     blob = json.dumps(ctx.obj)
-    if _ROW_BY_ROW.search(blob) and not _BULK_ACTIVITY.search(blob):
-        return binary(False, "Data movement shows row-by-row or serial execution without a bulk/batch pattern")
-    ok = bool(_BULK_ACTIVITY.search(blob))
-    return binary(ok, "Bulk/batch data-movement pattern detected" if ok
-                  else "No bulk/batch data-movement pattern detected")
+    moved = _data_move_summary(movers)
+    bulk = _matched_tokens(_BULK_ACTIVITY, blob)
+    row_by_row = _matched_tokens(_ROW_BY_ROW, blob)
+    if row_by_row and not bulk:
+        return binary(
+            False,
+            f"{moved}: row-by-row / serial execution ({', '.join(row_by_row)}) with no "
+            f"bulk/batch pattern — replace per-row iteration with a set-based bulk Copy, "
+            f"COPY INTO, or batched write (parallelCopies, batchCount, batch size)",
+        )
+    if bulk:
+        return binary(
+            True,
+            f"{moved}: bulk/batch data-movement pattern present ({', '.join(bulk)})",
+        )
+    return binary(
+        False,
+        f"{moved}: no bulk/batch data-movement pattern found — none of parallelCopies, "
+        f"batchCount, batch size, bulk, COPY INTO, write.mode, saveAsTable, repartition "
+        f"or coalesce is present to confirm the movement is set-based rather than row-by-row",
+    )
+
 
 
 @check(
@@ -1680,13 +1753,35 @@ def pl_bulk_move(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_eam_ingest(ctx: CheckContext) -> Verdict:
-    """EAM/JSON ingestion uses streaming, partitioning, or bounded-file parsing."""
-    code = executable_code(ctx.obj)
-    if not _EAM_JSON.search(code):
-        return not_applicable("Notebook has no recognizable EAM/JSON ingestion")
-    ok = bool(_EAM_EFFICIENT.search(code))
-    return binary(ok, "EAM/JSON ingestion uses streaming, partitioning, or bounded parsing" if ok
-                  else "EAM/JSON ingestion has no streaming/partitioning/bounded-file pattern")
+    """EAM/JSON ingestion uses streaming, partitioning, or bounded-file parsing.
+
+    Commented-out code is ignored: ``executable_code`` removes Python ``#``
+    comments and ``strip_sql_comments`` removes SQL ``--`` / ``/* */`` comments,
+    so a table name or technique that appears only in a comment does not open the
+    gate. The evidence names the EAM/JSON signal that opened the gate and the
+    efficiency pattern found, or every pattern searched for on a failure.
+    """
+    code = strip_sql_comments(executable_code(ctx.obj))
+    signals = _matched_tokens(_EAM_JSON, code)
+    if not signals:
+        return not_applicable(
+            "Notebook has no EAM/JSON ingestion once commented-out code is ignored "
+            "(no spark.read.json / from_json / readStream JSON / EAM signal in live code)"
+        )
+    efficient = _matched_tokens(_EAM_EFFICIENT, code)
+    if efficient:
+        return binary(
+            True,
+            f"EAM/JSON ingestion ({', '.join(signals)}) parses efficiently "
+            f"({', '.join(efficient)})",
+        )
+    return binary(
+        False,
+        f"EAM/JSON ingestion ({', '.join(signals)}) has no streaming/partitioning/"
+        f"bounded-file pattern — none of readStream, partitionBy, repartition, "
+        f"maxFilesPerTrigger, multiLine=False, badRecordsPath, from_json or "
+        f"schema_of_json is present to bound file size or parallelize the parse",
+    )
 
 
 @check(
@@ -1835,9 +1930,19 @@ def nb_dq_rules(ctx: CheckContext) -> Verdict:
     code = executable_code(ctx.obj)
     if not (_INPUT_READ.search(code) or _WRITE_PATTERN.search(code)):
         return not_applicable("Notebook has no recognizable data-ingestion or write operation")
-    ok = bool(_DQ_RULE.search(code))
-    return binary(ok, "Data-quality rule logic is codified in notebook code/config" if ok
-                  else "Data movement has no recognizable codified data-quality rules")
+    found = _matched_tokens(_DQ_RULE, code)
+    if found:
+        return binary(True, (
+            "Data-quality rule logic is codified in notebook code/config — matched: "
+            + ", ".join(found)
+        ))
+    return binary(False, (
+        "Data movement (read/write) present but no recognizable codified data-quality "
+        "rule — searched for: assertions (assert), validation/quality wording, "
+        "quarantine/reject/invalid handling, dedup (dropDuplicates), null / isin / "
+        "anti-join tests, an explicit schema (StructType/StructField), or "
+        "expected schema/columns/values"
+    ))
 
 
 
