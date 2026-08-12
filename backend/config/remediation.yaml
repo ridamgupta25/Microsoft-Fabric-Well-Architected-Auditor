@@ -88,7 +88,6 @@
 "4.2.5": "Add audit columns (created_date, modified_date, source_system, batch_id) to tables for lineage."
 "4.4.1": "Organise the Warehouse into schemas by domain (sales, finance, hr...) rather than putting every table in dbo, and give landing/staging tables their own schema (stg / staging / landing) separate from the presentation schemas consumers query. Grant on the schema rather than table by table so the boundary is also a security boundary."
 "4.4.8": "Build a date/calendar dimension with the attributes reporting needs (fiscal year, quarter, holidays)."
-"4.4.7": "Give each dimension a surrogate key (e.g. <dim>_sk) instead of using the business key as the fact FK."
 "4.2.3": "Rename table columns to a consistent snake_case convention so they are self-documenting."
 "4.2.4": "Type date/time columns as date/timestamp (not string), and size text columns to the data instead of varchar(max), so comparisons, statistics and partition pruning work."
 "4.4.3": "Right-size column data types: remove oversized text widths and set decimal precision/scale to business-appropriate ranges instead of overly wide defaults."
