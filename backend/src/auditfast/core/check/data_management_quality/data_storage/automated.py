@@ -9,8 +9,8 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
+from auditfast.core.check._notebook import executable_code, notebook_code
 from auditfast.core.check._pipeline import activities as pipeline_activities
-from auditfast.core.check._notebook import executable_code
 from auditfast.core.check._pipeline import script_sql
 from auditfast.core.check._recency import parse_stamp
 from auditfast.core.check._tables import (
@@ -18,6 +18,7 @@ from auditfast.core.check._tables import (
     col_names,
     columns,
     has_audit_column,
+    has_surrogate_key,
     in_warehouse,
     is_audit_column,
     is_audit_table,
@@ -140,6 +141,13 @@ _GENERATED_KEY_HINT = re.compile(
     r"(?:hash|row_?number|row_?num|sequence|seq|surrogate)",
     re.IGNORECASE,
 )
+#: Column count above which a fact table is worth reviewing for denormalised
+#: attributes. Reported by ``TB-STARSCHEMA`` as context, never scored: how wide is
+#: "too wide" is a modelling judgement, and ``TB-FACT-PURITY`` (4.5.3) is what
+#: scores the underlying defect. On the reference estate every fact sat between 6
+#: and 25 columns, so 30 flags the genuinely unusual rather than the merely broad.
+_WIDE_FACT_COLUMNS = 30
+
 _SAMPLE_LIMIT = 8
 _BUSINESS_KEY_HINT = re.compile(
     r"(?:business|natural|code|number|_bk$)",
@@ -760,19 +768,47 @@ def _table_stores(ctx: CheckContext) -> str:
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.ITEMS], required=True,
 )
 def table_star_schema(ctx: CheckContext) -> Verdict:
-    """The model separates fact tables from dimension tables (not flat wide tables)."""
+    """The model separates fact tables from dimension tables (not flat wide tables).
+
+    **What it can determine.** Whether the workspace holds both fact-named
+    (``fact*``/``fct*``) and dimension-named (``dim*``) tables — the readable
+    signature of a dimensional model. The evidence also reports how wide the fact
+    tables are, because the point contrasts a star schema with "flat wide
+    tables": a fact carrying dozens of columns is the shape that warrants a look.
+
+    **What it cannot determine, and deliberately does not score.** Whether the
+    model is *correctly* star-shaped. Column width is reported but **not scored**
+    here, for two reasons: how wide is "too wide" is a modelling judgement rather
+    than a fact, and the underlying defect — descriptive attributes sitting on a
+    fact instead of a dimension — is already scored by ``TB-FACT-PURITY``
+    (ref 4.5.3). Scoring it twice would penalise one mistake under two refs.
+    Grain is judged by ``TB-FACT-GRAIN`` (4.5.2), relationships by
+    ``TB-REL-DECLARED`` (4.4.5), and the Warehouse-scoped version of this same
+    fact+dim question by ``TB-WH-MODELED`` (1.2.6).
+
+    Naming is the only signal Fabric exposes: a correctly modelled schema whose
+    tables are named in some other vocabulary is reported as *not detected*,
+    with the tables listed, rather than as a defect.
+    """
     tables = ctx.workspace.tables
     if not tables:
         return not_applicable(_NO_TABLES)
     stores = _table_stores(ctx)
-    has_fact = any(is_fact(n) for n in tables)
-    has_dim = any(is_dimension(n) for n in tables)
-    if has_fact and has_dim:
-        return binary(True, "Both fact (fact*/fct*) and dimension (dim*) tables are present", obj=stores)
+    facts = {n: t for n, t in tables.items() if is_fact(n)}
+    dims = {n: t for n, t in tables.items() if is_dimension(n)}
+
+    if facts and dims:
+        return binary(
+            True,
+            f"Both fact ({len(facts)}) and dimension ({len(dims)}) tables are present"
+            + _fact_width_note(facts),
+            obj=stores,
+        )
+
     reasons = []
-    if not has_fact:
+    if not facts:
         reasons.append("no fact tables (named fact*/fct*)")
-    if not has_dim:
+    if not dims:
         reasons.append("no dimension tables (named dim*)")
     names = sorted(tables)
     sample = ", ".join(names[:_SAMPLE_LIMIT])
@@ -785,6 +821,28 @@ def table_star_schema(ctx: CheckContext) -> Verdict:
         f"(e.g. fact_sales, dim_customer). Tables seen: {sample}",
         obj=stores,
     )
+
+
+def _fact_width_note(facts: dict[str, dict]) -> str:
+    """Report fact-table column widths — context for "not flat wide tables", unscored.
+
+    A star-schema fact holds keys and measures; a flat wide table has descriptive
+    attributes denormalised onto it. Width is the readable hint, but it is only
+    ever *reported* here — ``TB-FACT-PURITY`` (4.5.3) is what scores attributes
+    that belong on a dimension.
+    """
+    widths = {name: len(columns(table)) for name, table in facts.items() if columns(table)}
+    if not widths:
+        return ". No fact table had readable column metadata, so table width is not reported"
+    widest = sorted(widths.items(), key=lambda kv: -kv[1])
+    wide = [f"{n} ({c} cols)" for n, c in widest if c >= _WIDE_FACT_COLUMNS]
+    detail = (f". Widest fact: {widest[0][0]} ({widest[0][1]} columns) across "
+              f"{len(widths)} fact table(s) with readable columns")
+    if wide:
+        detail += (f"; {len(wide)} carry {_WIDE_FACT_COLUMNS}+ columns and are worth "
+                   f"reviewing for denormalised attributes — {', '.join(wide[:3])} "
+                   f"(reported, not scored: ref 4.5.3 judges fact-table purity)")
+    return detail
 
 
 @check(
@@ -1033,15 +1091,32 @@ def table_date_dimension(ctx: CheckContext) -> Verdict:
     required=False,
 )
 def table_surrogate_keys(ctx: CheckContext) -> Verdict:
-    """Dimensions have a surrogate key column (``*_sk`` / ``*_key``), not just a business key."""
+    """Dimensions declare a surrogate key column, not only a business key.
+
+    Accepts both spellings Microsoft's own material uses - ``customer_sk`` (the
+    Fabric dimensional-modelling guidance) and ``CustomerKey`` (AdventureWorksDW,
+    where it is an ``IDENTITY(1,1)`` column). An ``…AlternateKey`` is *not*
+    counted: AdventureWorks uses that for the natural/business key, which is the
+    distinction this point is about.
+
+    **What it cannot determine.** Whether the column is genuinely system-generated
+    - that is a load-time property, not readable from a schema. This judges the
+    declared shape only, so a business key named ``customer_key`` would pass.
+    """
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
     dims = {n: t for n, t in ctx.workspace.tables.items() if is_dimension(n) and columns(t)}
     if not dims:
         return not_applicable(_NO_DIMS)
-    ok = [n for n, t in dims.items()
-          if any(c.endswith(("_sk", "_key")) for c in col_names(t))]
-    return covered(len(ok), len(dims), f"{len(ok)} of {len(dims)} dimensions have a surrogate key")
+    ok = [n for n, t in dims.items() if has_surrogate_key(t)]
+    missing = sorted(set(dims) - set(ok))
+    evidence = f"{len(ok)} of {len(dims)} dimensions have a surrogate key"
+    if missing:
+        shown = ", ".join(missing[:_SAMPLE_LIMIT])
+        if len(missing) > _SAMPLE_LIMIT:
+            shown += f", \u2026(+{len(missing) - _SAMPLE_LIMIT} more)"
+        evidence += f". Without one: {shown}"
+    return covered(len(ok), len(dims), evidence)
 
 
 @check(
@@ -1051,15 +1126,57 @@ def table_surrogate_keys(ctx: CheckContext) -> Verdict:
     required=False,
 )
 def table_column_naming(ctx: CheckContext) -> Verdict:
-    """Table columns follow a consistent snake_case convention."""
+    """Column names follow *one* convention across the workspace — whichever one.
+
+    **Consistency is what is scored, not a particular house style.** Each name is
+    classified as ``snake_case``, ``UPPER_CASE``, ``PascalCase``, ``camelCase`` or
+    ``mixed``; the dominant convention is found, and the score is the share of
+    columns that follow it. Requiring ``snake_case`` specifically marked down any
+    estate that had standardised on something else — Microsoft's own AdventureWorks
+    sample is PascalCase throughout — which measured style preference rather than
+    quality. A ``mixed`` name (a space, ``Customer_ID`` blending Pascal with
+    underscores) can never be dominant: it follows no convention at all.
+
+    **Deliberately different from ``TB-WH-NAME-CONSISTENCY`` (ref 4.4.2)**, which
+    asks the same question but only of tables known to live in a **Warehouse**,
+    and judges table names as well as column names. This one covers **every**
+    table in the workspace, Lakehouse included, and only its columns — so a
+    Lakehouse-only estate (where 4.4.2 is N/A) is still assessed here.
+
+    **What it cannot determine.** Whether a consistently-named column is
+    *self-documenting*: ``col1``, ``x`` and ``value`` are all valid snake_case.
+    Only the convention half of the point is machine-readable.
+    """
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
     tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
     if not tables:
         return not_applicable(_NO_COLS)
-    names = [c.get("name", "") for t in tables.values() for c in columns(t)]
-    ok = [n for n in names if is_snake_case(n)]
-    return covered(len(ok), len(names), f"{len(ok)} of {len(names)} columns use snake_case names")
+    styles = [
+        naming_style(str(column.get("name") or ""))
+        for table in tables.values()
+        for column in columns(table)
+    ]
+    if not styles:
+        return not_applicable(_NO_COLS)
+
+    convention, following = _dominant(styles)
+    if convention == "none":
+        return covered(
+            0, len(styles),
+            f"None of {len(styles)} column name(s) across {len(tables)} table(s) follows "
+            f"a single naming convention — every name mixes styles (a space, or "
+            f"capitals joined by underscores)",
+        )
+    mixed = sum(1 for style in styles if style == "mixed")
+    return covered(
+        following, len(styles),
+        f"{following} of {len(styles)} column name(s) across {len(tables)} table(s) "
+        f"follow the dominant convention ({convention})"
+        + (f"; {mixed} name(s) follow no convention at all" if mixed else "")
+        + ". Consistency is what is scored — any one convention counts, provided "
+          "the estate sticks to it.",
+    )
 
 
 @check(

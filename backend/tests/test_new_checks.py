@@ -30,10 +30,10 @@ from auditfast.core.check.data_management_quality.data_prep.automated import (
 from auditfast.core.check.data_management_quality.data_storage.automated import (
     _shadow_reason,
     shortcut_scope,
-    table_type_sizing,
     table_partition_strategy,
     table_relationships_declared,
     table_surrogate_generated,
+    table_type_sizing,
 )
 from auditfast.core.check.data_management_quality.reporting_semantic.automated import (
     _normalised,
@@ -973,7 +973,16 @@ def _col(name: str, ctype: str, source_kind: str = "Warehouse") -> dict:
     return {"name": name, "type": ctype, "source_kind": source_kind}
 
 
-def test_partition_strategy_passes_when_large_fact_has_partition_key_columns():
+def test_partition_strategy_is_na_when_only_a_column_name_hints_at_partitioning():
+    """A date column is not evidence of a partitioning *strategy*.
+
+    Fabric's table metadata carries no partition/clustering keys - verified
+    against a real 1,845-table crawl, where ``partitionBy``/``partitionColumns``
+    appear only inside notebook source, never on a table. So the check can see
+    that a fact table *could* be partitioned by ``order_date``, but not whether
+    it *is*. Scoring that guess produced a verdict on unreadable data; N/A is the
+    honest answer, and the evidence names the permission that would be needed.
+    """
     ctx = _ws_ctx(
         id="w",
         tables={
@@ -984,21 +993,32 @@ def test_partition_strategy_passes_when_large_fact_has_partition_key_columns():
             ] * 12),
         },
     )
-    assert table_partition_strategy(ctx).score == 3
+    verdict = table_partition_strategy(ctx)
+    assert verdict.score is None
+    assert "no partition/clustering metadata" in verdict.evidence
 
 
-def test_partition_strategy_fails_when_large_fact_has_no_partition_hints():
-    ctx = _ws_ctx(
-        id="w",
-        tables={
-            "fact_sales": _table([
-                _col("sales_sk", "bigint"),
-                _col("metric_a", "decimal(18,2)"),
-                _col("metric_b", "decimal(18,2)"),
-            ] * 12),
-        },
+def test_partition_strategy_scores_only_declared_partition_metadata():
+    """When a table does declare partition keys, that is readable and is scored."""
+    partitioned = _table([_col("sales_sk", "bigint"), _col("order_date", "date")] * 12)
+    partitioned["partitionBy"] = ["order_date"]
+    plain = _table([_col("txn_sk", "bigint"), _col("amount", "decimal(18,2)")] * 12)
+
+    ctx = _ws_ctx(id="w", tables={"fact_sales": partitioned, "fact_txn": plain})
+    verdict = table_partition_strategy(ctx)
+    assert verdict.score is not None, "declared metadata is readable, so it is scored"
+    assert "1 of 1" in verdict.evidence, (
+        "only the table whose strategy could be *inspected* belongs in the ratio; "
+        "a table with no metadata is unknown, not a failure. NB: because the "
+        "denominator counts only tables that declared metadata, this check can "
+        "currently only ever return PASS or N/A - worth revisiting if Fabric "
+        "starts exposing partition keys on the table listing"
     )
-    assert table_partition_strategy(ctx).score == 0
+
+
+def test_partition_strategy_is_na_when_no_large_table_is_named():
+    ctx = _ws_ctx(id="w", tables={"dim_customer": _table([_col("customer_sk", "bigint")])})
+    assert table_partition_strategy(ctx).score is None
 
 
 def test_datatype_sizing_flags_oversized_text_and_invalid_decimal_precision():

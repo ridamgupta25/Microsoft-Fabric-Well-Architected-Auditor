@@ -378,3 +378,64 @@ def is_dimension(name: str) -> bool:
 
 def is_fact(name: str) -> bool:
     return (name or "").lower().startswith(("fact", "fct"))
+
+
+#: Trailing words that mark a column as a *key*. Matched against the final word of
+#: the split name, so ``customer_sk``, ``CustomerKey`` and ``CUSTOMER_ID`` are one
+#: thing while ``monkey`` and ``turkey`` (which split to a single word) are not.
+#: Trailing words that mark a column as a *surrogate* key. Deliberately narrower
+#: than :data:`_KEY_WORDS` above (which is the generous "is this any kind of
+#: identifier?" vocabulary used by fact-purity and snowflake detection): a
+#: surrogate key is spelled ``sk``, ``key`` or ``id``, never ``number``/``code``.
+#: Named distinctly so it cannot shadow the broader set.
+_SURROGATE_KEY_WORDS: frozenset[str] = frozenset({"sk", "key", "id"})
+
+#: Words marking a key as the *business/natural* key rather than the surrogate.
+#: Verified against Microsoft's AdventureWorksDW script, where ``CustomerKey`` is
+#: an ``IDENTITY(1,1)`` surrogate and ``CustomerAlternateKey`` is the source
+#: identifier - so an alternate/natural/business key must never satisfy 4.5.6.
+_NATURAL_KEY_WORDS: frozenset[str] = frozenset({
+    "alternate", "alt", "natural", "business", "source", "src", "nk", "bk",
+})
+
+
+def _ordered_words(name: str) -> list[str]:
+    """Lower-cased words of a name, in order (:func:`name_words` is unordered)."""
+    words: list[str] = []
+    for chunk in _WORD_SPLIT.split(name or ""):
+        if chunk:
+            words.extend(part.lower() for part in _CAMEL_SPLIT.split(chunk) if part)
+    return words
+
+
+def is_surrogate_key_column(name: str) -> bool:
+    """True when ``name`` reads as a *surrogate* key column.
+
+    Naming is an implementation convention, not a standard: Microsoft's own
+    material shows both spellings - ``Salesperson_SK`` in the Fabric
+    dimensional-modelling guidance, and ``CustomerKey`` / ``ProductKey`` /
+    ``DateKey`` (all ``IDENTITY(1,1)`` columns) in AdventureWorksDW. Matching
+    only the underscored form reported ``0 of 19`` on an estate where more than
+    half the dimensions were correctly modelled, so both are accepted.
+
+    Word splitting is what keeps this safe: ``monkey`` and ``turkey`` are single
+    words, never ``…|key``, so they cannot match. An *alternate* key is excluded
+    because AdventureWorks uses ``CustomerAlternateKey`` for the business key -
+    the very distinction this check exists to draw.
+
+    **What it cannot determine:** whether the column is genuinely system
+    generated. That is a load-time property, not visible in a schema, so a
+    business key named ``customer_key`` would pass.
+    """
+    words = _ordered_words(name)
+    if not words:
+        return False
+    if set(words) & _NATURAL_KEY_WORDS:
+        return False
+    # The *last* word must be the key token: ``customer_key`` yes, ``key_lookup`` no.
+    return words[-1] in _SURROGATE_KEY_WORDS
+
+
+def has_surrogate_key(table: dict) -> bool:
+    """True when the table declares at least one surrogate-key column."""
+    return any(is_surrogate_key_column(c.get("name") or "") for c in columns(table))

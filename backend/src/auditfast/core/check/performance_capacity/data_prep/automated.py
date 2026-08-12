@@ -27,8 +27,6 @@ from auditfast.core.models import CheckContext
 
 from . import _spark
 from ._spark import NOTEBOOK_LAYERS, pip_targets, unpinned_targets, writes_delta
-import re
-import re
 
 # -- Delta table maintenance (3.3.x) ------------------------------------------
 
@@ -100,8 +98,15 @@ def delta_zorder(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def delta_vorder(ctx: CheckContext) -> Verdict:
-    """Explicit V-Order configuration is present where read-optimization matters."""
-    code = notebook_code(ctx.obj)
+    """Explicit V-Order configuration is present where read-optimization matters.
+
+    **What it cannot determine.** The *effective* setting. V-Order is on by
+    default in Fabric and can also be set on the environment, the session or the
+    table property - none of which is readable from a notebook definition. So a
+    notebook with no explicit configuration is N/A ("we cannot tell"), never a
+    finding: writing no V-Order line is the normal, correct case.
+    """
+    code = executable_code(ctx.obj)
     if not writes_delta(code):
         return not_applicable("Notebook does not write Delta tables")
     if _spark.VORDER.search(code):
@@ -118,8 +123,15 @@ def delta_vorder(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def delta_tblprops(ctx: CheckContext) -> Verdict:
-    """Write-side tuning (autoOptimize / optimizeWrite / autoCompaction) is set."""
-    code = notebook_code(ctx.obj)
+    """Write-side tuning (autoOptimize / optimizeWrite / autoCompaction) is set.
+
+    Unlike its V-Order and retention siblings this one *scores* the absent case,
+    at 1 rather than 0: write tuning is a deliberate choice a notebook author
+    makes in code, so its absence is a real (if minor) observation rather than
+    something unknowable. The properties can also be set on the table or the
+    environment, which is why it is a partial score and not a failure.
+    """
+    code = executable_code(ctx.obj)
     if not writes_delta(code):
         return not_applicable("Notebook does not write Delta tables")
     if _spark.TBLPROPS.search(code):
@@ -136,8 +148,14 @@ def delta_tblprops(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def delta_retention(ctx: CheckContext) -> Verdict:
-    """Log / deleted-file retention is tuned rather than left at the default."""
-    code = notebook_code(ctx.obj)
+    """Log / deleted-file retention is tuned rather than left at the default.
+
+    **What it cannot determine.** The *effective* retention. It can be set as a
+    table property, on the environment, or by a VACUUM run elsewhere - none
+    readable from a notebook definition - so no explicit configuration is N/A,
+    never a finding.
+    """
+    code = executable_code(ctx.obj)
     if not writes_delta(code):
         return not_applicable("Notebook does not write Delta tables")
     if _spark.RETENTION.search(code):
@@ -385,9 +403,13 @@ def spark_partition_pruning(ctx: CheckContext) -> Verdict:
 def spark_profile(ctx: CheckContext) -> Verdict:
     """Long-running applications carry Spark profiling evidence.
 
-    This check verifies profiling *coverage* for long-running notebooks. The
-    quality of that profiling (skew/spill/shuffle issues) is evaluated by
-    SPARK-UI (3.5.1) to avoid duplicate issue scoring under two refs.
+    This check verifies profiling *coverage*: a long-running notebook should have
+    Advisor or stage metrics to look at in the first place. The **quality** of
+    what those metrics show - skew, spill, heavy shuffle - is scored by
+    ``SPARK-UI`` (ref 3.5.1), which calls the same
+    ``performance_issues()`` helper. Scoring the issues here too failed one
+    notebook twice under two refs for a single underlying problem, so this one
+    deliberately stops at "is there anything to review?".
     """
     evidence = _spark.monitoring(ctx.obj)
     usage = evidence.get("resource_usage")
@@ -403,16 +425,15 @@ def spark_profile(ctx: CheckContext) -> Verdict:
         return not_applicable(
             f"Latest Spark application ran for {int(duration)} ms; below {threshold} ms threshold"
         )
-    if "advice" not in evidence and "stages" not in evidence:
-        return not_applicable("Long-running application has no Advisor or stage profiling metrics")
-    shuffle_threshold = int(
-        _spark.number(ctx.setting("heavy_shuffle_bytes", 1_073_741_824), -1)
+    profiled = "advice" in evidence or "stages" in evidence
+    return binary(
+        profiled,
+        f"Profiled {int(duration)} ms application; Advisor/stage metrics are available "
+        f"to review (what they show is scored by ref 3.5.1)"
+        if profiled else
+        f"Long-running application ({int(duration)} ms) has no Advisor or stage "
+        f"profiling metrics, so its performance cannot be reviewed",
     )
-    if shuffle_threshold < 0:
-        return not_applicable("Project heavy_shuffle_bytes threshold is invalid")
-    issues = _spark.performance_issues(ctx.obj, shuffle_threshold)
-    return binary(not issues, f"Profiled {int(duration)} ms application; no open performance issue"
-                  if not issues else f"Profiled {int(duration)} ms application; open issues: {', '.join(issues)}")
 
 @check(
     id="NB-PUSHDOWN",
@@ -433,7 +454,7 @@ def nb_pushdown(ctx: CheckContext) -> Verdict:
     code = notebook_code(ctx.obj)
     lines = code.splitlines()
 
-    read_idxs = [i for i, l in enumerate(lines) if _spark.EXTERNAL_READ.search(l)]
+    read_idxs = [i for i, line in enumerate(lines) if _spark.EXTERNAL_READ.search(line)]
     if not read_idxs:
         return not_applicable("Notebook does not read from shortcut or external data sources")
 

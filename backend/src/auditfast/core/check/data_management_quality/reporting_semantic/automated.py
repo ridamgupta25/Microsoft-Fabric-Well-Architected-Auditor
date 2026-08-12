@@ -98,7 +98,6 @@ def _measure_detail(names: list[str], verb: str) -> str:
 
 @check(
     id="SM-FK-SURROGATE",
-   
     ref="5.4.1",
     title="Fact-dimension referential integrity: all FKs in fact tables match dimension surrogate keys",
     pillar=Pillar.DATA,

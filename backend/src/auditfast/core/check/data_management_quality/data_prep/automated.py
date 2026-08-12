@@ -12,7 +12,9 @@ from auditfast.core.check._notebook import (
     NOTEBOOK_LAYERS,
     executable_code,
     has_parameters_cell,
+    layer_undetermined_evidence,
     markdown_sources,
+    medallion_layer,
     notebook_code,
 )
 from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities, script_sql, walk_activities
@@ -685,7 +687,17 @@ _RI_PATTERN = re.compile(
     \b(?:referential|integrity|fk_check|integrity_check|orphan|unmatched|missing_parent|no_parent)\b
     """
 )
-_JOIN_PATTERN = re.compile(r"(?is)\.join\s*\(|\bleft\s+join\b|\binner\s+join\b|\bright\s+join\b|\bfull\s+join\b", re.IGNORECASE)
+#: A join, in either the DataFrame or the SQL spelling. ``anti`` and ``semi`` are
+#: listed explicitly: ``LEFT ANTI JOIN`` is the standard way to isolate orphan
+#: rows, and without it the very notebooks that *do* detect orphans were reported
+#: as performing no join at all - N/A instead of the PASS they had earned.
+_JOIN_PATTERN = re.compile(
+    r"(?is)\.join\s*\(|"
+    r"\b(?:left|right|full|inner|cross)\s+(?:outer\s+)?join\b|"
+    r"\bleft\s+(?:anti|semi)\s+join\b|"
+    r"\bjoin\b\s+\w+\s+\bon\b",
+    re.IGNORECASE,
+)
 _FK_INTEGRITY = re.compile(
     # An anti-join - the standard way to isolate FK values with no parent row.
     # ``"anti"`` is quoted so the join-type argument matches but the English word
@@ -920,6 +932,29 @@ _EAM_EFFICIENT = re.compile(
     r"maxFilesPerTrigger|badRecordsPath|from_json\s*\(|schema_of_json",
     re.IGNORECASE,
 )
+#: A read from *outside* the lakehouse: a file, an API, or an external database.
+#: This is what makes a notebook an *ingestion* notebook, and therefore what makes
+#: recording provenance meaningful. Deliberately excludes ``spark.read.table`` and
+#: ``spark.sql`` - reading a table already in the lakehouse carries its own
+#: lineage, so a derived/Gold notebook has no external source to record and must
+#: not be failed for omitting one.
+_EXTERNAL_SOURCE_READ = re.compile(
+    # File formats and storage paths.
+    r"\.read\s*\.\s*(?:csv|json|parquet|text|xml|orc|avro|excel)\s*\(|"
+    r"\.read\s*\.\s*format\s*\(\s*[\"'](?:csv|json|parquet|text|xml|orc|avro|jdbc|"
+    r"cosmos\.oltp|sqlserver|mongodb|kafka)[\"']|"
+    r"abfss://|wasbs://|https?://|s3a?://|gs://|file:///|dbfs:/|/lakehouse/default/Files|"
+    r"\bFiles/|"
+    # Pandas-side ingestion.
+    r"\bpd\.read_(?:csv|json|excel|parquet|sql|html|xml)\s*\(|"
+    # APIs and databases.
+    r"\brequests\.(?:get|post)\s*\(|\bhttpx\.(?:get|post)\s*\(|urlopen\s*\(|"
+    r"\bjdbc\b|pyodbc\.connect|create_engine\s*\(|"
+    # Fabric/Spark connectors to an external system.
+    r"mssparkutils\.fs\.(?:cp|mv|ls)\s*\(|notebookutils\.fs\.(?:cp|mv|ls)\s*\(",
+    re.IGNORECASE,
+)
+
 _SOURCE_METADATA = re.compile(
     r"ingest(?:ed|ion)[_ ]?(?:timestamp|time|date)|ingested_at|"
     r"source[_ ]?(?:metadata|system|file|path)|input_file_name\s*\(|"
@@ -1625,13 +1660,35 @@ def nb_key_quality(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_bronze_metadata(ctx: CheckContext) -> Verdict:
-    """Bronze writes retain ingestion timestamp, source identity, and batch metadata."""
+    """Bronze writes retain ingestion timestamp, source identity, and batch metadata.
+
+    **Only Bronze notebooks are judged.** The layer is taken from what the
+    notebook *writes to* (or, failing that, the lakehouse it is attached to) -
+    never from the word "bronze" appearing somewhere in the file, which matched
+    notebooks that merely *read* raw data and failed them for lacking metadata
+    they were never meant to carry.
+
+    **What it cannot determine.** Whether the estate uses the medallion pattern
+    at all. When no signal identifies a layer the notebook is reported N/A: an
+    org whose layers are named ``raw``/``curated``/``publish`` is *not assessed*
+    rather than failed.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
     code = executable_code(ctx.obj)
     if not _WRITE_PATTERN.search(code):
-        return not_applicable("Notebook does not write a raw/Bronze table")
+        return not_applicable("Notebook does not write a table")
+    layer, how = medallion_layer(ctx.obj, code)
+    if not layer:
+        return not_applicable(layer_undetermined_evidence(ctx.obj, code))
+    if layer != "bronze":
+        return not_applicable(
+            f"Notebook produces the {layer} layer ({how}), so the Bronze "
+            "raw-capture rule does not apply"
+        )
     if not _BRONZE_METADATA.search(code):
-        return binary(False, "Bronze write has no ingestion/source/batch audit metadata")
-    return binary(True, "Bronze write captures ingestion/source/batch audit metadata")
+        return binary(False, f"Bronze write ({how}) has no ingestion/source/batch audit metadata")
+    return binary(True, f"Bronze write ({how}) captures ingestion/source/batch audit metadata")
 
 
 @check(
@@ -1641,15 +1698,36 @@ def nb_bronze_metadata(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_silver_quality(ctx: CheckContext) -> Verdict:
-    """Silver writes apply at least one explicit cleansing, deduplication, or type-conformance transformation."""
+    """Silver writes apply at least one explicit cleansing, deduplication, or type-conformance transformation.
+
+    **Only Silver notebooks are judged**, decided by what the notebook writes to
+    rather than by the word "silver" appearing anywhere in it - a Gold notebook
+    that *reads* a silver table was previously judged as though it produced one.
+
+    **What it cannot determine.** That the transformation is *correct*, only that
+    an explicit cleansing/dedup/conformance step is present. When no signal
+    identifies a layer the notebook is reported N/A rather than failed.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
     code = executable_code(ctx.obj)
     if not _WRITE_PATTERN.search(code):
-        return not_applicable("Notebook does not write a Silver table")
-    if not re.search(r"silver", code, re.IGNORECASE):
-        return not_applicable("Notebook does not identify a Silver-layer write")
+        return not_applicable("Notebook does not write a table")
+    layer, how = medallion_layer(ctx.obj, code)
+    if not layer:
+        return not_applicable(layer_undetermined_evidence(ctx.obj, code))
+    if layer != "silver":
+        return not_applicable(
+            f"Notebook produces the {layer} layer ({how}), so the Silver "
+            "cleansing rule does not apply"
+        )
     ok = bool(_SILVER_QUALITY.search(code))
-    return binary(ok, "Silver write applies cleansing/deduplication/conformance/type standardization" if ok
-                  else "Silver write has no recognizable quality transformation")
+    return binary(
+        ok,
+        f"Silver write ({how}) applies cleansing/deduplication/conformance/type standardization"
+        if ok else
+        f"Silver write ({how}) has no recognizable quality transformation",
+    )
 
 
 @check(
@@ -1696,13 +1774,36 @@ def nb_eam_ingest(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_source_metadata(ctx: CheckContext) -> Verdict:
-    """Notebook writes retain source metadata including an ingestion timestamp."""
+    """Notebooks that ingest from *outside* the lakehouse record where the data came from.
+
+    **Scoped to ingestion.** The point is about provenance: a load that reads an
+    external file, an API or a database must record its source. A notebook that
+    reads a table already inside the lakehouse and writes a derived table has no
+    external source to capture - failing it for missing "source metadata" is a
+    false finding, and judging every writing notebook did exactly that.
+
+    **Sibling.** ``NB-BRONZE-METADATA`` (ref 1.2.3) asks a *narrower* question of
+    a *narrower* population: it requires ingestion timestamp **and** batch/source
+    identity, and only of notebooks writing the Bronze layer. This one applies
+    wherever an external read happens - Bronze or not - and asks only that the
+    provenance of that read is recorded. A Bronze ingestion notebook is judged by
+    both, which is intended: they are different thresholds on the same practice.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
     code = executable_code(ctx.obj)
     if not _WRITE_PATTERN.search(code):
         return not_applicable("Notebook does not write data to a table")
+    if not _EXTERNAL_SOURCE_READ.search(code):
+        return not_applicable(
+            "Notebook reads no external source (file, API or database) - it "
+            "transforms data already in the lakehouse, so there is no ingestion "
+            "provenance to capture"
+        )
     ok = bool(_SOURCE_METADATA.search(code))
     return binary(ok, "Source metadata and ingestion timestamp are captured" if ok
-                  else "Writes data without source metadata or an ingestion timestamp")
+                  else "Ingests from an external source without recording its "
+                       "provenance (source system/file or an ingestion timestamp)")
 
 
 @check(
