@@ -130,7 +130,7 @@
 "3.6.7": "Update and maintain statistics after significant Warehouse loads so query performance remains stable."
 "5.2.1": "Define and enforce the expected incoming schema, including column count, names, and data types, before processing records such as EAM JSON."
 "5.2.4": "Validate incoming file format before processing: require UTF-8 encoding, the expected delimiter, and a valid JSON structure for EAM payloads."
-"5.3.5": "Standardize incoming dates, codes, and reference values with explicit conversions, normalization rules, and approved lookup mappings."
+"5.3.5": "Standardize incoming dates and codes with explicit conversions and normalization rules — e.g. to_date/to_timestamp/date_format for dates and upper/lower/trim/regexp_replace for codes."
 "5.2.8": "Capture source metadata with every load, including a UTC ingestion timestamp, source system or file, and batch identifier."
 "5.3.4": "Detect duplicate business records before writing by checking the business key and removing or routing duplicate rows."
 "5.5.3": "Validate or explicitly configure UTF-8 handling for incoming string and text data before processing it."
