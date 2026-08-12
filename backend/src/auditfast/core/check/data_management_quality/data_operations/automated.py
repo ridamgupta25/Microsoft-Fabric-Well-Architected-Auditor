@@ -13,6 +13,43 @@ from auditfast.core.check.registry import check
 from auditfast.core.enums import LAYER_ITEM_TYPES, Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
 
+#: Workspace-name fragments that reveal a layer role when the workspace is not
+#: explicitly tagged. Ordered so the more specific "store"/"consumption" hints
+#: win before the broad "prep"/"ops" ones. Matched case-insensitively as
+#: substrings, so ``MLC_DATAPREP_DEV`` and ``prj-data-store-qa`` both resolve.
+_LAYER_NAME_HINTS: tuple[tuple[str, Layer], ...] = (
+    ("dataprep", Layer.PREP),
+    ("data_prep", Layer.PREP),
+    ("datastore", Layer.STORAGE),
+    ("data_store", Layer.STORAGE),
+    ("storage", Layer.STORAGE),
+    ("datalog", Layer.LOGS),
+    ("data_log", Layer.LOGS),
+    ("dataops", Layer.OPERATIONS),
+    ("data_ops", Layer.OPERATIONS),
+    ("report", Layer.REPORTING),
+    ("semantic", Layer.REPORTING),
+    ("consumption", Layer.REPORTING),
+)
+
+
+def _effective_layer(ctx: CheckContext) -> Layer:
+    """The workspace's layer role, inferred from its name when not tagged.
+
+    A workspace explicitly tagged with a single-layer role uses that. An
+    untagged (``MIXED``) workspace whose name carries a layer hint — the common
+    ``MLC_DATAPREP_*`` / ``*_DATA_STORE_*`` naming — is resolved from the name so
+    the separation rule still applies. A truly mixed workspace stays ``MIXED``.
+    """
+    layer = ctx.workspace.layer
+    if layer is not Layer.MIXED:
+        return layer
+    name = ctx.workspace.name.lower()
+    for fragment, hinted in _LAYER_NAME_HINTS:
+        if fragment in name:
+            return hinted
+    return Layer.MIXED
+
 _INPUT_READ = re.compile(
     r"spark\.read|\.read\.(?:csv|json|text|format)|json\.loads|from_json\s*\(|"
     r"read_json|read_csv|EAM\s+JSON|EAM_JSON",
@@ -78,7 +115,7 @@ def layer_content(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="WS-LAYER-SEP", ref="1.1.9", title="Data Prep workspaces (`MLC_DATAPREP_*`) contain only Pipelines and Notebooks — no Lakehouses or Warehouses (all storage resides in the Data Store workspace)",
+    id="WS-LAYER-SEP", ref="1.1.9", title="Layer separation: each workspace holds only the item types appropriate to its layer role — e.g. Data Prep workspaces contain only Pipelines/Notebooks, with all storage (Lakehouses/Warehouses) kept in the Data Store layer",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     requires=[Resource.ITEMS], required=True,
 )
@@ -86,16 +123,26 @@ def layer_separation(ctx: CheckContext) -> Verdict:
     """The workspace does not hold item types that belong to a different layer."""
     if not ctx.workspace.has(Resource.ITEMS):
         return not_applicable("Workspace items could not be read from Fabric")
-    layer = ctx.workspace.layer
+    layer = _effective_layer(ctx)
     expected = LAYER_ITEM_TYPES.get(layer)
     if not expected:
-        return note(f"role '{layer.value}' has no separation rule")
+        # A workspace with no single-layer role permits every item type, so there
+        # is no separation rule to violate — a mixed workspace passes vacuously
+        # rather than reporting an unscored, confusing "no rule" note.
+        return binary(
+            True,
+            "Workspace has no single-layer role (mixed/untagged); all item types "
+            "are permitted, so there is no layer-separation rule to violate",
+        )
     foreign_types: set[str] = set()
     for other_layer, types in LAYER_ITEM_TYPES.items():
         if other_layer is not layer:
             foreign_types |= types
     foreign = ctx.workspace.item_types() & (foreign_types - expected)
-    return binary(not foreign, f"foreign item types found: {sorted(foreign) or ['none']}")
+    return binary(
+        not foreign,
+        f"layer '{layer.value}': foreign item types found: {sorted(foreign) or ['none']}",
+    )
 
 
 @check(
