@@ -552,8 +552,12 @@ _ALERT_NAME_RE = re.compile(r"notif|alert|email|teams", re.IGNORECASE)
 _TRUNK_BRANCH = re.compile(r"^(?:main|master|trunk)$", re.IGNORECASE)
 #: A hardened, promotion-oriented branch — ``release``, ``release/2.1``, ``hotfix/x``.
 _RELEASE_BRANCH = re.compile(r"^(?:release|releases|hotfix|rel)(?:[/-]|$)", re.IGNORECASE)
-#: The shared integration branch of a git-flow style strategy.
-_DEVELOP_BRANCH = re.compile(r"^(?:dev|develop|development|integration)$", re.IGNORECASE)
+#: The shared integration branch of a git-flow style strategy. Teams commonly
+#: qualify it with a repository/workspace name, such as ``DEV_FABRIC``.
+_DEVELOP_BRANCH = re.compile(
+    r"^(?:dev|develop|development|integration)(?:[/_-]|$)",
+    re.IGNORECASE,
+)
 #: An isolated working branch.
 _FEATURE_BRANCH = re.compile(r"^(?:feature|features|feat|bugfix|fix|users|user|topic)[/-]",
                              re.IGNORECASE)

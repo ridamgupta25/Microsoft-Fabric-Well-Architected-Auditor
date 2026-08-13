@@ -11,8 +11,8 @@ the detection:
 * 4.6.3 is a *workspace-level proxy*: the evidence must say so, and unreadable
   role assignments must be N/A, never a FAIL.
 * 5.2.2 / 5.2.3 verify that the safeguard exists, not that a load was complete or
-  on time — and 5.2.3 must **not** be satisfied by the watermark bookkeeping that
-  satisfies the incremental-load points (2.2.1 / 2.2.4).
+    on time — and 5.2.3 distinguishes a custom pipeline timeout from Fabric's
+    stamped multi-hour default.
 * 10.4.4 reads trend *mechanics* from the model; a report's visuals are never
   read, so a model with a date axis but no time intelligence is named rather than
   silently judged complete.
@@ -24,8 +24,8 @@ from auditfast.core.check.data_management_quality.data_logs.automated import (
     metadata_store_write_access_is_restricted,
 )
 from auditfast.core.check.data_management_quality.data_prep.automated import (
-    notebook_has_a_timeliness_control,
     notebook_has_an_arrival_completeness_control,
+    pipeline_has_a_timeliness_control,
 )
 from auditfast.core.check.data_management_quality.data_storage.automated import (
     degenerate_and_junk_dimension_candidates,
@@ -63,6 +63,19 @@ def _nb_ctx(code: str) -> CheckContext:
     definition = {"cells": [{"cell_type": "code", "source": code}], "metadata": {}}
     return CheckContext(workspace=WorkspaceContext(id="w"), settings={},
                         obj_name="nb", obj=definition)
+
+
+def _pipeline_ctx(*activities: dict) -> CheckContext:
+    definition = {"properties": {"activities": list(activities)}}
+    return CheckContext(workspace=WorkspaceContext(id="w"), settings={},
+                        obj_name="pipeline", obj=definition)
+
+
+def _refresh_activity(timeout: str | None = None) -> dict:
+    activity = {"name": "Refresh_Source", "type": "RefreshDataflow"}
+    if timeout is not None:
+        activity["policy"] = {"timeout": timeout}
+    return activity
 
 
 def _role(role: str, principal_type: str = "User", name: str = "someone") -> RoleAssignment:
@@ -295,6 +308,15 @@ def test_completeness_is_not_satisfied_by_a_commented_out_control():
     assert verdict.score == _FAIL
 
 
+def test_completeness_is_not_satisfied_by_a_missing_file_mode_name():
+    verdict = notebook_has_an_arrival_completeness_control(_nb_ctx(
+        'df = spark.read.csv(path)\n'
+        'if mode == "missing_file":\n'
+        '    spark.read.csv("Files/does_not_exist.csv").count()\n'
+    ))
+    assert verdict.score == _FAIL
+
+
 def test_completeness_evidence_does_not_claim_the_load_was_complete():
     verdict = notebook_has_an_arrival_completeness_control(_nb_ctx(
         'arrived = notebookutils.fs.ls(p)\nmissing_partitions = expected - arrived\n'
@@ -307,6 +329,14 @@ def test_completeness_is_na_when_the_notebook_reads_no_source():
     assert verdict.status is Status.NA
 
 
+def test_completeness_fails_when_a_write_has_no_recognisable_source_or_control():
+    verdict = notebook_has_an_arrival_completeness_control(_nb_ctx(
+        'df.write.mode("overwrite").saveAsTable("bronze.sales")\n'
+    ))
+    assert verdict.score == _FAIL
+    assert "no recognisable source read" in verdict.evidence
+
+
 def test_completeness_is_na_when_notebook_definitions_are_unavailable():
     workspace = WorkspaceContext(id="w", unavailable={Resource.NOTEBOOK_DEFINITIONS})
     ctx = CheckContext(workspace=workspace, settings={}, obj_name="nb",
@@ -315,71 +345,64 @@ def test_completeness_is_na_when_notebook_definitions_are_unavailable():
 
 
 # =============================================================================
-# 5.2.3 — NB-TIMELINESS-CONTROL
+# 5.2.3 — NB-TIMELINESS-CONTROL (pipeline-scoped for compatibility)
 # =============================================================================
 
-def test_timeliness_passes_when_data_age_is_compared_against_a_bound():
-    verdict = notebook_has_a_timeliness_control(_nb_ctx(
-        'max_load_ts = spark.sql("select max(load_ts) from bronze.sales").collect()[0][0]\n'
-        'if datetime.utcnow() - max_load_ts > timedelta(hours=6):\n'
-        '    raise ValueError("source data is older than the agreed window")\n'
+def test_timeliness_passes_when_every_refresh_activity_has_a_custom_timeout():
+    verdict = pipeline_has_a_timeliness_control(_pipeline_ctx(
+        _refresh_activity("0.01:00:00"),
+        {"name": "Copy_Source", "type": "Copy", "policy": {"timeout": "0.02:00:00"}},
     ))
     assert verdict.score == _PASS
+    assert "custom timeout" in verdict.evidence
 
 
-def test_timeliness_passes_on_an_explicitly_named_freshness_control():
-    verdict = notebook_has_a_timeliness_control(_nb_ctx(
-        'df = spark.read.parquet(path)\n'
-        'freshness_check(df, column="load_ts", max_age_hours=4)\n'
+def test_timeliness_is_partial_when_only_some_activities_have_custom_timeouts():
+    verdict = pipeline_has_a_timeliness_control(_pipeline_ctx(
+        _refresh_activity("0.01:00:00"),
+        {"name": "Copy_Source", "type": "Copy", "policy": {"timeout": "0.12:00:00"}},
     ))
-    assert verdict.score == _PASS
+    assert verdict.score == 2
+    assert "only partially configured" in verdict.evidence
 
 
-def test_a_watermark_alone_is_incremental_bookkeeping_not_a_timeliness_control():
-    """Deliberately *not* satisfied by what satisfies 2.2.1 / 2.2.4."""
-    verdict = notebook_has_a_timeliness_control(_nb_ctx(
-        'watermark = spark.sql("select value from meta.control").collect()[0][0]\n'
-        'df = spark.read.format("delta").load(path).filter(col("load_date") > watermark)\n'
-        'df.write.mode("append").saveAsTable("silver.sales")\n'
+def test_timeliness_is_partial_when_only_fabric_default_timeout_is_present():
+    verdict = pipeline_has_a_timeliness_control(_pipeline_ctx(
+        _refresh_activity("0.12:00:00")
     ))
     assert verdict.score == _PARTIAL_LOW
-    assert "not a timeliness" in verdict.evidence
+    assert "Fabric defaults" in verdict.evidence
 
 
-def test_timeliness_fails_when_no_data_age_is_computed_at_all():
-    verdict = notebook_has_a_timeliness_control(_nb_ctx(
-        'df = spark.read.parquet(path)\n'
-        'df.write.mode("overwrite").saveAsTable("bronze.sales")\n'
-    ))
+def test_timeliness_fails_when_refresh_activity_has_no_timeout():
+    verdict = pipeline_has_a_timeliness_control(_pipeline_ctx(_refresh_activity()))
     assert verdict.score == _FAIL
+    assert "sets an execution timeout" in verdict.evidence
 
 
-def test_timeliness_is_not_satisfied_by_a_commented_out_control():
-    verdict = notebook_has_a_timeliness_control(_nb_ctx(
-        'df = spark.read.parquet(path)\n'
-        '# if utcnow() - max_load_ts > timedelta(hours=6): raise\n'
-    ))
-    assert verdict.score == _FAIL
+def test_timeliness_descends_into_container_activities():
+    nested = {
+        "name": "ForEach_Source",
+        "type": "ForEach",
+        "typeProperties": {"activities": [_refresh_activity("0.01:00:00")]},
+    }
+    assert pipeline_has_a_timeliness_control(_pipeline_ctx(nested)).score == _PASS
 
 
-def test_timeliness_evidence_admits_the_sla_value_is_not_held():
-    verdict = notebook_has_a_timeliness_control(_nb_ctx(
-        'df = spark.read.parquet(p)\n'
-        'if current_timestamp() - max_ingestion_time > INTERVAL 4 HOURS:\n'
-        '    raise ValueError("late")\n'
-    ))
-    assert verdict.score == _PASS
-    assert "SLA value itself is not held" in verdict.evidence
+def test_timeliness_ignores_non_refresh_container_timeout_absence():
+    container = {"name": "ForEach_Source", "type": "ForEach", "typeProperties": {}}
+    assert pipeline_has_a_timeliness_control(_pipeline_ctx(container)).status is Status.NA
 
 
-def test_timeliness_is_na_when_the_notebook_moves_no_data():
-    assert notebook_has_a_timeliness_control(_nb_ctx("x = 1 + 1\n")).status is Status.NA
+def test_timeliness_is_na_when_pipeline_has_no_refresh_or_data_activity():
+    assert pipeline_has_a_timeliness_control(_pipeline_ctx()).status is Status.NA
 
 
-def test_timeliness_is_na_when_notebook_definitions_are_unavailable():
-    workspace = WorkspaceContext(id="w", unavailable={Resource.NOTEBOOK_DEFINITIONS})
-    ctx = CheckContext(workspace=workspace, settings={}, obj_name="nb", obj={"cells": []})
-    assert notebook_has_a_timeliness_control(ctx).status is Status.NA
+def test_timeliness_is_na_when_pipeline_definitions_are_unavailable():
+    workspace = WorkspaceContext(id="w", unavailable={Resource.PIPELINE_DEFINITIONS})
+    ctx = CheckContext(workspace=workspace, settings={}, obj_name="pipeline",
+                       obj={"properties": {"activities": []}})
+    assert pipeline_has_a_timeliness_control(ctx).status is Status.NA
 
 
 # =============================================================================
