@@ -67,7 +67,8 @@ def bi_content_source_controlled_and_promoted(ctx: CheckContext) -> Verdict:
 
     models = sum(1 for i in content if i.type == "SemanticModel")
     reports = len(content) - models
-    inventory = f"{models} semantic model(s) and {reports} report(s)"
+    inventory = (f"Workspace '{ctx.workspace.display_name or ctx.obj_name}' contains "
+                 f"{models} semantic model(s) and {reports} report(s)")
 
     git = ctx.workspace.git_connected
     promoted = ctx.workspace.deployment_pipeline

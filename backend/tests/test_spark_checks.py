@@ -15,11 +15,12 @@ from auditfast.core.check.performance_capacity.data_prep.automated import (
     spark_partition_pruning,
     spark_pool,
     spark_profile,
+    spark_repartition,
     spark_runtime,
     spark_select,
     spark_ui_review,
 )
-from auditfast.core.enums import Status
+from auditfast.core.enums import Resource, Status
 from auditfast.core.models import CheckContext, WorkspaceContext
 
 
@@ -146,6 +147,121 @@ def test_no_inline_install_passes():
     assert v.score == 3
 
 
+# -- SPARK-REPARTITION --------------------------------------------------------
+
+def test_write_with_repartition_passes():
+    v = spark_repartition(_ctx(_nb(
+        "df.repartition(16, 'load_date').write.format('delta').saveAsTable('sales')"
+    )))
+    assert v.score == 3
+    assert "repartition" in v.evidence
+
+
+def test_write_from_assigned_repartitioned_dataframe_passes():
+    v = spark_repartition(_ctx(_nb(
+        "df_balanced = df.repartition(200, 'year', 'month')\n"
+        "(df_balanced\n"
+        " .write\n"
+        " .format('delta')\n"
+        " .saveAsTable('rides_delta'))"
+    )))
+    assert v.score == 3
+    assert "repartition" in v.evidence
+
+
+def test_optimize_write_with_explicit_bin_size_passes():
+    v = spark_repartition(_ctx(_nb(
+        'spark.conf.set("spark.microsoft.delta.optimizeWrite.enabled", "true")\n'
+        'spark.conf.set("spark.microsoft.delta.optimizeWrite.binSize", "1073741824")\n'
+        'df.write.format("delta").partitionBy("Year", "Quarter").save("Tables/sales")'
+    )))
+    assert v.score == 3
+    assert "1 GiB" in v.evidence
+    assert "partitionBy(Year, Quarter)" in v.evidence
+
+
+def test_partition_by_without_file_sizing_is_partial():
+    v = spark_repartition(_ctx(_nb(
+        'df.write.format("delta").partitionBy("load_date").save("Tables/sales")'
+    )))
+    assert v.score == 2
+    assert "partitionBy(load_date)" in v.evidence
+    assert "file-size" in v.evidence
+
+
+def test_window_partition_by_does_not_count_as_write_partitioning():
+    v = spark_repartition(_ctx(_nb(
+        'window = Window.partitionBy("customer_key").orderBy("updated_at")\n'
+        'df.write.format("delta").mode("overwrite").saveAsTable("customers")'
+    )))
+    assert v.score == 0
+    assert "default partitioning" in v.evidence
+
+
+def test_optimize_write_without_explicit_bin_size_is_partial():
+    v = spark_repartition(_ctx(_nb(
+        'spark.conf.set("spark.microsoft.delta.optimizeWrite.enabled", "true")\n'
+        'df.write.format("delta").save("Tables/sales")'
+    )))
+    assert v.score == 2
+    assert "Optimize Write is enabled" in v.evidence
+
+
+def test_column_coalesce_does_not_count_as_output_coalescing():
+    v = spark_repartition(_ctx(_nb(
+        'df = df.withColumn("name", F.coalesce(F.col("name"), F.lit("unknown")))\n'
+        'spark.conf.set("spark.microsoft.delta.optimizeWrite.enabled", "true")\n'
+        'spark.conf.set("spark.microsoft.delta.autoOptimize.autoCompact", "true")\n'
+        'df.write.format("delta").mode("overwrite").saveAsTable("customers")'
+    )))
+    assert v.score == 2
+    assert "strategy: Optimize Write is enabled" in v.evidence
+    assert "Optimize Write is enabled" in v.evidence
+
+
+def test_write_without_partition_strategy_fails():
+    v = spark_repartition(_ctx(_nb(
+        "df.write.format('delta').mode('overwrite').saveAsTable('sales')"
+    )))
+    assert v.score == 0
+    assert "default partitioning" in v.evidence
+    assert "partitionBy" in v.evidence
+    assert "Optimize Write" in v.evidence
+
+
+def test_repartition_check_is_na_without_a_write():
+    v = spark_repartition(_ctx(_nb("df = spark.table('sales')")))
+    assert v.status is Status.NA
+
+
+def test_commented_out_repartition_does_not_pass():
+    v = spark_repartition(_ctx(_nb(
+        "# df = df.repartition(16, 'load_date')\n"
+        "df.write.format('delta').saveAsTable('sales')"
+    )))
+    assert v.score == 0
+
+
+def test_disabled_or_commented_optimize_write_does_not_pass():
+    v = spark_repartition(_ctx(_nb(
+        '# spark.conf.set("spark.microsoft.delta.optimizeWrite.enabled", "true")\n'
+        'spark.conf.set("spark.microsoft.delta.optimizeWrite.enabled", "false")\n'
+        'df.write.format("delta").save("Tables/sales")'
+    )))
+    assert v.score == 0
+
+
+def test_repartition_check_is_na_when_definitions_are_unavailable():
+    ctx = CheckContext(
+        workspace=WorkspaceContext(id="w", unavailable={Resource.NOTEBOOK_DEFINITIONS}),
+        settings={},
+        obj_name="nb",
+        obj=_nb("df.write.saveAsTable('sales')"),
+    )
+    v = spark_repartition(ctx)
+    assert v.status is Status.NA
+
+
 # -- SPARK-SELECT --------------------------------------------------------------
 
 def test_select_star_fails():
@@ -177,6 +293,8 @@ def test_partition_pruning_fails_for_unfiltered_select_star():
 def test_partition_pruning_is_na_without_partition_metadata():
     v = spark_partition_pruning(_ctx(_nb("print('hello')")))
     assert v.status is Status.NA
+    assert "Notebook 'nb'" in v.evidence
+    assert "partition_columns" in v.evidence
 
 
 def test_partition_pruning_checks_each_query_independently():
@@ -280,6 +398,9 @@ def test_pool_sizing_fails_for_underutilization():
         "coreEfficiency": 0.2, "capacityExceeded": False,
     })))
     assert v.score == 0
+    assert "Notebook 'nb'" in v.evidence
+    assert "minimum=0.5000" in v.evidence
+    assert "maximum=0.3000" in v.evidence
 
 
 def test_pool_sizing_is_na_without_metrics():

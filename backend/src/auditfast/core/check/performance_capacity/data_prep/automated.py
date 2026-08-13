@@ -266,13 +266,113 @@ def spark_cache(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def spark_repartition(ctx: CheckContext) -> Verdict:
-    """Writes use an explicit ``coalesce``/``repartition`` rather than the default."""
-    code = notebook_code(ctx.obj)
+    """Managed/table writes declare partitioning or file-sizing rather than defaulting.
+
+    Accepted definition signals include ``coalesce``/``repartition``, writer
+    ``partitionBy``, Fabric Optimize Write with a target bin size, and automatic
+    compaction. The definition cannot prove the resulting physical files are
+    right-sized; that requires table/file statistics which this check does not
+    fetch.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+
+    code = strip_sql_comments(executable_code(ctx.obj))
     if not writes_delta(code):
         return not_applicable("Notebook does not write tables")
-    if _spark.REPARTITION.search(code):
-        return binary(True, "Explicit coalesce/repartition before writes")
-    return not_applicable("No explicit repartition/coalesce; default partitioning on write")
+
+    def write_path_uses(method: str) -> bool:
+        direct = re.search(
+            rf"\.{method}\s*\([^)]*\)\s*\.?\s*\\?\s*\.write\b",
+            code,
+            re.IGNORECASE,
+        )
+        if direct:
+            return True
+        assignments = re.finditer(
+            rf"(?m)^\s*([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\.{method}\s*\(",
+            code,
+            re.IGNORECASE,
+        )
+        return any(
+            re.search(rf"\b{re.escape(match.group(1))}\s*\.write\b", code[match.end():], re.IGNORECASE)
+            for match in assignments
+        )
+
+    strategies: list[str] = []
+    if write_path_uses("repartition"):
+        strategies.append("repartition")
+    if write_path_uses("coalesce"):
+        strategies.append("coalesce")
+
+    partition_match = re.search(
+        r"\.write\b(?:\s*\\?\s*\.\w+\s*\([^)]*\))*?"
+        r"\s*\\?\s*\.partitionBy\s*\(([^)\n]*)\)",
+        code,
+        re.IGNORECASE,
+    )
+    partition_columns: list[str] = []
+    if partition_match:
+        partition_columns = re.findall(r"[\"']([^\"']+)[\"']", partition_match.group(1))
+        label = ", ".join(partition_columns) if partition_columns else "declared columns"
+        strategies.append(f"partitionBy({label})")
+
+    optimize_write = bool(re.search(
+        r"(?:spark\.microsoft\.delta\.optimizeWrite\.enabled|"
+        r"delta\.autoOptimize\.optimizeWrite|optimizeWrite)[\"']?\s*"
+        r"(?:,\s*|[=:]\s*)[\"']?true\b",
+        code,
+        re.IGNORECASE,
+    ))
+    bin_match = re.search(
+        r"optimizeWrite\.binSize[\"']?\s*(?:,\s*|[=:]\s*)[\"']?(\d+)",
+        code,
+        re.IGNORECASE,
+    )
+    bin_size = int(bin_match.group(1)) if bin_match else None
+    auto_compact = bool(re.search(
+        r"(?:delta\.autoOptimize\.autoCompact|autoCompaction|autoCompact)[\"']?\s*"
+        r"(?:,\s*|[=:]\s*)[\"']?true\b",
+        code,
+        re.IGNORECASE,
+    ))
+
+    if optimize_write:
+        strategies.append("Optimize Write is enabled")
+    if bin_size is not None:
+        if bin_size % (1024 ** 3) == 0:
+            size_label = f"{bin_size // (1024 ** 3)} GiB"
+        elif bin_size % (1024 ** 2) == 0:
+            size_label = f"{bin_size // (1024 ** 2)} MiB"
+        else:
+            size_label = f"{bin_size} bytes"
+        strategies.append(f"Optimize Write target {size_label}")
+    if auto_compact:
+        strategies.append("automatic compaction enabled")
+
+    runtime_note = "actual physical file sizes require runtime table/file statistics"
+    if any(strategy in strategies for strategy in ("repartition", "coalesce")) or (
+        optimize_write and bin_size is not None
+    ):
+        return graded(
+            3,
+            f"Managed/table write has an explicit partition/file-sizing strategy: "
+            f"{'; '.join(strategies)}; {runtime_note}",
+        )
+    if strategies:
+        return graded(
+            2,
+            f"Managed/table write has a partial partition/file-sizing strategy: "
+            f"{'; '.join(strategies)}, but no explicit coalesce/repartition or enabled "
+            f"Optimize Write file-size target; {runtime_note}",
+        )
+    return binary(
+        False,
+        "Managed/table write uses default partitioning: no executable coalesce(...), "
+        "repartition(...), partitionBy(...), enabled Optimize Write, or automatic "
+        "compaction strategy was found, so output partition/file counts are not "
+        "explicitly controlled",
+    )
 
 
 @check(
@@ -339,21 +439,31 @@ def spark_pool(ctx: CheckContext) -> Verdict:
     """Recent Spark resource usage stays within deterministic utilization limits."""
     usage = _spark.monitoring(ctx.obj).get("resource_usage")
     if not isinstance(usage, dict):
-        return not_applicable("Spark resource-usage metrics are unavailable for this notebook")
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' has no captured Spark resource-usage metrics "
+            f"(duration, idleTime, coreEfficiency, capacityExceeded)"
+        )
     duration = _spark.number(usage.get("duration"))
     efficiency = _spark.number(usage.get("coreEfficiency"), -1)
     idle_ratio = _spark.number(usage.get("idleTime")) / duration if duration > 0 else -1
     if efficiency < 0 or idle_ratio < 0:
-        return not_applicable("Spark resource-usage metrics lack efficiency or duration data")
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' has Spark metrics, but duration, idleTime, "
+            f"or coreEfficiency is missing or invalid"
+        )
     minimum_efficiency = _spark.number(ctx.setting("minimum_spark_core_efficiency", 0.5), -1)
     maximum_idle = _spark.number(ctx.setting("maximum_spark_idle_ratio", 0.3), -1)
     if minimum_efficiency < 0 or maximum_idle < 0:
         return not_applicable("Spark pool utilization thresholds are invalid")
     exceeded = bool(usage.get("capacityExceeded"))
     ok = efficiency >= minimum_efficiency and idle_ratio <= maximum_idle and not exceeded
+    duration_minutes = duration / 60_000
     return binary(
         ok,
-        f"coreEfficiency={efficiency:.2f}, idleRatio={idle_ratio:.2f}, capacityExceeded={exceeded}",
+        f"Notebook '{ctx.obj_name}': duration={duration_minutes:.1f} min, "
+        f"coreEfficiency={efficiency:.4f} (minimum={minimum_efficiency:.4f}), "
+        f"idleRatio={idle_ratio:.4f} (maximum={maximum_idle:.4f}), "
+        f"capacityExceeded={exceeded}",
     )
 
 
@@ -385,14 +495,28 @@ def spark_partition_pruning(ctx: CheckContext) -> Verdict:
     code = notebook_code(ctx.obj)
     configured = ctx.setting("partition_columns", {})
     if not isinstance(configured, dict) or not configured:
-        return not_applicable("No partition-column metadata configured for this project")
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' was not assessed: project setting "
+            f"'partition_columns' is empty, so the auditor cannot determine which "
+            f"table reads require partition predicates"
+        )
     reads = _spark.partitioned_sql_reads(code, configured)
     if not reads:
-        return not_applicable("Notebook has no SQL reads of configured partitioned tables")
+        tables = ", ".join(sorted(str(table) for table in configured))
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' has no SQL read of the configured partitioned "
+            f"table(s): {tables}"
+        )
     unfiltered = sorted({table for table, filtered in reads if not filtered})
     if unfiltered:
-        return binary(False, f"Partition predicate missing for: {', '.join(unfiltered)}")
-    return binary(True, f"All {len(reads)} configured partitioned-table read(s) filter a partition column")
+        details = ", ".join(
+            f"{table} ({'/'.join(map(str, configured.get(table, [])))})"
+            for table in unfiltered
+        )
+        return binary(False, f"Notebook '{ctx.obj_name}' reads configured partitioned "
+                      f"table(s) without a partition predicate: {details}")
+    return binary(True, f"Notebook '{ctx.obj_name}': all {len(reads)} configured "
+                  f"partitioned-table read(s) filter a configured partition column")
 
 
 @check(
