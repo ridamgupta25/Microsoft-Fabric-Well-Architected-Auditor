@@ -674,6 +674,54 @@ _FK_INTEGRITY = re.compile(
     r"\b(?:referential_integrity|referential_check|fk_check|integrity_check|ri_check)\s*[\(=]",
     re.IGNORECASE,
 )
+_TABLE_READ_ASSIGNMENT = re.compile(
+    r"(?P<variable>\w+)\s*=\s*spark\.table\s*\(\s*[\"'](?P<table>[^\"']+)[\"']\s*\)",
+    re.IGNORECASE,
+)
+_FK_ANTI_JOIN = re.compile(
+    r"(?P<child>\w+)(?:\.alias\s*\([^)]*\))?\s*\.join\s*\(\s*"
+    r"(?P<parent>\w+)(?:\.alias\s*\([^)]*\))?\s*,\s*"
+    r"(?P<left_var>\w+)\.(?P<left_key>\w+)\s*==\s*"
+    r"(?P<right_var>\w+)\.(?P<right_key>\w+)[\s\S]{0,160}?[\"']left_anti[\"']",
+    re.IGNORECASE,
+)
+_FK_ASSERTION = re.compile(
+    r"assert\s+[^\n]*(?:orphan|unmatched|missing_parent|no_parent)[^\n]*(?:==\s*0|not\s+)|"
+    r"(?:orphan|unmatched|missing_parent|no_parent)[_\w]*\.count\s*\(\s*\)\s*==\s*0",
+    re.IGNORECASE,
+)
+_FK_QUARANTINE = re.compile(
+    r"(?:orphan|unmatched|missing_parent|no_parent)[_\w]*[\s\S]{0,300}?"
+    r"(?:\.write\b|saveAsTable\s*\(|insertInto\s*\()[\s\S]{0,160}?"
+    r"(?:quarantin|reject|error[_-]?(?:record|table)|ri[_-]?orphan)|"
+    r"(?:quarantin|reject|error[_-]?(?:record|table)|ri[_-]?orphan)[\s\S]{0,160}?"
+    r"(?:\.write\b|saveAsTable\s*\(|insertInto\s*\()",
+    re.IGNORECASE,
+)
+
+
+def _fk_relationship(code: str) -> tuple[str, str, str, str] | None:
+    """Return child table/key and parent table/key for a static anti-join."""
+    join = _FK_ANTI_JOIN.search(code)
+    if not join:
+        return None
+    tables = {
+        match.group("variable"): match.group("table")
+        for match in _TABLE_READ_ASSIGNMENT.finditer(code)
+    }
+    child_var = join.group("child")
+    parent_var = join.group("parent")
+    left_var = join.group("left_var")
+    if left_var == child_var:
+        child_key, parent_key = join.group("left_key"), join.group("right_key")
+    else:
+        child_key, parent_key = join.group("right_key"), join.group("left_key")
+    return (
+        tables.get(child_var, child_var),
+        child_key,
+        tables.get(parent_var, parent_var),
+        parent_key,
+    )
 # One physical read. The chained ``spark.read...load(...)`` form is listed first so it
 # is consumed whole rather than counted as both a ``spark.read`` and a ``.load(``. The
 # chain may be split by line continuations and may nest one level of parentheses.
@@ -956,12 +1004,56 @@ def nb_recon_count(ctx: CheckContext) -> Verdict:
 )
 def nb_fk_integrity(ctx: CheckContext) -> Verdict:
     """Notebooks that join tables verify FK values exist in dimension/lookup tables."""
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definition could not be read from Fabric")
     code = executable_code(ctx.obj)
     if not _JOIN_PATTERN.search(code):
-        return not_applicable("Notebook does not perform joins")
-    ok = bool(_FK_INTEGRITY.search(code))
-    return binary(ok, "Referential integrity check present" if ok
-                  else "Joins tables without FK/referential integrity validation")
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' performs no join, so no foreign-key relationship "
+            "can be assessed",
+        )
+    if not _FK_INTEGRITY.search(code):
+        return binary(
+            False,
+            f"Notebook '{ctx.obj_name}' joins tables but does not isolate unmatched foreign "
+            "keys. Add a left_anti join (or a left join followed by a parent-key null test) "
+            "between the child FK and parent key; otherwise orphan fact/child rows can pass "
+            "through unnoticed",
+        )
+
+    relationship = _fk_relationship(code)
+    if relationship:
+        child_table, child_key, parent_table, parent_key = relationship
+        subject = (
+            f"Notebook '{ctx.obj_name}' validates {child_table}.{child_key} -> "
+            f"{parent_table}.{parent_key} with a left_anti join"
+        )
+    else:
+        subject = (
+            f"Notebook '{ctx.obj_name}' contains an explicit foreign-key integrity check, "
+            "but the child table, parent table, or join keys are dynamically resolved"
+        )
+
+    enforced = bool(_FK_ASSERTION.search(code))
+    quarantined = bool(_FK_QUARANTINE.search(code))
+    controls = []
+    if enforced:
+        controls.append("An assertion fails the run when orphan rows are found")
+    if quarantined:
+        controls.append("Unmatched rows are persisted to a quarantine/error target")
+    if controls:
+        return binary(
+            True,
+            f"{subject}. {'. '.join(controls)}. This verdict verifies the saved notebook "
+            "logic, not current table rows; a zero-row orphan result in the notebook output "
+            "is separate runtime confirmation that the current data passed",
+        )
+    return graded(
+        1,
+        f"{subject}, so unmatched keys are identified. However, the saved code does not "
+        "fail the run or persist the orphan set; invalid rows could be detected and then "
+        "ignored. Add an assertion or write the unmatched rows to a quarantine table",
+    )
 
 
 @check(
@@ -1747,6 +1839,63 @@ _WATERMARK_TABLE_READ = re.compile(
     r"(?:FROM|JOIN)\s+[\w.\[\]\"]*(?:watermark|control|metadata|etl_?config|load_?log)",
     re.IGNORECASE,
 )
+_WATERMARK_READ_TARGET = re.compile(
+    r"(?:FROM|JOIN)\s+(?P<table>[\w.\[\]\"]*"
+    r"(?:watermark|control|metadata|etl_?config|load_?log)[\w.\[\]\"]*)",
+    re.IGNORECASE,
+)
+_WATERMARK_WRITE_TARGET = re.compile(
+    r"(?:UPDATE|INSERT\s+INTO|MERGE\s+INTO)\s+(?P<table>[\w.\[\]\"]*"
+    r"(?:watermark|control|metadata|etl_?config|load_?log)[\w.\[\]\"]*)",
+    re.IGNORECASE,
+)
+
+
+def _activity_sql(activity: dict) -> str:
+    """Return SQL embedded in Lookup or Script activities."""
+    props = activity.get("typeProperties") or {}
+    parts: list[str] = []
+    source = props.get("source") or {}
+    for key in ("sqlReaderQuery", "query"):
+        value = source.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+        elif isinstance(value, dict) and value.get("value"):
+            parts.append(str(value["value"]))
+    for entry in props.get("scripts") or []:
+        if not isinstance(entry, dict):
+            continue
+        text = entry.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+        elif isinstance(text, dict) and text.get("value"):
+            parts.append(str(text["value"]))
+    if isinstance(props.get("script"), str):
+        parts.append(props["script"])
+    return "\n".join(parts)
+
+
+def _activity_connection(activity: dict) -> str | None:
+    """Return the Fabric connection/item name attached to an activity."""
+    props = activity.get("typeProperties") or {}
+    dataset = props.get("datasetSettings") or {}
+    for source in (activity, props, dataset):
+        linked = source.get("linkedService") or {}
+        if linked.get("name"):
+            return str(linked["name"])
+    return None
+
+
+def _normalise_table(name: str) -> str:
+    return name.replace("[", "").replace("]", "").replace('"', "").lower()
+
+
+def _succeeds_after(activity: dict, predecessor: str) -> bool:
+    return any(
+        dependency.get("activity") == predecessor
+        and "Succeeded" in (dependency.get("dependencyConditions") or [])
+        for dependency in activity.get("dependsOn") or []
+    )
 
 
 @check(
@@ -1767,25 +1916,82 @@ def pl_watermark_store(ctx: CheckContext) -> Verdict:
     if not _WATERMARK.search(blob):
         return not_applicable("Pipeline uses no watermark / control value")
 
-    sql = script_sql(ctx.obj)
     acts = walk_activities(ctx.obj)
-    lookup_sql = json.dumps([a for a in acts if (a.get("type") or "") == "Lookup"])
-    proc = any((a.get("type") or "") == "SqlServerStoredProcedure"
-               and _WATERMARK.search(json.dumps(a)) for a in acts)
+    reads: list[tuple[dict, str]] = []
+    writes: list[tuple[dict, str]] = []
+    procedures: list[dict] = []
+    for activity in acts:
+        activity_type = activity.get("type") or ""
+        activity_sql = _activity_sql(activity)
+        if activity_type == "Lookup":
+            reads.extend((activity, match.group("table"))
+                         for match in _WATERMARK_READ_TARGET.finditer(activity_sql))
+        if activity_type == "Script":
+            writes.extend((activity, match.group("table"))
+                          for match in _WATERMARK_WRITE_TARGET.finditer(activity_sql))
+        if activity_type == "SqlServerStoredProcedure" and _WATERMARK.search(json.dumps(activity)):
+            procedures.append(activity)
 
-    persists = bool(_WATERMARK_DURABLE.search(sql)) or proc
-    reads_table = bool(_WATERMARK_TABLE_READ.search(sql)
-                       or _WATERMARK_TABLE_READ.search(lookup_sql))
+    for read_activity, read_table in reads:
+        for write_activity, write_table in writes:
+            if _normalise_table(read_table) != _normalise_table(write_table):
+                continue
+            read_name = read_activity.get("name") or "unnamed Lookup"
+            write_name = write_activity.get("name") or "unnamed Script"
+            connection = _activity_connection(read_activity) or _activity_connection(write_activity)
+            location = f" in Warehouse/connection '{connection}'" if connection else ""
+            if _succeeds_after(write_activity, read_name):
+                return binary(
+                    True,
+                    f"Durable watermark pattern confirmed: Lookup '{read_name}' reads "
+                    f"{read_table}{location}; Script '{write_name}' updates the same "
+                    "table after the Lookup succeeds",
+                )
+            return graded(
+                2,
+                f"Lookup '{read_name}' reads {read_table}{location} and Script "
+                f"'{write_name}' writes the same table, but the write is not explicitly "
+                "dependent on Lookup success",
+            )
 
-    if persists and reads_table:
-        return binary(True, "Watermark is read from and written back to a durable "
-                            "control/metadata table")
-    if persists:
-        return graded(2, "Watermark is written back to a durable table, but no read "
-                         "of it was found — confirm the next run picks it up")
-    if reads_table:
-        return graded(1, "Watermark is read from a control/metadata table but never "
-                         "written back — the stored value goes stale")
+    if reads and procedures:
+        read_activity, read_table = reads[0]
+        procedure = procedures[0]
+        read_name = read_activity.get("name") or "unnamed Lookup"
+        procedure_name = procedure.get("name") or "unnamed stored procedure"
+        if _succeeds_after(procedure, read_name):
+            return binary(
+                True,
+                f"Durable watermark pattern confirmed: Lookup '{read_name}' reads "
+                f"{read_table}; stored-procedure activity '{procedure_name}' persists "
+                "the watermark after the Lookup succeeds",
+            )
+
+    if writes or procedures:
+        writer = writes[0][0] if writes else procedures[0]
+        writer_name = writer.get("name") or "unnamed write activity"
+        target = f" {writes[0][1]}" if writes else " a durable watermark store"
+        if reads:
+            read_name = reads[0][0].get("name") or "unnamed Lookup"
+            read_table = reads[0][1]
+            return graded(
+                2,
+                f"Lookup '{read_name}' reads {read_table}, while '{writer_name}' writes"
+                f"{target}; no safely sequenced same-table read/write pair was found",
+            )
+        return graded(
+            2,
+            f"Activity '{writer_name}' writes{target}, but no Lookup reads a durable "
+            "watermark table — confirm that each run retrieves the persisted value",
+        )
+    if reads:
+        reader, table = reads[0]
+        reader_name = reader.get("name") or "unnamed Lookup"
+        return graded(
+            1,
+            f"Lookup '{reader_name}' reads {table}, but no Script or stored procedure "
+            "writes the new watermark back — the persisted value can become stale",
+        )
     return binary(False, "Watermark exists only in pipeline variables/expressions, not "
                          "in a durable control table — it is lost when the run ends")
 
@@ -1793,9 +1999,20 @@ def pl_watermark_store(ctx: CheckContext) -> Verdict:
 # -- 2.3.2 operation type flag preserved in Bronze ----------------------------
 _BRONZE = re.compile(r"\bbronze\b|\braw\b|\blanding\b|pre[_ -]?bronze", re.IGNORECASE)
 _OP_TYPE_COLUMN = re.compile(
-    r"operation[_ -]?type|op[_ -]?type|change[_ -]?type|_change_type|__\$operation|"
-    r"cdc[_ -]?operation|dml[_ -]?action|record[_ -]?type|\bopcode\b|"
-    r"sys[_ -]?change[_ -]?operation",
+    r"(?P<column>operation[_ -]?type|op[_ -]?type|change[_ -]?type|_change_type|"
+    r"__\$operation|cdc[_ -]?operation|dml[_ -]?action|record[_ -]?type|\bopcode\b|"
+    r"sys[_ -]?change[_ -]?operation)",
+    re.IGNORECASE,
+)
+_CDC_SOURCE_SIGNAL = re.compile(
+    r"change[_ -]?data[_ -]?capture|\bcdc\b|change[_ -]?(?:feed|stream|events?|records?)|"
+    r"source[_ -]?changes?|readChangeFeed|readChangeData|startingVersion|startingTimestamp|"
+    r"_change_type|__\$operation|sys_change_operation|dml[_ -]?action",
+    re.IGNORECASE,
+)
+_NOTEBOOK_WRITE_TARGET = re.compile(
+    r"(?:saveAsTable\s*\(\s*|INSERT\s+(?:INTO|OVERWRITE(?:\s+TABLE)?)\s+)"
+    r"[\"'`\[]?(?P<table>[A-Za-z_][\w$.]*(?:\.[A-Za-z_][\w$]*)*)",
     re.IGNORECASE,
 )
 
@@ -1815,14 +2032,38 @@ def nb_operation_type(ctx: CheckContext) -> Verdict:
     """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
-    code = notebook_code(ctx.obj)
+    code = executable_code(ctx.obj)
     if not _WRITE_PATTERN.search(code) or not _BRONZE.search(code):
         return not_applicable("Notebook does not write a Bronze/raw table")
-    ok = bool(_OP_TYPE_COLUMN.search(code))
-    return binary(ok, "Bronze write carries the source operation type / change flag"
-                  if ok else
-                  "Bronze write drops the source operation type — an update cannot "
-                  "be told from an insert, and deletes are unrecoverable")
+    targets = list(dict.fromkeys(
+        match.group("table") for match in _NOTEBOOK_WRITE_TARGET.finditer(code)
+    ))
+    flags = list(dict.fromkeys(
+        match.group("column") for match in _OP_TYPE_COLUMN.finditer(code)
+    ))
+    target_evidence = ", ".join(targets) if targets else "target not statically resolved"
+    if flags:
+        return binary(
+            True,
+            f"Notebook '{ctx.obj_name}' writes Bronze/raw target(s) {target_evidence} "
+            f"and preserves recognized operation flag column(s): {', '.join(flags)}. "
+            "This verdict verifies the saved write logic, not the operation values in "
+            "current table rows",
+        )
+    if not _CDC_SOURCE_SIGNAL.search(code):
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' writes Bronze/raw target(s) {target_evidence}, "
+            "but the saved definition does not show that its source provides CDC/change "
+            "operation metadata; the 'where the source provides it' condition cannot be "
+            "determined",
+        )
+    return binary(
+        False,
+        f"Notebook '{ctx.obj_name}' writes Bronze/raw target(s) {target_evidence}, but "
+        "no operation flag column is preserved (expected operation_type, change_type, "
+        "opcode, or an equivalent CDC operation field) — updates cannot be distinguished "
+        "from inserts and deletes are unrecoverable",
+    )
 
 
 # -- 2.3.3 all applicable operation types (I/U/D) handled in the merge --------
@@ -1959,6 +2200,17 @@ _RUN_CONTROL_WRITE = re.compile(
     r"(?:run_?control|run_?log|batch_?log|audit_?log|etl_?log|load_?log)",
     re.IGNORECASE,
 )
+_RUN_CONTROL_SQL_TARGET = re.compile(
+    r"(?:INSERT\s+INTO|MERGE\s+INTO|UPDATE)\s+(?P<target>[\w.\[\]\"]*"
+    r"(?:run[_ -]?(?:control|log|history)|batch[_ -]?(?:control|log)|"
+    r"audit[_ -]?(?:log|table)|etl[_ -]?log|load[_ -]?log|process[_ -]?log)"
+    r"[\w.\[\]\"]*)",
+    re.IGNORECASE,
+)
+_RUN_CONTROL_NOTEBOOK_TARGET = re.compile(
+    r"saveAsTable\s*\(\s*[\"'`](?P<target>[^\"'`]+)[\"'`]",
+    re.IGNORECASE,
+)
 #: The four things a run-control row has to carry to be useful in an incident.
 _RUN_CONTROL_ELEMENTS = {
     "batch id": re.compile(r"batch[_ -]?id|run[_ -]?id|load[_ -]?id|execution[_ -]?id",
@@ -1967,9 +2219,37 @@ _RUN_CONTROL_ELEMENTS = {
                          re.IGNORECASE),
     "row counts": re.compile(r"row[_ -]?count|record[_ -]?count|rows[_ -]?(?:read|written|"
                              r"inserted|updated)|affected[_ -]?rows", re.IGNORECASE),
-    "timestamps": re.compile(r"start[_ -]?(?:time|date|utc)|end[_ -]?(?:time|date|utc)|"
-                             r"finish[_ -]?time|duration", re.IGNORECASE),
 }
+_RUN_CONTROL_START = re.compile(r"start[_ -]?(?:time|date|utc)", re.IGNORECASE)
+_RUN_CONTROL_END = re.compile(
+    r"end[_ -]?(?:time|date|utc)|finish[_ -]?time", re.IGNORECASE)
+
+
+def _run_control_target(text: str) -> str:
+    for pattern in (_RUN_CONTROL_SQL_TARGET, _RUN_CONTROL_NOTEBOOK_TARGET):
+        match = pattern.search(text)
+        if match:
+            return match.group("target").replace("[", "").replace("]", "").replace('"', "")
+    return "target not statically resolved"
+
+
+def _run_control_fields(text: str) -> tuple[dict[str, str], list[str]]:
+    fields = {
+        label: match.group(0)
+        for label, pattern in _RUN_CONTROL_ELEMENTS.items()
+        if (match := pattern.search(text))
+    }
+    start = _RUN_CONTROL_START.search(text)
+    end = _RUN_CONTROL_END.search(text)
+    if start and end:
+        fields["start/end timestamps"] = f"{start.group(0)}, {end.group(0)}"
+
+    missing = [label for label in _RUN_CONTROL_ELEMENTS if label not in fields]
+    if not start:
+        missing.append("start timestamp (expected start_time/start_utc or equivalent)")
+    if not end:
+        missing.append("end timestamp (expected end_time/end_utc/finish_time or equivalent)")
+    return fields, missing
 
 
 @check(
@@ -1988,41 +2268,55 @@ def ws_run_control(ctx: CheckContext) -> Verdict:
     *writes* the control rows: the control table's own columns are not returned
     by the Fabric REST API.
     """
-    pipelines = ctx.workspace.pipelines or {}
-    notebooks = ctx.workspace.notebooks or {}
+    pipeline_available = ctx.workspace.has(Resource.PIPELINE_DEFINITIONS)
+    notebook_available = ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS)
+    if not pipeline_available and not notebook_available:
+        return not_applicable("Pipeline and notebook definitions could not be read from Fabric")
+
+    pipelines = ctx.workspace.pipelines if pipeline_available else {}
+    notebooks = ctx.workspace.notebooks if notebook_available else {}
     if not pipelines and not notebooks:
         return not_applicable("No pipeline or notebook definitions available to "
                               "inspect for run-control logging")
 
-    writers: list[str] = []
-    corpus: list[str] = []
+    writers: list[tuple[str, str, str, str]] = []
     for name, defn in pipelines.items():
         text = json.dumps(defn)
         if _RUN_CONTROL_WRITE.search(text):
-            writers.append(name)
-            corpus.append(text)
+            writers.append(("Pipeline", name, _run_control_target(text), text))
     for name, defn in notebooks.items():
-        text = notebook_code(defn)
+        text = executable_code(defn)
         if _RUN_CONTROL_WRITE.search(text):
-            writers.append(name)
-            corpus.append(text)
+            writers.append(("Notebook", name, _run_control_target(text), text))
 
     if not writers:
         return binary(False, f"None of {len(pipelines)} pipeline(s) and "
                              f"{len(notebooks)} notebook(s) writes a run-control / "
-                             f"batch-log row — a failed load leaves no audit trail")
+                             f"batch-log row. Expected a write to a table such as "
+                             f"run_control, run_log, batch_log, audit_log, or etl_log; "
+                             f"without one, failed and partial loads leave no durable audit trail")
 
-    blob = "\n".join(corpus)
-    present = sorted(k for k, p in _RUN_CONTROL_ELEMENTS.items() if p.search(blob))
-    missing = sorted(k for k in _RUN_CONTROL_ELEMENTS if k not in present)
-    where = ", ".join(sorted(writers))
+    assessments = []
+    for kind, name, target, text in writers:
+        fields, missing = _run_control_fields(text)
+        assessments.append((len(fields), kind, name, target, fields, missing))
+    _, kind, name, target, fields, missing = max(
+        assessments, key=lambda assessment: assessment[0])
+
+    detected = "; ".join(f"{label} '{value}'" for label, value in fields.items())
+    location = f"{kind} '{name}' writes run-control target '{target}'"
     if not missing:
-        return graded(3, f"Run control in {where} captures batch id, status, "
-                         f"row counts and timestamps")
+        return graded(
+            3,
+            f"{location}. Detected fields: {detected}. Each run can be traced by batch, "
+            f"outcome, processed volume, and start/end time",
+        )
     return graded(
-        max(0, len(present) - 1),
-        f"Run control in {where} captures {', '.join(present)} but is missing "
-        f"{', '.join(missing)}",
+        max(0, len(fields) - 1),
+        f"{location}. Detected fields: {detected or 'none of the required fields'}. "
+        f"Missing: {'; '.join(missing)}. The run history cannot fully identify the "
+        f"batch, outcome, processed volume, and execution window until these fields "
+        f"are persisted by the same writer",
     )
 
 

@@ -46,6 +46,12 @@ PENDING_LABEL = "Pending validation"
 #: the working-checklist order and has no effect; the ref (the key) is all that
 #: drives the flag. Keys are unique — one line per ref.
 VALIDATED_CHECKLIST: dict[str, str] = {
+  "6.2.1":  "Row-Level Security (RLS) implemented on the Gold Warehouse and/or semantic models where required",
+  "14.2.6": "Gold Warehouse structured to serve the model efficiently (no expensive per-query transformations)",
+  "5.3.2":  "Referential integrity: FK values exist in corresponding dimension/lookup tables",
+  "2.2.4":  "Watermark / control values persisted reliably in the Metadata DB (not volatile locations)",
+  "2.3.2":  "Operation type column/flag preserved in Bronze for auditability where the source provides it",
+  "2.5.3":  "Run control tables capture batch ID, status, row counts, start/end timestamps",
     "6.4.2":  "No secrets in notebook code, pipeline expressions, or Spark config",
     "3.1.3":  "No hardcoded paths, connection strings, secrets, or environment-specific values",
     "2.4.1":  "All pipeline activities have appropriate retry policies configured (copy, notebook, lookup, web, ForEach)",
@@ -122,7 +128,6 @@ VALIDATED_CHECKLIST: dict[str, str] = {
     "14.1.1": "Star schema followed in the semantic model (single-direction relationships, no unnecessary bidirectional filters)",
     "14.1.3": "Measures centralized (no duplicated calculation logic across reports)",
     "14.1.4": "DAX follows good practices (variables, no repeated sub-expressions, avoids expensive iterators)",
-    "5.3.2":  "Range / domain validation: values fall within expected ranges and allowed value sets",
     "1.1.8":  "Single source of truth per data domain (no duplicate stores serving the same purpose)",
     "2.6.5":  "SQL-source Copy activities are tuned (source read folded, partitioned, sink batch size set)",
     "9.3.3":  "Transaction boundaries defined so a part-way failure leaves no inconsistent set of targets",

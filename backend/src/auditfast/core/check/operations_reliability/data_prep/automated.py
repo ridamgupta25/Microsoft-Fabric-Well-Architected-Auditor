@@ -627,26 +627,74 @@ def nb_retry_backoff(ctx: CheckContext) -> Verdict:
 
 
 # -- 9.3.4 data integrity validated across layers after failures --------------
-#: The notebook is written to run after something went wrong.
-_RECOVERY_CONTEXT = re.compile(
-    r"\brecover\w*|\brestart\w*|\breprocess\w*|\breplay\b|\bbackfill\b|"
-    r"\bresume\b|failed[_ -]?run|after[_ -]?failure|repair\b|reconcile[_ -]?after",
+#: The notebook is written to run after something went wrong. Patterns allow
+#: Python/SQL identifier separators, such as ``backfill_mode`` and ``failed_run``.
+_RECOVERY_CONTEXTS = (
+    ("recovery", re.compile(r"(?:^|\W|_)recover\w*", re.I)),
+    ("restart", re.compile(r"(?:^|\W|_)restart\w*", re.I)),
+    ("reprocessing", re.compile(r"(?:^|\W|_)reprocess\w*", re.I)),
+    ("replay", re.compile(r"(?:^|\W|_)replay(?:\W|_|$)", re.I)),
+    ("backfill", re.compile(r"(?:^|\W|_)backfill(?:\W|_|$)", re.I)),
+    ("resume", re.compile(r"(?:^|\W|_)resume(?:\W|_|$)", re.I)),
+    ("failed run", re.compile(r"failed[_ -]?run", re.I)),
+    ("after failure", re.compile(r"after[_ -]?failure", re.I)),
+    ("repair", re.compile(r"(?:^|\W|_)repair(?:\W|_|$)", re.I)),
+    ("post-failure reconciliation", re.compile(r"reconcile[_ -]?after", re.I)),
+)
+#: Common names for adjacent or explicitly compared data layers. Each pair is
+#: bounded so unrelated mentions elsewhere in a large notebook do not qualify.
+_CROSS_LAYER_PAIRS = (
+    ("Bronze", "Silver", re.compile(r"bronze[\s\S]{0,400}?silver|silver[\s\S]{0,400}?bronze", re.I)),
+    ("Silver", "Gold", re.compile(r"silver[\s\S]{0,400}?gold|gold[\s\S]{0,400}?silver", re.I)),
+    ("Source", "Target", re.compile(r"source[\s\S]{0,400}?target|target[\s\S]{0,400}?source", re.I)),
+    ("Staging", "Final", re.compile(r"staging[\s\S]{0,400}?final|final[\s\S]{0,400}?staging", re.I)),
+    ("Raw", "Curated", re.compile(
+        r"(?:^|\W|_)raw(?:\W|_)[\s\S]{0,400}?curated|"
+        r"curated[\s\S]{0,400}?(?:^|\W|_)raw(?:\W|_|$)",
+        re.I,
+    )),
+    ("Landing", "Curated", re.compile(r"landing[\s\S]{0,400}?curated|curated[\s\S]{0,400}?landing", re.I)),
+)
+_COUNT_COMPARISON = re.compile(
+    r"\.count\s*\(\s*\)\s*(?:==|!=|<|>|<=|>=)|"
+    r"\b\w*count\w*\s*(?:==|!=|<|>|<=|>=)\s*\w*count\w*",
     re.IGNORECASE,
 )
-#: It proves the layers agree before letting the run continue.
-_INTEGRITY_ASSERT = re.compile(
-    r"assert\b|\braise\s+\w*(?:Error|Exception)|"
-    r"\.count\s*\(\s*\)\s*(?:==|!=|<|>)|"
-    r"if\s+\w*count\w*\s*(?:==|!=|<|>)|"
-    r"mismatch|out[_ -]?of[_ -]?sync|integrity[_ -]?check|validate[_ -]?(?:layer|integrity)",
+_KEY_SET_COMPARISON = re.compile(
+    r"left[_ -]?anti|exceptAll\s*\(|\.subtract\s*\(|mismatch|out[_ -]?of[_ -]?sync",
     re.IGNORECASE,
 )
-#: …and it looks at more than one layer while doing so.
-_CROSS_LAYER = re.compile(
-    r"bronze[\s\S]{0,400}?silver|silver[\s\S]{0,400}?gold|"
-    r"source[\s\S]{0,400}?target|staging[\s\S]{0,400}?final",
+_VALUE_COMPARISON = re.compile(
+    r"checksum|hash[_ -]?(?:diff|compare|match)|compare[_ -]?(?:values|columns)|"
+    r"validate[_ -]?(?:layer|integrity)",
     re.IGNORECASE,
 )
+_INTEGRITY_ENFORCEMENT = re.compile(
+    r"\bassert\b|\braise\s+\w*(?:Error|Exception)",
+    re.IGNORECASE,
+)
+
+
+def _cross_layer_pair(code: str) -> tuple[str, str] | None:
+    for first, second, pattern in _CROSS_LAYER_PAIRS:
+        if pattern.search(code):
+            return first, second
+    return None
+
+
+def _recovery_contexts(code: str) -> list[str]:
+    return [label for label, pattern in _RECOVERY_CONTEXTS if pattern.search(code)]
+
+
+def _integrity_methods(code: str) -> list[str]:
+    methods: list[str] = []
+    if _COUNT_COMPARISON.search(code):
+        methods.append("row-count comparison")
+    if _KEY_SET_COMPARISON.search(code):
+        methods.append("key/set mismatch comparison")
+    if _VALUE_COMPARISON.search(code):
+        methods.append("value/checksum validation")
+    return methods
 
 
 @check(
@@ -665,17 +713,48 @@ def nb_post_failure_integrity(ctx: CheckContext) -> Verdict:
     """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
-    code = notebook_code(ctx.obj)
-    if not _RECOVERY_CONTEXT.search(code):
-        return not_applicable("Notebook implements no recovery / restart / replay path")
-    if not _CROSS_LAYER.search(code):
-        return not_applicable("Recovery path touches only one layer — nothing to "
-                              "cross-check against")
-    ok = bool(_INTEGRITY_ASSERT.search(code))
-    return binary(ok, "Recovery path validates integrity across layers before continuing"
-                  if ok else
-                  "Recovery/replay path reprocesses across layers but never asserts the "
-                  "layers agree — a partially-written layer is trusted as complete")
+    code = executable_code(ctx.obj)
+    recovery_contexts = _recovery_contexts(code)
+    if not recovery_contexts:
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' contains no executable recovery, restart, replay, "
+            "reprocessing, backfill, or failed-run path"
+        )
+    layer_pair = _cross_layer_pair(code)
+    if not layer_pair:
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' has a {', '.join(recovery_contexts)} path but no recognized "
+            "cross-layer pair (Bronze/Silver, Silver/Gold, Source/Target, Staging/Final, "
+            "Raw/Curated, or Landing/Curated) to compare"
+        )
+
+    methods = _integrity_methods(code)
+    enforced = bool(_INTEGRITY_ENFORCEMENT.search(code))
+    first_layer, second_layer = layer_pair
+    subject = (
+        f"Notebook '{ctx.obj_name}' declares post-failure context(s) "
+        f"[{', '.join(recovery_contexts)}] and compares the {first_layer} and "
+        f"{second_layer} layers"
+    )
+    if not methods:
+        return binary(
+            False,
+            f"{subject}, but no row-count, key/set, value, or checksum comparison is "
+            "implemented. The recovery can trust a partially written layer as complete",
+        )
+    method_detail = ", ".join(methods)
+    if not enforced:
+        return binary(
+            False,
+            f"{subject} using {method_detail}, but no assertion or raised exception blocks "
+            "continuation on a mismatch. Differences can therefore be detected and ignored",
+        )
+    return binary(
+        True,
+        f"{subject} using {method_detail}. An assertion or raised exception blocks "
+        "continuation when the layers disagree. This verdict verifies saved notebook logic, "
+        "not the current data values or the pipeline's failure dependency",
+    )
 
 
 # -- 9.3.2 — the write itself is a keyed upsert --------------------------------
