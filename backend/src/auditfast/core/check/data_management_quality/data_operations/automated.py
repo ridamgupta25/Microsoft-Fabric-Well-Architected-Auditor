@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 
 from auditfast.core.check._notebook import executable_code, notebook_code
-from auditfast.core.check.helpers import Verdict, binary, covered, not_applicable, note
+from auditfast.core.check.helpers import Verdict, binary, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import LAYER_ITEM_TYPES, Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
@@ -154,12 +154,11 @@ def notebook_format_validation(ctx: CheckContext) -> Verdict:
     layers=(Layer.OPERATIONS,), requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def notebook_standardization(ctx: CheckContext) -> Verdict:
-    """Notebook transformations standardize dates, codes, and reference mappings.
+    """Notebook transformations standardize incoming dates and codes.
 
-    Scored as *coverage* of the three practices rather than all-or-nothing: a
-    notebook that standardises dates and codes but maps no reference values has
-    done two thirds of the work, and reporting that as a flat failure told the
-    reader nothing about what was already in place.
+    Reference mapping was deliberately dropped from this point (commit 7ce7af1):
+    a ``lookup``/``join`` against a code table is too common a shape to read as
+    evidence of *standardisation*, and requiring it produced false failures.
 
     Reads ``executable_code`` so a commented-out ``to_date(...)`` cannot pass.
     """
