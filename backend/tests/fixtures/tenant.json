@@ -147,6 +147,9 @@
         { "id": "pl-3", "type": "DataPipeline", "displayName": "orchestrator_daily", "sensitivityLabel": null, "lastRunUtc": "2025-01-15T04:00:00Z" },
         { "id": "rf-1", "type": "Reflex", "displayName": "AlertRule", "sensitivityLabel": null, "lastRunUtc": "2026-07-01T04:00:00Z" }
       ],
+      "activators": {
+        "AlertRule": { "rules": 2, "active_rules": 2, "sources": 1, "actions": 1 }
+      },
       "pipelines": {
         "orchestrator_daily": {
           "name": "orchestrator_daily",

@@ -432,23 +432,23 @@ EVENT_SOURCE_TYPES: frozenset[str] = frozenset({
     id="WS-ACTIVATOR", ref="10.5.1",
     title="Data Activator (or equivalent) triggers configured for critical events",
     pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=(Layer.OPERATIONS,), requires=[Resource.ITEMS], required=True,
+    layers=(Layer.OPERATIONS,), requires=[Resource.ITEMS, Resource.ACTIVATOR_DEFINITIONS],
+    required=True,
 )
 def activator_configured(ctx: CheckContext) -> Verdict:
     """The workspace has *some* event-driven alerting on its operational items.
 
-    **Not Activator-only.** Microsoft documents several Fabric-native ways to be
-    told when something fails, and a workspace using any of them has met the
-    point: an Activator/Reflex item, a pipeline ending in a Teams or Outlook
-    activity (which Microsoft's own "create alerts for pipeline runs" guidance
-    recommends), or scheduled-job failure emails. Requiring a Reflex item failed
-    workspaces that alert exactly the way the documentation suggests.
+    **Presence is not enough.** An Activator/Reflex item that was created but
+    carries no rule triggers nothing, so the check reads the Activator's
+    definition and credits it only when it holds a live rule. A pipeline ending
+    in a Teams/Outlook activity, which Microsoft's "create alerts for pipeline
+    runs" guidance recommends, is accepted as the documented alternative.
 
-    **What it cannot determine.** Whether the alert routes to someone who acts on
-    it, and whether *scheduled-job failure notifications* are switched on - that
-    setting is not exposed on the items listing. So a workspace with no readable
-    alerting is reported as *none found*, with the alternatives named, rather
-    than as a definite absence.
+    **What it cannot determine.** Whether the rule's threshold is the *right* one,
+    whether the alert routes to someone who acts on it, and whether
+    *scheduled-job failure notifications* are switched on - that setting is not
+    exposed on the items listing. An Activator whose definition could not be read
+    is reported as *unverified* (N/A), never as a definite absence.
     """
     if not ctx.workspace.has(Resource.ITEMS):
         return not_applicable("Workspace items could not be read from Fabric")
@@ -460,21 +460,50 @@ def activator_configured(ctx: CheckContext) -> Verdict:
             "Workspace holds no pipeline, notebook, dataset, or stream, so there "
             "is no critical event for an Activator to trigger on"
         )
-    if activators:
-        names = ", ".join(sorted(i.display_name or i.id for i in activators)[:3])
-        return binary(True, f"{len(activators)} Data Activator item(s) present ({names}) "
-                            f"watching {len(sources)} operational item(s)")
 
-    # No Activator item - but a pipeline that ends in a Teams/Outlook notification
-    # is the alternative Microsoft documents, and counts just as well.
+    # An Activator with a live rule is the strongest evidence. Read the parsed
+    # rule counts from each Activator's definition.
+    summaries = [ctx.workspace.activators.get(i.display_name or i.id) for i in activators]
+    summaries = [s for s in summaries if s]
+    active_rules = sum(s.get("active_rules", 0) for s in summaries)
+    total_rules = sum(s.get("rules", 0) for s in summaries)
+    if activators and active_rules:
+        names = ", ".join(sorted(i.display_name or i.id for i in activators)[:3])
+        return binary(True, f"{len(activators)} Data Activator item(s) with {active_rules} active "
+                            f"rule(s) watching {len(sources)} operational item(s) ({names})")
+
+    # No live Activator rule — a pipeline that ends in a Teams/Outlook
+    # notification is the alternative Microsoft documents, and counts just as well.
     notifying = _pipelines_with_notification(ctx)
     if notifying:
         return binary(
             True,
-            f"No Data Activator item, but {len(notifying)} pipeline(s) alert through a "
+            f"No live Data Activator rule, but {len(notifying)} pipeline(s) alert through a "
             f"Teams/Outlook/webhook activity ({', '.join(notifying[:3])}) - the "
             f"alternative Microsoft's pipeline-alerting guidance recommends"
         )
+
+    # Activators exist but their rules could not be read — cannot judge the depth,
+    # so this is unverified, not a definite gap.
+    if activators and not ctx.workspace.has(Resource.ACTIVATOR_DEFINITIONS):
+        names = ", ".join(sorted(i.display_name or i.id for i in activators)[:3])
+        return not_applicable(
+            f"{len(activators)} Data Activator item(s) present ({names}) but their rule "
+            f"definitions could not be read (getDefinition needs Item.ReadWrite), and no "
+            f"pipeline notification was found - trigger configuration is unverified"
+        )
+
+    # Activators exist and were readable but carry no live rule — the empty-item gap.
+    if activators:
+        names = ", ".join(sorted(i.display_name or i.id for i in activators)[:3])
+        state = "every rule is paused" if total_rules else "no rules are configured"
+        return binary(
+            False,
+            f"{len(activators)} Data Activator item(s) present ({names}) but {state}, and no "
+            f"pipeline ends in a Teams/Outlook/webhook notification - {len(sources)} operational "
+            f"item(s) have no live critical-event trigger"
+        )
+
     return binary(
         False,
         f"No event-driven alerting found for {len(sources)} operational item(s): no "
