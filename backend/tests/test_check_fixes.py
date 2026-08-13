@@ -240,12 +240,11 @@ def test_notebook_format_validation_rejects_missing_format_controls():
     assert notebook_format_validation(_ctx(_nb("records = spark.read.json('Files/eam.json')"))).score == _FAIL
 
 
-def test_notebook_standardization_covers_dates_codes_and_reference_mapping():
+def test_notebook_standardization_covers_dates_and_codes():
     code = """
 records = spark.read.json('Files/eam.json')
 records = records.withColumn('event_date', to_date('event_date'))
 records = records.withColumn('employee_code', upper(trim('employee_code')))
-records = records.join(reference_mapping, 'employee_code')
 """
     assert notebook_standardization(_ctx(_nb(code))).score == _PASS
 
@@ -346,6 +345,27 @@ def test_layer_specific_checks_return_na_when_not_applicable():
     assert nb_silver_quality(notebook).status is Status.NA
     assert nb_eam_ingest(notebook).status is Status.NA
     assert pl_bulk_move(pipeline).score == _FAIL
+
+
+def test_bulk_move_is_na_for_notebook_only_pipeline():
+    # A pipeline that only runs a notebook moves no bulk data itself, so the
+    # bulk-vs-row-by-row question is judged in the notebook, not here.
+    pipeline = _pipe(
+        {"name": "Run notebook", "type": "TridentNotebook",
+         "typeProperties": {"notebookId": "abc"}},
+        {"name": "Read control table", "type": "Lookup"},
+    )
+    assert pl_bulk_move(_ctx(pipeline)).status is Status.NA
+
+
+def test_bulk_move_evidence_names_the_activity_and_reason():
+    # A Copy with no bulk-tuning token fails, and the evidence must name the
+    # data-move activity and say which patterns it looked for.
+    pipeline = _pipe({"name": "Move rows", "type": "Copy"})
+    verdict = pl_bulk_move(_ctx(pipeline))
+    assert verdict.score == _FAIL
+    assert "1 Copy" in verdict.evidence
+    assert "parallelCopies" in verdict.evidence
 
 
 # -- DQ RULES / RESTART / AUDIT LOG / FAILURE ALERT ---------------------------

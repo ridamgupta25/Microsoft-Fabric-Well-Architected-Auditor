@@ -235,6 +235,24 @@ def test_offending_measures_are_named_against_their_model():
     assert "Bad Measure" in details[0].evidence
 
 
+def test_scored_dax_verdict_names_the_models_and_problem_measures():
+    """The aggregate row is self-contained: it names every model it checked and the
+    measures that break a practice, so the reviewer needn't cross-reference detail rows."""
+    no_var_only = " + ".join(f"SUM(t[a{i}])" for i in range(40))  # >400 chars, no VAR
+    passing = "DIVIDE(SUM(Sales[Amount]), SUM(Sales[Quantity]), 0) + AVERAGE(Sales[Discount])"
+    assert len(_normalised(no_var_only)) > 400
+    models = {"SalesModel": {"measures": [
+        {"name": "Bad Measure", "expression": no_var_only},
+        {"name": "Good Measure", "expression": passing},
+    ]}}
+    scored = _scored(complex_measures_use_variables(_model_ctx(models)))
+    assert scored.status is None                       # the scored aggregate, not a note
+    assert "1 of 2" in scored.evidence
+    assert "SalesModel" in scored.evidence             # every model it checked is named
+    assert "Bad Measure (no VAR)" in scored.evidence   # the failing measure + its fault
+    assert "Good Measure" not in scored.evidence       # a compliant measure is not flagged
+
+
 def test_named_measures_are_capped_so_one_model_cannot_fill_the_report():
     long_no_var = "CALCULATE(SUM(t[Var Amount]), " + "FILTER(t, t[a] = 1), " * 25 + "ALL(t))"
     models = {"M": {"measures": [

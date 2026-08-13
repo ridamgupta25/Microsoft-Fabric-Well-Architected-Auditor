@@ -50,11 +50,6 @@ _CODE_STANDARDIZATION = re.compile(
     r"regexp_replace\s*\(|normalize[_ ]?code|standardize[_ ]?code|clean[_ ]?code",
     re.IGNORECASE,
 )
-_REFERENCE_MAPPING = re.compile(
-    r"reference[_ ]?(?:map|mapping|table)|code[_ ]?(?:map|mapping)|lookup|"
-    r"map(?:ping)?[_ ]?table|join\s*\([^\n]{0,160}(?:code|reference|lookup)",
-    re.IGNORECASE,
-)
 
 
 @check(
@@ -154,7 +149,7 @@ def notebook_format_validation(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-STANDARDIZE", ref="5.3.5",
-    title="Standardization: consistent formatting (dates, codes, reference mappings)",
+    title="Standardization: consistent formatting (dates, codes)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -177,12 +172,23 @@ def notebook_standardization(ctx: CheckContext) -> Verdict:
     checks = {
         "date formatting": bool(_DATE_STANDARDIZATION.search(code)),
         "code formatting": bool(_CODE_STANDARDIZATION.search(code)),
-        "reference mapping": bool(_REFERENCE_MAPPING.search(code)),
     }
     present = [name for name, ok in checks.items() if ok]
     missing = [name for name, ok in checks.items() if not ok]
-    evidence = (f"{len(present)} of {len(checks)} standardization practices present"
-                + (f" ({', '.join(present)})" if present else ""))
-    if missing:
-        evidence += f"; not found: {', '.join(missing)}"
-    return covered(len(present), len(checks), evidence)
+    if not missing:
+        return binary(True, (
+            "Incoming data is standardized — date formatting (to_date / to_timestamp / "
+            "date_format / cast to date) and code formatting (upper / lower / trim / "
+            "regexp_replace) are both present"
+        ))
+    hints = {
+        "date formatting":
+            "to_date / to_timestamp / date_format / strptime / cast to date or timestamp",
+        "code formatting":
+            "upper / lower / trim / ltrim / rtrim / regexp_replace / normalize_code",
+    }
+    missing_desc = "; ".join(f"{m} (looked for {hints[m]})" for m in missing)
+    found_desc = ", ".join(present) if present else "none"
+    return binary(False, (
+        f"Standardization missing: {missing_desc}. Present: {found_desc}"
+    ))
