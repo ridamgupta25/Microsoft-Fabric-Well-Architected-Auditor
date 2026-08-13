@@ -15,7 +15,7 @@ from auditfast.core.check._pipeline import (
     script_sql,
     walk_activities,
 )
-from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable
+from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
@@ -164,7 +164,22 @@ def failure_notification(ctx: CheckContext) -> Verdict:
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def restart_from_failure(ctx: CheckContext) -> Verdict:
-    """Pipeline definitions expose a restart boundary or durable progress marker."""
+    """Restart-from-failure is a Fabric platform capability, so this is reported, not scored.
+
+    **Why this is unscored.** Fabric Data Factory provides rerun-from-failure for
+    *every* pipeline, with nothing to configure: the run-history view offers
+    "rerun the entire pipeline, or rerun only from the failed activity"
+    (``learn.microsoft.com/fabric/data-factory/monitor-pipeline-runs``). The
+    capability the point asks about is therefore always present, and searching a
+    pipeline definition for a "restart boundary" failed pipelines for not
+    declaring something Fabric never asked them to declare.
+
+    **What is still worth reporting.** A rerun only helps if re-running an
+    activity is *safe*. That is idempotency, which ``PL-IDEMPOTENT`` (ref 2.4.6)
+    scores, and checkpointing, which shows up as watermark/incremental state. So
+    this emits an unscored note naming what the pipeline does have, and points at
+    the check that does the judging.
+    """
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
     acts = activities(ctx.obj)
@@ -172,9 +187,15 @@ def restart_from_failure(ctx: CheckContext) -> Verdict:
     if not data_acts:
         return not_applicable("Pipeline has no data-movement activity to restart")
     blob = json.dumps(ctx.obj)
-    ok = bool(_RESTART_BOUNDARY.search(blob))
-    return binary(ok, "Restart boundary/checkpoint or durable progress marker detected" if ok
-                  else "No restart-from-failure boundary; a retry may re-run the full pipeline")
+    marker = bool(_RESTART_BOUNDARY.search(blob))
+    return note(
+        "Fabric supports rerun-from-failed-activity for every pipeline with no "
+        "configuration, so restart capability is not scored here"
+        + (". This pipeline also keeps a durable progress marker (watermark or "
+           "checkpoint), so a rerun can resume rather than repeat" if marker else
+           ". No durable progress marker was found, so a rerun repeats the "
+           "activity - whether that is safe is scored by ref 2.4.6 (idempotency)")
+    )
 
 
 @check(
@@ -302,27 +323,44 @@ def notebook_bad_records(ctx: CheckContext) -> Verdict:
 def retry_values(ctx: CheckContext) -> Verdict:
     """Where retries are configured, the count is bounded and an interval is set.
 
-    A retry with no interval hammers a failing dependency; an unbounded count
-    turns a transient error into an hours-long hang. Only activities that already
-    declare a retry are judged — whether to retry at all is PL-RETRY's job.
+    A retry with no interval hammers a failing dependency. Only activities that
+    already declare a retry are judged - whether to retry at all is PL-RETRY's job.
+
+    **On the upper bound.** Fabric's documented range is 1-1000 with no
+    infinite option (``learn.microsoft.com/fabric/data-factory/activity-overview``),
+    so an unbounded retry is not something a pipeline *can* configure. What a high
+    count does mean is a long tail of failure: the threshold below is a
+    house opinion, not a platform limit, and is settable per project.
     """
     with_retry = [a for a in activities(ctx.obj)
                   if (a.get("policy") or {}).get("retry", 0) >= 1]
     if not with_retry:
         return not_applicable("No activity declares a retry policy")
 
+    limit = ctx.setting("max_retry_count", _DEFAULT_MAX_RETRY)
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = _DEFAULT_MAX_RETRY
+
     def sane(activity: dict) -> bool:
         policy = activity.get("policy") or {}
         count = policy.get("retry", 0)
         interval = policy.get("retryIntervalInSeconds", 0)
-        return 1 <= count <= 10 and bool(interval) and interval > 0
+        return 1 <= count <= limit and bool(interval) and interval > 0
 
     good = [a for a in with_retry if sane(a)]
     return covered(
         len(good), len(with_retry),
         f"{len(good)} of {len(with_retry)} retrying activities set a bounded count "
-        f"(1-10) and a positive interval",
+        f"(1-{limit}) and a positive interval. Fabric allows 1-1000 and has no "
+        f"infinite option, so the upper bound here is a project convention",
     )
+
+
+#: Retry attempts above which a failure takes long enough to look like a hang.
+#: Fabric permits up to 1000; this is a house convention, overridable per project.
+_DEFAULT_MAX_RETRY = 10
 
 
 @check(

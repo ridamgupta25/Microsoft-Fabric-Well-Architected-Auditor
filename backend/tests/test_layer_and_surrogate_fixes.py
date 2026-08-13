@@ -407,6 +407,31 @@ def test_ws_labels_is_na_when_items_are_unreadable():
     assert _run("WS-LABELS", ws, "ws", None).score is None
 
 
+def test_2_1_1_is_na_when_no_naming_convention_is_configured():
+    """Failing every pipeline against ``None`` is a finding invented from missing config.
+
+    Flagged by validate_all as one-sided: FAIL on all 50 pipelines of a real
+    estate, because the project set no ``pipeline_naming_convention``.
+    """
+    defn = {"properties": {"activities": [{"name": "Copy", "type": "Copy"}]}}
+    ws = _ws(pipelines={"Bronze": defn})
+    verdict = _run("PL-NAME", ws, "Bronze", defn)
+    assert verdict.score is None, "no configured convention means nothing to judge"
+    assert "pipeline_naming_convention" in verdict.evidence
+
+
+def test_2_1_1_still_judges_when_a_convention_is_configured():
+    defn = {"properties": {"activities": [{"name": "Copy", "type": "Copy"}]}}
+    ws = _ws(pipelines={"PL_Bronze_Load": defn, "random": defn})
+    settings = {"pipeline_naming_convention": r"^PL_"}
+    spec = _spec("PL-NAME")
+
+    ok = spec.fn(CheckContext(ws, settings, "PL_Bronze_Load", defn))
+    bad = spec.fn(CheckContext(ws, settings, "random", defn))
+    assert ok.score == 3
+    assert bad.score == 0
+
+
 # -- remediation --------------------------------------------------------------
 
 @pytest.mark.parametrize("ref", ["1.2.3", "1.2.5", "4.2.3", "4.2.4", "4.5.1", "4.5.6", "4.5.9"])

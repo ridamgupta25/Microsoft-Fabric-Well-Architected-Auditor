@@ -221,10 +221,17 @@ _PLATFORM_TABLE_PREFIXES: tuple[str, ...] = (
     "managed_delta_table_", "dm_db_", "dm_exec_", "dm_", "sys_", "sys.",
     "msdyn_", "adx_", "mspp_", "powerpages", "flowsession", "workflowlog",
 )
-#: Exact platform table names that carry no distinguishing prefix.
+#: Exact platform table names that carry no distinguishing prefix. The
+#: ``queryinsights`` group is Fabric's own SQL-endpoint telemetry: every
+#: Lakehouse and Warehouse exposes it, nobody models it, and it satisfies audit
+#: vocabulary by construction (``last_run_start_time``, ``rows_inserted``).
 _PLATFORM_TABLE_NAMES: frozenset[str] = frozenset({
     "syncerror", "tracelog", "plugintracelog", "ontology",
     "asyncoperation", "systemuser", "audit", "auditbase",
+    # queryinsights - Fabric SQL analytics endpoint telemetry views.
+    "exec_requests_history", "exec_sessions_history", "frequently_run_queries",
+    "long_running_queries", "managed_delta_tables", "sql_pool_insights",
+    "sql_query_insights", "query_insights",
 })
 
 
