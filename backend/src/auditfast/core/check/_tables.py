@@ -230,8 +230,8 @@ _PLATFORM_TABLE_NAMES: frozenset[str] = frozenset({
     "asyncoperation", "systemuser", "audit", "auditbase",
     # queryinsights - Fabric SQL analytics endpoint telemetry views.
     "exec_requests_history", "exec_sessions_history", "frequently_run_queries",
-    "long_running_queries", "managed_delta_tables", "sql_pool_insights",
-    "sql_query_insights", "query_insights",
+    "long_running_queries", "managed_delta_tables", "external_delta_tables",
+    "sql_pool_insights", "sql_query_insights", "query_insights",
 })
 
 

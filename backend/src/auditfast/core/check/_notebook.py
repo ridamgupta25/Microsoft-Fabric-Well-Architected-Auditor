@@ -48,6 +48,17 @@ def executable_code(definition: dict) -> str:
     )
 
 
+def executable_code_no_strings(definition: dict) -> str:
+    """Code cells with both ``#`` comments and string literals removed.
+
+    Import detection must not fire on an ``import``/``from`` that only appears
+    inside a docstring or string literal. Because ``from`` is also an ordinary
+    English word, a docstring line such as ``from raw we derive silver`` would
+    otherwise be misread as an import, so string bodies are dropped too.
+    """
+    return _STRING_OR_COMMENT.sub("", notebook_code(definition))
+
+
 #: SQL ``/* ... */`` block comment and ``--`` line comment. Spark SQL embedded in
 #: ``spark.sql("...")`` strings uses these, which :func:`executable_code` keeps
 #: (it only strips Python ``#`` comments and preserves string literals).

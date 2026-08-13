@@ -637,6 +637,24 @@ class LiveFabricProvider:
         return f"{name} ({item_id[:8]})"
 
     @staticmethod
+    def _annotate_partitions(ctx: WorkspaceContext, onelake, workspace_id: str, item) -> None:
+        """Record each Delta table's partition columns, and that we managed to look.
+
+        ``partitions_listed`` is what lets a check treat "no partition columns" as
+        a finding rather than as missing data.
+        """
+        partitions, failure = onelake.lakehouse_table_partitions(workspace_id, item.id)
+        if failure:
+            return
+        store = item.display_name or item.id
+        for table_name, partition_columns in partitions.items():
+            entry = ctx.tables.get(table_name) or ctx.tables.get(f"{store}.{table_name}")
+            if entry is None:
+                continue
+            entry["partitionColumns"] = partition_columns
+            entry["partitions_listed"] = True
+
+    @staticmethod
     def _record_failures(ctx: WorkspaceContext, resource: Resource,
                          attempted: int, read: int, forbidden: int, transient: int,
                          empty: int = 0, reasons: dict[str, int] | None = None) -> None:
@@ -1220,6 +1238,7 @@ class LiveFabricProvider:
                             ctx.lakehouse_files, item.display_name or item.id, item.id
                         )
                         ctx.lakehouse_files[key] = summary
+                        self._annotate_partitions(ctx, onelake, workspace_id, item)
             self._record_failures(ctx, Resource.LAKEHOUSE_FILES,
                                   attempted, read, forbidden, transient)
             log.info("fetch %s: lakehouse Files summaries read for %d of %d lakehouse(s)",
