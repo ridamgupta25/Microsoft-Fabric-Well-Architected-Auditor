@@ -185,10 +185,21 @@ class Resource(StrEnum):
     #: no refresh rows and no refresh history.
     SEMANTIC_MODEL_REFRESH_SCHEDULE = "semanticModelRefreshSchedule"
     CONNECTIONS = "connections"
+    #: Report → semantic-model bindings, from the Power BI *Get Reports In Group*
+    #: API (``/groups/{id}/reports``). Each row carries the report's ``datasetId``,
+    #: which is the only readable evidence of which model a report is built on.
+    #: An ordinary delegated ``Report.Read.All`` — **not** tenant-admin; without a
+    #: Power BI token it is unreadable and its checks report N/A. Report
+    #: definitions and pages are deliberately never fetched.
+    REPORTS = "reports"
     #: Per-item run/refresh recency, read from the job-scheduler history
     #: (``…/items/{id}/jobs/instances``) — the List Items API carries no
     #: timestamp, so this is a one-call-per-runnable-item enrichment.
     ITEM_RUN_HISTORY = "itemRunHistory"
+    #: Aggregated OneLake Files-section listing per Lakehouse, read through the
+    #: ADLS Gen2 List Path API using a Storage-audience token. The provider stores
+    #: only bounded counts/buckets, never individual file paths.
+    LAKEHOUSE_FILES = "lakehouseFiles"
 
 
 class Status(StrEnum):

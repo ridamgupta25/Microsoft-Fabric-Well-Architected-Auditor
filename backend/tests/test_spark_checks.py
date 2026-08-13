@@ -51,6 +51,22 @@ def test_merge_absent_is_na():
     assert v.status is Status.NA
 
 
+def test_merge_ignores_sql_commented_delete():
+    # A real one-time INSERT plus a SQL ``--`` commented-out DELETE is not the
+    # sequential DELETE+INSERT upsert anti-pattern — the DELETE is disabled.
+    v = delta_merge(_ctx(_nb(
+        "spark.sql('''\nINSERT INTO ctl SELECT * FROM src;\n-- DELETE from ctl;\n''')"
+    )))
+    assert v.status is Status.NA
+
+
+def test_merge_ignores_python_commented_dml():
+    v = delta_merge(_ctx(_nb(
+        "# spark.sql('DELETE FROM t')\n# spark.sql('INSERT INTO t SELECT * FROM s')"
+    )))
+    assert v.status is Status.NA
+
+
 # -- DELTA-OPTIMIZE ------------------------------------------------------------
 
 def test_optimize_after_write_passes():
@@ -298,6 +314,12 @@ def test_profile_passes_for_healthy_long_running_application():
 
 
 def test_profile_passes_for_long_running_application_even_when_ui_has_issues():
+    """3.5.11 scores *coverage*; the issues themselves belong to 3.5.1.
+
+    Both checks call the same ``performance_issues()`` helper, so scoring the
+    issues here failed one notebook twice under two refs for a single underlying
+    problem. Profiling data being *available* is what this one asks.
+    """
     v = spark_profile(_ctx(_monitored_nb(
         usage={"duration": 600_000},
         advice=[{"description": "Shuffle skew requires optimization"}], stages=[],
@@ -306,10 +328,29 @@ def test_profile_passes_for_long_running_application_even_when_ui_has_issues():
 
 
 def test_profile_fails_for_long_running_application_without_profiling_evidence():
+    """No metrics at all is a real, scoreable gap: the job cannot be reviewed."""
     v = spark_profile(_ctx(_monitored_nb(
         usage={"duration": 600_000},
     )))
     assert v.score == 0
+    assert "cannot be reviewed" in v.evidence
+
+
+def test_profile_and_spark_ui_do_not_both_score_the_same_issue():
+    """The dedup boundary, pinned in both directions.
+
+    One long-running notebook with a real skew problem: 3.5.1 must fail it (the
+    issue is real), 3.5.11 must pass it (the metrics needed to find that issue
+    exist, which is all this check claims).
+    """
+    from auditfast.core.check.performance_capacity.data_prep.automated import spark_ui_review
+
+    nb = _monitored_nb(
+        usage={"duration": 600_000},
+        advice=[{"description": "Shuffle skew requires optimization"}], stages=[],
+    )
+    assert spark_ui_review(_ctx(nb)).score == 0, "3.5.1 owns the issue"
+    assert spark_profile(_ctx(nb)).score == 3, "3.5.11 owns only the coverage"
 
 
 def test_profile_is_na_for_short_application():

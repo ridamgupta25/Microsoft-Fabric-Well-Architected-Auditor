@@ -19,10 +19,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 
-from ..clients.errors import WorkspaceAccessError
 from .check.helpers import EMPTY_REMEDIATION, RemediationBook, Verdict, not_applicable
 from .check.registry import REGISTRY, CheckRegistry
 from .enums import Layer, Pillar, Resource, Scope, Severity, Status
+from .errors import WorkspaceAccessError
 from .models import CheckContext, CheckResult, CheckSpec, WorkspaceContext
 from .scoring import status_from_score
 
@@ -132,6 +132,10 @@ def read_incomplete_result(workspace: WorkspaceContext, resource_value: str, sta
         kinds.append(f"{transient} throttled/timed out (HTTP 429/5xx/timeout)")
     if empty:
         kinds.append(f"{empty} returned no usable definition")
+    reasons = stat.get("reasons") or {}
+    if reasons:
+        top = sorted(reasons.items(), key=lambda kv: -kv[1])[:3]
+        kinds.append("reasons: " + "; ".join(f"{r} x{c}" for r, c in top))
     evidence = (
         f"{failed} of {attempted} {label} could not be read — {', '.join(kinds)}. "
         f"Re-sign-in with Item.ReadWrite.All and a workspace role that can read item "

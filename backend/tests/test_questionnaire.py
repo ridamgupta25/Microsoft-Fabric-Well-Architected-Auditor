@@ -68,6 +68,8 @@ def test_build_questionnaire_scopes_by_pillar_and_layer():
         "OPS-GIT-IGNORE", "OPS-GIT-COMMIT-MSG", "OPS-GIT-PR-REVIEW",
         "OPS-GIT-MIN-REVIEWERS", "OPS-WH-SCHEMA-SCM", "OPS-DEPLOY-RULES",
         "OPS-ENV-PARITY", "OPS-SLA-HISTORY",
+        "Q-CAT3-RELEASE-GOVERNANCE", "Q-CAT3-DR-READINESS",
+        "Q-CAT3-DATA-FRESHNESS", "Q-CAT3-INCIDENT-RESPONSE",
     }
     # Every item is serialized with its question and scored options for the UI.
     for item in q:
@@ -81,7 +83,7 @@ def test_build_questionnaire_omits_unselected_pillars():
         pillars=["Security"],
         workspaces=[{"id": "w", "role": "Mixed"}],
     )
-    assert q == []
+    assert {item["id"] for item in q} == {"Q-CAT3-ACCESS-REVIEWS"}
 
 
 # -- answers score and fan out per applicable workspace ------------------------

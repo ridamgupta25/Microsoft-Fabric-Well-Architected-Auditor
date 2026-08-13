@@ -41,9 +41,13 @@ class Item:
 
     @classmethod
     def from_api(cls, raw: dict) -> Item:
+        # Two spellings are real: the Fabric Core items API documents
+        # ``sensitivityLabel.id``, while the Power BI admin/scanner API returns
+        # ``sensitivityLabel.labelId``. Accepting both means a label read through
+        # either route lands in the same field.
         label = raw.get("sensitivityLabel")
         if isinstance(label, dict):
-            label = label.get("labelId")
+            label = label.get("id") or label.get("labelId")
         return cls(
             id=raw.get("id") or "",
             type=raw.get("type") or "",
@@ -142,6 +146,18 @@ class WorkspaceContext:
     #: never stored; TLS version and health remain unknown unless a provider
     #: supplies explicit evidence for them.
     connections: list[dict] = field(default_factory=list)
+    #: Report → semantic-model bindings, one dict per report in the workspace:
+    #: ``{"id": str, "name": str, "dataset_id": str, "dataset_workspace_id": str}``.
+    #: Only what the reuse checks need — no report definition, no pages, no
+    #: visuals. ``dataset_id`` is empty for a paginated (RDL) report that binds to
+    #: no semantic model, which is a real answer, not a read failure; a failed
+    #: read marks the resource unavailable instead.
+    reports: list[dict] = field(default_factory=list)
+    #: Per-Lakehouse OneLake Files-section summary, keyed by Lakehouse display
+    #: name. Each value is a bounded aggregate only: counts, byte buckets, a small
+    #: top-level folder sample, depth/date counts, and truncation flags. Individual
+    #: file names/paths are deliberately never persisted in the KB.
+    lakehouse_files: dict[str, dict] = field(default_factory=dict)
     #: The Git provider connection details (provider, org, repo, branch, dir) when
     #: the workspace is Git-connected — the authoritative source for item code.
     git_details: dict = field(default_factory=dict)
@@ -234,6 +250,8 @@ class WorkspaceContext:
             "warehouse_audit": self.warehouse_audit,
             "run_history": self.run_history,
             "connections": self.connections,
+            "reports": self.reports,
+            "lakehouse_files": self.lakehouse_files,
             "git_details": self.git_details,
             "unavailable": sorted(r.value for r in self.unavailable),
             "read_failures": self.read_failures,
@@ -262,6 +280,8 @@ class WorkspaceContext:
             warehouse_audit=dict(data.get("warehouse_audit", {})),
             run_history=dict(data.get("run_history", {})),
             connections=list(data.get("connections", [])),
+            reports=list(data.get("reports", [])),
+            lakehouse_files=dict(data.get("lakehouse_files", {})),
             git_details=dict(data.get("git_details", {})),
             unavailable={Resource(v) for v in data.get("unavailable", [])},
             read_failures=dict(data.get("read_failures", {})),

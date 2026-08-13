@@ -7,31 +7,38 @@ model. Each check is workspace-scoped and aggregates across every table found.
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 
+from auditfast.core.check._notebook import executable_code, notebook_code
 from auditfast.core.check._pipeline import activities as pipeline_activities
+from auditfast.core.check._pipeline import script_sql
+from auditfast.core.check._recency import parse_stamp
 from auditfast.core.check._tables import (
     TABLE_LAYERS,
     col_names,
     columns,
     has_audit_column,
+    has_surrogate_key,
     in_warehouse,
     is_audit_column,
     is_audit_table,
     is_dimension,
     is_fact,
     is_key_column,
+    is_platform_table,
     is_snake_case,
     is_text_column,
     is_timestamp_column,
     key_referent,
+    name_words,
     purpose_tokens,
     store_of,
     tables_by_store,
 )
-from auditfast.core.check.helpers import Verdict, binary, covered, not_applicable
+from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Pillar, Resource, Scope, Severity
-from auditfast.core.models import CheckContext
+from auditfast.core.models import CheckContext, Item
 
 _NO_TABLES = "No lakehouse/warehouse tables were read for this workspace"
 
@@ -123,6 +130,30 @@ _SURROGATE_KEY_NAME = re.compile(r"(?:^|_)(?:sk|surrogate|hash(?:_?key)?)(?:$|_)
 _PK_FK_NAME_HINT = re.compile(r"(?:^|_)(?:pk|fk|primary|foreign)(?:$|_)", re.IGNORECASE)
 _VIEW_PROC_HINT = re.compile(r"(?:^|_)(?:vw|view|sp|proc|procedure)(?:$|_)", re.IGNORECASE)
 _LOGIC_HINT = re.compile(r"(?:merge|join|window|row_number|dedup|rule|calc|business|transform)", re.IGNORECASE)
+
+_DECLARED_WIDTH = re.compile(r"^n?(?:varchar|char)\s*\(\s*(max|\d+)\s*\)", re.IGNORECASE)
+
+#: Widths above this are treated as oversized — they defeat statistics and inflate row size.
+_MAX_TEXT_WIDTH = 4000
+_DECIMAL_PRECISION = re.compile(r"^(?:decimal|numeric)\((\d+)\s*,\s*(\d+)\)$", re.IGNORECASE)
+
+
+_GENERATED_KEY_HINT = re.compile(
+    r"(?:hash|row_?number|row_?num|sequence|seq|surrogate)",
+    re.IGNORECASE,
+)
+#: Column count above which a fact table is worth reviewing for denormalised
+#: attributes. Reported by ``TB-STARSCHEMA`` as context, never scored: how wide is
+#: "too wide" is a modelling judgement, and ``TB-FACT-PURITY`` (4.5.3) is what
+#: scores the underlying defect. On the reference estate every fact sat between 6
+#: and 25 columns, so 30 flags the genuinely unusual rather than the merely broad.
+_WIDE_FACT_COLUMNS = 30
+
+_SAMPLE_LIMIT = 8
+_BUSINESS_KEY_HINT = re.compile(
+    r"(?:business|natural|code|number|_bk$)",
+    re.IGNORECASE,
+)
 
 _SQL_PERMISSION_HINT = (
     "Request workspace Viewer role (CONNECT + ReadData on Warehouse/SQL analytics endpoint and Metadata/Audit DBs) "
@@ -697,19 +728,81 @@ def table_partition_strategy(ctx: CheckContext) -> Verdict:
     required=False,
 )
 def table_audit_columns(ctx: CheckContext) -> Verdict:
-    """Each table records lineage via audit columns (created/modified/batch id).
+    """Each *solution* table records lineage via audit columns (created/modified/batch id).
 
     Matched on the *normalised* column name, so ``CreatedDate``, ``created_date``
     and ``load_dt`` all count. Business dates (``order_date``, ``birth_date``) do
-    not — the event vocabulary is deliberately narrow.
+    not - the event vocabulary is deliberately narrow.
+
+    **Platform and scratch tables are excluded from the population.** A workspace
+    carries hundreds of tables nobody designed: Fabric's own
+    ``managed_delta_table_*`` bookkeeping, SQL ``dm_*`` dynamic-management views,
+    Dynamics ``msdyn_*`` system tables, and Power Query staging tables named with
+    a GUID whose columns are ``Column1..Column8``. Scoring them turned a question
+    about a *deliberate* lineage practice into a headcount of platform noise -
+    on a real estate they were the majority of the "failing" tables, which is why
+    the ratio looked wrong to anyone who checked it by hand.
+
+    **What it cannot determine.** Whether the audit columns are *populated* or
+    maintained on each load - only that the column exists.
     """
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
-    tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
+    tables = {
+        n: t for n, t in ctx.workspace.tables.items()
+        if columns(t) and not is_platform_table(n) and not _is_scratch_table(n, t)
+    }
     if not tables:
-        return not_applicable(_NO_COLS)
+        return not_applicable(
+            "No solution-owned table with readable columns - every table read is "
+            "platform bookkeeping or an unnamed staging table, which carries no "
+            "deliberate audit practice to judge"
+        )
     ok = [n for n, t in tables.items() if has_audit_column(t)]
-    return covered(len(ok), len(tables), f"{len(ok)} of {len(tables)} tables have audit columns")
+    missing = sorted(set(tables) - set(ok))
+    evidence = f"{len(ok)} of {len(tables)} solution tables have audit columns"
+    if missing:
+        shown = ", ".join(missing[:_SAMPLE_LIMIT])
+        if len(missing) > _SAMPLE_LIMIT:
+            shown += f", \u2026(+{len(missing) - _SAMPLE_LIMIT} more)"
+        evidence += f". Without one: {shown}"
+    return covered(len(ok), len(tables), evidence)
+
+
+#: A Power Query / dataflow staging table: the name is a GUID fragment and the
+#: columns were never named. Nobody designed these, so they cannot evidence - or
+#: fail - an audit-column practice.
+_GUID_TABLE_NAME = re.compile(r"^[0-9a-f]{8,}[_-]?[0-9a-f]*$", re.IGNORECASE)
+_UNNAMED_COLUMN = re.compile(r"^column\d+$", re.IGNORECASE)
+
+
+def _is_scratch_table(name: str, table: dict) -> bool:
+    """True for a machine-generated staging table with machine-generated columns."""
+    leaf = (name or "").split(".")[-1].strip()
+    if not _GUID_TABLE_NAME.match(leaf.replace("_", "")):
+        return False
+    cols = [str(c.get("name") or "") for c in columns(table)]
+    return bool(cols) and all(_UNNAMED_COLUMN.match(c) for c in cols)
+
+def _table_stores(ctx: CheckContext) -> str:
+    """Name the lakehouse/warehouse(s) whose tables a workspace check inspected.
+
+    Workspace-scoped table checks aggregate over every store's tables, so the
+    engine leaves their object blank. Naming the store(s) here points the finding
+    at what was judged — the analogue of a pipeline check naming its pipeline.
+    Falls back to a generic label when the item list was not read.
+    """
+    names = sorted({
+        i.display_name or i.id
+        for i in ctx.workspace.items
+        if (i.type or "") in ("Lakehouse", "Warehouse")
+    })
+    if not names:
+        return "lakehouse/warehouse tables"
+    joined = ", ".join(names[:_SAMPLE_LIMIT])
+    if len(names) > _SAMPLE_LIMIT:
+        joined += f", \u2026(+{len(names) - _SAMPLE_LIMIT} more)"
+    return joined
 
 
 @check(
@@ -718,19 +811,47 @@ def table_audit_columns(ctx: CheckContext) -> Verdict:
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.ITEMS], required=True,
 )
 def table_star_schema(ctx: CheckContext) -> Verdict:
-    """The model separates fact tables from dimension tables (not flat wide tables)."""
+    """The model separates fact tables from dimension tables (not flat wide tables).
+
+    **What it can determine.** Whether the workspace holds both fact-named
+    (``fact*``/``fct*``) and dimension-named (``dim*``) tables — the readable
+    signature of a dimensional model. The evidence also reports how wide the fact
+    tables are, because the point contrasts a star schema with "flat wide
+    tables": a fact carrying dozens of columns is the shape that warrants a look.
+
+    **What it cannot determine, and deliberately does not score.** Whether the
+    model is *correctly* star-shaped. Column width is reported but **not scored**
+    here, for two reasons: how wide is "too wide" is a modelling judgement rather
+    than a fact, and the underlying defect — descriptive attributes sitting on a
+    fact instead of a dimension — is already scored by ``TB-FACT-PURITY``
+    (ref 4.5.3). Scoring it twice would penalise one mistake under two refs.
+    Grain is judged by ``TB-FACT-GRAIN`` (4.5.2), relationships by
+    ``TB-REL-DECLARED`` (4.4.5), and the Warehouse-scoped version of this same
+    fact+dim question by ``TB-WH-MODELED`` (1.2.6).
+
+    Naming is the only signal Fabric exposes: a correctly modelled schema whose
+    tables are named in some other vocabulary is reported as *not detected*,
+    with the tables listed, rather than as a defect.
+    """
     tables = ctx.workspace.tables
     if not tables:
         return not_applicable(_NO_TABLES)
     stores = _table_stores(ctx)
-    has_fact = any(is_fact(n) for n in tables)
-    has_dim = any(is_dimension(n) for n in tables)
-    if has_fact and has_dim:
-        return binary(True, "Both fact (fact*/fct*) and dimension (dim*) tables are present", obj=stores)
+    facts = {n: t for n, t in tables.items() if is_fact(n)}
+    dims = {n: t for n, t in tables.items() if is_dimension(n)}
+
+    if facts and dims:
+        return binary(
+            True,
+            f"Both fact ({len(facts)}) and dimension ({len(dims)}) tables are present"
+            + _fact_width_note(facts),
+            obj=stores,
+        )
+
     reasons = []
-    if not has_fact:
+    if not facts:
         reasons.append("no fact tables (named fact*/fct*)")
-    if not has_dim:
+    if not dims:
         reasons.append("no dimension tables (named dim*)")
     names = sorted(tables)
     sample = ", ".join(names[:_SAMPLE_LIMIT])
@@ -745,147 +866,180 @@ def table_star_schema(ctx: CheckContext) -> Verdict:
     )
 
 
+def _fact_width_note(facts: dict[str, dict]) -> str:
+    """Report fact-table column widths — context for "not flat wide tables", unscored.
+
+    A star-schema fact holds keys and measures; a flat wide table has descriptive
+    attributes denormalised onto it. Width is the readable hint, but it is only
+    ever *reported* here — ``TB-FACT-PURITY`` (4.5.3) is what scores attributes
+    that belong on a dimension.
+    """
+    widths = {name: len(columns(table)) for name, table in facts.items() if columns(table)}
+    if not widths:
+        return ". No fact table had readable column metadata, so table width is not reported"
+    widest = sorted(widths.items(), key=lambda kv: -kv[1])
+    wide = [f"{n} ({c} cols)" for n, c in widest if c >= _WIDE_FACT_COLUMNS]
+    detail = (f". Widest fact: {widest[0][0]} ({widest[0][1]} columns) across "
+              f"{len(widths)} fact table(s) with readable columns")
+    if wide:
+        detail += (f"; {len(wide)} carry {_WIDE_FACT_COLUMNS}+ columns and are worth "
+                   f"reviewing for denormalised attributes — {', '.join(wide[:3])} "
+                   f"(reported, not scored: ref 4.5.3 judges fact-table purity)")
+    return detail
+
+
 @check(
-    id="TB-TYPE-SIZING", ref="4.4.3",
-    title="Data types are appropriate and sized for analytical use",
+    id="TB-DATATYPE-SIZING", ref="4.4.3",
+    title="Data types are appropriate and sized correctly",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=True,
 )
 def table_type_sizing(ctx: CheckContext) -> Verdict:
-    """Check numeric precision validity and oversized varchar declarations where available."""
+    """Declared text widths and decimal precision/scale are within sane bounds."""
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
     tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
     if not tables:
-        return not_applicable("No table column metadata available")
+        return not_applicable(_NO_COLS)
 
-    inspectable = 0
-    sized_ok = 0
-    flagged: list[str] = []
+    assessed = compliant = oversized_text = imprecise_numeric = 0
+    lakehouse_defaults = 0
 
-    for table_name, table_meta in tables.items():
-        # SQL-endpoint sizing checks require warehouse-style typed metadata.
-        if "." not in table_name:
-            continue
-        for column in columns(table_meta):
-            col_name = str(column.get("name", "") or "")
-            col_type = str(column.get("type", "") or "").strip().lower()
-            if not col_type:
+    for table in tables.values():
+        for col in columns(table):
+            ctype = (col.get("type", "") or "").lower()
+            if not ctype:
                 continue
 
-            decimal = _DECIMAL_TYPE.match(col_type)
-            varchar = _OVERSIZED_VARCHAR.match(col_type)
-            if not decimal and not varchar:
+            if _is_lakehouse_default_text(col, ctype):
+                lakehouse_defaults += 1
                 continue
 
-            inspectable += 1
-            if decimal:
-                precision = int(decimal.group(1))
-                scale = int(decimal.group(2))
-                if 0 < precision <= 38 and 0 <= scale <= precision:
-                    sized_ok += 1
+            text_sizing = _too_wide(ctype)
+            if text_sizing is not None:
+                assessed += 1
+                if text_sizing:
+                    oversized_text += 1
                 else:
-                    flagged.append(f"{table_name}.{col_name}={col_type}")
+                    compliant += 1
                 continue
 
-            width = int(varchar.group(1))
-            if width <= 2000:
-                sized_ok += 1
-            else:
-                flagged.append(f"{table_name}.{col_name}=varchar({width})")
+            numeric_sizing = _decimal_is_reasonable(ctype)
+            if numeric_sizing is not None:
+                assessed += 1
+                if numeric_sizing:
+                    compliant += 1
+                else:
+                    imprecise_numeric += 1
 
-    if inspectable == 0:
+    if not assessed:
         return not_applicable(
-            "No inspectable decimal(v,s) or varchar(n) declarations were available in metadata to validate sizing. "
-            + _SQL_PERMISSION_HINT
+            "No assessable declared text widths or decimal/numeric precision "
+            "metadata"
+            + (f"; {lakehouse_defaults} Lakehouse default varchar("
+               f"{_LAKEHOUSE_TEXT_WIDTH}) column(s) excluded" if lakehouse_defaults else "")
         )
 
     return covered(
-        sized_ok,
-        inspectable,
-        f"{sized_ok} of {inspectable} inspectable column type declaration(s) meet sizing/precision rules"
-        + (f"; flagged: {', '.join(flagged[:5])}" if flagged else ""),
+        compliant, assessed,
+        f"{compliant} of {assessed} assessable columns have appropriate sizing — "
+        f"{oversized_text} oversized text column(s), {imprecise_numeric} "
+        "decimal/numeric column(s) with invalid precision/scale"
+        + (f"; {lakehouse_defaults} Lakehouse default varchar({_LAKEHOUSE_TEXT_WIDTH}) "
+           "column(s) excluded" if lakehouse_defaults else ""),
     )
 
 
 @check(
-    id="TB-SURROGATE-PATTERN", ref="4.4.4",
-    title="Dimension surrogate keys use a generated-key pattern",
+    id="TB-SURROGATE-GEN", ref="4.4.4",
+    title="Surrogate keys are implemented for dimensions with a generated-key pattern",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
+    required=True,
 )
-def table_surrogate_pattern(ctx: CheckContext) -> Verdict:
-    """Dimensions should expose surrogate key columns consistent with generated-key patterns."""
+def table_surrogate_generated(ctx: CheckContext) -> Verdict:
+    """Dimension schemas include surrogate keys with generation-oriented naming hints.
+
+    This is a schema-level proxy for generated-key patterns. It cannot inspect ETL
+    code paths (hash/window/key-table logic), so it looks for surrogate-key columns
+    plus a generation hint in the declared column names.
+    """
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
     dims = {n: t for n, t in ctx.workspace.tables.items() if is_dimension(n) and columns(t)}
     if not dims:
-        return not_applicable("No dimension tables with column metadata")
+        return not_applicable(_NO_DIMS)
 
-    inspectable = 0
-    patterned = 0
-    missing: list[str] = []
-    for name, table_meta in dims.items():
-        if "." not in name:
-            continue
-        names = col_names(table_meta)
-        if not names:
-            continue
-        inspectable += 1
-        has_pattern = any(_SURROGATE_KEY_NAME.search(col) or col.endswith(("_sk", "_key")) for col in names)
-        if has_pattern:
-            patterned += 1
-        else:
-            missing.append(name)
-
-    if inspectable == 0:
-        return not_applicable("No dimension columns were inspectable for surrogate key pattern checks")
+    compliant = 0
+    for table in dims.values():
+        names = col_names(table)
+        has_surrogate = any(
+            n.endswith(("_sk", "_key")) or n in {"surrogate_key", "surrogate_id"}
+            for n in names
+        )
+        has_generated_hint = any(_GENERATED_KEY_HINT.search(n) for n in names)
+        has_business_hint = any(_BUSINESS_KEY_HINT.search(n) for n in names)
+        if has_surrogate and (has_generated_hint or has_business_hint):
+            compliant += 1
 
     return covered(
-        patterned,
-        inspectable,
-        f"{patterned} of {inspectable} dimension table(s) expose surrogate key naming patterns"
-        + (f"; missing: {', '.join(missing[:5])}" if missing else ""),
+        compliant, len(dims),
+        f"{compliant} of {len(dims)} dimension table(s) include surrogate keys with "
+        "generation-oriented naming evidence",
     )
 
 
 @check(
-    id="TB-PKFK-DECLARED", ref="4.4.5",
-    title="Primary and foreign key constraints are declared where supported",
+    id="TB-REL-DECLARED", ref="4.4.5",
+    title="Primary/foreign key relationships are declared where supported",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+    layers=TABLE_LAYERS,
+    requires=[Resource.TABLE_SCHEMAS, Resource.SEMANTIC_MODEL_DEFINITIONS],
+    required=True,
 )
-def table_pkfk_declared(ctx: CheckContext) -> Verdict:
-    """Use structural metadata hints for declared PK/FK patterns; Fabric Warehouse enforcement is documented separately."""
-    tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
-    if not tables:
-        return not_applicable("No table column metadata available")
+def table_relationships_declared(ctx: CheckContext) -> Verdict:
+    """Fact tables are represented in declared semantic-model relationships.
 
-    inspectable = 0
-    hinted = 0
-    missing: list[str] = []
-    for name, table_meta in tables.items():
-        if "." not in name:
-            continue
-        names = col_names(table_meta)
-        if not names:
-            continue
-        inspectable += 1
-        has_hint = any(
-            _PK_FK_NAME_HINT.search(col)
-            or col.endswith(("_id", "_sk", "_fk", "_key"))
-            for col in names
+    Fabric Warehouse PK/FK constraints are metadata (not enforced), and direct
+    constraint metadata is not available in ``WorkspaceContext``. This check uses
+    semantic-model relationships as the machine-readable declaration of PK/FK
+    structure for workspace storage tables.
+    """
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
+    if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
+        return not_applicable("Semantic model definitions could not be read from Fabric")
+    models = ctx.workspace.semantic_models
+    if not models:
+        return not_applicable("No semantic models were read for this workspace")
+
+    facts = [name for name in ctx.workspace.tables if is_fact(name)]
+    if not facts:
+        return not_applicable("No fact-like tables found to assess for declared FK relationships")
+
+    table_names = {_norm_name(name) for name in ctx.workspace.tables}
+    linked_tables: set[str] = set()
+    for model in models.values():
+        for rel in model.get("relationships") or []:
+            from_table = _norm_name(str(rel.get("from_table") or rel.get("fromTable") or ""))
+            to_table = _norm_name(str(rel.get("to_table") or rel.get("toTable") or ""))
+            if from_table in table_names:
+                linked_tables.add(from_table)
+            if to_table in table_names:
+                linked_tables.add(to_table)
+
+    if not linked_tables:
+        return covered(
+            0, len(facts),
+            "No semantic-model relationships reference workspace storage tables"
         )
-        if has_hint:
-            hinted += 1
-        else:
-            missing.append(name)
 
-    if inspectable == 0:
-        return not_applicable("No tables were inspectable for PK/FK declaration hints")
-
+    linked_facts = [name for name in facts if _norm_name(name) in linked_tables]
     return covered(
-        hinted,
-        inspectable,
-        f"{hinted} of {inspectable} table(s) include PK/FK structural naming hints"
-        + (f"; no hints: {', '.join(missing[:5])}" if missing else "")
-        + "; note: Fabric Warehouse constraints are declarative and not enforced",
+        len(linked_facts), len(facts),
+        f"{len(linked_facts)} of {len(facts)} fact-like table(s) participate in declared "
+        "semantic-model relationships",
     )
 
 
@@ -980,15 +1134,32 @@ def table_date_dimension(ctx: CheckContext) -> Verdict:
     required=False,
 )
 def table_surrogate_keys(ctx: CheckContext) -> Verdict:
-    """Dimensions have a surrogate key column (``*_sk`` / ``*_key``), not just a business key."""
+    """Dimensions declare a surrogate key column, not only a business key.
+
+    Accepts both spellings Microsoft's own material uses - ``customer_sk`` (the
+    Fabric dimensional-modelling guidance) and ``CustomerKey`` (AdventureWorksDW,
+    where it is an ``IDENTITY(1,1)`` column). An ``…AlternateKey`` is *not*
+    counted: AdventureWorks uses that for the natural/business key, which is the
+    distinction this point is about.
+
+    **What it cannot determine.** Whether the column is genuinely system-generated
+    - that is a load-time property, not readable from a schema. This judges the
+    declared shape only, so a business key named ``customer_key`` would pass.
+    """
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
     dims = {n: t for n, t in ctx.workspace.tables.items() if is_dimension(n) and columns(t)}
     if not dims:
         return not_applicable(_NO_DIMS)
-    ok = [n for n, t in dims.items()
-          if any(c.endswith(("_sk", "_key")) for c in col_names(t))]
-    return covered(len(ok), len(dims), f"{len(ok)} of {len(dims)} dimensions have a surrogate key")
+    ok = [n for n, t in dims.items() if has_surrogate_key(t)]
+    missing = sorted(set(dims) - set(ok))
+    evidence = f"{len(ok)} of {len(dims)} dimensions have a surrogate key"
+    if missing:
+        shown = ", ".join(missing[:_SAMPLE_LIMIT])
+        if len(missing) > _SAMPLE_LIMIT:
+            shown += f", \u2026(+{len(missing) - _SAMPLE_LIMIT} more)"
+        evidence += f". Without one: {shown}"
+    return covered(len(ok), len(dims), evidence)
 
 
 @check(
@@ -998,15 +1169,57 @@ def table_surrogate_keys(ctx: CheckContext) -> Verdict:
     required=False,
 )
 def table_column_naming(ctx: CheckContext) -> Verdict:
-    """Table columns follow a consistent snake_case convention."""
+    """Column names follow *one* convention across the workspace — whichever one.
+
+    **Consistency is what is scored, not a particular house style.** Each name is
+    classified as ``snake_case``, ``UPPER_CASE``, ``PascalCase``, ``camelCase`` or
+    ``mixed``; the dominant convention is found, and the score is the share of
+    columns that follow it. Requiring ``snake_case`` specifically marked down any
+    estate that had standardised on something else — Microsoft's own AdventureWorks
+    sample is PascalCase throughout — which measured style preference rather than
+    quality. A ``mixed`` name (a space, ``Customer_ID`` blending Pascal with
+    underscores) can never be dominant: it follows no convention at all.
+
+    **Deliberately different from ``TB-WH-NAME-CONSISTENCY`` (ref 4.4.2)**, which
+    asks the same question but only of tables known to live in a **Warehouse**,
+    and judges table names as well as column names. This one covers **every**
+    table in the workspace, Lakehouse included, and only its columns — so a
+    Lakehouse-only estate (where 4.4.2 is N/A) is still assessed here.
+
+    **What it cannot determine.** Whether a consistently-named column is
+    *self-documenting*: ``col1``, ``x`` and ``value`` are all valid snake_case.
+    Only the convention half of the point is machine-readable.
+    """
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
     tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
     if not tables:
         return not_applicable(_NO_COLS)
-    names = [c.get("name", "") for t in tables.values() for c in columns(t)]
-    ok = [n for n in names if is_snake_case(n)]
-    return covered(len(ok), len(names), f"{len(ok)} of {len(names)} columns use snake_case names")
+    styles = [
+        naming_style(str(column.get("name") or ""))
+        for table in tables.values()
+        for column in columns(table)
+    ]
+    if not styles:
+        return not_applicable(_NO_COLS)
+
+    convention, following = _dominant(styles)
+    if convention == "none":
+        return covered(
+            0, len(styles),
+            f"None of {len(styles)} column name(s) across {len(tables)} table(s) follows "
+            f"a single naming convention — every name mixes styles (a space, or "
+            f"capitals joined by underscores)",
+        )
+    mixed = sum(1 for style in styles if style == "mixed")
+    return covered(
+        following, len(styles),
+        f"{following} of {len(styles)} column name(s) across {len(tables)} table(s) "
+        f"follow the dominant convention ({convention})"
+        + (f"; {mixed} name(s) follow no convention at all" if mixed else "")
+        + ". Consistency is what is scored — any one convention counts, provided "
+          "the estate sticks to it.",
+    )
 
 
 @check(
@@ -1260,7 +1473,7 @@ def table_scd2(ctx: CheckContext) -> Verdict:
 
 
 # =============================================================================
-# Store-aware table checks (1.2.6, 1.2.8, 4.4.9) and dimensional purity
+# Store-aware table checks and dimensional purity checks.
 # (4.5.3, 4.5.4, 4.5.8).
 #
 # The store-aware ones read ``store``/``store_kind``, which the crawler fills in
@@ -2124,3 +2337,270 @@ def warehouse_naming_is_internally_consistent(ctx: CheckContext) -> Verdict:
     detail += (". Consistency is what is scored — any one convention counts, "
                "provided the Warehouse sticks to it.")
     return covered(compliant, total, detail)
+
+
+# =============================================================================
+# View/procedure abstraction between the physical tables and the
+# semantic layer
+# =============================================================================
+
+#: A view definition in T-SQL or Spark SQL. ``CREATE OR ALTER VIEW`` and
+#: ``CREATE OR REPLACE VIEW`` are both spelled by the optional middle group.
+_VIEW_DDL = re.compile(
+    r"\bCREATE\s+(?:OR\s+(?:ALTER|REPLACE)\s+)?(?:MATERIALIZED\s+)?VIEW\b|"
+    r"\bALTER\s+VIEW\b",
+    re.IGNORECASE,
+)
+
+#: A stored procedure or a user-defined function — abstraction over the physical
+#: tables for *writes* and reusable logic, but not the semantic-facing read
+#: surface a view provides.
+_PROC_DDL = re.compile(
+    r"\bCREATE\s+(?:OR\s+(?:ALTER|REPLACE)\s+)?PROC(?:EDURE)?\b|\bALTER\s+PROC(?:EDURE)?\b|"
+    r"\bCREATE\s+(?:OR\s+(?:ALTER|REPLACE)\s+)?FUNCTION\b",
+    re.IGNORECASE,
+)
+
+#: How many defining items to name in the evidence before summarising.
+_MAX_NAMED_SOURCES = 5
+
+
+@check(
+    id="WS-VIEW-ABSTRACTION", ref="4.4.7",
+    title="Views/stored procedures used to abstract the semantic-facing layer from physical tables",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS,
+    requires=[Resource.TABLE_SCHEMAS, Resource.PIPELINE_DEFINITIONS,
+              Resource.NOTEBOOK_DEFINITIONS],
+    required=False,
+)
+def workspace_defines_a_view_layer_over_its_tables(ctx: CheckContext) -> Verdict:
+    """Reports use a view/procedure layer, so a physical table can change without breaking them.
+
+    **What it can determine.** ``CREATE VIEW`` / ``CREATE OR ALTER VIEW`` /
+    ``CREATE PROCEDURE`` / ``CREATE FUNCTION`` statements in the T-SQL a pipeline
+    runs through its Script activities, and in notebook SQL. Those are
+    definitions the estate keeps *in code*, which is also the only form that can
+    be reviewed and promoted.
+
+    **What it cannot — and this is a real limit on the finding.** The crawl reads
+    table metadata from ``INFORMATION_SCHEMA.COLUMNS``, which returns view
+    columns alongside table columns but carries no ``TABLE_TYPE``, so a view
+    cannot be told from a table in the workspace's table map. Consequently a view
+    created interactively in the SQL editor and never expressed in code is
+    invisible to this check. A 0 therefore means "no abstraction layer is defined
+    in any readable pipeline or notebook", not "no views exist" — the evidence
+    says so, and a reviewer should confirm in the SQL editor before acting.
+    """
+    if not ctx.workspace.has(Resource.TABLE_SCHEMAS):
+        return not_applicable(_NO_TABLES)
+    if not ctx.workspace.tables:
+        return not_applicable(_NO_TABLES)
+
+    readable = [r for r in (Resource.PIPELINE_DEFINITIONS, Resource.NOTEBOOK_DEFINITIONS)
+                if ctx.workspace.has(r)]
+    if not readable:
+        return not_applicable(
+            "Neither pipeline nor notebook definitions could be read, and view metadata is "
+            "not fetched, so no abstraction layer is observable"
+        )
+
+    pipelines = ctx.workspace.pipelines or {}
+    notebooks = ctx.workspace.notebooks or {}
+    if not pipelines and not notebooks:
+        return not_applicable(
+            "Workspace holds no pipeline or notebook definitions, and view metadata is not "
+            "fetched, so no view or procedure definition is observable"
+        )
+
+    view_sources: list[str] = []
+    proc_sources: list[str] = []
+    for name, defn in sorted(pipelines.items()):
+        sql = script_sql(defn)
+        if _VIEW_DDL.search(sql):
+            view_sources.append(name)
+        if _PROC_DDL.search(sql):
+            proc_sources.append(name)
+    for name, defn in sorted(notebooks.items()):
+        code = executable_code(defn)
+        if _VIEW_DDL.search(code):
+            view_sources.append(name)
+        if _PROC_DDL.search(code):
+            proc_sources.append(name)
+
+    caveat = (
+        " View metadata itself is not fetched (INFORMATION_SCHEMA.COLUMNS returns view "
+        "columns but no TABLE_TYPE), so this counts only definitions found in pipeline "
+        "Script activities and notebook SQL."
+    )
+    tables = len(ctx.workspace.tables)
+    if view_sources:
+        return graded(
+            3,
+            f"{len(view_sources)} pipeline(s)/notebook(s) define a view over the "
+            f"workspace's {tables} table(s): "
+            f"{', '.join(view_sources[:_MAX_NAMED_SOURCES])}." + caveat,
+        )
+    if proc_sources:
+        return graded(
+            2,
+            f"No view definition found, but {len(proc_sources)} pipeline(s)/notebook(s) "
+            f"define a stored procedure or function over the workspace's {tables} table(s): "
+            f"{', '.join(proc_sources[:_MAX_NAMED_SOURCES])} — logic is abstracted, but "
+            f"consumers still read the physical tables directly." + caveat,
+        )
+    return graded(
+        0,
+        f"No CREATE VIEW / CREATE PROCEDURE / CREATE FUNCTION statement appears in any of "
+        f"the {len(pipelines)} pipeline(s) and {len(notebooks)} notebook(s) read, so the "
+        f"semantic layer binds straight to the {tables} physical table(s) and any rename or "
+        f"retype breaks it." + caveat,
+    )
+
+
+# =============================================================================
+# The serving (Gold) items were actually refreshed inside their SLA.
+# =============================================================================
+
+#: Words in an *item* name that mark it as serving/Gold rather than an
+#: ingestion or staging store. Matched with :func:`name_words`, the shared
+#: name-token splitter, so ``LH_Sales_Gold``, ``lh-sales-gold`` and
+#: ``SalesGoldMart`` all yield the same tokens. A Warehouse needs no name match
+#: at all (see the check docstring) — this list only promotes a *Lakehouse* or a
+#: *SemanticModel* into the serving population.
+_SERVING_ITEM_WORDS: frozenset[str] = frozenset({
+    "gold", "serving", "serve", "curated", "mart", "marts", "datamart",
+    "presentation", "published", "publish", "consumption", "semantic",
+})
+
+#: Item types whose name is consulted for the serving vocabulary above.
+_NAME_MARKED_SERVING_TYPES = ("Lakehouse", "SemanticModel")
+
+#: Default freshness SLA, in hours. Deliberately **48**, not 24: the readable
+#: signal is a *run/refresh* timestamp, so a perfectly healthy daily batch that
+#: ran 25 hours before the audit would fail a 24-hour window purely on when the
+#: audit happened to be run. 48 hours still catches the real defect — a serving
+#: item that has not refreshed for days — without failing an estate for clock
+#: jitter. Tune per project with ``gold_freshness_sla_hours``.
+_DEFAULT_SLA_HOURS = 48
+
+#: How many stale item names to name in the evidence before summarising.
+_MAX_NAMED_STALE = 5
+
+def _serving_items(ctx: CheckContext) -> list[Item]:
+    """The workspace's Gold/serving items.
+
+    Every **Warehouse** qualifies by type: a Fabric Warehouse exists to be
+    queried by reports, so it *is* the serving surface regardless of what it is
+    called. A **Lakehouse** or **SemanticModel** qualifies only when its name
+    carries a serving token — a Bronze/Silver lakehouse is not Gold, and nothing
+    else in the item list distinguishes them.
+    """
+    serving: list[Item] = []
+    for item in ctx.workspace.items:
+        item_type = item.type or ""
+        if item_type == "Warehouse" or (
+            item_type in _NAME_MARKED_SERVING_TYPES
+            and name_words(item.display_name or "") & _SERVING_ITEM_WORDS
+        ):
+            serving.append(item)
+    return serving
+
+
+@check(
+    id="WS-GOLD-FRESHNESS", ref="5.4.7",
+    title="Freshness validation: Gold tables updated within defined SLA",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS,
+    requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=True,
+)
+def gold_items_refreshed_within_sla(ctx: CheckContext) -> Verdict:
+    """The Gold/serving items refreshed within the freshness SLA window.
+
+    **What it measures — an actual elapsed time, not a coded control.** Each
+    serving item's last run/refresh (``Item.last_run_utc``, filled from the
+    job-scheduler history and, for semantic models, the Power BI refresh
+    history) is compared against a window read from
+    ``gold_freshness_sla_hours`` (default 48 hours — long enough that a healthy
+    daily batch is not failed for the hour the audit happened to run).
+
+    **What counts as Gold.** Every Warehouse, because a Fabric Warehouse exists
+    to be queried by reports; plus any Lakehouse or SemanticModel whose name
+    carries a serving token (gold / serving / curated / mart / presentation /
+    published / consumption / semantic), matched with the shared
+    :func:`name_words` splitter.
+
+    **What it cannot determine.** This is the item's **last run/refresh**, which
+    is the closest readable proxy for "the Gold *table* was updated" — Delta
+    table commit times are not fetched, so a run that succeeded while writing
+    nothing still reads as fresh, and a table updated by a pipeline in another
+    workspace reads as stale here. It also cannot read the *agreed* SLA: the
+    window is a project setting, not something the tenant publishes.
+
+    **Missing timestamps are excluded, never counted stale.** An item with no
+    readable last-run stamp leaves the denominator entirely — "we could not read
+    when it last ran" is not "it is out of SLA". When no serving item exists, or
+    none of them has a readable stamp, the check is N/A.
+
+    **Sibling — ``NB-TIMELINESS-CONTROL`` (5.2.3), and the difference matters.**
+    That check reads notebook *code* and asks whether an arrival-lateness control
+    is implemented — does the code know how old its input is. This check reads no
+    code at all: it asks whether the serving items were in fact refreshed
+    recently. A workspace can pass 5.2.3 with a beautifully written staleness
+    guard and fail this one because nothing has run for a week, and vice versa.
+    """
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
+    if not ctx.workspace.has(Resource.ITEM_RUN_HISTORY):
+        return not_applicable(
+            "Per-item run/refresh history could not be read from Fabric "
+            "(jobs/instances was forbidden or unavailable), so Gold freshness "
+            "cannot be measured"
+        )
+
+    serving = _serving_items(ctx)
+    if not serving:
+        return not_applicable(
+            f"No Gold/serving item found among the {len(ctx.workspace.items)} item(s): no "
+            "Warehouse, and no Lakehouse or semantic model whose name marks it as gold / "
+            "serving / curated / mart / presentation"
+        )
+
+    dated = [(i, parse_stamp(i.last_run_utc)) for i in serving]
+    readable = [(i, stamp) for i, stamp in dated if stamp is not None]
+    if not readable:
+        return not_applicable(
+            f"None of the {len(serving)} Gold/serving item(s) carries a readable last "
+            "run/refresh timestamp, so how recently they were updated cannot be measured "
+            "— unknown recency is never reported as stale"
+        )
+
+    try:
+        sla_hours = int(ctx.setting("gold_freshness_sla_hours", _DEFAULT_SLA_HOURS))
+    except (TypeError, ValueError):
+        sla_hours = _DEFAULT_SLA_HOURS
+    if sla_hours <= 0:
+        sla_hours = _DEFAULT_SLA_HOURS
+    now = datetime.now(timezone.utc)
+    stale = sorted(
+        item.display_name or item.id
+        for item, stamp in readable
+        if (now - stamp).total_seconds() > sla_hours * 3600
+    )
+    excluded = len(serving) - len(readable)
+
+    detail = (
+        f"{len(readable) - len(stale)} of {len(readable)} Gold/serving item(s) with a "
+        f"readable last run/refresh were updated within the {sla_hours}h SLA "
+        f"(gold_freshness_sla_hours)"
+    )
+    if stale:
+        detail += (f"; stale: {', '.join(stale[:_MAX_NAMED_STALE])}"
+                   + (f", …(+{len(stale) - _MAX_NAMED_STALE} more)"
+                      if len(stale) > _MAX_NAMED_STALE else ""))
+    if excluded:
+        detail += (f". {excluded} further serving item(s) had no readable timestamp and are "
+                   "excluded rather than counted stale")
+    detail += (". This is the item's last run/refresh — the closest readable proxy for "
+               "\"the Gold table was updated\"; Delta commit times are not fetched.")
+    return covered(len(readable) - len(stale), len(readable), detail)
