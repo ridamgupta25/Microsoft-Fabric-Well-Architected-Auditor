@@ -37,8 +37,10 @@ from auditfast.core.check.data_management_quality.data_prep.automated import (
     nb_utf8_encoding,
     parameterized,
     pl_bulk_move,
+    pl_historical_separation,
     pl_incremental,
     pl_load_mode,
+    pl_metadata_driven,
 )
 from auditfast.core.check.data_management_quality.data_storage.automated import (
     table_audit_columns,
@@ -576,6 +578,211 @@ def test_load_mode_passes_when_the_name_declares_a_dedicated_mode():
 
 def test_load_mode_without_name_param_or_branch_still_fails():
     assert pl_load_mode(_named_pipe_ctx("PL_Generic_Copy", _COPY)).score == _FAIL
+
+
+# -- PL-METADATA-DRIVEN ------------------------------------------------------
+
+def _metadata_lookup(name: str = "Lookup_Ingestion_Config", query: str | None = None) -> dict:
+    return {
+        "name": name,
+        "type": "Lookup",
+        "typeProperties": {
+            "source": {
+                "type": "DataWarehouseSource",
+                "sqlReaderQuery": query or (
+                    "SELECT SourceName, LoadType, ScheduleName, TargetTable "
+                    "FROM dbo.ETL_Ingestion_Config"
+                ),
+            },
+        },
+    }
+
+
+def _lookup_loop(source: str, name: str = "ForEach_Config_Row") -> dict:
+    return {
+        "name": name,
+        "type": "ForEach",
+        "typeProperties": {
+            "items": {
+                "value": f"@activity('{source}').output.value",
+                "type": "Expression",
+            },
+            "activities": [{"name": "Run_Configured_Load", "type": "TridentNotebook"}],
+        },
+    }
+
+
+def test_metadata_driven_passes_only_when_complete_metadata_lookup_feeds_loop():
+    verdict = pl_metadata_driven(_named_pipe_ctx(
+        "PL_Metadata_Driven_PASS",
+        _metadata_lookup(),
+        _lookup_loop("Lookup_Ingestion_Config"),
+    ))
+    assert verdict.score == _PASS
+    assert "PL_Metadata_Driven_PASS" in verdict.evidence
+    assert "Lookup_Ingestion_Config" in verdict.evidence
+    assert "ForEach_Config_Row" in verdict.evidence
+    assert "source list, load type, schedule and target mapping" in verdict.evidence
+
+
+def test_metadata_driven_ignores_metadata_named_connection_for_generic_query():
+    lookup = {
+        "name": "Lookup_Runtime_Rows",
+        "type": "Lookup",
+        "typeProperties": {
+            "source": {
+                "type": "DataWarehouseSource",
+                "sqlReaderQuery": "SELECT ItemName FROM dbo.RuntimeRows",
+            },
+            "datasetSettings": {
+                "linkedService": {"name": "WH_Metadata"},
+            },
+        },
+    }
+    loop = {
+        "name": "ForEach_Runtime_Row",
+        "type": "ForEach",
+        "typeProperties": {
+            "items": {
+                "value": "@activity('Lookup_Runtime_Rows').output.value",
+                "type": "Expression",
+            },
+            "activities": [{"name": "Run_Runtime_Row", "type": "TridentNotebook"}],
+        },
+    }
+    verdict = pl_metadata_driven(
+        _named_pipe_ctx("PL_Generic_Lookup_Loop_PARTIAL", lookup, loop)
+    )
+    assert verdict.score == 1
+    assert "not a metadata/config source" in verdict.evidence
+
+
+def test_metadata_driven_does_not_pair_unrelated_metadata_lookup_and_loop():
+    generic_lookup = {
+        "name": "Lookup_Runtime_Rows",
+        "type": "Lookup",
+        "typeProperties": {
+            "source": {"sqlReaderQuery": "SELECT ItemName FROM dbo.RuntimeRows"},
+        },
+    }
+    verdict = pl_metadata_driven(_named_pipe_ctx(
+        "PL_Mismatched_Metadata_Link_TEST",
+        _metadata_lookup(),
+        generic_lookup,
+        _lookup_loop("Lookup_Runtime_Rows", "ForEach_Runtime_Row"),
+    ))
+    assert verdict.score == 1
+    assert "iterates 'Lookup_Runtime_Rows' instead" in verdict.evidence
+    assert "does not drive ingestion" in verdict.evidence
+
+
+def test_metadata_driven_lookup_without_foreach_is_partial():
+    verdict = pl_metadata_driven(_named_pipe_ctx(
+        "PL_Metadata_Lookup_Only_PARTIAL",
+        _metadata_lookup(),
+        {"name": "Run_Fixed_Load", "type": "TridentNotebook"},
+    ))
+    assert verdict.score == 1
+    assert "no ForEach iterates its output" in verdict.evidence
+
+
+def test_metadata_driven_link_missing_required_dimensions_is_partial():
+    lookup = _metadata_lookup(query=(
+        "SELECT SourceName, TargetTable FROM dbo.ETL_Ingestion_Config"
+    ))
+    verdict = pl_metadata_driven(_named_pipe_ctx(
+        "PL_Metadata_Missing_Fields_PARTIAL",
+        lookup,
+        _lookup_loop("Lookup_Ingestion_Config"),
+    ))
+    assert verdict.score == 2
+    assert "load type, schedule" in verdict.evidence
+
+
+def test_metadata_driven_hardcoded_activity_fails_with_pipeline_evidence():
+    verdict = pl_metadata_driven(_named_pipe_ctx(
+        "PL_Hardcoded_Ingestion_FAIL",
+        {"name": "Load_AdageCustomers", "type": "TridentNotebook"},
+    ))
+    assert verdict.score == _FAIL
+    assert "PL_Hardcoded_Ingestion_FAIL" in verdict.evidence
+
+
+def test_metadata_driven_empty_pipeline_is_na_with_pipeline_evidence():
+    verdict = pl_metadata_driven(_named_pipe_ctx("PL_No_Data_NA"))
+    assert verdict.status is Status.NA
+    assert "PL_No_Data_NA" in verdict.evidence
+
+
+# -- PL-HIST-SEPARATION -------------------------------------------------------
+
+def test_historical_separation_named_empty_pipeline_is_na():
+    verdict = pl_historical_separation(_named_pipe_ctx("PL_Adage_Historical_Backfill"))
+    assert verdict.status is Status.NA
+    assert "no activities" in verdict.evidence
+
+
+def test_historical_separation_dedicated_pipeline_passes_with_activity_evidence():
+    ctx = _named_pipe_ctx(
+        "PL_Adage_Historical_Backfill",
+        {"name": "Run_Historical_Backfill", "type": "TridentNotebook"},
+    )
+    verdict = pl_historical_separation(ctx)
+    assert verdict.score == _PASS
+    assert "Run_Historical_Backfill" in verdict.evidence
+
+
+def test_historical_separation_named_pipeline_still_fails_when_paths_are_inline():
+    ctx = _named_pipe_ctx(
+        "PL_Adage_Historical_Backfill",
+        {"name": "Run_Historical_Backfill", "type": "TridentNotebook"},
+        {"name": "Run_Daily_Incremental", "type": "TridentNotebook"},
+    )
+    assert pl_historical_separation(ctx).score == _FAIL
+
+
+def test_historical_separation_inline_combined_pipeline_fails():
+    ctx = _named_pipe_ctx(
+        "PL_Combined_Load_Test",
+        {"name": "Run_Historical_Backfill", "type": "TridentNotebook"},
+        {"name": "Run_Daily_Incremental", "type": "TridentNotebook"},
+    )
+    verdict = pl_historical_separation(ctx)
+    assert verdict.score == _FAIL
+    assert "ungated" in verdict.evidence
+
+
+def test_historical_separation_if_condition_passes_and_names_gate():
+    branch = {
+        "name": "Choose_Load_Mode",
+        "type": "IfCondition",
+        "typeProperties": {
+            "expression": {"value": "@equals('Historical', 'Incremental')"},
+            "ifTrueActivities": [
+                {"name": "Run_Historical_Backfill", "type": "TridentNotebook"},
+            ],
+            "ifFalseActivities": [
+                {"name": "Run_Daily_Incremental", "type": "TridentNotebook"},
+            ],
+        },
+    }
+    verdict = pl_historical_separation(_named_pipe_ctx("PL_Load_Mode_Orchestrator", branch))
+    assert verdict.score == _PASS
+    assert "IfCondition activity 'Choose_Load_Mode'" in verdict.evidence
+
+
+def test_historical_separation_historical_only_pipeline_is_partial():
+    ctx = _named_pipe_ctx(
+        "PL_Load_Investigation",
+        {"name": "Run_Historical_Backfill", "type": "TridentNotebook"},
+    )
+    assert pl_historical_separation(ctx).score == 1
+
+
+def test_historical_separation_no_historical_signal_is_na():
+    verdict = pl_historical_separation(_named_pipe_ctx("PL_Daily_Load", _COPY))
+    assert verdict.status is Status.NA
+    assert "PL_Daily_Load" in verdict.evidence
 
 
 # -- PL-COPY-PARALLEL (lone copy → N/A) ----------------------------------------

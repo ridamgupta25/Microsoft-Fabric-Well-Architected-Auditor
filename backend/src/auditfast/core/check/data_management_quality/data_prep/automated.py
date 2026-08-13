@@ -18,6 +18,7 @@ from auditfast.core.check._notebook import (
     medallion_layer,
     notebook_code,
     strip_sql_comments,
+    write_targets,
 )
 from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities, script_sql, walk_activities
 from auditfast.core.check._tables import (
@@ -707,7 +708,7 @@ _RI_PATTERN = re.compile(
 #: rows, and without it the very notebooks that *do* detect orphans were reported
 #: as performing no join at all - N/A instead of the PASS they had earned.
 _JOIN_PATTERN = re.compile(
-    r"(?is)\.join\s*\(|"
+    r"(?is)(?<![\"'])(?<!os\.path)\.join\s*\(|"
     r"\b(?:left|right|full|inner|cross)\s+(?:outer\s+)?join\b|"
     r"\bleft\s+(?:anti|semi)\s+join\b|"
     r"\bjoin\b\s+\w+\s+\bon\b",
@@ -989,7 +990,13 @@ _ROW_BY_ROW = re.compile(
     r"SqlServerStoredProcedure|\bScript\b",
     re.IGNORECASE,
 )
-_EAM_JSON = re.compile(r"EAM|JSON|json\.loads|from_json\s*\(|spark\.read\.json", re.IGNORECASE)
+_EAM_JSON = re.compile(
+    r"json\.loads\s*\(|from_json\s*\(|schema_of_json\s*\(|"
+    r"spark\.read(?:Stream)?(?:\s*\.\w+\s*\([^()\n]*\))*\s*\.json\s*\(|"
+    r"(?:spark\.read(?:Stream)?|\.read)\.format\s*\(\s*[\"']json[\"']\s*\)|"
+    r"\b(?:pd\.)?read_json\s*\(",
+    re.IGNORECASE,
+)
 _EAM_EFFICIENT = re.compile(
     r"readStream|partitionBy\s*\(|repartition\s*\(|multiLine\s*[=:]\s*False|"
     r"maxFilesPerTrigger|badRecordsPath|from_json\s*\(|schema_of_json",
@@ -1337,15 +1344,22 @@ def nb_orphan_detect(ctx: CheckContext) -> Verdict:
     """
     code = executable_code(ctx.obj)
     if not _JOIN_PATTERN.search(code):
-        return not_applicable("Notebook does not perform joins")
+        return not_applicable(f"Notebook '{ctx.obj_name}' does not perform joins")
     if not _ORPHAN_DETECT.search(code):
-        return binary(False, "Joins tables without orphan record detection")
+        return binary(
+            False,
+            f"Notebook '{ctx.obj_name}' joins tables without orphan record detection",
+        )
     if _orphan_set_is_handled(code):
-        return binary(True, "Orphan/unmatched records are detected and handled")
+        return binary(
+            True,
+            f"Notebook '{ctx.obj_name}' detects and handles orphan/unmatched records",
+        )
     return graded(
         1,
-        "Orphan/unmatched records are detected but not handled - the unmatched set "
-        "is computed and then dropped, never quarantined, raised on or recorded",
+        f"Notebook '{ctx.obj_name}': orphan/unmatched records are detected but not "
+        "handled - the unmatched set is computed and then dropped, never quarantined, "
+        "raised on or recorded",
     )
 
 
@@ -1481,6 +1495,15 @@ _UNKNOWN_MONITORED = re.compile(
     r"(?:log|insert\s+into|write)[^\n]{0,80}?(?:unknown|orphan|inferred)[^\n]{0,40}?(?:count|log|audit)",
     re.IGNORECASE,
 )
+#: A real dimensional unknown-member fallback. A generic string value such as
+#: ``city = "Unknown"`` is ordinary null cleansing, not a surrogate member.
+_UNKNOWN_MEMBER_USE = re.compile(
+    r"unknown[_\s]?member|inferred[_\s]?member|is_inferred|"
+    r"coalesce\s*\([^\n]{0,80}?-1|fillna\s*\([^\n]{0,60}?-1|"
+    r"\.na\.fill\s*\([^\n]{0,60}?-1|otherwise\s*\([^\n]{0,40}?-1|"
+    r"when\s*\([^\n]{0,80}?-1",
+    re.IGNORECASE,
+)
 #: Names of the medallion layers, to spot a notebook that spans two of them.
 _SILVER_REF = re.compile(r"\bsilver\b", re.IGNORECASE)
 _GOLD_REF = re.compile(r"\bgold\b", re.IGNORECASE)
@@ -1560,12 +1583,27 @@ def nb_unknown_monitored(ctx: CheckContext) -> Verdict:
     NB-LATE-ARRIVING's job.
     """
     code = strip_sql_comments(executable_code(ctx.obj))
-    if not _LATE_ARRIVING.search(code):
-        return not_applicable("Notebook uses no unknown/inferred member to monitor")
-    ok = bool(_UNKNOWN_MONITORED.search(code))
-    return binary(ok, "Unknown/orphan member usage is counted or logged" if ok
-                  else "Uses an unknown member but never counts how many rows land "
-                       "on it — a broken feed would go unnoticed")
+    if not (_DIM_CONTEXT.search(code) and _FACT_DIM_JOIN.search(code)):
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' performs no fact-to-dimension lookup with "
+            f"an unknown member to monitor"
+        )
+    member = _UNKNOWN_MEMBER_USE.search(code)
+    if not member:
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' performs a dimensional lookup but uses no "
+            f"deterministic unknown/inferred-member fallback (-1 or an explicitly "
+            f"named unknown/inferred member)"
+        )
+    monitored = _UNKNOWN_MONITORED.search(code)
+    fallback = " ".join(member.group(0).split())
+    if monitored:
+        signal = " ".join(monitored.group(0).split())
+        return binary(True, f"Notebook '{ctx.obj_name}' uses unknown-member fallback "
+                      f"'{fallback}' and monitors it with '{signal}'")
+    return binary(False, f"Notebook '{ctx.obj_name}' uses unknown-member fallback "
+                  f"'{fallback}' in a fact-to-dimension lookup but never counts, "
+                  f"logs, or audits how many rows use it")
 
 
 @check(
@@ -1581,15 +1619,24 @@ def nb_layer_recon(ctx: CheckContext) -> Verdict:
     in one load. This one is about the medallion hop: rows that entered Silver
     should be accounted for in Gold, allowing for aggregation.
     """
-    code = notebook_code(ctx.obj)
+    code = strip_sql_comments(executable_code(ctx.obj))
     if not (_SILVER_REF.search(code) and _GOLD_REF.search(code)):
-        return not_applicable("Notebook does not span the Silver and Gold layers")
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' has no executable Silver-to-Gold flow"
+        )
     if not _WRITE_PATTERN.search(code):
-        return not_applicable("Notebook reads both layers but writes neither")
-    ok = bool(_COUNT_RECONCILE.search(code))
-    return binary(ok, "Cross-layer row counts are reconciled" if ok
-                  else "Promotes Silver to Gold without reconciling row counts "
-                       "across the hop")
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' references Silver and Gold in executable "
+            f"code but contains no table write"
+        )
+    reconciliation = _COUNT_RECONCILE.search(code)
+    if reconciliation:
+        signal = " ".join(reconciliation.group(0).split())
+        return binary(True, f"Notebook '{ctx.obj_name}' promotes Silver to Gold and "
+                      f"reconciles row counts (matched '{signal}')")
+    return binary(False, f"Notebook '{ctx.obj_name}' promotes data from Silver to "
+                  f"Gold and writes output, but has no source/target count comparison "
+                  f"or explicitly named reconciliation control")
 
 
 # -- MLC Cat-1: grain uniqueness (5.4.9) --------------------------------------
@@ -1601,6 +1648,22 @@ _GRAIN_GUARD = re.compile(
     r"having\s+count\s*\(\s*\*?\s*\)\s*>\s*1|duplicate[_\s]?(?:check|count|test)",
     re.IGNORECASE,
 )
+_FACT_WRITE_RECEIVER = re.compile(
+    r"\b(?:fact|fct)(?:_[A-Za-z0-9]+)*\s*\.write\b",
+    re.IGNORECASE,
+)
+
+
+def _fact_write_evidence(code: str) -> str:
+    """Describe a provable fact write, or return empty when only reads are seen."""
+    targets = write_targets(code)
+    fact_targets = [target for target in targets if _FACT_REF.search(target)]
+    if fact_targets:
+        return f"write target '{fact_targets[0]}'"
+    receiver = _FACT_WRITE_RECEIVER.search(code)
+    if receiver:
+        return f"write receiver '{' '.join(receiver.group(0).split())}'"
+    return ""
 
 
 @check(
@@ -1617,15 +1680,24 @@ def nb_grain_unique(ctx: CheckContext) -> Verdict:
     or a duplicate probe. It cannot confirm the surviving rows are unique; that
     needs a GROUP BY against the warehouse.
     """
-    code = notebook_code(ctx.obj)
+    code = strip_sql_comments(executable_code(ctx.obj))
     if not _WRITE_PATTERN.search(code):
-        return not_applicable("Notebook writes no table")
-    if not _DIM_CONTEXT.search(code):
-        return not_applicable("Notebook does not write a fact or dimension table")
-    ok = bool(_GRAIN_GUARD.search(code))
-    return binary(ok, "Load enforces grain uniqueness (dedup / duplicate check)" if ok
-                  else "Writes a fact/dimension table with no dedup or duplicate "
-                       "check — re-runs and late replays can duplicate the grain")
+        return not_applicable(f"Notebook '{ctx.obj_name}' writes no table")
+    fact_write = _fact_write_evidence(code)
+    if not fact_write:
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' has table-write syntax but no provable fact "
+            f"write target or fact-named DataFrame write receiver; reading a fact "
+            f"table or writing a dimension does not establish fact-grain scope"
+        )
+    guard = _GRAIN_GUARD.search(code)
+    if guard:
+        signal = " ".join(guard.group(0).split())
+        return binary(True, f"Notebook '{ctx.obj_name}' has {fact_write} and enforces "
+                      f"grain uniqueness (matched '{signal}')")
+    return binary(False, f"Notebook '{ctx.obj_name}' has {fact_write} but contains no "
+                  f"dropDuplicates/distinct, row-number survivor filter, GROUP BY "
+                  f"duplicate probe, or explicitly named duplicate check")
 
 
 # -- MLC Cat-1: fact-to-dimension referential integrity (4.5.12) --------------
@@ -2320,34 +2392,55 @@ def pl_historical_separation(ctx: CheckContext) -> Verdict:
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
     blob = json.dumps(ctx.obj)
-    if not _HISTORICAL.search(blob) and not _HISTORICAL.search(ctx.obj_name):
-        return not_applicable("No historical / backfill load present in this pipeline")
-
-    # A pipeline whose own name marks it as the historical load is separated by
-    # construction — it is a different artifact from the incremental one.
-    if _HISTORICAL.search(ctx.obj_name):
-        return binary(True, f"'{ctx.obj_name}' is a dedicated historical/backfill "
-                            f"pipeline, separate from the ongoing incremental load")
-
     acts = walk_activities(ctx.obj)
-    gated_by_branch = any(
-        (a.get("type") or "") in {"Switch", "IfCondition"}
+    historical_in_name = bool(_HISTORICAL.search(ctx.obj_name))
+    historical_in_definition = bool(_HISTORICAL.search(blob))
+    if not historical_in_definition and not historical_in_name:
+        return not_applicable(
+            f"Pipeline '{ctx.obj_name}' contains no historical/backfill load signal"
+        )
+    if not acts:
+        return not_applicable(
+            f"Pipeline '{ctx.obj_name}' is named as a historical/backfill load but contains "
+            "no activities, so no implemented load or separation can be verified"
+        )
+
+    gating_branches = [
+        a for a in acts
+        if (a.get("type") or "") in {"Switch", "IfCondition"}
         and (_HISTORICAL.search(json.dumps(a)) or _LOAD_MODE.search(json.dumps(a)))
-        for a in acts
-    )
-    param_gated = any(
-        _HISTORICAL.search(p) or _LOAD_MODE.search(p)
-        for p in ((ctx.obj.get("properties") or {}).get("parameters") or {})
-    )
-    if gated_by_branch or param_gated:
-        return binary(True, "Historical load is gated behind a parameter or branch, "
-                            "so the routine run does not replay history")
+    ]
+    if gating_branches:
+        gate = gating_branches[0]
+        return binary(
+            True,
+            f"Pipeline '{ctx.obj_name}' gates its historical/backfill path behind "
+            f"{gate.get('type')} activity '{gate.get('name') or '?'}'; the routine "
+            "incremental path cannot enter it without the branch condition",
+        )
+
     if _ONGOING.search(blob):
-        return binary(False, "Historical/backfill logic sits inline with the ongoing "
-                             "incremental logic with no parameter or branch separating "
-                             "them — a routine run can replay the full history")
-    return graded(1, "Historical/backfill logic present but no ongoing incremental "
-                     "path found to separate it from")
+        return binary(
+            False,
+            f"Pipeline '{ctx.obj_name}' contains both historical/backfill and ongoing "
+            "incremental signals on an ungated activity path; no Switch or IfCondition "
+            "prevents a routine run from replaying history",
+        )
+
+    if historical_in_name:
+        activity_names = ", ".join(str(a.get("name") or "?") for a in acts[:3])
+        return binary(
+            True,
+            f"Pipeline '{ctx.obj_name}' is a dedicated historical/backfill artifact with "
+            f"{len(acts)} activity(ies) ({activity_names}) and no ongoing incremental "
+            "activity in its saved definition",
+        )
+
+    return graded(
+        1,
+        f"Pipeline '{ctx.obj_name}' contains historical/backfill logic but no ongoing "
+        "incremental path or explicit Switch/IfCondition separation to evaluate",
+    )
 
 
 # -- 2.2.4 watermark / control values persisted durably -----------------------
@@ -2678,8 +2771,38 @@ _METADATA_SOURCE = re.compile(
     r"load[_ -]?config|table[_ -]?list|\bconfig\b|manifest",
     re.IGNORECASE,
 )
-_ITERATES_LOOKUP = re.compile(r"activity\s*\(\s*'[^']+'\s*\)\s*\.output",
-                              re.IGNORECASE)
+_LOOKUP_OUTPUT_REF = re.compile(
+    r"activity\s*\(\s*(['\"])(?P<name>[^'\"]+)\1\s*\)\s*\.output",
+    re.IGNORECASE,
+)
+_METADATA_FIELDS = {
+    "source list": re.compile(
+        r"source[_\s-]?(?:name|object|table|path|list)|required[_\s-]?source",
+        re.IGNORECASE,
+    ),
+    "load type": re.compile(r"load[_\s-]?(?:type|mode|strategy)", re.IGNORECASE),
+    "schedule": re.compile(
+        r"schedule(?:[_\s-]?name)?|cadence|frequency", re.IGNORECASE
+    ),
+    "target mapping": re.compile(
+        r"target[_\s-]?(?:schema|table|object|path|mapping)", re.IGNORECASE
+    ),
+}
+
+
+def _metadata_lookup_signal(activity: dict) -> str:
+    """Return user-authored Lookup signals, excluding connection metadata."""
+    type_properties = activity.get("typeProperties") or {}
+    return json.dumps({
+        "name": activity.get("name") or "",
+        "source": type_properties.get("source") or {},
+    })
+
+
+def _lookup_reference(activity: dict) -> str | None:
+    items = (activity.get("typeProperties") or {}).get("items") or ""
+    match = _LOOKUP_OUTPUT_REF.search(json.dumps(items))
+    return match.group("name") if match else None
 
 
 @check(
@@ -2689,31 +2812,77 @@ _ITERATES_LOOKUP = re.compile(r"activity\s*\(\s*'[^']+'\s*\)\s*\.output",
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def pl_metadata_driven(ctx: CheckContext) -> Verdict:
-    """The source list comes from a metadata table, not from the pipeline body."""
+    """A metadata/config Lookup supplies all ingestion dimensions to a ForEach."""
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
     acts = walk_activities(ctx.obj)
     data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
     if not data_acts:
-        return not_applicable("Pipeline moves no data — nothing to drive from metadata")
+        return not_applicable(
+            f"Pipeline '{ctx.obj_name}' moves no data — nothing to drive from metadata"
+        )
 
-    lookups = [a for a in acts if (a.get("type") or "") == "Lookup"
-               and _METADATA_SOURCE.search(json.dumps(a))]
+    lookups = [a for a in acts if (a.get("type") or "") == "Lookup"]
+    metadata_lookups = {
+        str(activity.get("name") or ""): (activity, _metadata_lookup_signal(activity))
+        for activity in lookups
+        if _METADATA_SOURCE.search(_metadata_lookup_signal(activity))
+    }
     loops = [a for a in acts if (a.get("type") or "") == _FOREACH]
-    driven_loops = [a for a in loops if _ITERATES_LOOKUP.search(
-        json.dumps((a.get("typeProperties") or {}).get("items") or ""))]
+    driven_loops = [(activity, _lookup_reference(activity)) for activity in loops]
+    driven_loops = [(activity, source) for activity, source in driven_loops if source]
+    linked = [
+        (metadata_lookups[source], loop)
+        for loop, source in driven_loops
+        if source in metadata_lookups
+    ]
 
-    if lookups and driven_loops:
-        return binary(True, f"Ingestion is metadata-driven: Lookup "
-                            f"'{lookups[0].get('name')}' feeds a ForEach over its rows")
-    if lookups:
-        return graded(1, f"A metadata Lookup ('{lookups[0].get('name')}') exists but no "
-                         f"ForEach iterates its output — the source list is still fixed")
+    if linked:
+        (lookup, signal), loop = linked[0]
+        present = [label for label, pattern in _METADATA_FIELDS.items()
+                   if pattern.search(signal)]
+        missing = [label for label in _METADATA_FIELDS if label not in present]
+        if not missing:
+            return binary(
+                True,
+                f"Pipeline '{ctx.obj_name}' is metadata-driven: Lookup "
+                f"'{lookup.get('name')}' selects source list, load type, schedule and "
+                f"target mapping fields, and ForEach '{loop.get('name')}' iterates that "
+                "Lookup's output",
+            )
+        return graded(
+            2,
+            f"Pipeline '{ctx.obj_name}' links metadata Lookup '{lookup.get('name')}' to "
+            f"ForEach '{loop.get('name')}', but the saved Lookup does not expose "
+            f"{', '.join(missing)}",
+        )
+    if metadata_lookups:
+        lookup_name = next(iter(metadata_lookups))
+        if driven_loops:
+            loop, source = driven_loops[0]
+            return graded(
+                1,
+                f"Pipeline '{ctx.obj_name}' has metadata Lookup '{lookup_name}', but "
+                f"ForEach '{loop.get('name')}' iterates '{source}' instead — the metadata "
+                "source does not drive ingestion",
+            )
+        return graded(
+            1,
+            f"Pipeline '{ctx.obj_name}' has metadata Lookup '{lookup_name}', but no "
+            "ForEach iterates its output — the source list is still fixed",
+        )
     if driven_loops:
-        return graded(1, "A ForEach iterates another activity's output, but that source "
-                         "is not a metadata/config table")
-    return binary(False, f"{len(data_acts)} data activities with no metadata-driven "
-                         f"Lookup+ForEach — adding a source means editing the pipeline")
+        loop, source = driven_loops[0]
+        return graded(
+            1,
+            f"Pipeline '{ctx.obj_name}' has ForEach '{loop.get('name')}' iterating "
+            f"'{source}', but that Lookup is not a metadata/config source",
+        )
+    return binary(
+        False,
+        f"Pipeline '{ctx.obj_name}' has {len(data_acts)} data activity(ies) with no "
+        "metadata-driven Lookup+ForEach — adding a source means editing the pipeline",
+    )
 
 
 # -- 2.5.3 run control tables capture batch id, status, counts, timestamps ----
@@ -3392,6 +3561,7 @@ _DATE_HANDLING = re.compile(
     r"\b(?:date|dates|datetime|timestamp)\b|_date\b|_dt\b|\bdob\b",
     re.IGNORECASE,
 )
+_CREATE_TABLE_DDL = re.compile(r"\bCREATE\s+(?:OR\s+REPLACE\s+)?TABLE\b", re.IGNORECASE)
 #: A date is held against a bound — a literal, another date, or "now". The
 #: comparison may be separated from the column by a closing quote/paren, which is
 #: why a short run of ``")]`` characters is allowed before the operator.
@@ -3439,7 +3609,13 @@ def notebook_date_quality(ctx: CheckContext) -> Verdict:
     """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
-    code = executable_code(ctx.obj)
+    code = strip_sql_comments(executable_code(ctx.obj))
+    if (_CREATE_TABLE_DDL.search(code)
+            and not (_INPUT_READ.search(code) or _WRITE_PATTERN.search(code))):
+        return not_applicable(
+            "Notebook only declares a table schema; it does not read, transform, or write "
+            "date values"
+        )
     if not _DATE_HANDLING.search(code):
         return not_applicable("Notebook handles no date or timestamp data")
 
@@ -3522,7 +3698,7 @@ def notebook_money_precision(ctx: CheckContext) -> Verdict:
     """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
-    code = executable_code(ctx.obj)
+    code = strip_sql_comments(executable_code(ctx.obj))
     if not _MONEY_CONTEXT.search(code):
         return not_applicable("Notebook handles no monetary or financial value")
 
@@ -3550,16 +3726,17 @@ def notebook_money_precision(ctx: CheckContext) -> Verdict:
 
 
 # =============================================================================
-# 5.2.2 — completeness control, and 5.2.3 — timeliness control
+# 5.2.2 — completeness control, and 5.2.3 — pipeline timeliness timeout
 #
 # Both points describe a *runtime outcome*: whether every expected batch arrived,
 # and whether it arrived on time. Neither is a property of the code, and neither
 # can be answered without row data or run telemetry this tool must not fetch.
 #
-# What a notebook definition *does* answer is whether the safeguard exists — the
-# code that would notice a missing partition, or notice data that is too old.
-# Both checks below score exactly that and say so in their evidence, so nobody
-# reads a PASS as "today's load was complete / on time".
+# What a definition *does* answer is whether the safeguard exists — notebook
+# code that would notice a missing partition, or a pipeline activity timeout
+# that bounds refresh execution. Both checks below score exactly that and say so
+# in their evidence, so nobody reads a PASS as "today's load was complete / on
+# time".
 # =============================================================================
 
 #: Reading a source: files, a table, or a directory listing. The gate for both
@@ -3585,13 +3762,17 @@ _EXPECTED_INPUT_SET = re.compile(
     re.IGNORECASE,
 )
 
-#: The *unmatched* half, named directly. On its own this is already a
-#: completeness control: nothing computes ``missing_partitions`` by accident.
-_MISSING_INPUT_SET = re.compile(
+#: The *unmatched* half, assigned as an executable value. Requiring assignment
+#: prevents mode names and paths such as ``"missing_file"`` from masquerading
+#: as a completeness calculation.
+_MISSING_INPUT_COMPUTATION = re.compile(
+    r"(?:"
     r"\bmissing[_\s-]?(?:file|files|partition|partitions|batch|batches|table|tables|"
     r"source|sources|date|dates|day|days)\b|"
     r"\b(?:absent|unreceived|not_?received)[_\s-]?(?:file|files|batch|batches|"
-    r"partition|partitions)\b",
+    r"partition|partitions)\b"
+    r")"
+    r"\s*(?::[^=\n]+)?=",
     re.IGNORECASE,
 )
 
@@ -3646,13 +3827,15 @@ def notebook_has_an_arrival_completeness_control(ctx: CheckContext) -> Verdict:
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
     code = executable_code(ctx.obj)
-    if not _SOURCE_READ.search(code):
+    reads_source = bool(_SOURCE_READ.search(code))
+    moves_data = reads_source or bool(_WRITE_PATTERN.search(code))
+    if not moves_data:
         return not_applicable(
-            "Notebook reads no source files, partitions or tables, so there is no "
-            "arrival completeness to control here"
+            "Notebook neither reads nor writes data, so there is no source arrival "
+            "completeness to control here"
         )
 
-    if _MISSING_INPUT_SET.search(code):
+    if _MISSING_INPUT_COMPUTATION.search(code):
         return graded(
             3,
             "Notebook computes the missing/unreceived inputs explicitly — a completeness "
@@ -3674,139 +3857,89 @@ def notebook_has_an_arrival_completeness_control(ctx: CheckContext) -> Verdict:
             "asserts against it — a missing file, partition or source table would pass "
             "through unnoticed",
         )
+    source_evidence = (
+        "Notebook reads source data" if reads_source else
+        "Notebook moves data but its definition contains no recognisable source read"
+    )
     return graded(
         0,
-        "Notebook reads source data with no completeness control — nothing declares which "
+        f"{source_evidence} with no completeness control — nothing declares which "
         "files/partitions/source tables were expected, and nothing computes what is "
         "missing, so an absent batch would be silently loaded as a short one",
     )
 
 
 # -- 5.2.3 --------------------------------------------------------------------
-#
-# The trap here is the watermark. A watermark makes an *incremental read*
-# efficient (that is refs 2.2.1 / 2.2.4); it becomes a *timeliness* control only
-# when the code compares it against a bound and reacts. So the subject and the
-# bound must appear together, within one window, alongside a comparison.
 
-#: The subject of a freshness judgement: how old the data is, or the timestamp
-#: that says so.
-_FRESHNESS_SUBJECT = re.compile(
-    r"\bfreshness\b|\bstale(?:ness)?\b|\blateness\b|\bdata[_\s-]?age\b|"
-    r"\bsla(?![a-z])|\blag[_\s-]?(?:minutes|hours|days|seconds)\b|"
-    r"\b(?:max|latest|last)[_\s-]?(?:load|loaded|ingest|ingested|ingestion|event|update|"
-    r"updated|modified|refresh|refreshed|arrival|watermark)[_\s-]?"
-    r"(?:ts|time|timestamp|date|datetime|dt)\b|"
-    r"\bwatermark\b|\bage[_\s-]?(?:in[_\s-]?)?(?:minutes|hours|days)\b",
-    re.IGNORECASE,
-)
-
-#: The bound it is judged against: a clock, an interval, or a named threshold.
-_FRESHNESS_BOUND = re.compile(
-    r"current_timestamp\s*\(|current_date\s*\(|\bnow\s*\(|utcnow\s*\(|"
-    r"\bdatediff\s*\(|\bdate_diff\s*\(|\btimestampdiff\s*\(|\bmonths_between\s*\(|"
-    r"\btimedelta\s*\(|\bdate_sub\s*\(|\bdate_add\s*\(|\bINTERVAL\s+\d+|"
-    r"\b(?:max|sla|freshness|staleness|lateness|threshold|tolerance|expected)[_\s-]?"
-    r"(?:age|lag|delay|hours|minutes|days|seconds|window|threshold)\b",
-    re.IGNORECASE,
-)
-
-#: An actual comparison. Assignment alone records a value; it judges nothing.
-_FRESHNESS_COMPARISON = re.compile(r"(?:<=|>=|<|>|==|!=)|\bbetween\b", re.IGNORECASE)
-
-#: An explicitly named freshness control, as a *call or assignment* — a bare word
-#: also matches a comment or a column name.
-_NAMED_FRESHNESS_CONTROL = re.compile(
-    r"\b(?:freshness_check|check_freshness|assert_fresh\w*|staleness_check|check_staleness|"
-    r"sla_check|check_sla|timeliness_check|check_timeliness)\s*[\(=]",
-    re.IGNORECASE,
-)
-
-#: How far either side of the subject the bound and comparison may sit. One
-#: statement, pretty-printed across a couple of lines — not the whole notebook.
-_FRESHNESS_WINDOW = 200
-
-
-def _freshness_control(code: str) -> bool:
-    """True when a freshness/lateness subject is compared against a bound nearby.
-
-    Windowed on purpose: a ``watermark`` read at the top of the notebook and an
-    unrelated ``current_timestamp()`` three cells later are two facts, not one
-    control. Requiring them in the same window is what keeps incremental-load
-    bookkeeping from reading as a timeliness check.
-    """
-    if _NAMED_FRESHNESS_CONTROL.search(code):
-        return True
-    for match in _FRESHNESS_SUBJECT.finditer(code):
-        window = code[max(0, match.start() - _FRESHNESS_WINDOW):
-                      match.end() + _FRESHNESS_WINDOW]
-        if _FRESHNESS_BOUND.search(window) and _FRESHNESS_COMPARISON.search(window):
-            return True
-    return False
+# Fabric stamps a long timeout on many activity definitions even when the author
+# did not configure an SLA. Those defaults are evidence that the activity is
+# bounded eventually, but not that its expected refresh window was chosen.
+_DEFAULT_PIPELINE_TIMEOUTS = frozenset({"7.00:00:00", "0.12:00:00", "7.00:00", ""})
+_TIMELINESS_ACTIVITY_TYPES = frozenset({
+    "Copy", "Dataflow", "ExecutePipeline", "Lookup", "Notebook",
+    "RefreshDataflow", "Script", "SparkJobDefinition", "SqlServerStoredProcedure",
+    "TridentNotebook",
+})
 
 
 @check(
     id="NB-TIMELINESS-CONTROL", ref="5.2.3",
     title="Timeliness: data arrives within expected SLA window",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
-    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+    pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
-def notebook_has_a_timeliness_control(ctx: CheckContext) -> Verdict:
-    """The notebook implements a freshness/lateness control — data age judged against a bound.
+def pipeline_has_a_timeliness_control(ctx: CheckContext) -> Verdict:
+    """Pipeline refresh/data activities have an explicit timeout chosen for their SLA.
 
-    **What it verifies: the safeguard, not the outcome.** When data actually
-    arrived is a runtime fact, and the SLA window itself is a business agreement
-    this tool does not hold. A PASS means "the code would notice data that is too
-    old", never "the data arrived within its SLA".
-
-    **What it can determine.** Whether a freshness subject — a max/last
-    load/event/ingestion timestamp, a watermark, a named freshness/staleness/lag
-    value — is compared, *within the same statement window*, against a bound: a
-    clock (``current_timestamp()``, ``now()``), a date difference, an interval,
-    or a named threshold (``max_age_hours``, ``sla_hours``). A named control
-    (``freshness_check(...)``, ``assert_fresh...``) counts on its own.
-
-    **What it cannot.** Read the SLA value or judge whether the threshold is the
-    agreed one; see a freshness rule enforced by a Data Activator rule, a
-    pipeline, or a stored procedure; or confirm anything is alerted when the
-    bound is breached. Read with ``executable_code`` so a comment cannot pass.
-
-    **Siblings — deliberately not satisfied by these.** ``PL-INCREMENTAL``
-    (2.2.1) and ``PL-WATERMARK-STORE`` (2.2.4) are about a watermark used to read
-    *less*; a stored watermark with nothing compared against a bound scores in
-    the middle here, not a pass. ``WS-RUNTIME-BASELINE`` (2.6.1) judges how long
-    a *run* took, not how old the *data* is. ``NB-LATE-ARRIVAL`` (2.3.8) is about
-    applying out-of-order records safely once they do arrive.
+    This verifies the saved timeout safeguard, not whether a particular run or
+    batch arrived on time. Fabric's stamped multi-hour/day defaults are PARTIAL:
+    they eventually stop a run, but do not prove that the business SLA was used.
     """
-    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
-        return not_applicable("Notebook definitions could not be read from Fabric")
-    code = executable_code(ctx.obj)
-    if not (_SOURCE_READ.search(code) or _WRITE_PATTERN.search(code)):
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    relevant = [
+        activity for activity in walk_activities(ctx.obj)
+        if (activity.get("type") or "") in _TIMELINESS_ACTIVITY_TYPES
+    ]
+    if not relevant:
         return not_applicable(
-            "Notebook neither reads nor writes data, so there is no arrival timeliness "
-            "to control here"
+            "Pipeline has no refresh or data activity whose execution timeout can be assessed"
         )
 
-    if _freshness_control(code):
+    timeouts = [
+        str((activity.get("policy") or {}).get("timeout") or "").strip()
+        for activity in relevant
+    ]
+    custom = [value for value in timeouts if value and value not in _DEFAULT_PIPELINE_TIMEOUTS]
+    defaults = [value for value in timeouts if value in _DEFAULT_PIPELINE_TIMEOUTS and value]
+    missing = len(timeouts) - len(custom) - len(defaults)
+
+    if len(custom) == len(relevant):
         return graded(
             3,
-            "Notebook compares a data-age / load-timestamp value against a bound "
-            "(clock, interval or named threshold) — a timeliness control is present. "
-            "Whether any particular load met its SLA is a runtime outcome this check "
-            "does not read, and the SLA value itself is not held by this tool.",
+            f"All {len(relevant)} refresh/data activities set a custom timeout — the "
+            "pipeline execution window is explicitly bounded for its SLA. Whether a "
+            "particular batch arrived on time is a runtime outcome this check does not read.",
         )
-    if _FRESHNESS_SUBJECT.search(code):
+    if custom:
+        return graded(
+            2,
+            f"{len(custom)} of {len(relevant)} refresh/data activities set a custom timeout; "
+            f"{len(defaults)} keep a Fabric default and {missing} have none — the SLA "
+            "execution bound is only partially configured",
+        )
+    if defaults:
+        values = ", ".join(sorted(set(defaults)))
         return graded(
             1,
-            "Notebook records a load/event timestamp or watermark but never compares it "
-            "against a bound — that is incremental-load bookkeeping, not a timeliness "
-            "control: data arriving hours late would be processed without comment",
+            f"All assessed timeout values are Fabric defaults ({values}); no refresh/data "
+            "activity has a custom timeout chosen for the expected SLA window",
         )
     return graded(
         0,
-        "Notebook has no freshness or lateness control — no data-age value is computed and "
-        "nothing is compared against a threshold, so late or absent data is indistinguishable "
-        "from data that arrived on time",
+        f"None of the {len(relevant)} refresh/data activities sets an execution timeout — "
+        "the pipeline has no configured bound for its expected SLA window",
     )
 
 
@@ -4188,7 +4321,7 @@ def notebook_validates_json_payloads(ctx: CheckContext) -> Verdict:
     """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
-    code = executable_code(ctx.obj)
+    code = strip_sql_comments(executable_code(ctx.obj))
     if not _EAM_JSON.search(code):
         return not_applicable("Notebook has no recognizable EAM/JSON ingestion")
 

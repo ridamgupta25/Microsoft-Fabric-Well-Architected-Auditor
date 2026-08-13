@@ -596,13 +596,15 @@ _TXN_ATOMIC_WRITE = re.compile(
     r"\bCREATE\s+OR\s+REPLACE\s+TABLE\b",
     re.IGNORECASE,
 )
-#: An explicit T-SQL transaction — the real thing, available when the notebook
-#: drives a Warehouse or SQL database over JDBC/pyodbc.
-_TXN_EXPLICIT = re.compile(
-    r"\bBEGIN\s+TRAN(?:SACTION)?\b|\bSET\s+IMPLICIT_TRANSACTIONS\b|"
-    r"\bconn(?:ection)?\.commit\s*\(|\.rollback\s*\(|\bautocommit\s*=\s*False\b",
+#: An explicit transaction requires both an opener and a completion operation.
+#: A stray ``commit()``/``rollback()`` may belong to unrelated setup code.
+_TXN_BEGIN = re.compile(
+    r"\bBEGIN\s+TRAN(?:SACTION)?\b|\bSET\s+IMPLICIT_TRANSACTIONS\s+ON\b|"
+    r"\bautocommit\s*=\s*False\b",
     re.IGNORECASE,
 )
+_TXN_END = re.compile(r"\bCOMMIT(?:\s+TRAN(?:SACTION)?)?\b|\bROLLBACK\b|\.commit\s*\(|\.rollback\s*\(", re.IGNORECASE)
+_TXN_CONTEXT = re.compile(r"\bwith\s+[^\n:]{0,120}?\.begin\s*\([^\n:]*\)\s*:", re.IGNORECASE)
 #: Stage everything aside, then swap it in with one atomic rename/replace.
 #: ``_tmp``/``_temp`` are deliberately absent — they are ordinary variable
 #: suffixes, so including them would let any notebook holding a ``df_tmp`` pass
@@ -614,17 +616,33 @@ _TXN_STAGING_SWAP = re.compile(
     r"\bCREATE\s+OR\s+REPLACE\s+TABLE\b|\bREPLACE\s+TABLE\b|\bSWAP\b)",
     re.IGNORECASE,
 )
-#: A caught failure that undoes or cleans up the partial work — the hand-rolled
-#: compensating transaction. Bare words like "restore" or "revert" are excluded:
-#: a log message mentioning one is not a compensation, so only an operation that
-#: actually reverses or removes the partial write counts.
+#: A caught failure that undoes or cleans up partial work. The operation must be
+#: inside the indented ``except`` suite; a later DROP/DELETE is normal notebook
+#: logic and does not compensate for the failed sequence.
 _TXN_COMPENSATION = re.compile(
-    r"\bexcept\b[\s\S]{0,800}?"
-    r"(?:\brollback\b|compensat|"
-    r"\bRESTORE\s+TABLE\b|VERSION\s+AS\s+OF|restoreToVersion|"
-    r"\bDROP\s+TABLE\b|\bDELETE\s+FROM\b|\bTRUNCATE\s+TABLE\b|fs\.rm\s*\()",
+    r"\brollback\b|compensat|\bRESTORE\s+TABLE\b|VERSION\s+AS\s+OF|"
+    r"restoreToVersion|\bDROP\s+TABLE\b|\bDELETE\s+FROM\b|"
+    r"\bTRUNCATE\s+TABLE\b|fs\.rm\s*\(",
     re.IGNORECASE,
 )
+_EXCEPT_SUITE = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)except\b[^\n]*:\s*\n"
+    r"(?P<body>(?:(?P=indent)[ \t]+[^\n]*(?:\n|$))+)",
+)
+
+
+def _transaction_compensation(code: str) -> str:
+    """Return the compensating operation found inside an exception suite."""
+    for suite in _EXCEPT_SUITE.finditer(code):
+        match = _TXN_COMPENSATION.search(suite.group("body"))
+        if match:
+            return " ".join(match.group(0).split())
+    return ""
+
+
+def _explicit_transaction(code: str) -> bool:
+    """Whether code proves a transaction lifecycle, not just a stray commit."""
+    return bool(_TXN_CONTEXT.search(code) or (_TXN_BEGIN.search(code) and _TXN_END.search(code)))
 
 
 @check(
@@ -650,32 +668,39 @@ def notebook_transaction_boundary(ctx: CheckContext) -> Verdict:
     writes = _TXN_WRITE_OP.findall(code)
     if len(writes) < 2:
         return not_applicable(
-            f"Notebook performs {len(writes)} write operation(s) — no multi-step "
-            f"operation to bound"
+            f"Notebook '{ctx.obj_name}' performs {len(writes)} terminal write "
+            f"operation(s); at least 2 are required for a multi-step transaction "
+            f"boundary assessment"
         )
 
-    if _TXN_EXPLICIT.search(code):
-        return graded(3, f"{len(writes)} writes bounded by an explicit transaction "
-                         f"(BEGIN/COMMIT/ROLLBACK or a managed connection commit)")
+    if _explicit_transaction(code):
+        return graded(3, f"Notebook '{ctx.obj_name}' has {len(writes)} writes bounded "
+                         f"by an explicit transaction (BEGIN/COMMIT/ROLLBACK or a "
+                         f"managed connection commit)")
     if _TXN_STAGING_SWAP.search(code):
-        return graded(3, f"{len(writes)} writes staged and swapped in atomically, so a "
-                         f"mid-sequence failure leaves the published tables untouched")
-    if _TXN_COMPENSATION.search(code):
-        return graded(3, f"{len(writes)} writes bounded by failure compensation — the "
-                         f"partial work is rolled back, restored, or cleaned up on error")
+        return graded(3, f"Notebook '{ctx.obj_name}' has {len(writes)} writes staged "
+                         f"and swapped in atomically, so a mid-sequence failure leaves "
+                         f"the published tables untouched")
+    compensation = _transaction_compensation(code)
+    if compensation:
+        return graded(3, f"Notebook '{ctx.obj_name}' has {len(writes)} writes bounded "
+                         f"by failure compensation inside an exception handler "
+                         f"(matched '{compensation}')")
 
     atomic = len(_TXN_ATOMIC_WRITE.findall(code))
     if atomic >= len(writes):
         return graded(
             1,
-            f"All {len(writes)} writes are individually atomic (merge/overwrite/replace) "
-            f"but the sequence is unbounded — a failure part-way leaves the set of "
-            f"targets inconsistent",
+            f"Notebook '{ctx.obj_name}': all {len(writes)} writes are individually "
+            f"atomic (merge/overwrite/replace), but the sequence is unbounded: it has "
+            f"no transaction, staging swap, or exception-handler compensation; a "
+            f"failure part-way leaves the target set inconsistent",
         )
     return graded(
         0,
-        f"{len(writes)} dependent writes with no transaction, staging swap, or "
-        f"compensation — a failure part-way through leaves the load half-applied",
+        f"Notebook '{ctx.obj_name}': {len(writes)} dependent writes have no explicit "
+        f"transaction, staging swap, or compensation inside an exception handler; "
+        f"a failure part-way through leaves the load half-applied",
     )
 
 
