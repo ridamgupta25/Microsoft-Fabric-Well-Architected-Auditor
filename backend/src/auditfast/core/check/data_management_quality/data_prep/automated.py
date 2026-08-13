@@ -2217,6 +2217,33 @@ def _bare_table(name: str) -> str:
     return (name or "").replace("[", "").replace("]", "").replace('"', "").split(".")[-1]
 
 
+#: Signals that a full reload is a one-time / first-time load rather than the
+#: routine run — the case the checklist explicitly permits for fact tables.
+_INITIAL_LOAD = re.compile(
+    r"initial[_ -]?load|first[_ -]?load|full[_ -]?load|is[_ -]?initial|one[_ -]?time|"
+    r"back[_ -]?fill|backfill|historical|seed|bootstrap|reload[_ -]?history",
+    re.IGNORECASE,
+)
+
+
+def _is_initial_load_context(ctx: CheckContext) -> bool:
+    """True when the pipeline declares itself an initial / one-time load.
+
+    Read from the pipeline name, an initial-load parameter, or a Switch/If branch
+    that selects the load mode — the three ways a first-load is kept off the
+    routine incremental path.
+    """
+    if _INITIAL_LOAD.search(ctx.obj_name):
+        return True
+    params = (ctx.obj.get("properties") or {}).get("parameters") or {}
+    if any(_INITIAL_LOAD.search(p) for p in params):
+        return True
+    return any(
+        (a.get("type") or "") in {"Switch", "IfCondition"} and _INITIAL_LOAD.search(json.dumps(a))
+        for a in walk_activities(ctx.obj)
+    )
+
+
 @check(
     id="PL-FULLLOAD", ref="2.2.2",
     title="Full load reserved only for small reference/dimension tables or initial loads",
@@ -2224,7 +2251,7 @@ def _bare_table(name: str) -> str:
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def pl_full_load(ctx: CheckContext) -> Verdict:
-    """Wholesale reloads target lookup/dimension tables, never fact tables."""
+    """Wholesale reloads target lookup/dimension tables, or are a one-time initial load."""
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
     sql = script_sql(ctx.obj)
@@ -2238,7 +2265,14 @@ def pl_full_load(ctx: CheckContext) -> Verdict:
     if not targets and not overwrite_copy:
         return not_applicable("Pipeline runs no full-reload statement "
                               "(TRUNCATE / INSERT OVERWRITE / overwrite sink)")
+
+    # An initial / one-time load may reload anything, fact tables included — the
+    # checklist reserves full loads for small tables *or* initial loads.
+    initial_load = _is_initial_load_context(ctx)
     if not targets:
+        if initial_load:
+            return binary(True, "A Copy activity overwrites its sink, but this is a dedicated "
+                                "initial/one-time load, which the standard permits")
         return graded(1, "A Copy activity overwrites its sink, but the target table "
                          "is not named in the definition — cannot confirm it is a "
                          "small reference/dimension table")
@@ -2246,6 +2280,10 @@ def pl_full_load(ctx: CheckContext) -> Verdict:
     facts = sorted({t for t in targets if is_fact(t)})
     safe = sorted({t for t in targets if not is_fact(t)})
     if facts:
+        if initial_load:
+            return binary(True, f"Full reload targets fact table(s): {', '.join(facts)}, but "
+                                f"this is a dedicated initial/one-time load, which the standard "
+                                f"permits for fact tables")
         return binary(False, f"Full reload targets fact table(s): {', '.join(facts)} — "
                              f"facts should load incrementally, not be replaced wholesale")
     kind = "dimension/reference" if any(is_dimension(t) for t in safe) else "reference"
