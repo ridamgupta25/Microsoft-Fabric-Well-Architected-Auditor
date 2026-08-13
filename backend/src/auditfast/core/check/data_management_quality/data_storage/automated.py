@@ -25,6 +25,7 @@ from auditfast.core.check._tables import (
     is_dimension,
     is_fact,
     is_key_column,
+    is_platform_table,
     is_snake_case,
     is_text_column,
     is_timestamp_column,
@@ -727,19 +728,61 @@ def table_partition_strategy(ctx: CheckContext) -> Verdict:
     required=False,
 )
 def table_audit_columns(ctx: CheckContext) -> Verdict:
-    """Each table records lineage via audit columns (created/modified/batch id).
+    """Each *solution* table records lineage via audit columns (created/modified/batch id).
 
     Matched on the *normalised* column name, so ``CreatedDate``, ``created_date``
     and ``load_dt`` all count. Business dates (``order_date``, ``birth_date``) do
-    not — the event vocabulary is deliberately narrow.
+    not - the event vocabulary is deliberately narrow.
+
+    **Platform and scratch tables are excluded from the population.** A workspace
+    carries hundreds of tables nobody designed: Fabric's own
+    ``managed_delta_table_*`` bookkeeping, SQL ``dm_*`` dynamic-management views,
+    Dynamics ``msdyn_*`` system tables, and Power Query staging tables named with
+    a GUID whose columns are ``Column1..Column8``. Scoring them turned a question
+    about a *deliberate* lineage practice into a headcount of platform noise -
+    on a real estate they were the majority of the "failing" tables, which is why
+    the ratio looked wrong to anyone who checked it by hand.
+
+    **What it cannot determine.** Whether the audit columns are *populated* or
+    maintained on each load - only that the column exists.
     """
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
-    tables = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
+    tables = {
+        n: t for n, t in ctx.workspace.tables.items()
+        if columns(t) and not is_platform_table(n) and not _is_scratch_table(n, t)
+    }
     if not tables:
-        return not_applicable(_NO_COLS)
+        return not_applicable(
+            "No solution-owned table with readable columns - every table read is "
+            "platform bookkeeping or an unnamed staging table, which carries no "
+            "deliberate audit practice to judge"
+        )
     ok = [n for n, t in tables.items() if has_audit_column(t)]
-    return covered(len(ok), len(tables), f"{len(ok)} of {len(tables)} tables have audit columns")
+    missing = sorted(set(tables) - set(ok))
+    evidence = f"{len(ok)} of {len(tables)} solution tables have audit columns"
+    if missing:
+        shown = ", ".join(missing[:_SAMPLE_LIMIT])
+        if len(missing) > _SAMPLE_LIMIT:
+            shown += f", \u2026(+{len(missing) - _SAMPLE_LIMIT} more)"
+        evidence += f". Without one: {shown}"
+    return covered(len(ok), len(tables), evidence)
+
+
+#: A Power Query / dataflow staging table: the name is a GUID fragment and the
+#: columns were never named. Nobody designed these, so they cannot evidence - or
+#: fail - an audit-column practice.
+_GUID_TABLE_NAME = re.compile(r"^[0-9a-f]{8,}[_-]?[0-9a-f]*$", re.IGNORECASE)
+_UNNAMED_COLUMN = re.compile(r"^column\d+$", re.IGNORECASE)
+
+
+def _is_scratch_table(name: str, table: dict) -> bool:
+    """True for a machine-generated staging table with machine-generated columns."""
+    leaf = (name or "").split(".")[-1].strip()
+    if not _GUID_TABLE_NAME.match(leaf.replace("_", "")):
+        return False
+    cols = [str(c.get("name") or "") for c in columns(table)]
+    return bool(cols) and all(_UNNAMED_COLUMN.match(c) for c in cols)
 
 def _table_stores(ctx: CheckContext) -> str:
     """Name the lakehouse/warehouse(s) whose tables a workspace check inspected.

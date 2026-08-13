@@ -355,16 +355,27 @@ def test_dq_rules_are_codified():
     assert nb_dq_rules(_ctx(_nb(code))).score == _PASS
 
 
-def test_restart_boundary_is_detected():
+def test_restart_reports_a_progress_marker_without_scoring_it():
+    """9.1.1 is unscored: Fabric reruns from the failed activity for every pipeline.
+
+    Microsoft documents the capability as a run-history action needing no
+    configuration ("rerun the entire pipeline, or rerun only from the failed
+    activity"), so a pipeline cannot fail this point by omitting a marker. What
+    the note still reports is whether a *durable progress marker* exists, because
+    that decides whether a rerun resumes or repeats.
+    """
     pipeline = _pipe({
         "name": "Load batch", "type": "Copy",
         "typeProperties": {"watermark": "control_table.last_loaded"},
     })
-    assert restart_from_failure(_ctx(pipeline)).score == _PASS
+    verdict = restart_from_failure(_ctx(pipeline))
+    assert verdict.score is None, "the platform provides this, so nothing is scored"
+    assert verdict.status is Status.INFO
+    assert "durable progress marker" in verdict.evidence
 
 
-def test_run_id_logging_is_not_restart_boundary():
-    """A failure logger carrying Fabric's run id is not proof of restart-from-failure."""
+def test_restart_note_says_when_no_progress_marker_is_present():
+    """Still unscored - but it points at 2.4.6, which judges whether a rerun is safe."""
     pipeline = _pipe(
         {"name": "Notebook1", "type": "TridentNotebook"},
         {
@@ -384,7 +395,9 @@ def test_run_id_logging_is_not_restart_boundary():
             },
         },
     )
-    assert restart_from_failure(_ctx(pipeline)).score == _FAIL
+    verdict = restart_from_failure(_ctx(pipeline))
+    assert verdict.score is None
+    assert "2.4.6" in verdict.evidence, "the reader is pointed at the check that scores"
 
 
 def test_audit_quality_log_writer_is_detected():

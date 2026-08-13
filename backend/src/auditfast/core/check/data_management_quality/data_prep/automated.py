@@ -58,15 +58,27 @@ _DYNAMIC_CONTENT = re.compile(
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def naming_convention(ctx: CheckContext) -> Verdict:
-    """The pipeline name matches the convention configured for the project."""
+    """The pipeline name matches the convention configured for the project.
+
+    **N/A when no convention is configured.** ``pipeline_naming_convention`` is a
+    project setting with no default, because there is no universal Fabric
+    pipeline naming standard to fall back on. With the setting absent, every
+    pipeline was previously failed against ``None`` - a finding manufactured from
+    the absence of configuration rather than from anything in the estate.
+    """
     pattern = ctx.setting("pipeline_naming_convention")
+    if not pattern:
+        return not_applicable(
+            "No pipeline naming convention is configured for this project "
+            "(project setting 'pipeline_naming_convention'), so pipeline names "
+            "cannot be judged against one"
+        )
     name = ctx.obj_name
-    ok = bool(pattern) and re.match(pattern, name) is not None
-    if ok:
+    if re.match(pattern, name) is not None:
         return binary(True, f"'{name}' matches convention")
     evidence = f"'{name}' does not match {pattern!r}"
     if not activities(ctx.obj):
-        evidence += (" — the pipeline is also empty (no activities) and its name looks like a "
+        evidence += (" - the pipeline is also empty (no activities) and its name looks like a "
                      "leftover test pipeline; delete it or rename it to the naming convention")
     return binary(False, evidence)
 

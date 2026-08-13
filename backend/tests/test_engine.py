@@ -85,9 +85,9 @@ def test_status_counts_are_unchanged(provider):
     agg = aggregate(_run(provider))
     assert agg["counts"][Status.PASS] == 63
     assert agg["counts"][Status.PARTIAL] == 21
-    assert agg["counts"][Status.FAIL] == 69
+    assert agg["counts"][Status.FAIL] == 66
     assert agg["counts"][Status.NA] == 209
-    assert agg["counts"][Status.INFO] == 8
+    assert agg["counts"][Status.INFO] == 11
 
 
 def test_mixed_layer_runs_every_layers_checks():

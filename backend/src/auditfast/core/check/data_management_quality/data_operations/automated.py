@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import re
 
-from auditfast.core.check._notebook import notebook_code
-from auditfast.core.check.helpers import Verdict, binary, not_applicable, note
+from auditfast.core.check._notebook import executable_code, notebook_code
+from auditfast.core.check.helpers import Verdict, binary, covered, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import LAYER_ITEM_TYPES, Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
@@ -159,10 +159,18 @@ def notebook_format_validation(ctx: CheckContext) -> Verdict:
     layers=(Layer.OPERATIONS,), requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def notebook_standardization(ctx: CheckContext) -> Verdict:
-    """Notebook transformations standardize dates, codes, and reference mappings."""
+    """Notebook transformations standardize dates, codes, and reference mappings.
+
+    Scored as *coverage* of the three practices rather than all-or-nothing: a
+    notebook that standardises dates and codes but maps no reference values has
+    done two thirds of the work, and reporting that as a flat failure told the
+    reader nothing about what was already in place.
+
+    Reads ``executable_code`` so a commented-out ``to_date(...)`` cannot pass.
+    """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
-    code = notebook_code(ctx.obj)
+    code = executable_code(ctx.obj)
     if not _INPUT_READ.search(code):
         return not_applicable("Notebook has no recognizable incoming file or JSON read")
 
@@ -171,10 +179,10 @@ def notebook_standardization(ctx: CheckContext) -> Verdict:
         "code formatting": bool(_CODE_STANDARDIZATION.search(code)),
         "reference mapping": bool(_REFERENCE_MAPPING.search(code)),
     }
-    missing = [name for name, present in checks.items() if not present]
-    return binary(
-        not missing,
-        "Dates, codes, and reference values are standardized"
-        if not missing else
-        f"Standardization missing: {', '.join(missing)}",
-    )
+    present = [name for name, ok in checks.items() if ok]
+    missing = [name for name, ok in checks.items() if not ok]
+    evidence = (f"{len(present)} of {len(checks)} standardization practices present"
+                + (f" ({', '.join(present)})" if present else ""))
+    if missing:
+        evidence += f"; not found: {', '.join(missing)}"
+    return covered(len(present), len(checks), evidence)

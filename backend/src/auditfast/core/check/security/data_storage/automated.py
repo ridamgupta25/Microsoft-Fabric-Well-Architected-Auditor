@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 
 from auditfast.core.check._semantic import hidden_columns, rls_roles
-from auditfast.core.check._tables import TABLE_LAYERS, columns
+from auditfast.core.check._tables import TABLE_LAYERS, columns, in_warehouse
 from auditfast.core.check.helpers import Verdict, covered, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
@@ -173,6 +173,12 @@ _SENSITIVE_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+#: N/A reason when no lakehouse/warehouse table was read at all.
+_NO_TABLES_READ = "No lakehouse/warehouse tables were read for this workspace"
+
+#: How many column names to list in evidence before summarising.
+_SAMPLE_LIMIT = 8
+
 
 @check(
     id="WS-DDM", ref="6.2.3",
@@ -182,45 +188,66 @@ _SENSITIVE_PATTERNS = re.compile(
     required=True,
 )
 def dynamic_data_masking(ctx: CheckContext) -> Verdict:
-    """Warehouse tables apply Dynamic Data Masking on columns that hold sensitive data."""
+    """Warehouse tables apply Dynamic Data Masking on columns that hold sensitive data.
+
+    **What it can determine.** ``sys.columns.is_masked``, read over the SQL
+    analytics endpoint alongside the column schema, records whether DDM is
+    applied to a column. Sensitivity is inferred from the column *name*
+    (``email``, ``ssn``, ``phone``), so the population is a name guess - a
+    sensitive column named ``col_17`` is invisible here, and the evidence says so.
+
+    **Masking is a Warehouse feature.** Lakehouse Delta tables are surfaced
+    read-only through the SQL analytics endpoint and are not the place DDM is
+    applied, so only Warehouse-owned tables are judged. When none of the tables
+    read belong to a Warehouse the answer is N/A, not a finding.
+    """
     if not ctx.workspace.has(Resource.TABLE_SCHEMAS):
-        return not_applicable(
-            "No lakehouse/warehouse tables were read for this workspace"
-        )
+        return not_applicable(_NO_TABLES_READ)
     tables = ctx.workspace.tables
     if not tables:
+        return not_applicable(_NO_TABLES_READ)
+    if not ctx.workspace.has(Resource.TABLE_COLUMNS):
         return not_applicable(
-            "No lakehouse/warehouse tables were read for this workspace"
+            "Column metadata could not be read over the SQL analytics endpoint, "
+            "so masking cannot be assessed"
+        )
+
+    warehouse_tables = {n: t for n, t in tables.items() if in_warehouse(t)}
+    if not warehouse_tables:
+        return not_applicable(
+            f"No table among the {len(tables)} read is known to live in a Warehouse. "
+            "Dynamic Data Masking is a Warehouse feature, so there is nothing to assess"
         )
 
     sensitive_cols: list[str] = []
     masked_cols: list[str] = []
-
-    for table_name, table in tables.items():
+    for table_name, table in warehouse_tables.items():
         for col in columns(table):
             col_name = (col.get("name") or "").lower()
             if not _SENSITIVE_PATTERNS.search(col_name):
                 continue
             qualified = f"{table_name}.{col.get('name', '')}"
             sensitive_cols.append(qualified)
-            # DDM metadata: provider exposes masking_function when a mask is defined.
-            masking = col.get("masking_function") or col.get("data_mask")
-            if masking:
+            if col.get("is_masked") or col.get("masking_function") or col.get("data_mask"):
                 masked_cols.append(qualified)
 
     if not sensitive_cols:
-        # Two very different reasons produce an empty list; say which one it was.
-        if not any(columns(t) for t in tables.values()):
+        if not any(columns(t) for t in warehouse_tables.values()):
             return not_applicable(
-                f"No column metadata available for the {len(tables)} table(s) read "
-                f"— Fabric's table listing does not return columns"
+                f"No column metadata available for the {len(warehouse_tables)} "
+                f"Warehouse table(s) read"
             )
         return not_applicable(
-            f"No sensitive-looking column names found across {len(tables)} table(s)"
+            f"No sensitive-looking column names found across "
+            f"{len(warehouse_tables)} Warehouse table(s). Sensitivity is judged "
+            f"from the column name, so a sensitive column named opaquely is not seen"
         )
 
-    return covered(
-        len(masked_cols), len(sensitive_cols),
-        f"{len(masked_cols)} of {len(sensitive_cols)} sensitive columns "
-        f"have Dynamic Data Masking applied",
-    )
+    unmasked = sorted(set(sensitive_cols) - set(masked_cols))
+    evidence = (f"{len(masked_cols)} of {len(sensitive_cols)} sensitive-looking "
+                f"Warehouse column(s) have Dynamic Data Masking applied")
+    if unmasked:
+        evidence += f". Unmasked: {', '.join(unmasked[:_SAMPLE_LIMIT])}"
+        if len(unmasked) > _SAMPLE_LIMIT:
+            evidence += f", \u2026(+{len(unmasked) - _SAMPLE_LIMIT} more)"
+    return covered(len(masked_cols), len(sensitive_cols), evidence)
