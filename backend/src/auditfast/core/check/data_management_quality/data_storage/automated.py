@@ -2543,11 +2543,11 @@ def gold_items_refreshed_within_sla(ctx: CheckContext) -> Verdict:
     none of them has a readable stamp, the check is N/A.
 
     **Sibling — ``NB-TIMELINESS-CONTROL`` (5.2.3), and the difference matters.**
-    That check reads notebook *code* and asks whether an arrival-lateness control
-    is implemented — does the code know how old its input is. This check reads no
-    code at all: it asks whether the serving items were in fact refreshed
-    recently. A workspace can pass 5.2.3 with a beautifully written staleness
-    guard and fail this one because nothing has run for a week, and vice versa.
+    That compatibility ID now checks whether pipeline refresh/data activities
+    have a custom execution timeout chosen for their SLA. This check reads no
+    pipeline policy: it asks whether the serving items were in fact refreshed
+    recently. A workspace can pass 5.2.3 with well-bounded pipeline activities
+    and fail this one because nothing has run for a week, and vice versa.
     """
     if not ctx.workspace.has(Resource.ITEMS):
         return not_applicable("Workspace items could not be read from Fabric")

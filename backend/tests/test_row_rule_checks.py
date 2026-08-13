@@ -222,6 +222,15 @@ def test_json_validation_shares_the_eam_gate_with_its_sibling():
     assert nb_eam_ingest(ctx).status is Status.NA
 
 
+def test_json_validation_is_na_for_a_non_json_eam_table_name():
+    ctx = _nb_ctx(
+        'df = spark.read.table("eam_work_orders")\n'
+        'df.write.saveAsTable("silver_eam_work_orders")\n'
+    )
+    assert notebook_validates_json_payloads(ctx).status is Status.NA
+    assert nb_eam_ingest(ctx).status is Status.NA
+
+
 def test_json_validation_is_na_when_notebook_definitions_were_unreadable():
     ctx = _nb_ctx("", unavailable={Resource.NOTEBOOK_DEFINITIONS})
     assert notebook_validates_json_payloads(ctx).status is Status.NA
