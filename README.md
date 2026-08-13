@@ -50,6 +50,7 @@ new commands are found.
 | **Node.js** (includes npm) | 18 LTS or newer | `winget install -e --id OpenJS.NodeJS.LTS` | Frontend |
 | **Git** | any | `winget install -e --id Git.Git` | Getting the code |
 | **Azure CLI** (recommended) | any | `winget install -e --id Microsoft.AzureCLI` | The easiest sign-in |
+| **ODBC Driver 18 for SQL Server** (optional) | 18 | `winget install -e --id Microsoft.msodbcsql.18` | Only for lakehouse / warehouse **column-level** checks — see [Optional — enable lakehouse & warehouse column checks](#optional--enable-lakehouse--warehouse-column-checks) |
 | **A Fabric workspace** | — | — | You need at least **Viewer** access to one workspace to run a real audit |
 
 You do **not** need Docker, a database, or your own app registration — sign-in
@@ -167,6 +168,58 @@ Go back to the project root, ready for the next step:
 ```powershell
 cd ..
 ```
+
+### Optional — enable lakehouse & warehouse column checks
+
+A small group of checks inspect **column-level** details of your lakehouse and
+warehouse tables — column names, data types, surrogate keys, SCD2 audit columns,
+star-schema shape, and warehouse row-level security. That information is **not**
+in the Fabric REST API: it lives only behind the **SQL analytics endpoint** that
+Fabric provisions for every lakehouse and warehouse, reached over TDS (port
+1433). To read it, the machine running the backend needs two extra things:
+
+1. the **`pyodbc`** Python package, and
+2. a **SQL Server ODBC driver** (Driver 18 recommended).
+
+> **This step is completely optional.** If you skip it, those column-level checks
+> simply report **N/A** (never counted, never failed) and every other check runs
+> exactly as normal. Set it up only if you want lakehouse/warehouse column-level
+> coverage.
+
+**1. Install the ODBC driver** (needs a normal terminal; reopen the terminal
+after it finishes so the driver is found):
+
+```powershell
+winget install -e --id Microsoft.msodbcsql.18
+```
+
+**2. Install `pyodbc` into the project's virtual environment** (run from the
+project root — the folder with `backend\` and `frontend\`):
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install pyodbc
+```
+
+**3. Make sure outbound TCP port 1433 is open** from this machine — corporate
+firewalls sometimes block it. Nothing else is required: the tool discovers each
+endpoint's address automatically and signs the SQL connection with the same
+read-only session you already sign in with, so there is no connection string and
+no extra sign-in.
+
+**Verify the driver is visible to Python:**
+
+```powershell
+.\.venv\Scripts\python.exe -c "import pyodbc; print([d for d in pyodbc.drivers() if 'SQL Server' in d])"
+```
+
+Expected: a list containing something like `ODBC Driver 18 for SQL Server`. An
+empty list `[]` means the driver isn't installed yet — repeat step 1 and reopen
+the terminal. `ModuleNotFoundError: pyodbc` means step 2 didn't run in this
+`.venv`.
+
+> The SQL reads are **on by default** and stay silent if any piece is missing. To
+> turn them off entirely, set `AUDITFAST_SQL_ENDPOINT_ENABLED=false` before you
+> start the backend.
 
 ### 4. Configuration (optional — skip for a first run)
 
@@ -302,6 +355,7 @@ a recorded fixture, needs no credentials, and never touches a real tenant.
 | An audit is rejected with **401** before it starts | You're not signed in (or the session expired). Reconnect via **Connect to Fabric**. |
 | An audit returns **403** for a workspace | The signed-in user needs at least **Viewer** on it. Use **Troubleshoot access** on the sign-in page to confirm. |
 | `az` sign-in fails | Run `az login` first, on the same machine that runs the backend. |
+| Lakehouse / warehouse **column** checks all show **N/A** | The SQL analytics endpoint couldn't be read. Install `pyodbc` and **ODBC Driver 18**, make sure outbound **port 1433** is open (see [Optional — enable lakehouse & warehouse column checks](#optional--enable-lakehouse--warehouse-column-checks)), then re-run. These checks degrade to N/A by design — they never fail the audit. |
 
 More detail: **[docs/getting-started.md](docs/getting-started.md)**.
 
@@ -347,6 +401,7 @@ Checks apply at three object scopes:
 | **Workspace** | naming, roles via security groups, least-privilege admins, guest access, sensitivity labels, Git, deployment pipeline, capacity, orphaned items, layer content / separation, inventory |
 | **Pipeline** | naming, descriptions, parameterization, retry, on-failure path, failure notification, timeouts, no hardcoded secrets |
 | **Notebook** | Delta MERGE / OPTIMIZE / VACUUM / Z-ORDER / V-ORDER, table properties, retention, Spark env & pinned libraries, shuffle / cache / repartition, `SELECT *` |
+| **Lakehouse / Warehouse** | table & column naming, data types, surrogate keys, SCD2 audit columns, star-schema / fact-grain shape, warehouse schemas and row-level security (the **column-level** checks need the [SQL-endpoint setup](#optional--enable-lakehouse--warehouse-column-checks)) |
 
 The seven Well-Architected pillars it scores:
 
@@ -358,9 +413,10 @@ The seven Well-Architected pillars it scores:
 - Governance & Compliance
 - Foundation (informational)
 
-Lakehouse / Delta storage, semantic models, and Eventhouse are not yet
-automated. The engine dispatches on object *scope*, so adding them requires no
-engine change.
+Lakehouse and warehouse **table & column** checks need the optional SQL-endpoint
+setup ([see above](#optional--enable-lakehouse--warehouse-column-checks));
+semantic models and Eventhouse are not yet fully automated. The engine dispatches
+on object *scope*, so adding more requires no engine change.
 
 ---
 
