@@ -627,11 +627,44 @@ def test_environment_isolation_is_na_when_the_name_declares_no_tier():
 
 # --- 10.5.1 Data Activator ---------------------------------------------------
 
-def test_a_reflex_item_satisfies_the_activator_check():
-    ctx = _ws_ctx(id="w", items=_items(("DataPipeline", "PL_Load"), ("Reflex", "RX_Alerts")))
+def test_an_activator_with_a_live_rule_satisfies_the_check():
+    ctx = _ws_ctx(
+        id="w",
+        items=_items(("DataPipeline", "PL_Load"), ("Reflex", "RX_Alerts")),
+        activators={"RX_Alerts": {"rules": 1, "active_rules": 1, "sources": 1, "actions": 1}},
+    )
     verdict = activator_configured(ctx)
     assert verdict.score == 3
     assert "RX_Alerts" in verdict.evidence
+
+
+def test_an_empty_activator_with_no_rules_does_not_pass():
+    """A Reflex item created but carrying no rule triggers nothing — the reviewer's gap."""
+    ctx = _ws_ctx(
+        id="w",
+        items=_items(("DataPipeline", "PL_Load"), ("Reflex", "RX_Empty")),
+        activators={"RX_Empty": {"rules": 0, "active_rules": 0, "sources": 0, "actions": 0}},
+    )
+    assert activator_configured(ctx).score == 0
+
+
+def test_an_activator_with_only_paused_rules_does_not_pass():
+    ctx = _ws_ctx(
+        id="w",
+        items=_items(("DataPipeline", "PL_Load"), ("Reflex", "RX_Paused")),
+        activators={"RX_Paused": {"rules": 2, "active_rules": 0, "sources": 1, "actions": 1}},
+    )
+    assert activator_configured(ctx).score == 0
+
+
+def test_activator_is_na_when_its_definition_could_not_be_read():
+    """A present Activator whose rules are unreadable is unverified, never a FAIL."""
+    ctx = _ws_ctx(
+        id="w",
+        items=_items(("DataPipeline", "PL_Load"), ("Reflex", "RX_Alerts")),
+        unavailable={Resource.ACTIVATOR_DEFINITIONS},
+    )
+    assert activator_configured(ctx).status is Status.NA
 
 
 def test_operational_items_without_an_activator_fail():

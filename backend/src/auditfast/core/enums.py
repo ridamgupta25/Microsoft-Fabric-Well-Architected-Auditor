@@ -200,6 +200,12 @@ class Resource(StrEnum):
     #: ADLS Gen2 List Path API using a Storage-audience token. The provider stores
     #: only bounded counts/buckets, never individual file paths.
     LAKEHOUSE_FILES = "lakehouseFiles"
+    #: Per-Data-Activator (Reflex) rule configuration, parsed from the item's
+    #: ``ReflexEntities.json`` definition via ``getDefinition``. Only bounded
+    #: counts are kept (rules / active rules / sources / actions), never the rule
+    #: bodies. Needs the ``Item.ReadWrite`` scope getDefinition requires; without
+    #: it the definition is unreadable and the trigger-depth check reports N/A.
+    ACTIVATOR_DEFINITIONS = "activatorDefinitions"
 
 
 class Status(StrEnum):
