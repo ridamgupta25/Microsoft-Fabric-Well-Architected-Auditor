@@ -18,19 +18,22 @@ the frontend on Terminal 2, and the app open at **http://localhost:5173**.
 4. [Step 1 — Sign in to Fabric](#step-1--sign-in-to-fabric)
 5. [Step 2 — Choose what to audit](#step-2--choose-what-to-audit)
 6. [Step 3 — Run it and watch progress](#step-3--run-it-and-watch-progress)
-7. [Step 4 — Read the report](#step-4--read-the-report)
-8. [Understanding the score](#understanding-the-score)
-9. [Layer roles explained](#layer-roles-explained)
-10. [Browse the check library](#browse-the-check-library)
-11. [Review past audits (History)](#review-past-audits-history)
-12. [Download and share reports](#download-and-share-reports)
-13. [Using the command line (no browser)](#using-the-command-line-no-browser)
-14. [Configure a project (YAML)](#configure-a-project-yaml)
-15. [Environment variables](#environment-variables)
-16. [Caching and re-runs](#caching-and-re-runs)
-17. [Tips and good practices](#tips-and-good-practices)
-18. [Frequently asked questions](#frequently-asked-questions)
-19. [Where to get more help](#where-to-get-more-help)
+7. [Answer or skip the self-assessed checklist (questionnaire)](#answer-or-skip-the-self-assessed-checklist-questionnaire)
+8. [Step 4 — Read the report](#step-4--read-the-report)
+9. [Understanding the score](#understanding-the-score)
+10. [Layer roles explained](#layer-roles-explained)
+11. [Lakehouse & warehouse column checks](#lakehouse--warehouse-column-checks)
+12. [Browse the check library](#browse-the-check-library)
+13. [Propose a new check (the Checklist tab)](#propose-a-new-check-the-checklist-tab)
+14. [Review past audits (History)](#review-past-audits-history)
+15. [Download and share reports](#download-and-share-reports)
+16. [Using the command line (no browser)](#using-the-command-line-no-browser)
+17. [Configure a project (YAML)](#configure-a-project-yaml)
+18. [Environment variables](#environment-variables)
+19. [Caching and re-runs](#caching-and-re-runs)
+20. [Tips and good practices](#tips-and-good-practices)
+21. [Frequently asked questions](#frequently-asked-questions)
+22. [Where to get more help](#where-to-get-more-help)
 
 ---
 
@@ -81,7 +84,12 @@ The navigation bar at the top has these tabs:
 | **Dashboard** | The landing page: what the tool covers and your most recent runs. |
 | **Run audit** | Pick workspaces and pillars, then run an audit and watch it live. |
 | **Checks** | Browse the full rule library. No sign-in needed. |
+| **Checklist** | Type a best-practice point and see whether the tool already covers it. No sign-in needed. |
 | **History** | Every past audit, with a link back to each report. |
+
+![The top navigation bar: the app name, the green health badge showing how many
+checks are loaded, the Dashboard / Run audit / Checks / Checklist / History tabs,
+and the Login button on the right.](images/01-dashboard.png)
 
 To the right of the tabs is the **account control**: a **Login** button when
 you're signed out, or your name with a **Sign out** option when you're connected.
@@ -95,6 +103,10 @@ Choosing **Account & diagnostics** opens the sign-in page, where you can also
 Every audit reads a live tenant, so you must sign in first. There are three ways;
 pick the first one that works for you. **All three are read-only, and your Fabric
 token never reaches the browser — the session lives on the server.**
+
+![The sign-in page. Expand “Running the app on this machine?” to see the two
+local options (Reuse my Azure CLI session, Open the sign-in window on the API
+host). “Troubleshoot access” is at the bottom.](images/02-signin-page.png)
 
 ### A. Reuse your Azure CLI session (easiest)
 
@@ -154,6 +166,10 @@ one sub-resource (for example, items readable but role assignments returning
 Go to the **Run audit** tab. Once you're signed in, it lists **every workspace
 your account can see**, all selected by default.
 
+![The Run audit page: a table of your workspaces, each with an Audit checkbox and
+a Layer role dropdown, plus the box to add a workspace by name or ID, and the
+pillar tick-boxes below.](images/03-run-audit-workspaces.png)
+
 **Workspaces**
 
 - **Select / deselect** the workspaces you want in this run.
@@ -189,13 +205,70 @@ on the server and the page shows **live status** rather than freezing.
 - Results appear **workspace by workspace**. You can open the report while it's
   still running and use **Reload results** to fetch the latest.
 
-When it finishes, you land on the full report.
+![Audit in progress: a spinner reads “Auditing your workspaces…” while the
+self-assessed checklist waits below. The audit id is shown on the
+right.](images/04-audit-running.png)
+
+When the crawl finishes, one of two things happens:
+
+- If the workspaces you chose have **self-assessed** points to answer, the report
+  waits for you — see
+  [the next section](#answer-or-skip-the-self-assessed-checklist-questionnaire).
+- Otherwise you land on the full report automatically.
+
+---
+
+## Answer or skip the self-assessed checklist (questionnaire)
+
+Some Well-Architected best practices **cannot be read from Fabric** — things like
+“is there a tested disaster-recovery plan?” or “do you review capacity cost each
+month?”. The tool asks *you* about those. They appear as a **self-assessed
+checklist** (a questionnaire) on the same page, **while the automated crawl is
+still running**, so you lose no time. It is grouped by pillar and layer.
+
+![The self-assessed checklist appears below the progress panel while the audit
+runs. Each point shows a question, scored options, and a “Skip this check”
+option.](images/05-questionnaire.png)
+
+**How each point works**
+
+- Read the question and pick the **one option** that best matches your
+  environment. Each option shows a score out of 3 (for example, *“Documented and
+  tested” = 3/3*).
+- Every point also has a **“Skip this check”** option. Skipping records it as
+  **N/A** — left out of the score entirely, never counted as a failure.
+- The line at the top shows *“X of N answered”*.
+
+### Skip the whole questionnaire in one click
+
+You do **not** have to answer anything. **Any point you leave blank is treated as
+skipped (N/A).** So to skip the *entire* questionnaire at once:
+
+1. Leave every question unanswered (that's the default — don't tick anything).
+2. Click **Submit answers & view report**.
+
+![To skip every self-assessed point at once, answer nothing and click “Submit
+answers & view report”. The note beneath the button confirms unanswered points
+are recorded as skipped (N/A).](images/06-questionnaire-skip.png)
+
+That single click records **all** self-assessed points as N/A and takes you
+straight to the report as soon as the automated crawl has finished. You can also
+answer some and skip the rest — only the ones you leave blank become N/A.
+
+> **You must click Submit to reach the report.** When a run has self-assessed
+> points, the report opens only after you submit (even if you answered nothing).
+> If no self-assessed points apply to the workspaces you chose, there is nothing
+> to submit and the report opens on its own.
 
 ---
 
 ## Step 4 — Read the report
 
 The report page has several sections, top to bottom.
+
+![The top of a report: the workspace name, the big overall percentage with a
+colour-coded rating badge, the pass / partial / fail summary, and the Markdown
+and Excel download buttons.](images/07-report-overall.png)
 
 ### Header
 
@@ -236,6 +309,10 @@ The heart of the report — a filterable table. Each finding shows:
 - a **recommended fix** (pre-written remediation).
 
 Use this list to plan the work: sort by severity and start at the top.
+
+![The Findings table: each row shows the check, its severity, the evidence
+observed, the affected item, and the recommended fix. Filters sit above the
+table.](images/08-report-findings.png)
 
 ### Workspaces requiring additional access
 
@@ -283,6 +360,25 @@ workspace holding content that should live elsewhere.
 
 ---
 
+## Lakehouse & warehouse column checks
+
+A small group of checks look at the **columns** inside your lakehouse and
+warehouse tables — column names, data types, surrogate keys, SCD2 audit columns,
+star-schema shape, and warehouse row-level security. That detail is **not** in
+the Fabric REST API, so the tool reads it over the **SQL analytics endpoint**
+(port 1433) that Fabric provisions for every lakehouse and warehouse.
+
+For those checks to produce a verdict, the machine running the backend needs
+`pyodbc` and a **SQL Server ODBC driver** installed, plus outbound port 1433
+open. That is a one-time, **optional** setup — see
+[README → Optional: enable lakehouse & warehouse column checks](../README.md#optional--enable-lakehouse--warehouse-column-checks).
+
+> **If it isn't set up, nothing breaks.** The column-level checks simply report
+> **N/A** (never counted, never failed) and every other check runs exactly as
+> normal. Set it up only if you want that extra coverage.
+
+---
+
 ## Browse the check library
 
 Open the **Checks** tab. This page needs **no sign-in and no audit** — it lists
@@ -297,6 +393,15 @@ every rule the tool can apply, straight from its metadata.
 Use it to understand what a finding means, or to see exactly what the tool covers
 before you run anything.
 
+![The Checks tab: a searchable, filterable table of every rule, showing each
+check's ID, reference, pillar, scope, severity, and title.](images/09-checks-catalog.png)
+
+---
+
+
+
+
+
 ---
 
 ## Review past audits (History)
@@ -304,6 +409,9 @@ before you run anything.
 Open the **History** tab for a list of every past run: its id, when it was
 submitted, its status, and its score. Click an id to **reopen that report**. The
 **Dashboard** also shows your five most recent runs.
+
+![The History tab: a table of past audits with id, submitted time, status, and
+score; each id links back to its report.](images/11-history.png)
 
 ---
 
@@ -485,6 +593,17 @@ counted against you.
 **Why did I get fewer results than I expected?**
 Almost always access. Use **Troubleshoot access** on the sign-in page, grant at
 least Viewer on the missing workspaces, and re-run.
+
+**Why are all my lakehouse / warehouse column checks N/A?**
+Those checks read column details over the SQL analytics endpoint, which needs
+`pyodbc`, an ODBC driver, and outbound port 1433. Set that up (see
+[Lakehouse & warehouse column checks](#lakehouse--warehouse-column-checks)) and
+re-run. Until then they stay N/A — never counted against you.
+
+**How do I skip the self-assessed questionnaire?**
+Leave the points unanswered and click **Submit answers & view report** — every
+unanswered point is recorded as N/A. See
+[Answer or skip the self-assessed checklist](#answer-or-skip-the-self-assessed-checklist-questionnaire).
 
 **Where are my report files?**
 Download them from the report page (Markdown / Excel), or find them in
