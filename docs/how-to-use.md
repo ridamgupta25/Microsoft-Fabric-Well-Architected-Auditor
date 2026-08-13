@@ -398,23 +398,9 @@ check's ID, reference, pillar, scope, severity, and title.](images/09-checks-cat
 
 ---
 
-## Propose a new check (the Checklist tab)
 
-The **Checklist** tab lets you type a best-practice point in plain language (for
-example, *“Notebooks should not use SELECT *”*) and instantly see whether the
-tool **already covers it**. It needs **no sign-in** and runs no audit.
 
-- If a matching check already exists, it's shown so you know it's covered.
-- If nothing matches, the tool drafts a **proposal** (a suggested pillar, scope,
-  severity, and a starter definition) that an engineer can turn into a real
-  check later.
 
-This never changes your scores or adds a check on its own — it's a way to check
-coverage and capture ideas.
-
-![The Checklist tab: a text box to describe a best-practice point, and the
-result panel showing either the matching existing check or a drafted
-proposal.](images/10-checklist-page.png)
 
 ---
 
