@@ -30,10 +30,10 @@ from auditfast.core.check.data_management_quality.data_prep.automated import (
 from auditfast.core.check.data_management_quality.data_storage.automated import (
     _shadow_reason,
     shortcut_scope,
-    table_datatype_sizing,
     table_partition_strategy,
     table_relationships_declared,
     table_surrogate_generated,
+    table_type_sizing,
 )
 from auditfast.core.check.data_management_quality.reporting_semantic.automated import (
     _normalised,
@@ -233,6 +233,24 @@ def test_offending_measures_are_named_against_their_model():
     details = _details(complex_measures_use_variables(_model_ctx(models)))
     assert [d.obj for d in details] == ["M"]
     assert "Bad Measure" in details[0].evidence
+
+
+def test_scored_dax_verdict_names_the_models_and_problem_measures():
+    """The aggregate row is self-contained: it names every model it checked and the
+    measures that break a practice, so the reviewer needn't cross-reference detail rows."""
+    no_var_only = " + ".join(f"SUM(t[a{i}])" for i in range(40))  # >400 chars, no VAR
+    passing = "DIVIDE(SUM(Sales[Amount]), SUM(Sales[Quantity]), 0) + AVERAGE(Sales[Discount])"
+    assert len(_normalised(no_var_only)) > 400
+    models = {"SalesModel": {"measures": [
+        {"name": "Bad Measure", "expression": no_var_only},
+        {"name": "Good Measure", "expression": passing},
+    ]}}
+    scored = _scored(complex_measures_use_variables(_model_ctx(models)))
+    assert scored.status is None                       # the scored aggregate, not a note
+    assert "1 of 2" in scored.evidence
+    assert "SalesModel" in scored.evidence             # every model it checked is named
+    assert "Bad Measure (no VAR)" in scored.evidence   # the failing measure + its fault
+    assert "Good Measure" not in scored.evidence       # a compliant measure is not flagged
 
 
 def test_named_measures_are_capped_so_one_model_cannot_fill_the_report():
@@ -973,7 +991,16 @@ def _col(name: str, ctype: str, source_kind: str = "Warehouse") -> dict:
     return {"name": name, "type": ctype, "source_kind": source_kind}
 
 
-def test_partition_strategy_passes_when_large_fact_has_partition_key_columns():
+def test_partition_strategy_is_na_when_only_a_column_name_hints_at_partitioning():
+    """A date column is not evidence of a partitioning *strategy*.
+
+    Fabric's table metadata carries no partition/clustering keys - verified
+    against a real 1,845-table crawl, where ``partitionBy``/``partitionColumns``
+    appear only inside notebook source, never on a table. So the check can see
+    that a fact table *could* be partitioned by ``order_date``, but not whether
+    it *is*. Scoring that guess produced a verdict on unreadable data; N/A is the
+    honest answer, and the evidence names the permission that would be needed.
+    """
     ctx = _ws_ctx(
         id="w",
         tables={
@@ -984,21 +1011,32 @@ def test_partition_strategy_passes_when_large_fact_has_partition_key_columns():
             ] * 12),
         },
     )
-    assert table_partition_strategy(ctx).score == 3
+    verdict = table_partition_strategy(ctx)
+    assert verdict.score is None
+    assert "no partition/clustering metadata" in verdict.evidence
 
 
-def test_partition_strategy_fails_when_large_fact_has_no_partition_hints():
-    ctx = _ws_ctx(
-        id="w",
-        tables={
-            "fact_sales": _table([
-                _col("sales_sk", "bigint"),
-                _col("metric_a", "decimal(18,2)"),
-                _col("metric_b", "decimal(18,2)"),
-            ] * 12),
-        },
+def test_partition_strategy_scores_only_declared_partition_metadata():
+    """When a table does declare partition keys, that is readable and is scored."""
+    partitioned = _table([_col("sales_sk", "bigint"), _col("order_date", "date")] * 12)
+    partitioned["partitionBy"] = ["order_date"]
+    plain = _table([_col("txn_sk", "bigint"), _col("amount", "decimal(18,2)")] * 12)
+
+    ctx = _ws_ctx(id="w", tables={"fact_sales": partitioned, "fact_txn": plain})
+    verdict = table_partition_strategy(ctx)
+    assert verdict.score is not None, "declared metadata is readable, so it is scored"
+    assert "1 of 1" in verdict.evidence, (
+        "only the table whose strategy could be *inspected* belongs in the ratio; "
+        "a table with no metadata is unknown, not a failure. NB: because the "
+        "denominator counts only tables that declared metadata, this check can "
+        "currently only ever return PASS or N/A - worth revisiting if Fabric "
+        "starts exposing partition keys on the table listing"
     )
-    assert table_partition_strategy(ctx).score == 0
+
+
+def test_partition_strategy_is_na_when_no_large_table_is_named():
+    ctx = _ws_ctx(id="w", tables={"dim_customer": _table([_col("customer_sk", "bigint")])})
+    assert table_partition_strategy(ctx).score is None
 
 
 def test_datatype_sizing_flags_oversized_text_and_invalid_decimal_precision():
@@ -1013,7 +1051,7 @@ def test_datatype_sizing_flags_oversized_text_and_invalid_decimal_precision():
             ]),
         },
     )
-    verdict = table_datatype_sizing(ctx)
+    verdict = table_type_sizing(ctx)
     assert verdict.score == 1
     assert "oversized text" in verdict.evidence
 

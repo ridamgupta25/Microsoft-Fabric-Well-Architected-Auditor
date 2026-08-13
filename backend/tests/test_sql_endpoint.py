@@ -219,3 +219,192 @@ def test_new_resources_are_distinct_from_table_schemas():
     """Separate resources so a run that reads no columns pays no SQL round trip."""
     assert Resource.TABLE_COLUMNS is not Resource.TABLE_SCHEMAS
     assert Resource.WAREHOUSE_SECURITY.value == "warehouseSecurity"
+
+
+# =============================================================================
+# Retry on transient failure.
+#
+# Two crawls of the same 105-endpoint workspace a day apart read 502 then 307
+# tables, and the second lost Warehouse RLS entirely. Verdicts moved with it
+# (4.2.5 PARTIAL -> FAIL) purely because less data was read - which reads as
+# "the estate got worse" when nothing about the estate changed.
+# =============================================================================
+
+def test_a_transient_failure_is_retried_and_can_succeed(monkeypatch):
+    from auditfast.clients import sqlendpoint as mod
+
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    reader = mod.SqlEndpointReader("token")
+    endpoint = mod.SqlEndpoint("Lakehouse", "Bronze", "host")
+    calls = {"n": 0}
+
+    def flaky(_endpoint, _sql):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            reader.failures[_endpoint.name] = "the endpoint accepted the connection but the query did not finish in time"
+            return None
+        return [("t", "c")]
+
+    monkeypatch.setattr(reader, "_attempt", flaky)
+    assert reader._query(endpoint, "SELECT 1") == [("t", "c")]
+    assert calls["n"] == 3
+    assert endpoint.name not in reader.failures, "a recovered endpoint is not a failure"
+
+
+def test_a_permission_failure_is_not_retried(monkeypatch):
+    """A denial is deterministic for a given token - retrying only costs time."""
+    from auditfast.clients import sqlendpoint as mod
+
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    reader = mod.SqlEndpointReader("token")
+    endpoint = mod.SqlEndpoint("Warehouse", "WH", "host")
+    calls = {"n": 0}
+
+    def denied(_endpoint, _sql):
+        calls["n"] += 1
+        reader.failures[_endpoint.name] = "the signed-in user has no access to this database"
+        return None
+
+    monkeypatch.setattr(reader, "_attempt", denied)
+    assert reader._query(endpoint, "SELECT 1") is None
+    assert calls["n"] == 1, "a permission denial must not be retried"
+
+
+def test_retries_are_bounded(monkeypatch):
+    from auditfast.clients import sqlendpoint as mod
+
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    reader = mod.SqlEndpointReader("token")
+    endpoint = mod.SqlEndpoint("Lakehouse", "Bronze", "host")
+    calls = {"n": 0}
+
+    def always_timeout(_endpoint, _sql):
+        calls["n"] += 1
+        reader.failures[_endpoint.name] = "the endpoint is not reachable - port 1433 may be blocked"
+        return None
+
+    monkeypatch.setattr(reader, "_attempt", always_timeout)
+    assert reader._query(endpoint, "SELECT 1") is None
+    assert calls["n"] == mod._MAX_ATTEMPTS
+
+
+# =============================================================================
+# Token expiry mid-crawl.
+#
+# A 105-endpoint crawl read 17 and lost 88. Every failure was "no access", which
+# is (correctly) not retryable - but the cause was an *expired* token, not a
+# denial. The Fabric REST client already refreshes for exactly this reason; the
+# SQL token was minted once and never renewed, so reads stopped partway through
+# and the gap looked like a permission problem.
+# =============================================================================
+
+_EXPIRED = "the signed-in user has no access to this database"
+
+
+def test_an_expired_token_is_re_minted_and_the_read_succeeds(monkeypatch):
+    from auditfast.clients import sqlendpoint as mod
+
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    reader = mod.SqlEndpointReader("stale", token_provider=lambda: "fresh")
+    endpoint = mod.SqlEndpoint("Lakehouse", "Bronze", "host")
+    calls = {"n": 0}
+
+    def expired_until_refreshed(_endpoint, _sql):
+        calls["n"] += 1
+        if reader._token == "stale":
+            reader.failures[_endpoint.name] = _EXPIRED
+            return None
+        return [("t", "c")]
+
+    monkeypatch.setattr(reader, "_attempt", expired_until_refreshed)
+    assert reader._query(endpoint, "SELECT 1") == [("t", "c")]
+    assert calls["n"] == 2, "one failed attempt, then one after the re-mint"
+    assert endpoint.name not in reader.failures
+    assert reader._token == "fresh"
+
+
+def test_a_genuine_denial_is_not_retried_forever_when_a_refresher_exists(monkeypatch):
+    """The re-mint is one-shot: a real denial survives it and still fails fast."""
+    from auditfast.clients import sqlendpoint as mod
+
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    reader = mod.SqlEndpointReader("token", token_provider=lambda: "another")
+    endpoint = mod.SqlEndpoint("Warehouse", "WH", "host")
+    calls = {"n": 0}
+
+    def always_denied(_endpoint, _sql):
+        calls["n"] += 1
+        reader.failures[_endpoint.name] = _EXPIRED
+        return None
+
+    monkeypatch.setattr(reader, "_attempt", always_denied)
+    assert reader._query(endpoint, "SELECT 1") is None
+    assert calls["n"] == 2, "one attempt plus a single re-mint retry, then stop"
+
+
+def test_a_refresher_that_returns_the_same_token_does_not_retry(monkeypatch):
+    """No new token means nothing changed, so a second attempt is wasted work."""
+    from auditfast.clients import sqlendpoint as mod
+
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    reader = mod.SqlEndpointReader("token", token_provider=lambda: "token")
+    endpoint = mod.SqlEndpoint("Warehouse", "WH", "host")
+    calls = {"n": 0}
+
+    def always_denied(_endpoint, _sql):
+        calls["n"] += 1
+        reader.failures[_endpoint.name] = _EXPIRED
+        return None
+
+    monkeypatch.setattr(reader, "_attempt", always_denied)
+    assert reader._query(endpoint, "SELECT 1") is None
+    assert calls["n"] == 1
+
+
+def test_a_failing_refresher_does_not_crash_the_crawl(monkeypatch):
+    from auditfast.clients import sqlendpoint as mod
+
+    def boom():
+        raise RuntimeError("sign-in expired")
+
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    reader = mod.SqlEndpointReader("token", token_provider=boom)
+    endpoint = mod.SqlEndpoint("Warehouse", "WH", "host")
+
+    def always_denied(_endpoint, _sql):
+        reader.failures[_endpoint.name] = _EXPIRED
+        return None
+
+    monkeypatch.setattr(reader, "_attempt", always_denied)
+    assert reader._query(endpoint, "SELECT 1") is None
+
+
+def test_without_a_refresher_the_behaviour_is_unchanged(monkeypatch):
+    """The refresher is optional - absent, a denial still fails on one attempt."""
+    from auditfast.clients import sqlendpoint as mod
+
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    reader = mod.SqlEndpointReader("token")
+    endpoint = mod.SqlEndpoint("Warehouse", "WH", "host")
+    calls = {"n": 0}
+
+    def always_denied(_endpoint, _sql):
+        calls["n"] += 1
+        reader.failures[_endpoint.name] = _EXPIRED
+        return None
+
+    monkeypatch.setattr(reader, "_attempt", always_denied)
+    assert reader._query(endpoint, "SELECT 1") is None
+    assert calls["n"] == 1
+
+
+@pytest.mark.parametrize("reason,retryable", [
+    ("the endpoint accepted the connection but the query did not finish in time", True),
+    ("the endpoint is not reachable - port 1433 may be blocked", True),
+    ("the signed-in user has no access to this database", False),
+    ("the workspace has too many warehouses/SQL endpoints for one Entra token", False),
+])
+def test_retryable_classification(reason: str, retryable: bool):
+    from auditfast.clients.sqlendpoint import _is_retryable
+
+    assert _is_retryable(reason) is retryable

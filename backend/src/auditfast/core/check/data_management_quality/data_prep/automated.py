@@ -12,8 +12,11 @@ from auditfast.core.check._notebook import (
     NOTEBOOK_LAYERS,
     executable_code,
     has_parameters_cell,
+    layer_undetermined_evidence,
     markdown_sources,
+    medallion_layer,
     notebook_code,
+    strip_sql_comments,
 )
 from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities, script_sql, walk_activities
 from auditfast.core.check._tables import (
@@ -56,15 +59,27 @@ _DYNAMIC_CONTENT = re.compile(
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def naming_convention(ctx: CheckContext) -> Verdict:
-    """The pipeline name matches the convention configured for the project."""
+    """The pipeline name matches the convention configured for the project.
+
+    **N/A when no convention is configured.** ``pipeline_naming_convention`` is a
+    project setting with no default, because there is no universal Fabric
+    pipeline naming standard to fall back on. With the setting absent, every
+    pipeline was previously failed against ``None`` - a finding manufactured from
+    the absence of configuration rather than from anything in the estate.
+    """
     pattern = ctx.setting("pipeline_naming_convention")
+    if not pattern:
+        return not_applicable(
+            "No pipeline naming convention is configured for this project "
+            "(project setting 'pipeline_naming_convention'), so pipeline names "
+            "cannot be judged against one"
+        )
     name = ctx.obj_name
-    ok = bool(pattern) and re.match(pattern, name) is not None
-    if ok:
+    if re.match(pattern, name) is not None:
         return binary(True, f"'{name}' matches convention")
     evidence = f"'{name}' does not match {pattern!r}"
     if not activities(ctx.obj):
-        evidence += (" — the pipeline is also empty (no activities) and its name looks like a "
+        evidence += (" - the pipeline is also empty (no activities) and its name looks like a "
                      "leftover test pipeline; delete it or rename it to the naming convention")
     return binary(False, evidence)
 
@@ -532,6 +547,33 @@ _LATE_SAFE_WRITE = re.compile(
     r"latest[_ -]?version|newer[_ -]?version|when[_ -]?matched",
     re.IGNORECASE,
 )
+#: Human-readable roll-up of the duplicate-safe writes ``_LATE_SAFE_WRITE`` accepts,
+#: listed in a FAIL so the reviewer sees exactly what was searched for.
+_SAFE_WRITE_NAMES = (
+    "MERGE, upsert, dropDuplicates, row_number(), dedup, "
+    "latest/newer-version, or when-matched"
+)
+
+
+def _matched_tokens(pattern: re.Pattern[str], blob: str, limit: int = 6) -> list[str]:
+    """Distinct literal substrings ``pattern`` matched in ``blob`` (order-preserving)."""
+    seen: list[str] = []
+    for m in pattern.finditer(blob):
+        tok = re.sub(r"\s+", " ", m.group(0)).strip().lower()
+        if tok and tok not in seen:
+            seen.append(tok)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
+def _data_move_summary(acts: list[dict]) -> str:
+    """A short '1 Copy, 2 Script' tally of the data-movement activities present."""
+    tally: dict[str, int] = {}
+    for a in acts:
+        t = a.get("type") or "?"
+        tally[t] = tally.get(t, 0) + 1
+    return ", ".join(f"{n} {t}" for t, n in tally.items())
 
 
 @check(
@@ -658,7 +700,17 @@ _RI_PATTERN = re.compile(
     \b(?:referential|integrity|fk_check|integrity_check|orphan|unmatched|missing_parent|no_parent)\b
     """
 )
-_JOIN_PATTERN = re.compile(r"(?is)\.join\s*\(|\bleft\s+join\b|\binner\s+join\b|\bright\s+join\b|\bfull\s+join\b", re.IGNORECASE)
+#: A join, in either the DataFrame or the SQL spelling. ``anti`` and ``semi`` are
+#: listed explicitly: ``LEFT ANTI JOIN`` is the standard way to isolate orphan
+#: rows, and without it the very notebooks that *do* detect orphans were reported
+#: as performing no join at all - N/A instead of the PASS they had earned.
+_JOIN_PATTERN = re.compile(
+    r"(?is)\.join\s*\(|"
+    r"\b(?:left|right|full|inner|cross)\s+(?:outer\s+)?join\b|"
+    r"\bleft\s+(?:anti|semi)\s+join\b|"
+    r"\bjoin\b\s+\w+\s+\bon\b",
+    re.IGNORECASE,
+)
 _FK_INTEGRITY = re.compile(
     # An anti-join - the standard way to isolate FK values with no parent row.
     # ``"anti"`` is quoted so the join-type argument matches but the English word
@@ -932,7 +984,7 @@ _BULK_ACTIVITY = re.compile(
 )
 _ROW_BY_ROW = re.compile(
     r"ForEach|foreach|row[_ -]?by[_ -]?row|insert\s+into|execute\s+query|"
-    r"SqlServerStoredProcedure|Script",
+    r"SqlServerStoredProcedure|\bScript\b",
     re.IGNORECASE,
 )
 _EAM_JSON = re.compile(r"EAM|JSON|json\.loads|from_json\s*\(|spark\.read\.json", re.IGNORECASE)
@@ -941,6 +993,29 @@ _EAM_EFFICIENT = re.compile(
     r"maxFilesPerTrigger|badRecordsPath|from_json\s*\(|schema_of_json",
     re.IGNORECASE,
 )
+#: A read from *outside* the lakehouse: a file, an API, or an external database.
+#: This is what makes a notebook an *ingestion* notebook, and therefore what makes
+#: recording provenance meaningful. Deliberately excludes ``spark.read.table`` and
+#: ``spark.sql`` - reading a table already in the lakehouse carries its own
+#: lineage, so a derived/Gold notebook has no external source to record and must
+#: not be failed for omitting one.
+_EXTERNAL_SOURCE_READ = re.compile(
+    # File formats and storage paths.
+    r"\.read\s*\.\s*(?:csv|json|parquet|text|xml|orc|avro|excel)\s*\(|"
+    r"\.read\s*\.\s*format\s*\(\s*[\"'](?:csv|json|parquet|text|xml|orc|avro|jdbc|"
+    r"cosmos\.oltp|sqlserver|mongodb|kafka)[\"']|"
+    r"abfss://|wasbs://|https?://|s3a?://|gs://|file:///|dbfs:/|/lakehouse/default/Files|"
+    r"\bFiles/|"
+    # Pandas-side ingestion.
+    r"\bpd\.read_(?:csv|json|excel|parquet|sql|html|xml)\s*\(|"
+    # APIs and databases.
+    r"\brequests\.(?:get|post)\s*\(|\bhttpx\.(?:get|post)\s*\(|urlopen\s*\(|"
+    r"\bjdbc\b|pyodbc\.connect|create_engine\s*\(|"
+    # Fabric/Spark connectors to an external system.
+    r"mssparkutils\.fs\.(?:cp|mv|ls)\s*\(|notebookutils\.fs\.(?:cp|mv|ls)\s*\(",
+    re.IGNORECASE,
+)
+
 _SOURCE_METADATA = re.compile(
     r"ingest(?:ed|ion)[_ ]?(?:timestamp|time|date)|ingested_at|"
     r"source[_ ]?(?:metadata|system|file|path)|input_file_name\s*\(|"
@@ -972,6 +1047,48 @@ _FLAG_DOMAIN = re.compile(
     r"BooleanType\s*\(\)|when\s*\([^\n]{0,120}?\)\.otherwise\s*\(",
     re.IGNORECASE,
 )
+#: A *categorical* domain restriction - 5.5.5. Deliberately distinct from
+#: ``_FLAG_DOMAIN`` (5.5.7), which covers the two-valued boolean/flag case: a
+#: membership test whose literals are ``Y``/``N``/``true``/``false``/``0``/``1``
+#: is a flag test and is excluded below, so the two checks cannot both claim the
+#: same line of code.
+#:
+#: Three shapes count, because they are the three ways a team actually pins a
+#: code list in Spark:
+#:   * a membership test against a named allow-list or literal code set;
+#:   * an anti/semi join against a reference, lookup or dimension table - the
+#:     standard "reject codes absent from the dimension" pattern;
+#:   * a declared allowed-value collection (``VALID_STATUSES = {...}``).
+_CATEGORICAL_DOMAIN = re.compile(
+    # .isin(...) / ~col.isin(...) on a non-boolean literal set of >= 2 codes
+    r"\.isin\s*\(\s*\[?\s*[\"'][A-Za-z0-9_\- ]{2,}[\"']\s*,",
+    re.IGNORECASE,
+)
+
+#: A membership test naming a *variable* allow-list rather than inline literals.
+_CATEGORICAL_ALLOWLIST = re.compile(
+    r"\.isin\s*\(\s*(?:\*\s*)?[A-Za-z_][A-Za-z0-9_]*\s*\)|"
+    r"\b(?:allowed|valid|expected|permitted|accepted|reference|master)[_ ]?"
+    r"(?:codes?|categories|category|statuses|status|types?|values|list|set|domain)\b|"
+    r"\b(?:code|category|status|type)[_ ]?(?:list|set|domain|lookup|allowlist|whitelist)\b",
+    re.IGNORECASE,
+)
+
+#: Validation by joining to a reference/lookup/dimension table - the codes that
+#: do not match are the invalid ones.
+_CATEGORICAL_REFERENCE_JOIN = re.compile(
+    r"left_anti|leftanti|left_semi|leftsemi|"
+    r"join\s*\([^\n]{0,160}?(?:ref|reference|lookup|dim|dimension|master|codes?)"
+    r"[A-Za-z0-9_]*[^\n]{0,80}?\)",
+    re.IGNORECASE,
+)
+
+#: A boolean/flag membership test - 5.5.7's territory, never 5.5.5's.
+_BOOLEAN_LITERALS = re.compile(
+    r"\.isin\s*\(\s*\[?\s*(?:True|False|[\"'](?:Y|N|yes|no|true|false|0|1)[\"'])",
+    re.IGNORECASE,
+)
+
 _DQ_RULE = re.compile(
     r"assert\b|validation|validate|quality|quarantine|reject|invalid|"
     r"dropDuplicates|drop_duplicates|left_anti|isNull|isin\s*\(|"
@@ -1056,6 +1173,99 @@ def nb_fk_integrity(ctx: CheckContext) -> Verdict:
     )
 
 
+# -- 5.3.6 evidence helpers: name *what* was found, not only how many ----------
+#: The reconciliation techniques 5.3.6 accepts, split out so the evidence can name
+#: the one(s) actually present. The verdict still comes from ``_CROSS_SOURCE_RECON``;
+#: these regexes only enrich the message and never change which branch is taken.
+_RECON_TECHNIQUES = (
+    (re.compile(
+        r"\.count\s*\(\s*\)[^\n]{0,120}?(?:==|!=|<=|>=|<|>)[^\n]{0,120}?\.count\s*\(\s*\)|"
+        r"\b(?:source|src|left|before|expected)_count\b[^\n]{0,60}"
+        r"(?:==|!=|<=|>=|<|>)[^\n]{0,60}\b(?:target|tgt|right|after|actual)_count\b|"
+        r"\b(?:target|tgt|right|after|actual)_count\b[^\n]{0,60}"
+        r"(?:==|!=|<=|>=|<|>)[^\n]{0,60}\b(?:source|src|left|before|expected)_count\b",
+        re.IGNORECASE), "a count-vs-count comparison"),
+    (re.compile(
+        r"\.subtract\s*\(|\.exceptAll\s*\(|\bEXCEPT\s+(?:ALL\s+)?SELECT\b|\bMINUS\s+SELECT\b",
+        re.IGNORECASE), "a set difference (EXCEPT / subtract / exceptAll)"),
+    (re.compile(r"left_anti|leftanti|\bleft\s+anti\s+join\b", re.IGNORECASE), "an anti-join"),
+    (re.compile(
+        r"cross[_\s-]?source[_\s-]?recon|source[_\s-]?to[_\s-]?target|"
+        r"\breconcile_sources\b|\bcompare_sources\b",
+        re.IGNORECASE), "an explicitly named source-to-target reconciliation"),
+)
+
+
+def _summarize_sources(matches: list[str]) -> str:
+    """Tally the read call-sites the multi-source detector matched, grouped by kind."""
+    tally: dict[str, int] = {}
+    for raw in matches:
+        text = raw.strip().lower()
+        if "spark.read" in text and "load" in text:
+            kind = "spark.read().load()"
+        elif "spark.read" in text:
+            kind = "spark.read"
+        elif "spark.table" in text:
+            kind = "spark.table()"
+        else:
+            kind = ".load()"
+        tally[kind] = tally.get(kind, 0) + 1
+    return ", ".join(f"{n}\u00d7 {kind}" for kind, n in tally.items())
+
+
+def _recon_techniques(code: str) -> str:
+    """Name the cross-source reconciliation technique(s) actually present in ``code``."""
+    found = [label for pattern, label in _RECON_TECHNIQUES if pattern.search(code)]
+    return ", ".join(found) if found else "a cross-source comparison"
+
+
+def _count_reconcile_evidence(code: str) -> str:
+    """Name the single-dataset record-count idiom the notebook does have."""
+    if re.search(r"\bassert\b[^\n]*\.count\s*\(", code, re.IGNORECASE):
+        return "an asserted record count"
+    if re.search(r"reconcil|\bcount_check\b|expect_table_row_count", code, re.IGNORECASE):
+        return "a named row-count validation"
+    if re.search(r"\.count\s*\(\s*\)\s*(?:==|!=|<=|>=|<|>)", code):
+        return "a record-count comparison"
+    return "a record-count validation"
+
+
+#: Python-level loaders the bare ``.load(`` arm of ``_MULTI_SOURCE`` also matches.
+#: Named so the evidence can say *which* non-Spark loader was seen.
+_PY_LOADERS = (
+    ("json.load()", re.compile(r"\bjson\s*\.\s*loads?\s*\(", re.IGNORECASE)),
+    ("yaml.load()", re.compile(r"\byaml\s*\.\s*(?:safe_load|load)\s*\(", re.IGNORECASE)),
+    ("pickle.load()",
+     re.compile(r"\b(?:pickle|cpickle|cloudpickle)\s*\.\s*loads?\s*\(", re.IGNORECASE)),
+    ("numpy.load()", re.compile(r"\b(?:np|numpy)\s*\.\s*load\s*\(", re.IGNORECASE)),
+    ("joblib.load()", re.compile(r"\bjoblib\s*\.\s*load\s*\(", re.IGNORECASE)),
+    ("torch.load()", re.compile(r"\btorch\s*\.\s*load\s*\(", re.IGNORECASE)),
+)
+#: A genuine Spark data-source read. Its absence is what turns a ``.load(`` match
+#: into a false "source".
+_SPARK_READ = re.compile(r"spark\.read\b|spark\.table\s*\(", re.IGNORECASE)
+
+
+def _nonspark_load_note(code: str, matches: list[str]) -> str:
+    """Caveat when the detected reads are Python ``.load()`` calls, not Spark reads.
+
+    The 5.3.6 source detector also matches a bare ``.load(``, which catches Python
+    loaders such as ``json.load()``. When no ``spark.read`` / ``spark.table`` appears
+    anywhere, the counted 'sources' are almost certainly configuration/file reads,
+    not data - so the finding is flagged as such instead of silently over-counting.
+    """
+    if _SPARK_READ.search(code):
+        return ""
+    if not any(".load(" in m.replace(" ", "").lower() for m in matches):
+        return ""
+    named = [label for label, pattern in _PY_LOADERS if pattern.search(code)]
+    which = ", ".join(named) if named else "bare .load()"
+    return (
+        " \u2014 note: no Spark read (spark.read / spark.table) is present, so these are "
+        f"Python {which} calls (configuration/file reads), not Spark data-source reads"
+    )
+
+
 @check(
     id="NB-CROSS-RECON", ref="5.3.6",
     title="Cross-source reconciliation: records from multiple sources reconciled correctly",
@@ -1075,18 +1285,37 @@ def nb_cross_recon(ctx: CheckContext) -> Verdict:
     """
     code = executable_code(ctx.obj)
     sources = _MULTI_SOURCE.findall(code)
+    note = _nonspark_load_note(code, sources)
     if len(sources) < 2:
-        return not_applicable("Notebook reads from fewer than 2 sources")
+        seen = _summarize_sources(sources)
+        detail = f" ({seen})" if seen else ""
+        return not_applicable(
+            f"Reads from {len(sources)} data-source call-site(s){detail} — cross-source "
+            "reconciliation applies only when 2 or more sources are combined in one notebook"
+            + note
+        )
+    breakdown = _summarize_sources(sources)
     if _CROSS_SOURCE_RECON.search(code):
-        return binary(True, f"Reads {len(sources)} sources and reconciles across them")
+        return binary(
+            True,
+            f"Reads {len(sources)} source call-sites ({breakdown}) and reconciles "
+            f"across them via {_recon_techniques(code)}" + note,
+        )
     if _COUNT_RECONCILE.search(code):
         return graded(
             1,
-            f"Reads {len(sources)} sources and validates a record count, but nothing "
-            f"compares the sources against each other — no count-vs-count check, set "
-            f"difference, or anti-join",
+            f"Reads {len(sources)} source call-sites ({breakdown}) and validates a "
+            f"single dataset ({_count_reconcile_evidence(code)}), but nothing compares "
+            f"the sources against each other — no count-vs-count check, set difference "
+            f"(EXCEPT / subtract / exceptAll), or anti-join spanning the sources" + note,
         )
-    return binary(False, f"Reads {len(sources)} sources without cross-source reconciliation")
+    return binary(
+        False,
+        f"Reads {len(sources)} source call-sites ({breakdown}) without cross-source "
+        f"reconciliation — none of a count-vs-count comparison, set difference "
+        f"(EXCEPT / subtract / exceptAll), anti-join, or explicitly named "
+        f"source-to-target reconciliation was found across the sources" + note,
+    )
 
 
 @check(
@@ -1254,7 +1483,27 @@ _UNKNOWN_MONITORED = re.compile(
 _SILVER_REF = re.compile(r"\bsilver\b", re.IGNORECASE)
 _GOLD_REF = re.compile(r"\bgold\b", re.IGNORECASE)
 
+#: A genuine fact→dimension lookup, distinct from a Python ``str.join``. A Spark
+#: DataFrame join (``df.join(``) is never written ``"literal".join(``, so a
+#: ``.join(`` preceded by a quote is excluded; a SQL ``… JOIN … ON`` also counts.
+#: Without this, ``", ".join(cols)`` would read as a fact-to-dimension lookup.
+_FACT_DIM_JOIN = re.compile(
+    r"(?<![\"'])\.join\s*\(|"
+    r"\b(?:left|right|full|inner|cross)?\s*join\b[^\n;]{0,200}?\bon\b",
+    re.IGNORECASE | re.DOTALL,
+)
+#: A dimension is being *built* (SCD upsert / MERGE), not looked up by a fact —
+#: the inferred-member fallback belongs in the fact load, so such a notebook is
+#: N/A rather than FAIL when it never references a fact.
+_DIM_UPSERT = re.compile(r"\bmerge\b|\bupsert\b|when\s+matched|whenmatched", re.IGNORECASE)
+_FACT_REF = re.compile(r"\bfact[_\s.]|\bfct[_\s.]", re.IGNORECASE)
 
+
+# NB-LATE-ARRIVING (4.5.10): flags a fact→dimension load with no unknown/inferred-member
+# fallback. Was: raw code + any ``.join(`` gate → false-FAILed metadata/DQ notebooks whose
+# only "join" was a Python ``str.join`` or whose ``dim``/``fact`` sat in a comment.
+# Updated 2026-08-12: strip comments, require a real DataFrame/SQL join (``_FACT_DIM_JOIN``),
+# and N/A a dimension-build/upsert that never references a fact (``_DIM_UPSERT`` w/o ``_FACT_REF``).
 @check(
     id="NB-LATE-ARRIVING", ref="4.5.10",
     title="Late-arriving dimensions and facts handled (unknown/inferred member pattern)",
@@ -1264,16 +1513,30 @@ _GOLD_REF = re.compile(r"\bgold\b", re.IGNORECASE)
 def nb_late_arriving(ctx: CheckContext) -> Verdict:
     """A fact arriving before its dimension gets an inferred member, not dropped.
 
-    Without the pattern the load either discards the fact — silent data loss —
-    or fails outright. The evidence is a stub/unknown member: an ``is_inferred``
-    flag, an explicit "unknown" member, or the conventional ``-1`` surrogate key
-    substituted when the lookup misses.
+    Commented-out code is ignored and only a genuine fact→dimension join counts
+    (a Spark ``df.join(`` or SQL ``… JOIN … ON`` — never a Python ``str.join``),
+    so a metadata/DQ notebook whose only "join" builds a string, or whose only
+    ``dim``/``fact`` mention sits in a comment, is N/A rather than FAIL. A notebook
+    that merely *builds* a dimension (an SCD upsert) is also N/A — the fallback
+    belongs in the fact load. Without the pattern the load either discards the
+    fact (silent data loss) or fails outright; the evidence is a stub/unknown
+    member: an ``is_inferred`` flag, an explicit "unknown" member, or the
+    conventional ``-1`` surrogate key substituted when the lookup misses.
     """
-    code = notebook_code(ctx.obj)
+    code = strip_sql_comments(executable_code(ctx.obj))
     if not _DIM_CONTEXT.search(code):
         return not_applicable("Notebook does not load or join dimensional tables")
-    if not _JOIN_PATTERN.search(code):
-        return not_applicable("Notebook performs no fact-to-dimension lookup")
+    if not _FACT_DIM_JOIN.search(code):
+        return not_applicable(
+            "Notebook performs no fact-to-dimension lookup — no DataFrame or SQL "
+            "join is present (a Python string join does not count)"
+        )
+    if _DIM_UPSERT.search(code) and not _FACT_REF.search(code):
+        return not_applicable(
+            "Notebook builds/updates a dimension table (SCD upsert/merge), not a "
+            "fact-to-dimension lookup — the inferred-member fallback belongs in the "
+            "fact load"
+        )
     ok = bool(_LATE_ARRIVING.search(code))
     return binary(ok, "Late-arriving rows get an inferred/unknown member" if ok
                   else "Joins dimensions with no inferred/unknown member fallback — "
@@ -1294,7 +1557,7 @@ def nb_unknown_monitored(ctx: CheckContext) -> Verdict:
     that actually use an unknown/inferred member are judged — creating one is
     NB-LATE-ARRIVING's job.
     """
-    code = notebook_code(ctx.obj)
+    code = strip_sql_comments(executable_code(ctx.obj))
     if not _LATE_ARRIVING.search(code):
         return not_applicable("Notebook uses no unknown/inferred member to monitor")
     ok = bool(_UNKNOWN_MONITORED.search(code))
@@ -1452,17 +1715,32 @@ def pl_late_arrival(ctx: CheckContext) -> Verdict:
     acts = walk_activities(ctx.obj)
     data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
     if not data_acts:
-        return not_applicable("No data-movement activity to assess for late changes")
+        return not_applicable(
+            "No data-movement activity (Copy / Script / Notebook / Stored-proc / Lookup) "
+            "to assess for late-arriving changes"
+        )
     blob = json.dumps(ctx.obj)
-    late_signal = bool(_LATE_ARRIVAL.search(blob))
-    safe_write = bool(_LATE_SAFE_WRITE.search(blob))
-    if not late_signal:
-        return not_applicable("No late-arrival or out-of-order handling signal found")
+    signals = _matched_tokens(_LATE_ARRIVAL, blob)
+    writes = _matched_tokens(_LATE_SAFE_WRITE, blob)
+    moved = _data_move_summary(data_acts)
+    if not signals:
+        return not_applicable(
+            f"{moved} present, but no late-arrival / out-of-order signal (watermark, "
+            f"event-time, sequence/version id, effective-date, lookback) is referenced, so "
+            f"late-change handling does not apply to this pipeline"
+        )
+    if writes:
+        return binary(
+            True,
+            f"{moved} with a late-arrival signal ({', '.join(signals)}) and a version-aware "
+            f"/ duplicate-safe write ({', '.join(writes)}), so out-of-order changes cannot "
+            f"corrupt the target",
+        )
     return binary(
-        safe_write,
-        "Late/out-of-order handling uses a version-aware or duplicate-safe write pattern"
-        if safe_write else
-        "Late/out-of-order handling is indicated but no version-aware duplicate-safe write was found",
+        False,
+        f"{moved} references a late-arrival signal ({', '.join(signals)}) but NO version-aware "
+        f"/ duplicate-safe write was found \u2014 none of {_SAFE_WRITE_NAMES} appears, so a "
+        f"re-sent or out-of-order record can insert a duplicate or overwrite a newer row",
     )
 
 
@@ -1521,13 +1799,35 @@ def nb_key_quality(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_bronze_metadata(ctx: CheckContext) -> Verdict:
-    """Bronze writes retain ingestion timestamp, source identity, and batch metadata."""
+    """Bronze writes retain ingestion timestamp, source identity, and batch metadata.
+
+    **Only Bronze notebooks are judged.** The layer is taken from what the
+    notebook *writes to* (or, failing that, the lakehouse it is attached to) -
+    never from the word "bronze" appearing somewhere in the file, which matched
+    notebooks that merely *read* raw data and failed them for lacking metadata
+    they were never meant to carry.
+
+    **What it cannot determine.** Whether the estate uses the medallion pattern
+    at all. When no signal identifies a layer the notebook is reported N/A: an
+    org whose layers are named ``raw``/``curated``/``publish`` is *not assessed*
+    rather than failed.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
     code = executable_code(ctx.obj)
     if not _WRITE_PATTERN.search(code):
-        return not_applicable("Notebook does not write a raw/Bronze table")
+        return not_applicable("Notebook does not write a table")
+    layer, how = medallion_layer(ctx.obj, code)
+    if not layer:
+        return not_applicable(layer_undetermined_evidence(ctx.obj, code))
+    if layer != "bronze":
+        return not_applicable(
+            f"Notebook produces the {layer} layer ({how}), so the Bronze "
+            "raw-capture rule does not apply"
+        )
     if not _BRONZE_METADATA.search(code):
-        return binary(False, "Bronze write has no ingestion/source/batch audit metadata")
-    return binary(True, "Bronze write captures ingestion/source/batch audit metadata")
+        return binary(False, f"Bronze write ({how}) has no ingestion/source/batch audit metadata")
+    return binary(True, f"Bronze write ({how}) captures ingestion/source/batch audit metadata")
 
 
 @check(
@@ -1537,15 +1837,44 @@ def nb_bronze_metadata(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_silver_quality(ctx: CheckContext) -> Verdict:
-    """Silver writes apply at least one explicit cleansing, deduplication, or type-conformance transformation."""
+    """Silver writes apply at least one explicit cleansing, deduplication, or type-conformance transformation.
+
+    **Only Silver notebooks are judged**, decided by what the notebook writes to
+    rather than by the word "silver" appearing anywhere in it - a Gold notebook
+    that *reads* a silver table was previously judged as though it produced one.
+
+    **What it cannot determine.** That the transformation is *correct*, only that
+    an explicit cleansing/dedup/conformance step is present. When no signal
+    identifies a layer the notebook is reported N/A rather than failed.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
     code = executable_code(ctx.obj)
     if not _WRITE_PATTERN.search(code):
-        return not_applicable("Notebook does not write a Silver table")
-    if not re.search(r"silver", code, re.IGNORECASE):
-        return not_applicable("Notebook does not identify a Silver-layer write")
+        return not_applicable("Notebook does not write a table")
+    layer, how = medallion_layer(ctx.obj, code)
+    if not layer:
+        return not_applicable(layer_undetermined_evidence(ctx.obj, code))
+    if layer != "silver":
+        return not_applicable(
+            f"Notebook produces the {layer} layer ({how}), so the Silver "
+            "cleansing rule does not apply"
+        )
     ok = bool(_SILVER_QUALITY.search(code))
-    return binary(ok, "Silver write applies cleansing/deduplication/conformance/type standardization" if ok
-                  else "Silver write has no recognizable quality transformation")
+    return binary(
+        ok,
+        f"Silver write ({how}) applies cleansing/deduplication/conformance/type standardization"
+        if ok else
+        f"Silver write ({how}) has no recognizable quality transformation",
+    )
+
+
+#: Activity types that actually move or transform *bulk data inside the pipeline*.
+#: A notebook run (``TridentNotebook``), a control-table ``Lookup``, or an
+#: ``ExecutePipeline`` orchestration moves no bulk data itself — any movement
+#: happens in the notebook or child pipeline and is judged there — so a pipeline
+#: built only from those is N/A for this check rather than a failure.
+_BULK_MOVE_TYPES = {"Copy", "Script", "SqlServerStoredProcedure"}
 
 
 @check(
@@ -1555,18 +1884,48 @@ def nb_silver_quality(ctx: CheckContext) -> Verdict:
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def pl_bulk_move(ctx: CheckContext) -> Verdict:
-    """Data-moving pipelines use bulk or batch movement rather than row-by-row execution."""
+    """A data-moving pipeline uses a bulk/batch pattern, not row-by-row execution.
+
+    Only an in-pipeline data mover — a Copy activity, a Script, or a stored
+    procedure — is judged. A pipeline that merely runs a notebook, reads a
+    control table with a Lookup, or invokes child pipelines moves no bulk data
+    itself, so it is N/A here (the movement, if any, is judged where it happens).
+    The evidence names the data-movement activities found and the exact
+    bulk-pattern or row-by-row signals that decided the verdict.
+    """
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
-    acts = activities(ctx.obj)
-    if not any((a.get("type") or "") in _DATA_MOVE_TYPES for a in acts):
-        return not_applicable("Pipeline has no data-movement activity")
+    movers = [a for a in walk_activities(ctx.obj)
+              if (a.get("type") or "") in _BULK_MOVE_TYPES]
+    if not movers:
+        return not_applicable(
+            "Pipeline moves no bulk data itself — it only runs notebooks, reads "
+            "control tables (Lookup), or invokes child pipelines, so any data "
+            "movement is judged where it happens, not in this pipeline"
+        )
     blob = json.dumps(ctx.obj)
-    if _ROW_BY_ROW.search(blob) and not _BULK_ACTIVITY.search(blob):
-        return binary(False, "Data movement shows row-by-row or serial execution without a bulk/batch pattern")
-    ok = bool(_BULK_ACTIVITY.search(blob))
-    return binary(ok, "Bulk/batch data-movement pattern detected" if ok
-                  else "No bulk/batch data-movement pattern detected")
+    moved = _data_move_summary(movers)
+    bulk = _matched_tokens(_BULK_ACTIVITY, blob)
+    row_by_row = _matched_tokens(_ROW_BY_ROW, blob)
+    if row_by_row and not bulk:
+        return binary(
+            False,
+            f"{moved}: row-by-row / serial execution ({', '.join(row_by_row)}) with no "
+            f"bulk/batch pattern — replace per-row iteration with a set-based bulk Copy, "
+            f"COPY INTO, or batched write (parallelCopies, batchCount, batch size)",
+        )
+    if bulk:
+        return binary(
+            True,
+            f"{moved}: bulk/batch data-movement pattern present ({', '.join(bulk)})",
+        )
+    return binary(
+        False,
+        f"{moved}: no bulk/batch data-movement pattern found — none of parallelCopies, "
+        f"batchCount, batch size, bulk, COPY INTO, write.mode, saveAsTable, repartition "
+        f"or coalesce is present to confirm the movement is set-based rather than row-by-row",
+    )
+
 
 
 @check(
@@ -1576,13 +1935,35 @@ def pl_bulk_move(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_eam_ingest(ctx: CheckContext) -> Verdict:
-    """EAM/JSON ingestion uses streaming, partitioning, or bounded-file parsing."""
-    code = executable_code(ctx.obj)
-    if not _EAM_JSON.search(code):
-        return not_applicable("Notebook has no recognizable EAM/JSON ingestion")
-    ok = bool(_EAM_EFFICIENT.search(code))
-    return binary(ok, "EAM/JSON ingestion uses streaming, partitioning, or bounded parsing" if ok
-                  else "EAM/JSON ingestion has no streaming/partitioning/bounded-file pattern")
+    """EAM/JSON ingestion uses streaming, partitioning, or bounded-file parsing.
+
+    Commented-out code is ignored: ``executable_code`` removes Python ``#``
+    comments and ``strip_sql_comments`` removes SQL ``--`` / ``/* */`` comments,
+    so a table name or technique that appears only in a comment does not open the
+    gate. The evidence names the EAM/JSON signal that opened the gate and the
+    efficiency pattern found, or every pattern searched for on a failure.
+    """
+    code = strip_sql_comments(executable_code(ctx.obj))
+    signals = _matched_tokens(_EAM_JSON, code)
+    if not signals:
+        return not_applicable(
+            "Notebook has no EAM/JSON ingestion once commented-out code is ignored "
+            "(no spark.read.json / from_json / readStream JSON / EAM signal in live code)"
+        )
+    efficient = _matched_tokens(_EAM_EFFICIENT, code)
+    if efficient:
+        return binary(
+            True,
+            f"EAM/JSON ingestion ({', '.join(signals)}) parses efficiently "
+            f"({', '.join(efficient)})",
+        )
+    return binary(
+        False,
+        f"EAM/JSON ingestion ({', '.join(signals)}) has no streaming/partitioning/"
+        f"bounded-file pattern — none of readStream, partitionBy, repartition, "
+        f"maxFilesPerTrigger, multiLine=False, badRecordsPath, from_json or "
+        f"schema_of_json is present to bound file size or parallelize the parse",
+    )
 
 
 @check(
@@ -1592,13 +1973,36 @@ def nb_eam_ingest(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_source_metadata(ctx: CheckContext) -> Verdict:
-    """Notebook writes retain source metadata including an ingestion timestamp."""
+    """Notebooks that ingest from *outside* the lakehouse record where the data came from.
+
+    **Scoped to ingestion.** The point is about provenance: a load that reads an
+    external file, an API or a database must record its source. A notebook that
+    reads a table already inside the lakehouse and writes a derived table has no
+    external source to capture - failing it for missing "source metadata" is a
+    false finding, and judging every writing notebook did exactly that.
+
+    **Sibling.** ``NB-BRONZE-METADATA`` (ref 1.2.3) asks a *narrower* question of
+    a *narrower* population: it requires ingestion timestamp **and** batch/source
+    identity, and only of notebooks writing the Bronze layer. This one applies
+    wherever an external read happens - Bronze or not - and asks only that the
+    provenance of that read is recorded. A Bronze ingestion notebook is judged by
+    both, which is intended: they are different thresholds on the same practice.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
     code = executable_code(ctx.obj)
     if not _WRITE_PATTERN.search(code):
         return not_applicable("Notebook does not write data to a table")
+    if not _EXTERNAL_SOURCE_READ.search(code):
+        return not_applicable(
+            "Notebook reads no external source (file, API or database) - it "
+            "transforms data already in the lakehouse, so there is no ingestion "
+            "provenance to capture"
+        )
     ok = bool(_SOURCE_METADATA.search(code))
     return binary(ok, "Source metadata and ingestion timestamp are captured" if ok
-                  else "Writes data without source metadata or an ingestion timestamp")
+                  else "Ingests from an external source without recording its "
+                       "provenance (source system/file or an ingestion timestamp)")
 
 
 @check(
@@ -1650,6 +2054,77 @@ def nb_flag_domain(ctx: CheckContext) -> Verdict:
 
 
 @check(
+    id="NB-CATEGORICAL-DOMAIN", ref="5.5.5",
+    title="**Categorical / Enum**: Values within expected domain; no invalid codes flowing to Gold",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def nb_categorical_domain(ctx: CheckContext) -> Verdict:
+    """The notebook pins categorical/code columns to an expected set of values.
+
+    **What it verifies: the control, not the data.** Whether any particular row
+    carries a valid code is a runtime fact in the data, which this tool never
+    reads. A PASS means "an invalid code would be caught", never "every code is
+    valid".
+
+    **What it can determine.** Three shapes, because they are the three ways a
+    team actually pins a code list in Spark: a membership test against literal
+    codes or a named allow-list (``status.isin(VALID_STATUSES)``), an anti/semi
+    join against a reference, lookup or dimension table (the standard "reject
+    codes absent from the dimension" pattern), or a declared allowed-value
+    collection. Read with ``executable_code`` so a commented-out validation
+    cannot pass.
+
+    **What it cannot.** Confirm the code list is the *correct* one, see a domain
+    enforced by a Delta ``CHECK`` constraint or a warehouse foreign key, or see a
+    rule applied downstream in a pipeline. A notebook that writes no table has no
+    codes flowing to Gold and is N/A.
+
+    **Sibling - deliberately not satisfied by it.** ``NB-FLAG-DOMAIN`` (5.5.7)
+    covers the two-valued boolean/flag case. A membership test whose literals are
+    ``Y``/``N``/``true``/``false``/``0``/``1`` is a *flag* test and is excluded
+    here, so one line of code cannot satisfy both points.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable(
+            "Notebook writes no table, so there is no categorical value flowing "
+            "onward to constrain"
+        )
+
+    if _CATEGORICAL_REFERENCE_JOIN.search(code):
+        return binary(True, (
+            "Categorical values are validated against a reference/lookup table - a "
+            "code absent from the reference is separated rather than written on. "
+            "Whether any given run's codes were valid is a runtime outcome this "
+            "check does not read."
+        ))
+    literal_set = _CATEGORICAL_DOMAIN.search(code)
+    allow_list = _CATEGORICAL_ALLOWLIST.search(code)
+    if literal_set or allow_list:
+        how = ("an explicit code list" if literal_set
+               else "a named allowed-value set")
+        return binary(True, (
+            f"Categorical/enum columns are restricted to {how}, so an unexpected "
+            f"code is detectable before it reaches Gold. Whether the list itself is "
+            f"correct is not machine-checkable."
+        ))
+    if _BOOLEAN_LITERALS.search(code):
+        return binary(False, (
+            "The only value restriction found is a boolean/flag test (Y/N, true/false), "
+            "which is scored by 5.5.7 - no categorical or code column is pinned to an "
+            "expected domain, so an invalid code would flow through unchallenged"
+        ))
+    return binary(False, (
+        "Notebook writes data with no categorical domain validation - no allowed-value "
+        "test and no reference/lookup join appears, so an invalid or retired code is "
+        "indistinguishable from a valid one"
+    ))
+
+
+@check(
     id="NB-DQ-RULES", ref="5.1.2",
     title="DQ rules codified in code/config (not ad-hoc manual checks)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
@@ -1660,9 +2135,19 @@ def nb_dq_rules(ctx: CheckContext) -> Verdict:
     code = executable_code(ctx.obj)
     if not (_INPUT_READ.search(code) or _WRITE_PATTERN.search(code)):
         return not_applicable("Notebook has no recognizable data-ingestion or write operation")
-    ok = bool(_DQ_RULE.search(code))
-    return binary(ok, "Data-quality rule logic is codified in notebook code/config" if ok
-                  else "Data movement has no recognizable codified data-quality rules")
+    found = _matched_tokens(_DQ_RULE, code)
+    if found:
+        return binary(True, (
+            "Data-quality rule logic is codified in notebook code/config — matched: "
+            + ", ".join(found)
+        ))
+    return binary(False, (
+        "Data movement (read/write) present but no recognizable codified data-quality "
+        "rule — searched for: assertions (assert), validation/quality wording, "
+        "quarantine/reject/invalid handling, dedup (dropDuplicates), null / isin / "
+        "anti-join tests, an explicit schema (StructType/StructField), or "
+        "expected schema/columns/values"
+    ))
 
 
 
@@ -3688,4 +4173,262 @@ def notebook_validates_json_payloads(ctx: CheckContext) -> Verdict:
         + (f"; missing: {'; '.join(missing)}" if missing else "")
         + ". Whether the declared structure matches the source contract is not readable "
           "from code.",
+    )
+
+
+# =============================================================================
+# 5.3.8 — historical consistency: this run's volume held against a previous run
+#
+# The point describes a *runtime outcome* — did the row count move as expected.
+# Row data and run telemetry are never fetched, so what is scored is whether the
+# code carries the run-over-run control that would notice an unexplained
+# shrinkage. The evidence says so, exactly as 5.2.2 / 5.2.3 do.
+# =============================================================================
+
+#: A count belonging to an **earlier run**. This is the whole distinction from
+#: ``NB-RECON-COUNT`` (5.2.5), which compares this run's output against *this
+#: run's source*: ``source_count``, ``expected_count`` and a bare
+#: ``df.count() == src.count()`` are all same-run reconciliation and must not
+#: match here. Only a token that names a *prior* run does.
+_PREVIOUS_RUN_COUNT = re.compile(
+    r"\b(?:prev|previous|prior|last|lastrun|yester(?:day)?|historic(?:al)?|baseline|"
+    r"benchmark)[_\s-]?(?:run[_\s-]?)?(?:row[_\s-]?|record[_\s-]?)?"
+    r"(?:count|rowcount|rowcounts|rows|volume)\b|"
+    r"\b(?:row|record)[_\s-]?count[_\s-]?"
+    r"(?:prev|previous|prior|last|yesterday|baseline|history|historical)\b",
+    re.IGNORECASE,
+)
+
+#: The run-over-run *movement* named directly — a delta, a percentage change, or
+#: a shrinkage. Nothing computes ``pct_change`` on a row count by accident.
+_VOLUME_MOVEMENT = re.compile(
+    r"\b(?:row|record|count|volume)[_\s-]?"
+    r"(?:delta|diff|difference|change|drop|variance|swing)\b|"
+    r"\b(?:delta|diff|difference|change|drop|variance)[_\s-]?"
+    r"(?:row|record|count|volume)s?\b|"
+    r"\bpct[_\s-]?(?:change|diff|drop|delta|variance)\b|"
+    r"\bpercent(?:age)?[_\s-]?(?:change|diff|drop|delta|variance)\b|"
+    r"\bshrink(?:age|ing)?\b|\bunexpected[_\s-]?drop\b|\bvolume[_\s-]?drop\b",
+    re.IGNORECASE,
+)
+
+#: An explicitly named run-over-run guard, as a *call or assignment* — a bare
+#: word also matches a comment or a column name.
+_NAMED_TREND_GUARD = re.compile(
+    r"\b(?:volume_check|check_volume|trend_check|check_trend|shrinkage_check|"
+    r"check_shrinkage|variance_check|check_variance|count_trend|row_count_trend|"
+    r"historical_check|check_historical|drift_check|check_drift)\s*[\(=]",
+    re.IGNORECASE,
+)
+
+#: A relational comparison. A previous count merely *read* judges nothing.
+_TREND_COMPARISON = re.compile(r"(?:<=|>=|==|!=|<|>)|\bbetween\b", re.IGNORECASE)
+
+#: A row count is persisted somewhere a later run could read it back. That is the
+#: raw material for a trend, without the trend itself.
+#: The separator deliberately excludes whitespace: ``row_count`` / ``rowcount``
+#: is an identifier or a column, while ``"row count mismatch"`` is prose inside
+#: an assertion message. Allowing a space made a same-run reconciliation whose
+#: *error text* mentioned a row count read as a persisted count.
+_COUNT_PERSISTED = re.compile(
+    r"(?:row|record)[_-]?count[\s\S]{0,200}?"
+    r"(?:INSERT\s+INTO|\.saveAsTable\s*\(|\.write\b)|"
+    r"(?:INSERT\s+INTO|\.saveAsTable\s*\(|\.write\b)[\s\S]{0,200}?"
+    r"(?:row|record)[_-]?count",
+    re.IGNORECASE,
+)
+
+#: How far from the previous-run token the comparison may sit: one statement,
+#: pretty-printed over a couple of lines — not the whole notebook.
+_TREND_WINDOW = 200
+
+
+def _run_over_run_control(code: str) -> bool:
+    """True when a previous-run count or a volume movement is actually compared."""
+    if _NAMED_TREND_GUARD.search(code):
+        return True
+    for pattern in (_PREVIOUS_RUN_COUNT, _VOLUME_MOVEMENT):
+        for match in pattern.finditer(code):
+            window = code[max(0, match.start() - _TREND_WINDOW):match.end() + _TREND_WINDOW]
+            if _TREND_COMPARISON.search(window):
+                return True
+    return False
+
+
+@check(
+    id="NB-VOLUME-TREND", ref="5.3.8",
+    title="Historical consistency: row counts change as expected (no unexplained shrinkage)",
+    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def notebook_has_a_run_over_run_volume_control(ctx: CheckContext) -> Verdict:
+    """The notebook holds this load's row count against a **previous run's**.
+
+    **What it verifies: the control, not the outcome.** Whether today's count
+    actually moved as expected is a runtime fact that lives in the data and the
+    run history; this tool reads neither. A PASS means "the code would notice an
+    unexplained shrinkage", never "the volume was correct".
+
+    **What it can determine.** A comparison against a count from an *earlier
+    run* — a ``previous_count`` / ``last_run_row_count`` / ``baseline_count``
+    read back and compared, a named movement (``row_delta``, ``pct_change``,
+    ``shrinkage``) held against a bound, or a named guard
+    (``volume_check(...)``, ``check_drift(...)``). A row count that is merely
+    *persisted* for a later run to read scores in the middle: the history is
+    being accumulated, but nothing compares it.
+
+    **What it cannot.** Resolve a threshold that lives in a config table, see a
+    volume rule enforced by a Data Activator alert or a monitoring dashboard, or
+    judge whether the tolerance is the right one. Read with ``executable_code``
+    so a commented-out check cannot pass.
+
+    **Sibling — deliberately not satisfied by it.** ``NB-RECON-COUNT`` (5.2.5)
+    compares this run's output against *this run's source* (``source_count``,
+    ``expected_count``, ``df.count() == src.count()``). That is reconciliation
+    across a hop, in one moment. This point is reconciliation across **time**, so
+    none of those tokens match here; only a count naming a prior run does.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+    code = executable_code(ctx.obj)
+    if not _WRITE_PATTERN.search(code):
+        return not_applicable(
+            "Notebook writes no table, so there is no load volume to compare against "
+            "a previous run"
+        )
+
+    if _run_over_run_control(code):
+        return graded(
+            3,
+            "Notebook compares its row count against a previous run's count or against a "
+            "named delta / percentage-change bound — a run-over-run consistency control is "
+            "present. Whether any particular run's volume was correct is a runtime outcome "
+            "this check does not read.",
+        )
+    if _COUNT_PERSISTED.search(code):
+        return graded(
+            1,
+            "Notebook records its row count to a table, so the history exists, but nothing "
+            "reads a previous run's count back and compares it — a load that silently "
+            "halves would still be written and logged as normal",
+        )
+    return graded(
+        0,
+        "Notebook writes data with no run-over-run volume control — no previous-run count, "
+        "delta or percentage-change test appears anywhere, so an unexplained shrinkage is "
+        "indistinguishable from a normal load",
+    )
+
+
+# =============================================================================
+# 2.1.4 — activities are logically grouped and self-documenting
+# =============================================================================
+
+#: A name Fabric generates when an activity is dropped on the canvas — the
+#: activity type, optionally with a trailing number. It documents nothing.
+#: ``Copy Sales To Bronze`` does not match: the tail after the type word must be
+#: empty or a number.
+_DEFAULT_ACTIVITY_NAME = re.compile(
+    r"^(?:copy(?:\s*data)?|notebook|script|lookup|get\s*metadata|for\s*each|foreach|"
+    r"if\s*condition|switch|until|wait|web(?:hook)?|set\s*variable|append\s*variable|"
+    r"execute\s*pipeline|invoke\s*pipeline|fail|filter|delete(?:\s*data)?|"
+    r"stored\s*procedure|dataflow|activity|new\s*activity|untitled|test|temp|tmp|"
+    r"office\s*365\s*outlook|teams|semantic\s*model\s*refresh|refresh|new)"
+    r"[\s_-]*\d*$",
+    re.IGNORECASE,
+)
+
+#: Activity types that *group* work: their children are a labelled unit rather
+#: than one more row in a flat list.
+_CONTAINER_TYPES = frozenset({"ForEach", "IfCondition", "Switch", "Until"})
+
+#: Above this many top-level activities with no container at all, the pipeline is
+#: a flat wall of steps — readable as a list, not as a structure.
+_FLAT_ACTIVITY_LIMIT = 10
+
+#: Shortest name that can carry a subject and a verb.
+_MIN_NAME_CHARS = 8
+
+_NAME_WORD_SPLIT = re.compile(r"[\s_\-]+|(?<=[a-z0-9])(?=[A-Z])")
+
+
+def _is_self_documenting(name: str) -> bool:
+    """True when an activity name says what the step does, not what type it is.
+
+    Two conditions, both cheap and both stable across tenants: the name is not a
+    Fabric-generated default (``Copy data1``, ``Notebook3``, ``Untitled``), and
+    it carries at least two words — ``LoadDimCustomer`` and ``Copy Sales To
+    Bronze`` qualify, ``Stage`` does not.
+    """
+    text = (name or "").strip()
+    if not text or _DEFAULT_ACTIVITY_NAME.match(text):
+        return False
+    words = [w for w in _NAME_WORD_SPLIT.split(text) if w]
+    return len(words) >= 2 and len(text) >= _MIN_NAME_CHARS
+
+
+@check(
+    id="PL-ACTIVITY-SELFDOC", ref="2.1.4",
+    title="Pipeline activities are logically grouped, annotated, and self-documenting",
+    pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.LOW,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
+)
+def pipeline_activities_are_self_documenting(ctx: CheckContext) -> Verdict:
+    """Activity *names* say what each step does, and related steps sit inside a container.
+
+    **What it can determine.** Two readable properties of the definition. First,
+    naming: a Fabric-generated default (``Copy data1``, ``Notebook3``,
+    ``Untitled``, or a bare type word) documents nothing, while a name with two
+    or more words (``Copy Sales To Bronze``, ``LoadDimCustomer``) does. Second,
+    grouping: whether the pipeline uses container activities — ForEach, If
+    Condition, Switch, Until — or presents more than
+    ``10`` steps as one flat top-level list. A flat, uncontained wall of steps
+    costs one band.
+
+    **What it cannot.** Judge whether a well-formed name is *accurate*, see
+    logical grouping expressed by a naming prefix rather than a container, or
+    know that a short pipeline was deliberately kept flat.
+
+    **Sibling — deliberately disjoint.** ``PL-DESC`` (2.1.6) scores whether the
+    ``description`` fields are populated. This check never reads a description:
+    a pipeline whose every activity carries a description but is still called
+    ``Copy data1`` passes 2.1.6 and fails here, which is the whole point — an
+    annotation you have to open the properties pane to see is not the same thing
+    as a canvas that reads itself.
+    """
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+    every = walk_activities(ctx.obj)
+    if not every:
+        return not_applicable("Pipeline has no activities to name or group")
+
+    named, defaults = [], []
+    for activity in every:
+        name = str(activity.get("name") or "")
+        (named if _is_self_documenting(name) else defaults).append(name or "?")
+    defaults = sorted(defaults)
+    top_level = activities(ctx.obj)
+    containers = [a for a in every if a.get("type") in _CONTAINER_TYPES]
+    flat = not containers and len(top_level) > _FLAT_ACTIVITY_LIMIT
+
+    detail = (
+        f"{len(named)} of {len(every)} activity name(s) are self-documenting "
+        f"(two or more words, not a Fabric default)"
+    )
+    if defaults:
+        detail += f"; default/one-word names: {', '.join(defaults[:5])}"
+    detail += (
+        f". {len(containers)} container activity(ies) (ForEach/If/Switch/Until) group "
+        f"{len(top_level)} top-level step(s)."
+        if containers else
+        f". No container activity groups the {len(top_level)} top-level step(s)."
+    )
+
+    verdict = covered(len(named), len(every), detail)
+    if not flat:
+        return verdict
+    return graded(
+        max(0, (verdict.score or 0) - 1),
+        detail + f" More than {_FLAT_ACTIVITY_LIMIT} steps sit in one flat list with no "
+                 f"grouping container, which costs a band.",
     )

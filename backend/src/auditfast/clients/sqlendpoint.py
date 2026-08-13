@@ -33,6 +33,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import struct
+import time
 from typing import Any
 
 log = logging.getLogger("auditfast.sqlendpoint")
@@ -50,6 +51,62 @@ _QUERY_TIMEOUT_SECONDS = 30
 #: workspace the Entra token can exceed its size limit. We read what we can and
 #: record the rest as unread rather than failing the whole crawl.
 MAX_ENDPOINTS_PER_WORKSPACE = 40
+
+#: How many times to re-attempt one endpoint read before giving up, and how long
+#: to wait between attempts.
+#:
+#: Without this a single transient failure lost a whole store's schema for the
+#: entire audit: two crawls of the same 105-endpoint workspace a day apart read
+#: 502 and then 307 tables, and the second lost Warehouse RLS completely. The
+#: verdicts moved with it (4.2.5 went PARTIAL -> FAIL) purely because less data
+#: was read, which reads as "the estate got worse" when nothing changed.
+#:
+#: Only *transient* failures are retried. A permission denial or a blocked port
+#: will fail identically on a second attempt, so retrying it just doubles the
+#: time a large workspace takes to crawl.
+_MAX_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = 2.0
+
+#: Failure reasons worth a second attempt: throttling, a dropped connection, and
+#: timeouts. Matched against :func:`_classify`'s output, so the vocabulary stays
+#: in one place.
+_RETRYABLE_REASONS = (
+    "did not finish in time",
+    "not reachable",
+    "connection",
+    "timeout",
+    "timed out",
+    "throttl",
+    "too many requests",
+    "transport",
+)
+
+
+def _is_auth_failure(reason: str) -> bool:
+    """True when the reason looks like a rejected/expired token.
+
+    An Entra access token lives about an hour. A large workspace takes longer
+    than that to crawl, which is exactly why the Fabric REST client carries a
+    refresher. pyodbc reports a dead token as ``Login failed for user
+    '<token-identified principal>'``, which :func:`_classify` renders as an
+    access problem - indistinguishable from a genuine permission denial, and
+    deliberately *not* retryable, since retrying with the same dead token
+    changes nothing. Re-minting the token is the only thing that helps.
+    """
+    return "no access to this database" in (reason or "").lower()
+
+
+def _is_retryable(reason: str) -> bool:
+    """True when a failure reason describes a condition that may clear on retry.
+
+    A permission problem ("no access") and the Entra token-size limit are
+    deliberately excluded: they are deterministic for a given token, so a second
+    attempt costs time and changes nothing.
+    """
+    text = (reason or "").lower()
+    if "no access" in text or "system limit" in text or "too many warehouses" in text:
+        return False
+    return any(marker in text for marker in _RETRYABLE_REASONS)
 
 
 class SqlEndpoint:
@@ -147,8 +204,11 @@ class SqlEndpointReader:
     accurate reason instead of an empty result that looks like "nothing found".
     """
 
-    def __init__(self, sql_token: str | None):
+    def __init__(self, sql_token: str | None, token_provider=None):
         self._token = sql_token
+        #: Re-mints the SQL-audience token when the current one is rejected.
+        #: Optional: without it the reader behaves exactly as before.
+        self._token_provider = token_provider
         #: ``endpoint name -> reason it could not be read``.
         self.failures: dict[str, str] = {}
         self._driver: str | None = None
@@ -195,14 +255,35 @@ class SqlEndpointReader:
         ``decimal(18,2)``, ``int``. ``source_kind`` travels with every column so a
         check can tell a Lakehouse's forced ``varchar(8000)`` from a width a
         Warehouse author actually chose.
+
+        ``is_masked`` comes from ``sys.columns`` and records whether Dynamic Data
+        Masking is applied. It is read with a ``LEFT JOIN`` so a Lakehouse
+        endpoint - where the catalog view may be absent or empty - still returns
+        every column, just with ``is_masked`` false.
         """
         rows = self._query(endpoint, """
-            SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE,
-                   CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE,
-                   IS_NULLABLE, ORDINAL_POSITION
-            FROM INFORMATION_SCHEMA.COLUMNS
-            ORDER BY TABLE_NAME, ORDINAL_POSITION
+            SELECT c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE,
+                   c.CHARACTER_MAXIMUM_LENGTH, c.NUMERIC_PRECISION, c.NUMERIC_SCALE,
+                   c.IS_NULLABLE, c.ORDINAL_POSITION,
+                   COALESCE(sc.is_masked, 0) AS is_masked
+            FROM INFORMATION_SCHEMA.COLUMNS AS c
+            LEFT JOIN sys.columns AS sc
+                   ON sc.object_id = OBJECT_ID(
+                          QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME))
+                  AND sc.name = c.COLUMN_NAME
+            ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION
         """)
+        if rows is None:
+            # ``sys.columns`` is not guaranteed on every endpoint kind. Fall back
+            # to the plain projection rather than losing every column schema:
+            # masking is one check, columns feed a dozen.
+            rows = self._query(endpoint, """
+                SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE,
+                       CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE,
+                       IS_NULLABLE, ORDINAL_POSITION, 0 AS is_masked
+                FROM INFORMATION_SCHEMA.COLUMNS
+                ORDER BY TABLE_NAME, ORDINAL_POSITION
+            """)
         if rows is None:
             return None
         tables: dict[str, list[dict[str, Any]]] = {}
@@ -210,12 +291,17 @@ class SqlEndpointReader:
             table = str(row[0] or "")
             if not table:
                 continue
-            tables.setdefault(table, []).append({
+            column: dict[str, Any] = {
                 "name": str(row[1] or ""),
                 "type": _render_type(row[2], row[3], row[4], row[5]),
                 "nullable": str(row[6] or "").upper() == "YES",
                 "source_kind": endpoint.kind,
-            })
+            }
+            # Only recorded when true, so a snapshot does not grow by a false
+            # flag on every one of tens of thousands of columns.
+            if len(row) > 8 and row[8]:
+                column["is_masked"] = True
+            tables.setdefault(table, []).append(column)
         return tables
 
     def security_policies(self, endpoint: SqlEndpoint) -> list[dict[str, Any]] | None:
@@ -238,7 +324,64 @@ class SqlEndpointReader:
         ]
 
     def _query(self, endpoint: SqlEndpoint, sql: str) -> list[tuple] | None:
-        """Run one read-only query. Any failure returns None and records why."""
+        """Run one read-only query, retrying a transient failure. None on failure.
+
+        A transient failure - a throttle, a dropped connection, a slow gateway -
+        previously lost a whole store's schema for the entire audit. Each attempt
+        opens a fresh connection, because a half-open one is often what failed.
+
+        An *expired* token is handled separately: it is not transient (retrying
+        with the same dead token fails identically), so it gets one re-mint and
+        one extra attempt, outside the retry budget. Without this a crawl longer
+        than the token's ~1h life reads the first N endpoints and loses every one
+        after, which looks exactly like throttling but is not.
+        """
+        last_reason = ""
+        refreshed = False
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            rows = self._attempt(endpoint, sql)
+            if rows is not None:
+                if attempt > 1:
+                    # The endpoint recovered, so it is no longer a failure.
+                    self.failures.pop(endpoint.name, None)
+                    log.info("sql endpoint read for %s succeeded on attempt %d",
+                             endpoint.name, attempt)
+                return rows
+            last_reason = self.failures.get(endpoint.name, "")
+
+            if not refreshed and self._token_provider and _is_auth_failure(last_reason):
+                refreshed = True
+                if self._refresh_token():
+                    rows = self._attempt(endpoint, sql)
+                    if rows is not None:
+                        self.failures.pop(endpoint.name, None)
+                        return rows
+                    last_reason = self.failures.get(endpoint.name, "")
+
+            if attempt == _MAX_ATTEMPTS or not _is_retryable(last_reason):
+                break
+            time.sleep(_RETRY_BACKOFF_SECONDS * attempt)
+            log.info("retrying sql endpoint read for %s (attempt %d of %d) - %s",
+                     endpoint.name, attempt + 1, _MAX_ATTEMPTS, last_reason)
+        return None
+
+    def _refresh_token(self) -> bool:
+        """Re-mint the SQL token. True when a *different* token was obtained."""
+        try:
+            new_token = self._token_provider()
+        except Exception as exc:  # noqa: BLE001 - a failed refresh must not crash
+            log.warning("sql token refresh failed: %s", exc)
+            return False
+        if not new_token or new_token == self._token:
+            log.warning("sql token refresh returned no new token")
+            return False
+        self._token = new_token
+        self._unavailable = None
+        log.info("sql token refreshed, resuming endpoint reads")
+        return True
+
+    def _attempt(self, endpoint: SqlEndpoint, sql: str) -> list[tuple] | None:
+        """One connection + query. Any failure returns None and records why."""
         if not self.available:
             self.failures[endpoint.name] = self.unavailable_reason
             return None
@@ -295,6 +438,7 @@ def _render_type(data_type: Any, max_len: Any, precision: Any, scale: Any) -> st
     if precision is not None and base in {"decimal", "numeric"}:
         return f"{base}({int(precision)},{int(scale or 0)})"
     return base
+
 
 
 def _classify(exc: Exception) -> str:

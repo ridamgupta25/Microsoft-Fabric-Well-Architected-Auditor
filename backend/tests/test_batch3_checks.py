@@ -1,4 +1,4 @@
-"""Tests for the nine checks added for refs 14.1.2, 14.1.7, 14.1.8, 12.3.3, 1.1.5,
+"""Tests for the checks added for refs 14.1.2, 14.1.8, 12.3.3, 1.1.5,
 4.4.1, 4.4.2, 12.2.1 and 12.2.7.
 
 Every check here is a pure function of metadata the knowledge base already holds,
@@ -24,7 +24,6 @@ from auditfast.core.check.data_management_quality.reporting_semantic.automated i
     _redundant_pairs,
     key_columns_are_hidden,
     relationships_have_no_ambiguous_paths,
-    unused_model_columns,
 )
 from auditfast.core.check.operations_reliability.data_operations.automated import (
     medallion_architecture,
@@ -133,45 +132,6 @@ def test_ambiguous_paths_are_na_without_definitions_or_relationships():
     # One relationship cannot form a second path.
     single = _model_ctx({"m": {"relationships": [_rel("Sales", "Date")]}})
     assert _scored(relationships_have_no_ambiguous_paths(single)).status is Status.NA
-
-
-# =============================================================================
-# 14.1.7 — removal candidates (unscored by design)
-# =============================================================================
-
-def test_unused_columns_are_reported_but_never_scored():
-    models = {"m": {
-        "tables": ["Sales"],
-        "columns": [_column("Sales", "Amount"), _column("Sales", "Note")],
-        "measures": [{"name": "Total", "table": "Sales",
-                      "expression": "SUM(Sales[Amount])"}],
-        "relationships": [],
-    }}
-    outcome = unused_model_columns(_model_ctx(models))
-    summary = _scored(outcome)
-    assert summary.status is Status.INFO and summary.score is None
-    assert "1 of 2 column(s)" in summary.evidence
-    assert "Report visuals are not fetched" in summary.evidence
-    assert "Sales[Note]" in _details(outcome)[0].evidence
-
-
-def test_relationship_columns_are_not_removal_candidates():
-    models = {"m": {
-        "tables": ["Sales", "Customer"],
-        "columns": [_column("Sales", "CustomerKey"), _column("Customer", "CustomerKey")],
-        "measures": [],
-        "relationships": [{"from_table": "Sales", "from_column": "CustomerKey",
-                           "to_table": "Customer", "to_column": "CustomerKey",
-                           "is_active": True}],
-    }}
-    summary = _scored(unused_model_columns(_model_ctx(models)))
-    assert "0 of 2 column(s)" in summary.evidence
-
-
-def test_unused_columns_are_na_without_column_declarations():
-    unreadable = _model_ctx({}, unavailable={Resource.SEMANTIC_MODEL_DEFINITIONS})
-    assert _scored(unused_model_columns(unreadable)).status is Status.NA
-    assert _scored(unused_model_columns(_model_ctx({"m": {"columns": []}}))).status is Status.NA
 
 
 # =============================================================================
@@ -452,7 +412,6 @@ def test_every_new_ref_is_registered_once_and_has_remediation_text():
     book = load_remediation(load_project(PROJECT_FILE))
     new = {
         "14.1.2": "R-REL-AMBIGUOUS",
-        "14.1.7": "R-MODEL-UNUSED",
         "14.1.8": "R-MODEL-HIDDEN-KEYS",
         "12.3.3": "WS-SPARK-IDLE",
         "1.1.5": "WS-MEDALLION",

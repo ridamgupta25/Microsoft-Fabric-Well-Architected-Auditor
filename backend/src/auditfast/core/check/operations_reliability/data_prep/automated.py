@@ -8,14 +8,19 @@ from __future__ import annotations
 import json
 import re
 
-from auditfast.core.check._notebook import NOTEBOOK_LAYERS, executable_code, notebook_code
+from auditfast.core.check._notebook import (
+    NOTEBOOK_LAYERS,
+    executable_code,
+    notebook_code,
+    strip_sql_comments,
+)
 from auditfast.core.check._pipeline import (
     PIPELINE_LAYERS,
     activities,
     script_sql,
     walk_activities,
 )
-from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable
+from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
@@ -164,7 +169,22 @@ def failure_notification(ctx: CheckContext) -> Verdict:
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def restart_from_failure(ctx: CheckContext) -> Verdict:
-    """Pipeline definitions expose a restart boundary or durable progress marker."""
+    """Restart-from-failure is a Fabric platform capability, so this is reported, not scored.
+
+    **Why this is unscored.** Fabric Data Factory provides rerun-from-failure for
+    *every* pipeline, with nothing to configure: the run-history view offers
+    "rerun the entire pipeline, or rerun only from the failed activity"
+    (``learn.microsoft.com/fabric/data-factory/monitor-pipeline-runs``). The
+    capability the point asks about is therefore always present, and searching a
+    pipeline definition for a "restart boundary" failed pipelines for not
+    declaring something Fabric never asked them to declare.
+
+    **What is still worth reporting.** A rerun only helps if re-running an
+    activity is *safe*. That is idempotency, which ``PL-IDEMPOTENT`` (ref 2.4.6)
+    scores, and checkpointing, which shows up as watermark/incremental state. So
+    this emits an unscored note naming what the pipeline does have, and points at
+    the check that does the judging.
+    """
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
     acts = activities(ctx.obj)
@@ -172,9 +192,15 @@ def restart_from_failure(ctx: CheckContext) -> Verdict:
     if not data_acts:
         return not_applicable("Pipeline has no data-movement activity to restart")
     blob = json.dumps(ctx.obj)
-    ok = bool(_RESTART_BOUNDARY.search(blob))
-    return binary(ok, "Restart boundary/checkpoint or durable progress marker detected" if ok
-                  else "No restart-from-failure boundary; a retry may re-run the full pipeline")
+    marker = bool(_RESTART_BOUNDARY.search(blob))
+    return note(
+        "Fabric supports rerun-from-failed-activity for every pipeline with no "
+        "configuration, so restart capability is not scored here"
+        + (". This pipeline also keeps a durable progress marker (watermark or "
+           "checkpoint), so a rerun can resume rather than repeat" if marker else
+           ". No durable progress marker was found, so a rerun repeats the "
+           "activity - whether that is safe is scored by ref 2.4.6 (idempotency)")
+    )
 
 
 @check(
@@ -302,27 +328,44 @@ def notebook_bad_records(ctx: CheckContext) -> Verdict:
 def retry_values(ctx: CheckContext) -> Verdict:
     """Where retries are configured, the count is bounded and an interval is set.
 
-    A retry with no interval hammers a failing dependency; an unbounded count
-    turns a transient error into an hours-long hang. Only activities that already
-    declare a retry are judged — whether to retry at all is PL-RETRY's job.
+    A retry with no interval hammers a failing dependency. Only activities that
+    already declare a retry are judged - whether to retry at all is PL-RETRY's job.
+
+    **On the upper bound.** Fabric's documented range is 1-1000 with no
+    infinite option (``learn.microsoft.com/fabric/data-factory/activity-overview``),
+    so an unbounded retry is not something a pipeline *can* configure. What a high
+    count does mean is a long tail of failure: the threshold below is a
+    house opinion, not a platform limit, and is settable per project.
     """
     with_retry = [a for a in activities(ctx.obj)
                   if (a.get("policy") or {}).get("retry", 0) >= 1]
     if not with_retry:
         return not_applicable("No activity declares a retry policy")
 
+    limit = ctx.setting("max_retry_count", _DEFAULT_MAX_RETRY)
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = _DEFAULT_MAX_RETRY
+
     def sane(activity: dict) -> bool:
         policy = activity.get("policy") or {}
         count = policy.get("retry", 0)
         interval = policy.get("retryIntervalInSeconds", 0)
-        return 1 <= count <= 10 and bool(interval) and interval > 0
+        return 1 <= count <= limit and bool(interval) and interval > 0
 
     good = [a for a in with_retry if sane(a)]
     return covered(
         len(good), len(with_retry),
         f"{len(good)} of {len(with_retry)} retrying activities set a bounded count "
-        f"(1-10) and a positive interval",
+        f"(1-{limit}) and a positive interval. Fabric allows 1-1000 and has no "
+        f"infinite option, so the upper bound here is a project convention",
     )
+
+
+#: Retry attempts above which a failure takes long enough to look like a hang.
+#: Fabric permits up to 1000; this is a house convention, overridable per project.
+_DEFAULT_MAX_RETRY = 10
 
 
 @check(
@@ -414,6 +457,31 @@ def pl_deadletter(ctx: CheckContext) -> Verdict:
     )
 
 
+#: A *genuine* dead-letter sink names its target, so keyword co-occurrence alone
+#: can no longer score a pass. Three real forms — a PySpark write to an
+#: error-named literal target (``saveAsTable``/``insertInto``/``.save``), a SQL
+#: ``INSERT``/``INSERT OVERWRITE`` into an error-named table, and an error-named
+#: DataFrame being written (``rejected_df.write``, ``exclusions_df.write``).
+_ERR_SINK = (
+    r"(?:reject|invalid|quarantin|dead[_ -]?letter|error|bad[_ -]?rec|"
+    r"fail(?:ed|ure)|corrupt|discard|exclus|violation|exception)"
+)
+_ERR_TABLE_WRITE = re.compile(
+    r"""(?:saveastable|insertinto|\.save)\s*\(\s*[fr]?["'`][^"'`)]*""" + _ERR_SINK + r"|"
+    r"""insert\s+(?:into|overwrite)\s+(?:table\s+)?[\w.`"']*""" + _ERR_SINK + r"|"
+    r"\b\w*" + _ERR_SINK + r"\w*\.\s*write\b",
+    re.IGNORECASE,
+)
+#: Any persist — a table write, insert, or file write. Distinguishes "wrote the
+#: failed rows *somewhere*" (unverifiable sink → PARTIAL) from "detected errors
+#: and wrote nothing" (dropped → FAIL).
+_ANY_WRITE = re.compile(
+    r"\.write\b|saveastable|insertinto|insert\s+(?:into|overwrite)|"
+    r"create\s+or\s+replace|\.save\s*\(",
+    re.IGNORECASE,
+)
+
+
 @check(
     id="NB-DEADLETTER", ref="5.1.10",
     title="DQ quarantine pattern: failed records routed to error tables with failure reason",
@@ -421,21 +489,65 @@ def pl_deadletter(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_deadletter(ctx: CheckContext) -> Verdict:
-    """Invalid records are retained in a dead-letter or quarantine output."""
+    """Failed records are retained in a distinctly-named dead-letter / quarantine table.
+
+    Tiered so keyword co-occurrence can no longer score a pass — the old check
+    matched any ``write``/``reject``/``invalid`` token, including ones sitting in a
+    comment, so a notebook that merely *mentioned* "invalid" passed:
+
+      * **PASS** — the *executable* code writes to a distinctly error / quarantine /
+        reject / exclusion-named sink (an error-named ``saveAsTable`` / ``INSERT
+        INTO`` target, or an error-named DataFrame being written).
+      * **PARTIAL** — either the quarantine intent is only in **comments** (documented,
+        not implemented), or the notebook flags record errors and writes to *some*
+        table but no recognisably error-named sink could be confirmed (the target is
+        often a runtime variable) — flagged for a human to verify.
+      * **FAIL** — the executable code flags record errors but performs no write at
+        all: the failed rows are detected and then dropped, nothing retained.
+      * **N/A** — no record-error vocabulary anywhere (not a DQ notebook).
+    """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
-    code = notebook_code(ctx.obj)
-    if not _RECORD_ERROR.search(code):
+    raw = notebook_code(ctx.obj)
+    if not _RECORD_ERROR.search(raw):
         return not_applicable("Notebook has no record-validation or error-routing pattern")
-    ok = bool(re.search(
-        r"(?:write|save|insert|append|quarantine|dead[_ -]?letter|reject|invalid)",
-        code,
-        re.IGNORECASE,
-    ))
+    # Judge only uncommented code (strip Python ``#`` and SQL ``--`` / ``/* */``);
+    # string literals are kept so a table name or embedded SQL still counts.
+    code = strip_sql_comments(executable_code(ctx.obj))
+
+    hit = _ERR_TABLE_WRITE.search(code)
+    if hit:
+        return binary(
+            True,
+            "Executable code writes failed/invalid records to a distinctly-named "
+            f"error / quarantine / reject sink (matched: {hit.group(0).strip()[:80]})",
+        )
+
+    if not _RECORD_ERROR.search(code):
+        found = ", ".join(sorted({m.lower() for m in _RECORD_ERROR.findall(raw)}))
+        return graded(
+            1,
+            f"Dead-letter / quarantine references ({found}) were found only in comments, "
+            "not in the executable code. Looked for an actual write to a distinct error / "
+            "quarantine / reject table (saveAsTable / INSERT INTO an error-named target) in "
+            "the uncommented code and SQL queries but found none — the quarantine pattern "
+            "is documented but not implemented",
+        )
+
+    if _ANY_WRITE.search(code):
+        return graded(
+            1,
+            "Executable code flags record errors (validation / reject) and writes to a "
+            "table, but no distinctly error / quarantine / reject-named sink could be "
+            "confirmed — the write target is a runtime variable, so it is not provable "
+            "from the code that the failed records are retained with a failure reason "
+            "rather than merged into the main output; verify manually",
+        )
+
     return binary(
-        ok,
-        "Notebook routes failed/invalid records to a retained output" if ok
-        else "Notebook detects record errors but does not retain a failed-record output",
+        False,
+        "Executable code flags record errors (validation / reject) but performs no write "
+        "at all — the failed/invalid records are detected and then dropped, not retained",
     )
 
 

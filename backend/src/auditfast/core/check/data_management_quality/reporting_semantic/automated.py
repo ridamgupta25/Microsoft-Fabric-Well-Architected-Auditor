@@ -20,7 +20,7 @@ from auditfast.core.check._dax import (
     uses_variables,
 )
 from auditfast.core.check._dax import normalised as dax_normalised
-from auditfast.core.check._semantic import is_row_identifier, relationship_columns
+from auditfast.core.check._semantic import is_row_identifier
 from auditfast.core.check.helpers import Verdict, covered, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
@@ -91,6 +91,33 @@ def _measure_detail(names: list[str], verb: str) -> str:
     return f"{len(names)} measure(s) {verb}: {shown}{more}"
 
 
+def _name_list(names: list[str], limit: int = _MAX_NAMED_MEASURES) -> str:
+    """Comma-joined names, capped so a large estate cannot fill the evidence."""
+    shown = ", ".join(names[:limit])
+    more = f" (+{len(names) - limit} more)" if len(names) > limit else ""
+    return f"{shown}{more}"
+
+
+def _offender_breakdown(offenders: dict[str, list[str]], limit: int = _MAX_NAMED_MEASURES) -> str:
+    """``Model: m1 (fault), m2 (fault); Model2: m3 (fault)`` — the offending measures
+    grouped under the model they belong to, capped at ``limit`` measures total so one
+    workspace cannot flood the scored row's evidence.
+    """
+    total_named = sum(len(names) for names in offenders.values())
+    parts: list[str] = []
+    shown = 0
+    for model_name, names in sorted(offenders.items()):
+        if shown >= limit:
+            break
+        picked = names[: limit - shown]
+        shown += len(picked)
+        parts.append(f"{model_name}: {', '.join(picked)}")
+    text = "; ".join(parts)
+    if total_named > limit:
+        text += f" (+{total_named - limit} more)"
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Structure checks — referential integrity
 # ---------------------------------------------------------------------------
@@ -98,7 +125,6 @@ def _measure_detail(names: list[str], verb: str) -> str:
 
 @check(
     id="SM-FK-SURROGATE",
-   
     ref="5.4.1",
     title="Fact-dimension referential integrity: all FKs in fact tables match dimension surrogate keys",
     pillar=Pillar.DATA,
@@ -304,8 +330,9 @@ def complex_measures_use_variables(ctx: CheckContext) -> list[Verdict]:
 
     Whether a *particular* iterator is truly avoidable is a modelling judgement,
     so only the two unambiguous anti-patterns above count against a measure. The
-    scored workspace verdict is followed by one unscored detail row per model,
-    naming the offending measures and which practice each breaks.
+    scored workspace verdict names every model it assessed and the measures that
+    break a practice, and is followed by one unscored detail row per model
+    repeating that model's offenders.
     """
     if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
         return [not_applicable(_UNREADABLE)]
@@ -315,13 +342,16 @@ def complex_measures_use_variables(ctx: CheckContext) -> list[Verdict]:
 
     total = compliant = 0
     no_var = repeated = iterators = 0
+    assessed_models: list[str] = []
     offenders: dict[str, list[str]] = {}
     for model_name, defn in models.items():
+        model_assessed = False
         for measure in defn.get("measures") or []:
             expr = _normalised(measure.get("expression"))
             if len(expr) <= _MIN_MEASURE_CHARS:
                 continue
             total += 1
+            model_assessed = True
             faults = []
             if len(expr) > _COMPLEX_MEASURE_CHARS and not uses_variables(expr):
                 faults.append("no VAR")
@@ -337,17 +367,23 @@ def complex_measures_use_variables(ctx: CheckContext) -> list[Verdict]:
                 offenders.setdefault(model_name, []).append(f"{name} ({', '.join(faults)})")
             else:
                 compliant += 1
+        if model_assessed:
+            assessed_models.append(model_name)
 
     if not total:
         return [not_applicable("No semantic model measures substantial enough to assess")]
 
-    verdicts = [covered(
-        compliant, total,
-        f"{compliant} of {total} substantial measures follow all three DAX practices — "
+    headline = (
+        f"{compliant} of {total} substantial measure(s) follow all three DAX practices "
+        f"across {len(assessed_models)} semantic model(s) "
+        f"({_name_list(assessed_models)}) — "
         f"{no_var} measure(s) longer than {_COMPLEX_MEASURE_CHARS} characters declare no VAR, "
         f"{repeated} repeat a substantial sub-expression, "
-        f"{iterators} use an iterator pattern with a cheaper equivalent",
-    )]
+        f"{iterators} use an iterator pattern with a cheaper equivalent"
+    )
+    if offenders:
+        headline += ". Measures needing attention — " + _offender_breakdown(offenders)
+    verdicts = [covered(compliant, total, headline)]
     verdicts += [
         note(_measure_detail(names, "break a DAX practice"), obj=model_name)
         for model_name, names in sorted(offenders.items())
@@ -499,128 +535,6 @@ def relationships_have_no_ambiguous_paths(ctx: CheckContext) -> list[Verdict]:
 
 
 # ---------------------------------------------------------------------------
-# 14.1.7 — columns and tables that nothing in the model references
-# ---------------------------------------------------------------------------
-
-#: How many candidate names one detail row spells out before summarising.
-_MAX_NAMED_COLUMNS = 15
-
-
-def _referenced_columns(model: dict[str, Any]) -> set[tuple[str, str]]:
-    """``(table, column)`` pairs, lower-cased, that the *model* itself uses.
-
-    Two routes count: a relationship endpoint (read via the shared
-    ``relationship_columns`` helper) and a mention in a measure's DAX. DAX names
-    a column as ``[Column]`` or ``'Table'[Column]``; the table qualifier is
-    optional and frequently omitted, so a mention is credited against every
-    table that owns a column of that name. Crediting too generously is the safe
-    direction here — it can only *shrink* the candidate list.
-    """
-    referenced: set[tuple[str, str]] = set(relationship_columns(model))
-
-    expressions = " ".join(_normalised(m.get("expression")) for m in model.get("measures") or [])
-    mentioned = {m.lower() for m in re.findall(r"\[([^\]\[]+)\]", expressions)}
-    if mentioned:
-        for column in model.get("columns") or []:
-            name = str(column.get("name") or "").strip().lower()
-            if name and name in mentioned:
-                referenced.add((str(column.get("table") or "").strip().lower(), name))
-    return referenced
-
-
-@check(
-    id="R-MODEL-UNUSED", ref="14.1.7",
-    title="Unused columns/tables removed from the model to reduce size and confusion",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
-    layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
-)
-def unused_model_columns(ctx: CheckContext) -> list[Verdict]:
-    """Report the columns and tables nothing *in the model* references.
-
-    A column is a removal **candidate** when no measure expression mentions it
-    and no relationship binds it; a table is a candidate when none of its
-    columns is referenced, it carries no measure, and it takes part in no
-    relationship.
-
-    **The hard limit, stated plainly: report visuals are not fetched.** A column
-    dragged straight onto a visual — the single most common way a column earns
-    its place — is invisible to this check and will appear in the candidate
-    list. That makes the false-positive rate structurally high and unknowable
-    from the data available, which is why this check is **unscored**: it emits
-    ``note`` rows so a modeller can review the candidates, and never a PASS or a
-    FAIL. Scoring it, even generously, would penalise a correct model for a gap
-    in the crawler rather than a defect in the model — the opposite of the
-    N/A-not-FAIL principle this library is built on.
-    """
-    if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
-        return [not_applicable(_UNREADABLE)]
-    models = ctx.workspace.semantic_models
-    if not models:
-        return [not_applicable(_NO_MODELS)]
-
-    total_columns = total_candidates = 0
-    details: dict[str, str] = {}
-    for name, defn in models.items():
-        model_columns = defn.get("columns") or []
-        if not model_columns:
-            continue
-        referenced = _referenced_columns(defn)
-        candidates: list[str] = []
-        used_tables: set[str] = set()
-        for column in model_columns:
-            table = str(column.get("table") or "").strip()
-            column_name = str(column.get("name") or "").strip()
-            if not column_name:
-                continue
-            total_columns += 1
-            if (table.lower(), column_name.lower()) in referenced:
-                used_tables.add(table.lower())
-                continue
-            candidates.append(f"{table}[{column_name}]" if table else column_name)
-        total_candidates += len(candidates)
-
-        measure_tables = {str(m.get("table") or "").strip().lower()
-                          for m in defn.get("measures") or []}
-        related = {t for edge in _active_edges(defn) for t in edge}
-        related |= {_table_key(r.get("from_table")) for r in _relationships(defn)}
-        related |= {_table_key(r.get("to_table")) for r in _relationships(defn)}
-        orphan_tables = sorted(
-            t for t in (defn.get("tables") or [])
-            if t and t.strip().lower() not in (used_tables | measure_tables | related)
-        )
-
-        if not candidates and not orphan_tables:
-            continue
-        shown = ", ".join(candidates[:_MAX_NAMED_COLUMNS])
-        more = (f" (+{len(candidates) - _MAX_NAMED_COLUMNS} more)"
-                if len(candidates) > _MAX_NAMED_COLUMNS else "")
-        parts = []
-        if candidates:
-            parts.append(f"{len(candidates)} of {len(model_columns)} column(s) are "
-                         f"referenced by no measure and no relationship: {shown}{more}")
-        if orphan_tables:
-            parts.append(f"{len(orphan_tables)} table(s) carry no measure, no "
-                         f"relationship and no referenced column: "
-                         f"{', '.join(orphan_tables[:10])}")
-        details[name] = "; ".join(parts)
-
-    if not total_columns:
-        return [not_applicable(
-            "No semantic model carries column declarations, so removal candidates "
-            "cannot be identified"
-        )]
-
-    summary = note(
-        f"{total_candidates} of {total_columns} column(s) across "
-        f"{len(models)} semantic model(s) are referenced by no measure and no "
-        f"relationship. Report visuals are not fetched, so a column used only in "
-        f"a visual is indistinguishable from an unused one — review before "
-        f"removing. Reported, not scored."
-    )
-    return [summary] + [note(reason, obj=name) for name, reason in sorted(details.items())]
-
-
-# ---------------------------------------------------------------------------
 # 14.1.8 — consumer-friendly model: technical keys hidden
 # ---------------------------------------------------------------------------
 
@@ -696,3 +610,136 @@ def key_columns_are_hidden(ctx: CheckContext) -> list[Verdict]:
             obj=model_name,
         ))
     return verdicts
+
+
+# ---------------------------------------------------------------------------
+# Shared report/model helpers (14.3.4)
+# ---------------------------------------------------------------------------
+
+#: How many names to list in evidence before summarising.
+_MAX_NAMED_MODELS = 5
+
+#: How many visible key columns to name per model before summarising the rest.
+_MAX_NAMED_COLUMNS = 10
+
+#: Stated wherever a check would otherwise be read as judging *certification*.
+#: Verified against Microsoft's *Get Datasets In Group* reference: the standard
+#: response carries no ``endorsementDetails`` — endorsement (Promoted /
+#: Certified) is only available from the admin/scanner API, which this read-only
+#: auditor never calls.
+_ENDORSEMENT_LIMIT = (
+    "Endorsement is not readable (the standard datasets API carries no "
+    "endorsementDetails; Promoted/Certified needs the admin/scanner API), so this "
+    "scores sharing and reuse, never certification."
+)
+
+
+def _reports_by_model(reports: list[dict]) -> dict[str, list[dict]]:
+    """Group the workspace's reports by the semantic model they are built on.
+
+    Reports with no ``dataset_id`` — paginated (RDL) reports bind to no semantic
+    model — are excluded rather than grouped under an empty key: they cannot
+    evidence either reuse or a private extract.
+    """
+    grouped: dict[str, list[dict]] = {}
+    for report in reports:
+        dataset_id = str(report.get("dataset_id") or "")
+        if dataset_id:
+            grouped.setdefault(dataset_id, []).append(report)
+    return grouped
+
+
+# ---------------------------------------------------------------------------
+# 14.3.4 — reports built on a shared model, not a private ad-hoc extract
+# ---------------------------------------------------------------------------
+
+
+@check(
+    id="R-REPORT-SHARED-MODEL", ref="14.3.4",
+    title="Reports use the shared certified model rather than private ad-hoc extracts",
+    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=[Layer.REPORTING],
+    requires=[Resource.REPORTS], required=False,
+)
+def reports_are_built_on_a_shared_model(ctx: CheckContext) -> Verdict:
+    """Each report is built on a model other reports also use, not on its own extract.
+
+    **What it can determine.** Every report's ``datasetId`` (Power BI *Get
+    Reports In Group*, delegated ``Report.Read.All``), grouped by model. A report
+    counts as reuse when either the model it binds to also serves another report
+    in this workspace, **or** the model lives in a *different* workspace — that
+    second case is the central-hub pattern, where the report deliberately
+    consumes a shared model published elsewhere. Everything else is a model with
+    exactly one report and no wider audience: the readable shape of a private
+    ad-hoc extract.
+
+    **What it cannot determine — stated plainly, because the point says
+    "certified".** Endorsement is *not* readable: the standard *Get Datasets In
+    Group* response carries no ``endorsementDetails``, and Promoted/Certified
+    needs the admin/scanner API this read-only auditor never calls. So this check
+    scores **sharing and reuse only**. A workspace can score 3 here with a
+    thoroughly uncertified model.
+
+    It also sees only *this* workspace's reports, so a model whose other
+    consumers live elsewhere is under-counted — which is why a cross-workspace
+    binding is credited as reuse outright. Paginated (RDL) reports carry no
+    ``datasetId`` at all; they are excluded from both sides of the ratio, never
+    counted as a private extract.
+
+    **Scope limit — this scores sharing, never certification.** Ref 14.1.5
+    ("shared/**certified** semantic model reused across domains") was removed
+    from this library: endorsement (Promoted / Certified) is readable only from
+    the admin/scanner API, so that point cannot be fully automated on a
+    normal delegated sign-in and is tracked as an admin-scoped check. What is
+    readable — and what this judges — is whether reports actually share a model
+    or each sit on their own private extract.
+    """
+    if not ctx.workspace.has(Resource.REPORTS):
+        return not_applicable(
+            "Report → semantic-model bindings could not be read (the Power BI reports "
+            "listing was unavailable or the sign-in yielded no Power BI token)"
+        )
+    reports = ctx.workspace.reports
+    if not reports:
+        return not_applicable("This workspace holds no report, so none can be judged")
+
+    grouped = _reports_by_model(reports)
+    bound = sum(len(rows) for rows in grouped.values())
+    unbound = len(reports) - bound
+    if not bound:
+        return not_applicable(
+            f"None of the {len(reports)} report(s) declares a semantic-model binding — "
+            "paginated (RDL) reports carry no datasetId, so no model reuse is observable"
+        )
+    if bound < 2:
+        return not_applicable(
+            f"Only {bound} report in this workspace declares a model binding, so whether a "
+            "model is shared between reports cannot be observed from one report"
+        )
+
+    workspace_id = ctx.workspace.id
+    shared = 0
+    private: list[str] = []
+    for dataset_id, rows in grouped.items():
+        external = any(
+            row.get("dataset_workspace_id") and row.get("dataset_workspace_id") != workspace_id
+            for row in rows
+        )
+        if len(rows) > 1 or external:
+            shared += len(rows)
+        else:
+            private.append(rows[0].get("name") or rows[0].get("id") or dataset_id)
+
+    detail = (
+        f"{shared} of {bound} report(s) with a model binding are built on a model that is "
+        f"shared — used by another report here, or published in another workspace — across "
+        f"{len(grouped)} distinct model(s)"
+    )
+    if private:
+        detail += (f"; {len(private)} report(s) sit on a model no other report uses: "
+                   f"{', '.join(sorted(private)[:_MAX_NAMED_MODELS])}")
+    if unbound:
+        detail += (f". {unbound} paginated/unbound report(s) are excluded, not counted as "
+                   "private extracts")
+    detail += f". {_ENDORSEMENT_LIMIT}"
+    return covered(shared, bound, detail)

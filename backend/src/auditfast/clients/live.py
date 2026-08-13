@@ -46,7 +46,8 @@ class LiveFabricProvider:
     BASE = "https://api.fabric.microsoft.com/v1"
 
     def __init__(self, token: str, timeout: int = 60, token_refresher=None,
-                 powerbi_token: str | None = None, sql_token: str | None = None):
+                 powerbi_token: str | None = None, sql_token: str | None = None,
+                 storage_token: str | None = None, sql_token_refresher=None):
         import requests  # imported lazily so offline mode needs no HTTP stack
 
         self._session = requests.Session()
@@ -66,7 +67,17 @@ class LiveFabricProvider:
         #: blocked ⇒ those reads are skipped and the affected checks report N/A,
         #: exactly as they did before the endpoint was wired in.
         self._sql_token = sql_token
+        #: Re-mints the SQL token when it is rejected mid-crawl. The Fabric token
+        #: already has ``token_refresher`` for exactly this reason: a large
+        #: workspace takes longer to crawl than an Entra token lives. Without the
+        #: same treatment the SQL reads silently stop partway through.
+        self._sql_token_refresher = sql_token_refresher
         self._sql_reader = None
+        #: A Storage-audience token (``https://storage.azure.com``), used only for
+        #: OneLake ADLS Gen2 Files listings. Without it, file-layout checks report
+        #: N/A rather than treating unreadable Files sections as empty.
+        self._storage_token = storage_token
+        self._onelake_client = None
 
     # -- transport -------------------------------------------------------------
     def _get(self, path: str) -> tuple[int | None, Any]:
@@ -398,19 +409,22 @@ class LiveFabricProvider:
 
         endpoints = discover_endpoints(get_json, workspace_id)
         if not endpoints:
-            if want_columns:
-                ctx.unavailable.add(Resource.TABLE_COLUMNS)
-            if want_security:
-                ctx.unavailable.add(Resource.WAREHOUSE_SECURITY)
+            reason = ("no provisioned SQL analytics endpoint was discovered in this "
+                      "workspace (a newly created Lakehouse/Warehouse provisions one "
+                      "asynchronously, and a paused capacity serves none)")
+            self._record_environment_gap(ctx, wanted, reason, len(endpoints))
             log.info("fetch %s: no provisioned SQL endpoints discovered", workspace_id)
             return
 
-        reader = SqlEndpointReader(self._sql_token)
+        reader = SqlEndpointReader(self._sql_token,
+                                   token_provider=self._sql_token_refresher)
         if not reader.available:
-            if want_columns:
-                ctx.unavailable.add(Resource.TABLE_COLUMNS)
-            if want_security:
-                ctx.unavailable.add(Resource.WAREHOUSE_SECURITY)
+            # The reason lives on the reader, and used to reach the log only - so
+            # the single most common cause of "no Lakehouse columns" (a server with
+            # no ODBC driver) produced a snapshot that could not explain itself.
+            # Persisting it means the report says *why*, with no log to scrape.
+            self._record_environment_gap(
+                ctx, wanted, reader.unavailable_reason, len(endpoints))
             log.warning("fetch %s: SQL endpoint unavailable - %s",
                         workspace_id, reader.unavailable_reason)
             return
@@ -466,29 +480,32 @@ class LiveFabricProvider:
 
         # None readable means "we could not look", which must not read as "none
         # configured". Some readable is a partial gap, recorded but still usable.
+        # The per-endpoint reasons ride along so the snapshot explains itself.
+        reason_counts: dict[str, int] = {}
+        for reason in reader.failures.values():
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
         if want_columns:
             self._record_failures(ctx, Resource.TABLE_COLUMNS, col_attempted,
-                                  col_read, 0, col_attempted - col_read)
+                                  col_read, 0, col_attempted - col_read,
+                                  reasons=reason_counts)
         if collisions:
             log.info("fetch %s: %d table name(s) exist in more than one store; "
                      "the duplicates are keyed '<store>.<table>'",
                      workspace_id, collisions)
         if want_security and sec_attempted:
             self._record_failures(ctx, Resource.WAREHOUSE_SECURITY, sec_attempted,
-                                  sec_read, 0, sec_attempted - sec_read)
+                                  sec_read, 0, sec_attempted - sec_read,
+                                  reasons=reason_counts)
         elif want_security:
             # No Warehouse in the workspace: nothing to read, nothing to report.
             ctx.unavailable.add(Resource.WAREHOUSE_SECURITY)
 
         # The per-endpoint reasons are the only way to tell a blocked port from a
         # permission gap, so surface the distinct ones rather than burying them.
-        if reader.failures:
-            reasons: dict[str, int] = {}
-            for reason in reader.failures.values():
-                reasons[reason] = reasons.get(reason, 0) + 1
-            for reason, count in sorted(reasons.items(), key=lambda kv: -kv[1]):
-                log.warning("fetch %s: %d SQL endpoint read(s) failed - %s",
-                            workspace_id, count, reason)
+        for reason, count in sorted(reason_counts.items(), key=lambda kv: -kv[1]):
+            log.warning("fetch %s: %d SQL endpoint read(s) failed - %s",
+                        workspace_id, count, reason)
 
         log.info("fetch %s: SQL endpoints - columns %d/%d, warehouse security %d/%d%s",
                  workspace_id, col_read, col_attempted, sec_read, sec_attempted,
@@ -622,7 +639,7 @@ class LiveFabricProvider:
     @staticmethod
     def _record_failures(ctx: WorkspaceContext, resource: Resource,
                          attempted: int, read: int, forbidden: int, transient: int,
-                         empty: int = 0) -> None:
+                         empty: int = 0, reasons: dict[str, int] | None = None) -> None:
         """Record a one-per-item read outcome on the context.
 
         When some items of a type could not be read, store the counts so the gap
@@ -632,9 +649,15 @@ class LiveFabricProvider:
         ``empty`` counts items whose definition call returned but carried nothing
         usable. Those are a real coverage gap, but re-crawling will not fix them,
         so they are reported without making the snapshot un-cacheable.
+
+        ``reasons`` is a ``reason -> count`` histogram. Counts alone say *how
+        many* reads failed but never *why*, and the why used to exist only in the
+        crawl log - which is discarded once the process exits, leaving a snapshot
+        that cannot explain itself. Persisting it makes a blocked port
+        distinguishable from a throttled tenant after the fact.
         """
         if attempted and (forbidden or transient or empty):
-            ctx.read_failures[resource.value] = {
+            stat = {
                 "attempted": attempted,
                 "read": read,
                 "failed": forbidden + transient + empty,
@@ -642,8 +665,41 @@ class LiveFabricProvider:
                 "transient": transient,
                 "empty": empty,
             }
+            if reasons:
+                stat["reasons"] = dict(
+                    sorted(reasons.items(), key=lambda kv: -kv[1])
+                )
+            ctx.read_failures[resource.value] = stat
             if read == 0:
                 ctx.unavailable.add(resource)
+
+    @staticmethod
+    def _record_environment_gap(ctx: WorkspaceContext, wanted: set[Resource],
+                                reason: str, endpoints: int) -> None:
+        """Persist a whole-resource SQL gap, with its reason, onto the context.
+
+        Distinct from :meth:`_record_failures`, which reports per-item outcomes.
+        Here nothing was attempted at all - the reader could not start - so the
+        count is the number of endpoints that *would* have been read. Recording it
+        the same way means the report's crawl-completeness section explains the
+        gap ("no ODBC driver installed") instead of silently showing no columns.
+
+        This matters most where the operator cannot see the server console: a
+        hosted deployment, or a colleague running the tool on another machine.
+        """
+        for resource in (Resource.TABLE_COLUMNS, Resource.WAREHOUSE_SECURITY):
+            if resource not in wanted:
+                continue
+            ctx.unavailable.add(resource)
+            ctx.read_failures[resource.value] = {
+                "attempted": endpoints,
+                "read": 0,
+                "failed": endpoints,
+                "forbidden": 0,
+                "transient": 0,
+                "empty": 0,
+                "reasons": {reason: endpoints or 1},
+            }
 
     def _run_stamps(self, workspace_id: str, item_id: str) -> tuple[list[str], str]:
         """Return one item's job-run timestamps (newest first) and a failure classifier.
@@ -767,6 +823,16 @@ class LiveFabricProvider:
         self._powerbi_client = PowerBIClient(self._powerbi_token, timeout=self._timeout)
         return self._powerbi_client
 
+    def _onelake(self):
+        """Return a OneLake ADLS Gen2 client, or None without a Storage token."""
+        if self._onelake_client is not None:
+            return self._onelake_client
+        if not self._storage_token:
+            return None
+        from .onelake import OneLakeClient
+        self._onelake_client = OneLakeClient(self._storage_token, timeout=self._timeout)
+        return self._onelake_client
+
     def _semantic_model_last_refresh(self, workspace_id: str, item_id: str) -> tuple[str | None, str]:
         """Return a semantic model's last-refresh time and a failure classifier.
 
@@ -807,6 +873,41 @@ class LiveFabricProvider:
         except Exception as exc:
             log.warning("semantic model %s refresh schedule error: %s", item_id, exc)
             return None, "transient"
+
+    def _workspace_reports(self, workspace_id: str) -> tuple[list[dict], bool]:
+        """Read the workspace's report → semantic-model bindings.
+
+        Served by the Power BI *Get Reports In Group* API, whose audience differs
+        from the Fabric crawl token, so without a Power BI token the bindings are
+        *unknown* (``readable=False``) rather than "no report exists" — the
+        distinction that lets the reuse checks report N/A instead of inventing a
+        finding. Needs the ordinary delegated ``Report.Read.All`` scope, not
+        tenant-admin.
+
+        Only the four fields the checks read are kept: report definitions, pages
+        and visuals are deliberately never fetched. ``datasetId`` is absent for a
+        paginated (RDL) report, which is a real answer — those reports are
+        excluded by the checks, never failed.
+        """
+        pbi = self._powerbi()
+        if pbi is None:
+            return [], False
+        try:
+            rows, known = pbi.list_reports_known(group_id=workspace_id)
+        except Exception as exc:
+            log.warning("fetch %s: report list error: %s", workspace_id, exc)
+            return [], False
+        reports = [
+            {
+                "id": row.get("id") or "",
+                "name": row.get("name") or "",
+                "dataset_id": row.get("datasetId") or "",
+                "dataset_workspace_id": row.get("datasetWorkspaceId") or "",
+            }
+            for row in rows
+            if isinstance(row, dict) and row.get("id")
+        ]
+        return reports, known
 
     def _enrich_run_history(self, ctx: WorkspaceContext, workspace_id: str) -> None:
         """Fill ``Item.last_run_utc`` from each runnable item's run/refresh history.
@@ -924,6 +1025,15 @@ class LiveFabricProvider:
                 ctx.unavailable.add(Resource.CONNECTIONS)
             log.info("fetch %s: %d connection records read", workspace_id, len(ctx.connections))
 
+        # Report → semantic-model bindings (Power BI Get Reports In Group). One
+        # list call, no per-report fetch: only id/name/datasetId are retained.
+        if Resource.REPORTS in wanted:
+            ctx.reports, readable = self._workspace_reports(workspace_id)
+            if not readable:
+                ctx.unavailable.add(Resource.REPORTS)
+            log.info("fetch %s: %d report binding(s) read (readable=%s)",
+                     workspace_id, len(ctx.reports), readable)
+
         # Pipeline, notebook, and table reads all walk the item list, so fetch it
         # whenever any item-derived resource was asked for.
         if wanted & {
@@ -937,6 +1047,7 @@ class LiveFabricProvider:
             Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE,
             Resource.ITEM_RUN_HISTORY,
             Resource.WAREHOUSE_AUDIT,
+            Resource.LAKEHOUSE_FILES,
         }:
             rows, known = self._values(f"/workspaces/{workspace_id}/items")
             ctx.items = [Item.from_api(row) for row in rows]
@@ -1078,6 +1189,41 @@ class LiveFabricProvider:
         # failing the crawl.
         if Resource.TABLE_COLUMNS in wanted or Resource.WAREHOUSE_SECURITY in wanted:
             self._read_sql_endpoints(ctx, workspace_id, wanted)
+
+        # OneLake Files listing per Lakehouse. The ADLS Gen2 API can return very
+        # large listings, so the OneLake client aggregates during fetch and caps
+        # enumeration. The KB stores only bounded counts/buckets, not file paths.
+        if Resource.LAKEHOUSE_FILES in wanted:
+            lakehouses = [i for i in ctx.items if i.type == "Lakehouse"]
+            attempted = read = forbidden = transient = 0
+            onelake = self._onelake()
+            if lakehouses and onelake is None:
+                ctx.unavailable.add(Resource.LAKEHOUSE_FILES)
+                forbidden = len(lakehouses)
+                attempted = len(lakehouses)
+                log.warning(
+                    "fetch %s: %d lakehouse Files listing(s) need a Storage-audience "
+                    "token; lakehouse file checks will be N/A",
+                    workspace_id, len(lakehouses),
+                )
+            elif onelake is not None:
+                for item in lakehouses:
+                    attempted += 1
+                    summary, failure = onelake.lakehouse_files_summary(workspace_id, item.id)
+                    if failure == "forbidden":
+                        forbidden += 1
+                    elif failure == "transient":
+                        transient += 1
+                    else:
+                        read += 1
+                        key = self._unique_key(
+                            ctx.lakehouse_files, item.display_name or item.id, item.id
+                        )
+                        ctx.lakehouse_files[key] = summary
+            self._record_failures(ctx, Resource.LAKEHOUSE_FILES,
+                                  attempted, read, forbidden, transient)
+            log.info("fetch %s: lakehouse Files summaries read for %d of %d lakehouse(s)",
+                     workspace_id, read, len(lakehouses))
 
         # Warehouse SQL audit *configuration* — plain Fabric REST, one call per
         # Warehouse, gated on the Audit permission of the item (not tenant-admin).
