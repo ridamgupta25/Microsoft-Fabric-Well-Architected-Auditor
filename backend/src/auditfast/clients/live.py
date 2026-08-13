@@ -39,6 +39,36 @@ log = logging.getLogger("auditfast.live")
 #: the knowledge-base snapshot.
 _MAX_RETAINED_RUNS = 25
 
+#: Why a semantic model's refresh schedule could not be read. Recorded on the
+#: snapshot so the gap explains itself without anyone reading a crawl log - and
+#: so a network blip is never mistaken for a permission denial.
+_SCHEDULE_FORBIDDEN_REASON = (
+    "Power BI rejected the token (HTTP 401/403) - the sign-in lacks "
+    "Dataset.Read.All, or the tenant setting for it is off"
+)
+_SCHEDULE_TRANSIENT_REASON = (
+    "Power BI was unreachable or throttled (DNS failure, reset connection, "
+    "timeout, 429 or 5xx) - retryable, and not a permission problem"
+)
+
+#: Schemas the platform owns. Their views and routines ship with every SQL
+#: endpoint, so counting them would report an abstraction layer nobody built.
+_PLATFORM_SCHEMAS: frozenset[str] = frozenset({
+    "sys", "queryinsights", "information_schema", "guest",
+    "db_owner", "db_accessadmin", "db_securityadmin", "db_ddladmin",
+})
+
+#: Database principals every SQL endpoint ships with. Recording them would make
+#: an empty estate look populated, so the access checks judge only real grants.
+#: Lower-cased: SQL identifiers are case-insensitive, and the filter compares
+#: against a lower-cased name.
+_SYSTEM_PRINCIPALS: frozenset[str] = frozenset({
+    "public", "dbo", "guest", "sys", "information_schema",
+    "db_owner", "db_accessadmin", "db_securityadmin", "db_ddladmin",
+    "db_backupoperator", "db_datareader", "db_datawriter",
+    "db_denydatareader", "db_denydatawriter",
+})
+
 
 class LiveFabricProvider:
     """Reads a live Fabric tenant with a delegated, read-only OAuth2 token."""
@@ -471,6 +501,11 @@ class LiveFabricProvider:
                                 "store": endpoint.name,
                                 "store_kind": endpoint.kind,
                             }
+                    # One extra connection per endpoint, carrying every remaining
+                    # catalog read as a single batch. Attempted only where the
+                    # column read already succeeded: if that failed, this one has
+                    # no better prospect and would just double the wasted time.
+                    self._store_endpoint_metadata(ctx, reader, endpoint)
             if want_security and endpoint.kind == "Warehouse":
                 sec_attempted += 1
                 policies = reader.security_policies(endpoint)
@@ -672,6 +707,111 @@ class LiveFabricProvider:
             ctx.read_failures[resource.value] = stat
             if read == 0:
                 ctx.unavailable.add(resource)
+
+    def _store_endpoint_metadata(self, ctx: WorkspaceContext, reader,
+                                 endpoint) -> None:
+        """Fold one endpoint's catalog batch into the workspace context.
+
+        **Bounded by construction.** Nothing here scales with the *data* in the
+        estate: row counts are integers read from partition metadata, foreign
+        keys are a small edge list, and view/procedure bodies are already capped
+        by the query. Per the knowledge-base rule, no row content is ever stored.
+
+        Everything is keyed by the same table name the column reader uses, so a
+        check reads ``table["row_count"]`` or ``table["references"]`` without
+        knowing the endpoint existed.
+        """
+        try:
+            sets = reader.metadata(endpoint)
+        except Exception as exc:  # noqa: BLE001 - extra metadata is best-effort
+            log.info("sql metadata batch failed for %s: %s", endpoint.name, exc)
+            return
+        if not sets:
+            return
+
+        # object_id -> (schema, name, type) for everything the endpoint declared.
+        objects: dict[int, tuple[str, str, str]] = {}
+        for row in sets.get("objects", ()):
+            try:
+                objects[int(row[0])] = (str(row[1] or ""), str(row[2] or ""),
+                                        str(row[3] or "").strip())
+            except (TypeError, ValueError):
+                continue
+
+        def table_entry(object_id) -> dict | None:
+            """The context table an object id belongs to, if it is one we hold."""
+            info = objects.get(int(object_id)) if object_id is not None else None
+            if not info:
+                return None
+            name = info[1]
+            return (ctx.tables.get(name)
+                    or ctx.tables.get(f"{endpoint.name}.{name}"))
+
+        for row in sets.get("row_counts", ()):
+            entry = table_entry(row[0])
+            if entry is not None and row[1] is not None:
+                # Approximate by definition - partition metadata, not a COUNT(*).
+                entry["row_count"] = int(row[1])
+
+        # Declared foreign keys, stored as a name-level edge list on the
+        # referencing table. This is what lets a check tell a fact from a
+        # dimension structurally instead of reading the table's name.
+        for row in sets.get("foreign_keys", ()):
+            parent = table_entry(row[1])
+            referenced = objects.get(int(row[2])) if row[2] is not None else None
+            if parent is None or not referenced:
+                continue
+            parent.setdefault("references", [])
+            if referenced[1] not in parent["references"]:
+                parent["references"].append(referenced[1])
+
+        for row in sets.get("key_constraints", ()):
+            entry = table_entry(row[1])
+            if entry is not None:
+                entry["has_declared_key"] = True
+
+        for row in sets.get("stats", ()):
+            entry = table_entry(row[0])
+            if entry is not None:
+                entry["statistics"] = int(entry.get("statistics", 0)) + 1
+
+        # Views and routines are workspace-level, not per table: they describe the
+        # load logic, which several Warehouse checks need and none can read today.
+        # Platform schemas are excluded - every SQL endpoint ships hundreds of
+        # ``sys``/``queryinsights`` view definitions that nobody wrote. Storing
+        # them bloats the snapshot (1,171 arrived on one real crawl, all platform)
+        # and would let a check report an abstraction layer nobody built.
+        views = [
+            {"schema": str(r[0] or ""), "name": str(r[1] or ""),
+             "definition": str(r[2] or ""), "store": endpoint.name}
+            for r in sets.get("views", ())
+            if str(r[0] or "").lower() not in _PLATFORM_SCHEMAS
+        ]
+        routines = [
+            {"schema": str(r[0] or ""), "name": str(r[1] or ""),
+             "type": str(r[2] or ""), "definition": str(r[3] or ""),
+             "store": endpoint.name}
+            for r in sets.get("routines", ())
+            if str(r[0] or "").lower() not in _PLATFORM_SCHEMAS
+        ]
+        if views:
+            ctx.sql_views.extend(views)
+        if routines:
+            ctx.sql_routines.extend(routines)
+
+        # Database-scoped principals: the same "who has access" question as
+        # workspace role assignments, from a source that needs no admin.
+        # Compared case-insensitively - SQL identifiers are not case-sensitive,
+        # so a ``DBO`` or ``Public`` would otherwise slip past the filter and
+        # make an empty estate look populated.
+        principals = [
+            {"name": str(r[1] or ""), "type": str(r[2] or ""),
+             "authentication": str(r[3] or ""), "store": endpoint.name}
+            for r in sets.get("principals", ())
+            if str(r[1] or "").strip().lower() not in _SYSTEM_PRINCIPALS
+        ]
+        if principals:
+            ctx.sql_principals.extend(principals)
 
     @staticmethod
     def _record_environment_gap(ctx: WorkspaceContext, wanted: set[Resource],
@@ -1303,6 +1443,7 @@ class LiveFabricProvider:
         # team" is actually configured. No refresh rows are read.
         if Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE in wanted:
             attempted = read = forbidden = transient = 0
+            schedule_reasons: dict[str, int] = {}
             for item in ctx.items:
                 if item.type != "SemanticModel":
                     continue
@@ -1312,8 +1453,10 @@ class LiveFabricProvider:
                 )
                 if failure == "forbidden":
                     forbidden += 1
+                    reason = _SCHEDULE_FORBIDDEN_REASON
                 elif failure == "transient":
                     transient += 1
+                    reason = _SCHEDULE_TRANSIENT_REASON
                 else:
                     # A model with no schedule read cleanly: absence from the map
                     # is the finding, so it must not count as a failure.
@@ -1323,10 +1466,14 @@ class LiveFabricProvider:
                             ctx.refresh_schedules, item.display_name or item.id, item.id
                         )
                         ctx.refresh_schedules[key] = schedule
+                    continue
+                schedule_reasons[reason] = schedule_reasons.get(reason, 0) + 1
             self._record_failures(ctx, Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE,
-                                  attempted, read, forbidden, transient)
-            log.info("fetch %s: refresh schedule read for %d of %d semantic model(s)",
-                     workspace_id, read, attempted)
+                                  attempted, read, forbidden, transient,
+                                  reasons=schedule_reasons)
+            log.info("fetch %s: refresh schedule read for %d of %d semantic model(s) "
+                     "(%d forbidden, %d transient)",
+                     workspace_id, read, attempted, forbidden, transient)
 
         return ctx
 

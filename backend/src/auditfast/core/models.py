@@ -161,6 +161,19 @@ class WorkspaceContext:
     #: The Git provider connection details (provider, org, repo, branch, dir) when
     #: the workspace is Git-connected — the authoritative source for item code.
     git_details: dict = field(default_factory=dict)
+    #: View definitions read over the SQL analytics endpoint:
+    #: ``{"schema", "name", "definition", "store"}``. The definition is capped by
+    #: the reader, so this cannot grow with the size of the data.
+    sql_views: list[dict] = field(default_factory=list)
+    #: Stored procedures and functions, same shape as :attr:`sql_views` plus
+    #: ``type``. This is the Warehouse load logic that no Fabric REST endpoint
+    #: exposes - TRY/CATCH handling, incremental patterns, statistics maintenance.
+    sql_routines: list[dict] = field(default_factory=list)
+    #: Database-scoped principals from the SQL endpoint:
+    #: ``{"name", "type", "authentication", "store"}``. A second, admin-free view
+    #: of "who has access", for the workspace whose role assignments could not be
+    #: read from Fabric REST.
+    sql_principals: list[dict] = field(default_factory=list)
     #: Resources the provider tried and failed to read. A check whose data lands
     #: here must report N/A rather than failing: "we could not determine this" is
     #: not the same finding as "this is not configured".
@@ -253,6 +266,9 @@ class WorkspaceContext:
             "reports": self.reports,
             "lakehouse_files": self.lakehouse_files,
             "git_details": self.git_details,
+            "sql_views": self.sql_views,
+            "sql_routines": self.sql_routines,
+            "sql_principals": self.sql_principals,
             "unavailable": sorted(r.value for r in self.unavailable),
             "read_failures": self.read_failures,
         }
@@ -283,6 +299,9 @@ class WorkspaceContext:
             reports=list(data.get("reports", [])),
             lakehouse_files=dict(data.get("lakehouse_files", {})),
             git_details=dict(data.get("git_details", {})),
+            sql_views=list(data.get("sql_views", [])),
+            sql_routines=list(data.get("sql_routines", [])),
+            sql_principals=list(data.get("sql_principals", [])),
             unavailable={Resource(v) for v in data.get("unavailable", [])},
             read_failures=dict(data.get("read_failures", {})),
         )

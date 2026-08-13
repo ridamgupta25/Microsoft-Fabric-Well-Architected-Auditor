@@ -315,7 +315,20 @@ def wh_staging_pattern(ctx: CheckContext) -> Verdict:
     required=True,
 )
 def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
-    """Inspectable SQL load logic wraps transactional changes in TRY...CATCH."""
+    """Load SQL wraps transactional changes in TRY...CATCH.
+
+    **Two sources of SQL.** Stored procedures and functions declared in the
+    Warehouse, now read from ``INFORMATION_SCHEMA.ROUTINES`` - which is where a
+    ``SqlServerStoredProcedure`` activity's logic actually lives - plus the
+    inline T-SQL a pipeline runs through a Script activity. Before the routine
+    bodies were fetched, a pipeline that called a stored procedure was recorded
+    as an *opaque* load and the whole check reported N/A: the logic existed, it
+    simply had not been read.
+
+    **What it cannot determine.** Whether a ``Copy`` activity's implicit load is
+    transactional - it runs no SQL of its own - so those are still counted as
+    opaque and named in the evidence rather than judged.
+    """
     if not ctx.workspace.has(Resource.ITEMS):
         return not_applicable("Workspace items could not be read from Fabric")
 
@@ -326,46 +339,59 @@ def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
     if not storage_items:
         return not_applicable("No Warehouse/Lakehouse items found in this workspace")
 
-    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
-        return not_applicable("Pipeline definitions could not be read from Fabric")
-
     inspected: list[tuple[str, bool]] = []
     opaque_loads: list[str] = []
 
-    for pipeline_name, pipeline_def in ctx.workspace.pipelines.items():
-        for activity in pipeline_activities(pipeline_def):
-            activity_type = str(activity.get("type", "") or "")
-            activity_name = activity.get("name", activity_type) or activity_type
-            marker = f"{pipeline_name}/{activity_name}"
+    # Stored procedures and functions declared in the Warehouse itself.
+    for routine in ctx.workspace.sql_routines:
+        text = str(routine.get("definition") or "")
+        if not _WAREHOUSE_SQL_LOAD.search(text):
+            continue
+        marker = f"{routine.get('store', '')}/{routine.get('name', '')}"
+        inspected.append((
+            marker,
+            bool(_TRY_CATCH_SQL.search(text)) and bool(_TXN_SQL.search(text)),
+        ))
 
-            if activity_type == "Script":
-                text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
-                if not _WAREHOUSE_SQL_LOAD.search(text):
+    if ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        for pipeline_name, pipeline_def in ctx.workspace.pipelines.items():
+            for activity in pipeline_activities(pipeline_def):
+                activity_type = str(activity.get("type", "") or "")
+                activity_name = activity.get("name", activity_type) or activity_type
+                marker = f"{pipeline_name}/{activity_name}"
+
+                if activity_type == "Script":
+                    text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
+                    if not _WAREHOUSE_SQL_LOAD.search(text):
+                        continue
+                    has_try_catch = bool(_TRY_CATCH_SQL.search(text))
+                    has_transaction = bool(_TXN_SQL.search(text))
+                    inspected.append((marker, has_try_catch and has_transaction))
                     continue
-                has_try_catch = bool(_TRY_CATCH_SQL.search(text))
-                has_transaction = bool(_TXN_SQL.search(text))
-                inspected.append((marker, has_try_catch and has_transaction))
-                continue
 
-            if activity_type in ("SqlServerStoredProcedure", "StoredProcedure", "Copy"):
-                opaque_loads.append(marker)
+                if activity_type in ("SqlServerStoredProcedure", "StoredProcedure", "Copy"):
+                    opaque_loads.append(marker)
 
     if not inspected:
         if opaque_loads:
             return not_applicable(
-                "Load logic is present but SQL bodies are not inspectable in this snapshot; "
-                "cannot verify TRY...CATCH transaction handling. " + _SQL_PERMISSION_HINT
+                f"{len(opaque_loads)} load activity/activities run through a stored "
+                "procedure or Copy whose SQL is not in this snapshot, and the "
+                "Warehouse declared no routine body to read, so TRY...CATCH "
+                "handling cannot be verified. " + _SQL_PERMISSION_HINT
             )
         return not_applicable("No inspectable scripted SQL load activity was found")
 
     compliant = [name for name, ok in inspected if ok]
-    return covered(
-        len(compliant),
-        len(inspected),
-        f"{len(compliant)} of {len(inspected)} inspectable SQL load activity/activities use "
+    evidence = (
+        f"{len(compliant)} of {len(inspected)} inspectable SQL load(s) use "
         "TRY...CATCH and BEGIN/COMMIT/ROLLBACK transaction handling"
-        + (f"; compliant: {', '.join(compliant[:5])}" if compliant else ""),
+        + (f"; compliant: {', '.join(compliant[:5])}" if compliant else "")
     )
+    if opaque_loads:
+        evidence += (f". {len(opaque_loads)} Copy/stored-procedure activity/activities "
+                     f"run no readable SQL and are not judged")
+    return covered(len(compliant), len(inspected), evidence)
 
 @check(
     id="WS-WH-INCREMENTAL", ref="3.6.6",
@@ -375,38 +401,55 @@ def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
     required=True,
 )
 def wh_incremental_loads(ctx: CheckContext) -> Verdict:
-    """Inspectable warehouse SQL loads favor incremental patterns over full reloads."""
+    """Warehouse loads favour incremental patterns over full reloads.
+
+    Reads both sources of load SQL: stored procedures and functions declared in
+    the Warehouse (``INFORMATION_SCHEMA.ROUTINES``), and the inline T-SQL a
+    pipeline Script activity runs. A ``SqlServerStoredProcedure`` activity keeps
+    its logic in the routine, not the pipeline, so before those bodies were
+    fetched such a load could not be judged at all.
+    """
     if not ctx.workspace.has(Resource.ITEMS):
         return not_applicable("Workspace items could not be read from Fabric")
     warehouses = [item for item in ctx.workspace.items if item.type == "Warehouse"]
     if not warehouses:
         return not_applicable("No Warehouse items found in this workspace")
-    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
-        return not_applicable("Pipeline definitions could not be read from Fabric")
 
     inspected: list[tuple[str, bool]] = []
-    for pipeline_name, pipeline_def in ctx.workspace.pipelines.items():
-        for activity in pipeline_activities(pipeline_def):
-            if str(activity.get("type", "") or "") != "Script":
-                continue
-            text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
-            if not _WAREHOUSE_SQL_LOAD.search(text):
-                continue
-            inspected.append((
-                f"{pipeline_name}/{activity.get('name', 'Script')}",
-                bool(_INCREMENTAL_SQL.search(text)),
-            ))
+
+    for routine in ctx.workspace.sql_routines:
+        text = str(routine.get("definition") or "")
+        if not _WAREHOUSE_SQL_LOAD.search(text):
+            continue
+        inspected.append((
+            f"{routine.get('store', '')}/{routine.get('name', '')}",
+            bool(_INCREMENTAL_SQL.search(text)),
+        ))
+
+    if ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        for pipeline_name, pipeline_def in ctx.workspace.pipelines.items():
+            for activity in pipeline_activities(pipeline_def):
+                if str(activity.get("type", "") or "") != "Script":
+                    continue
+                text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
+                if not _WAREHOUSE_SQL_LOAD.search(text):
+                    continue
+                inspected.append((
+                    f"{pipeline_name}/{activity.get('name', 'Script')}",
+                    bool(_INCREMENTAL_SQL.search(text)),
+                ))
 
     if not inspected:
         return not_applicable(
-            "No inspectable scripted warehouse load was found; Copy/stored-procedure "
-            "loads do not expose enough logic in the snapshot to judge incremental vs full reload"
+            "No readable warehouse load SQL was found - the Warehouse declared no "
+            "stored procedure, and no pipeline runs an inline Script load, so "
+            "incremental versus full reload cannot be judged"
         )
 
     incremental = [name for name, is_incremental in inspected if is_incremental]
     return covered(
         len(incremental), len(inspected),
-        f"{len(incremental)} of {len(inspected)} inspectable warehouse load activity/activities "
+        f"{len(incremental)} of {len(inspected)} readable warehouse load(s) "
         f"use incremental signals (MERGE / watermark / CDC)"
         + (f"; incremental: {', '.join(incremental[:5])}" if incremental else ""),
     )
@@ -456,25 +499,45 @@ def wh_stats_updated_after_loads(ctx: CheckContext) -> Verdict:
                 opaque_loads.append(marker)
 
     inspectable_pipelines = sorted(pipeline_loads)
-    if not inspectable_pipelines:
+
+    # Statistics maintenance also lives in stored procedures, and the Warehouse's
+    # own ``sys.stats`` says whether user-created statistics exist at all - a
+    # second, structural answer to the same question.
+    routine_loads = [
+        r for r in ctx.workspace.sql_routines
+        if _WAREHOUSE_SQL_LOAD.search(str(r.get("definition") or ""))
+    ]
+    routine_stats = [
+        r for r in routine_loads
+        if _STATS_UPDATE_SQL.search(str(r.get("definition") or ""))
+    ]
+
+    if not inspectable_pipelines and not routine_loads:
         if opaque_loads:
             return not_applicable(
-                "Significant loads are present but SQL bodies are not inspectable in this snapshot; "
-                "cannot verify post-load statistics maintenance. " + _SQL_PERMISSION_HINT
+                f"{len(opaque_loads)} load activity/activities run through a Copy or "
+                "stored procedure whose SQL is not in this snapshot, and the "
+                "Warehouse declared no routine body to read, so post-load "
+                "statistics maintenance cannot be verified. " + _SQL_PERMISSION_HINT
             )
-        return not_applicable("No significant inspectable SQL warehouse/lakehouse load was found")
+        return not_applicable("No significant readable SQL warehouse/lakehouse load was found")
 
-    compliant = [name for name in inspectable_pipelines if pipeline_stats.get(name)]
+    total = len(inspectable_pipelines) + len(routine_loads)
+    compliant_pipelines = [name for name in inspectable_pipelines if pipeline_stats.get(name)]
+    compliant = len(compliant_pipelines) + len(routine_stats)
     evidence = (
-        f"{len(compliant)} of {len(inspectable_pipelines)} pipeline(s) with significant inspectable SQL loads "
-        "also run statistics maintenance (UPDATE STATISTICS / sp_updatestats / ANALYZE TABLE)"
+        f"{compliant} of {total} readable load(s) also run statistics maintenance "
+        "(UPDATE STATISTICS / sp_updatestats / ANALYZE TABLE)"
     )
+    if routine_loads:
+        evidence += (f"; {len(routine_stats)} of {len(routine_loads)} Warehouse stored "
+                     f"procedure(s) that load data maintain statistics")
     if opaque_loads:
-        evidence += f"; {len(opaque_loads)} load activity/activities remain non-inspectable"
-    if compliant:
-        evidence += f"; compliant pipelines: {', '.join(compliant[:5])}"
+        evidence += f"; {len(opaque_loads)} Copy activity/activities run no readable SQL"
+    if compliant_pipelines:
+        evidence += f"; compliant pipelines: {', '.join(compliant_pipelines[:5])}"
 
-    return covered(len(compliant), len(inspectable_pipelines), evidence)
+    return covered(compliant, total, evidence)
 
 
 @check(
@@ -867,12 +930,14 @@ def table_star_schema(ctx: CheckContext) -> Verdict:
 
 
 def _fact_width_note(facts: dict[str, dict]) -> str:
-    """Report fact-table column widths — context for "not flat wide tables", unscored.
+    """Report fact-table width and size - context for "not flat wide tables", unscored.
 
     A star-schema fact holds keys and measures; a flat wide table has descriptive
-    attributes denormalised onto it. Width is the readable hint, but it is only
-    ever *reported* here — ``TB-FACT-PURITY`` (4.5.3) is what scores attributes
-    that belong on a dimension.
+    attributes denormalised onto it. Width is the readable hint, and the row
+    count (read from partition metadata, never by scanning rows) says whether the
+    table is big enough for the shape to matter. Both are only ever *reported*
+    here - ``TB-FACT-PURITY`` (4.5.3) is what scores attributes that belong on a
+    dimension.
     """
     widths = {name: len(columns(table)) for name, table in facts.items() if columns(table)}
     if not widths:
@@ -881,9 +946,16 @@ def _fact_width_note(facts: dict[str, dict]) -> str:
     wide = [f"{n} ({c} cols)" for n, c in widest if c >= _WIDE_FACT_COLUMNS]
     detail = (f". Widest fact: {widest[0][0]} ({widest[0][1]} columns) across "
               f"{len(widths)} fact table(s) with readable columns")
+
+    sized = {n: t.get("row_count") for n, t in facts.items()
+             if isinstance(t.get("row_count"), int)}
+    if sized:
+        largest = max(sized.items(), key=lambda kv: kv[1])
+        detail += (f"; largest holds ~{largest[1]:,} rows ({largest[0]}) by partition "
+                   f"metadata, so no row was read")
     if wide:
         detail += (f"; {len(wide)} carry {_WIDE_FACT_COLUMNS}+ columns and are worth "
-                   f"reviewing for denormalised attributes — {', '.join(wide[:3])} "
+                   f"reviewing for denormalised attributes - {', '.join(wide[:3])} "
                    f"(reported, not scored: ref 4.5.3 judges fact-table purity)")
     return detail
 
@@ -999,48 +1071,65 @@ def table_surrogate_generated(ctx: CheckContext) -> Verdict:
     required=True,
 )
 def table_relationships_declared(ctx: CheckContext) -> Verdict:
-    """Fact tables are represented in declared semantic-model relationships.
+    """Fact tables declare their key relationships somewhere machine-readable.
 
-    Fabric Warehouse PK/FK constraints are metadata (not enforced), and direct
-    constraint metadata is not available in ``WorkspaceContext``. This check uses
-    semantic-model relationships as the machine-readable declaration of PK/FK
-    structure for workspace storage tables.
+    **Two sources, strongest first.** A Warehouse can declare ``NOT ENFORCED``
+    PK/FK constraints, and the crawl now reads them from ``sys.foreign_keys`` -
+    that is the point stated literally, so a table carrying one satisfies it
+    outright. Where no constraint is declared (a Lakehouse table, or a Warehouse
+    that never declared any), semantic-model relationships are the fallback:
+    they are the same structure expressed in the model rather than the database.
+
+    **What it cannot determine.** Whether a declared relationship is *correct* -
+    Fabric does not enforce these constraints, so a declaration is a statement of
+    intent, not a guarantee that the data honours it. ``NB-FK-INTEGRITY`` (5.3.2)
+    is what looks for code that actually validates the values.
     """
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
-    if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
-        return not_applicable("Semantic model definitions could not be read from Fabric")
-    models = ctx.workspace.semantic_models
-    if not models:
-        return not_applicable("No semantic models were read for this workspace")
 
     facts = [name for name in ctx.workspace.tables if is_fact(name)]
     if not facts:
         return not_applicable("No fact-like tables found to assess for declared FK relationships")
 
-    table_names = {_norm_name(name) for name in ctx.workspace.tables}
-    linked_tables: set[str] = set()
-    for model in models.values():
-        for rel in model.get("relationships") or []:
-            from_table = _norm_name(str(rel.get("from_table") or rel.get("fromTable") or ""))
-            to_table = _norm_name(str(rel.get("to_table") or rel.get("toTable") or ""))
-            if from_table in table_names:
-                linked_tables.add(from_table)
-            if to_table in table_names:
-                linked_tables.add(to_table)
+    # Declared database constraints - the direct answer where they exist.
+    with_constraint = {
+        name for name in facts
+        if (ctx.workspace.tables.get(name) or {}).get("references")
+    }
 
-    if not linked_tables:
-        return covered(
-            0, len(facts),
-            "No semantic-model relationships reference workspace storage tables"
+    linked_tables: set[str] = set()
+    models = ctx.workspace.semantic_models if ctx.workspace.has(
+        Resource.SEMANTIC_MODEL_DEFINITIONS) else {}
+    if models:
+        table_names = {_norm_name(name) for name in ctx.workspace.tables}
+        for model in models.values():
+            for rel in model.get("relationships") or []:
+                from_table = _norm_name(str(rel.get("from_table") or rel.get("fromTable") or ""))
+                to_table = _norm_name(str(rel.get("to_table") or rel.get("toTable") or ""))
+                if from_table in table_names:
+                    linked_tables.add(from_table)
+                if to_table in table_names:
+                    linked_tables.add(to_table)
+
+    declared = with_constraint | {
+        name for name in facts if _norm_name(name) in linked_tables
+    }
+    if not declared and not models and not with_constraint:
+        return not_applicable(
+            "Neither declared database constraints nor semantic-model "
+            "relationships could be read, so key relationships cannot be assessed"
         )
 
-    linked_facts = [name for name in facts if _norm_name(name) in linked_tables]
-    return covered(
-        len(linked_facts), len(facts),
-        f"{len(linked_facts)} of {len(facts)} fact-like table(s) participate in declared "
-        "semantic-model relationships",
-    )
+    evidence = (f"{len(declared)} of {len(facts)} fact-like table(s) declare their key "
+                f"relationships")
+    if with_constraint:
+        evidence += (f" ({len(with_constraint)} through a Warehouse FK constraint, the "
+                     f"rest through semantic-model relationships)")
+    else:
+        evidence += (" through semantic-model relationships; no Warehouse FK constraint "
+                     "is declared, which Fabric supports as NOT ENFORCED metadata")
+    return covered(len(declared), len(facts), evidence)
 
 
 @check(
@@ -1050,7 +1139,14 @@ def table_relationships_declared(ctx: CheckContext) -> Verdict:
     layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def stats_strategy_defined(ctx: CheckContext) -> Verdict:
-    """Inspect pipeline SQL automation for recurring stats maintenance patterns."""
+    """A statistics-maintenance strategy is defined and automated.
+
+    Three sources of evidence, strongest first: statistics objects the Warehouse
+    actually holds (``sys.stats``, counted per table during the crawl), stored
+    procedures that maintain them, and pipeline Script activities that run
+    ``UPDATE STATISTICS``. The first is structural - it says statistics exist,
+    not merely that some code mentions them.
+    """
     if not ctx.workspace.has(Resource.ITEMS):
         return not_applicable("Workspace items could not be read from Fabric")
 
@@ -1058,42 +1154,63 @@ def stats_strategy_defined(ctx: CheckContext) -> Verdict:
     if not storage_items:
         return not_applicable("No Warehouse/Lakehouse items found in this workspace")
 
-    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
-        return not_applicable("Pipeline definitions could not be read from Fabric")
-
     inspectable = 0
     automated = 0
     opaque = 0
 
-    for _, pipeline_def in (ctx.workspace.pipelines or {}).items():
-        for activity in pipeline_activities(pipeline_def):
-            activity_type = str(activity.get("type", "") or "")
-            if activity_type == "Script":
-                text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
-                if _STATS_UPDATE_SQL.search(text):
-                    inspectable += 1
-                    automated += 1
-                elif _WAREHOUSE_SQL_LOAD.search(text):
-                    inspectable += 1
-                continue
+    if ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        for _, pipeline_def in (ctx.workspace.pipelines or {}).items():
+            for activity in pipeline_activities(pipeline_def):
+                activity_type = str(activity.get("type", "") or "")
+                if activity_type == "Script":
+                    text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
+                    if _STATS_UPDATE_SQL.search(text):
+                        inspectable += 1
+                        automated += 1
+                    elif _WAREHOUSE_SQL_LOAD.search(text):
+                        inspectable += 1
+                    continue
 
-            if activity_type in ("Copy", "SqlServerStoredProcedure", "StoredProcedure"):
-                opaque += 1
+                if activity_type in ("Copy", "SqlServerStoredProcedure", "StoredProcedure"):
+                    opaque += 1
+
+    # Stored procedures that load data: do they maintain statistics too?
+    for routine in ctx.workspace.sql_routines:
+        text = str(routine.get("definition") or "")
+        if _STATS_UPDATE_SQL.search(text):
+            inspectable += 1
+            automated += 1
+        elif _WAREHOUSE_SQL_LOAD.search(text):
+            inspectable += 1
+
+    # Statistics the Warehouse actually holds - the structural signal.
+    tables_with_stats = sum(
+        1 for table in (ctx.workspace.tables or {}).values()
+        if table.get("statistics")
+    )
 
     if inspectable == 0:
+        if tables_with_stats:
+            return note(
+                f"No load automation could be inspected for a statistics strategy, but "
+                f"{tables_with_stats} table(s) carry statistics objects, so statistics "
+                f"exist even though nothing readable maintains them on a schedule"
+            )
         if opaque:
             return not_applicable(
-                "Storage load automation is present but SQL bodies are not inspectable, so statistics strategy cannot be verified. "
+                f"{opaque} load activity/activities run through a Copy or stored "
+                "procedure whose SQL is not in this snapshot, and no Warehouse "
+                "routine was readable, so a statistics strategy cannot be verified. "
                 + _SQL_PERMISSION_HINT
             )
-        return not_applicable("No inspectable storage-load automation was found to evaluate statistics strategy")
+        return not_applicable("No readable storage-load automation was found to evaluate statistics strategy")
 
-    return covered(
-        automated,
-        inspectable,
-        f"{automated} of {inspectable} inspectable load automation step(s) include statistics maintenance",
-        obj="inspectable load automation steps",
-    )
+    evidence = (f"{automated} of {inspectable} readable load automation step(s) include "
+                f"statistics maintenance")
+    if tables_with_stats:
+        evidence += f"; {tables_with_stats} table(s) carry statistics objects"
+    return covered(automated, inspectable, evidence,
+                   obj="readable load automation steps")
 
 @check(
     id="TB-DATEDIM", ref="4.5.7", title="Date/Time dimension exists with all required attributes (fiscal periods, quarter, holidays)",
@@ -1136,24 +1253,38 @@ def table_date_dimension(ctx: CheckContext) -> Verdict:
 def table_surrogate_keys(ctx: CheckContext) -> Verdict:
     """Dimensions declare a surrogate key column, not only a business key.
 
-    Accepts both spellings Microsoft's own material uses - ``customer_sk`` (the
-    Fabric dimensional-modelling guidance) and ``CustomerKey`` (AdventureWorksDW,
-    where it is an ``IDENTITY(1,1)`` column). An ``…AlternateKey`` is *not*
-    counted: AdventureWorks uses that for the natural/business key, which is the
-    distinction this point is about.
+    **Declared constraints first.** A Warehouse can declare ``NOT ENFORCED``
+    primary keys, and the crawl now reads them: a dimension with a declared key
+    is telling us so outright, which beats any name inference. The naming rule
+    below is the fallback for a Lakehouse table or a Warehouse that declares no
+    constraints - both common - and it accepts the spellings Microsoft's own
+    material uses: ``customer_sk`` (the Fabric dimensional-modelling guidance)
+    and ``CustomerKey`` (AdventureWorksDW, where it is an ``IDENTITY(1,1)``
+    column). Matching only the underscored form reported ``0 of 19`` on an estate
+    where most dimensions were correctly modelled.
 
-    **What it cannot determine.** Whether the column is genuinely system-generated
-    - that is a load-time property, not readable from a schema. This judges the
-    declared shape only, so a business key named ``customer_key`` would pass.
+    An ``…AlternateKey`` never counts: AdventureWorks uses that for the natural
+    key, which is the distinction this point is about.
+
+    **What it cannot determine.** Whether the column is genuinely system
+    generated - a load-time property, not visible in a schema.
     """
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
     dims = {n: t for n, t in ctx.workspace.tables.items() if is_dimension(n) and columns(t)}
     if not dims:
         return not_applicable(_NO_DIMS)
-    ok = [n for n, t in dims.items() if has_surrogate_key(t)]
+
+    declared = [n for n, t in dims.items() if t.get("has_declared_key")]
+    by_name = [n for n, t in dims.items()
+               if n not in declared and has_surrogate_key(t)]
+    ok = declared + by_name
     missing = sorted(set(dims) - set(ok))
+
     evidence = f"{len(ok)} of {len(dims)} dimensions have a surrogate key"
+    if declared:
+        evidence += (f" ({len(declared)} declare a primary/unique key constraint, "
+                     f"{len(by_name)} inferred from the column name)")
     if missing:
         shown = ", ".join(missing[:_SAMPLE_LIMIT])
         if len(missing) > _SAMPLE_LIMIT:
@@ -2102,12 +2233,20 @@ _DEFAULT_SCHEMA = "dbo"
 
 
 def _schema_qualifier(key: str, table: dict) -> str:
-    """The SQL schema a Warehouse table key declares, or ``""`` when it is bare.
+    """The SQL schema a Warehouse table belongs to, or ``""`` when unknown.
 
-    The crawler keys a table by its name, and prefixes ``"<store>."`` only when
-    two stores hold a table of the same name — so the owning store's name is
-    stripped first, and never mistaken for a schema.
+    Read from the column metadata (``INFORMATION_SCHEMA.TABLE_SCHEMA``, recorded
+    on each column by the SQL-endpoint reader) - the authoritative answer. The
+    key is only consulted as a fallback, for snapshots crawled before the reader
+    captured the schema: it keys a table by name and prefixes ``"<store>."`` only
+    when two stores hold the same table name, so the store is stripped first and
+    never mistaken for a schema.
     """
+    for column in columns(table):
+        declared = str(column.get("schema") or "").strip()
+        if declared:
+            return declared
+
     store = store_of(table)
     rest = key
     if store and rest.lower().startswith(f"{store.lower()}."):
@@ -2152,15 +2291,12 @@ def warehouse_schema_organization(ctx: CheckContext) -> Verdict:
     schema concept, and a table whose owning store could not be read is unknown,
     never a finding.
 
-    **What it cannot determine, and it matters here.** The schema qualifier is
-    read from the table key, and this project's SQL-endpoint reader currently
-    selects ``TABLE_NAME`` from ``INFORMATION_SCHEMA.COLUMNS`` **without**
-    ``TABLE_SCHEMA``, so on a snapshot taken by that reader no Warehouse table
-    carries a schema at all. That is a *gap in what was read*, not a badly
-    organised Warehouse, so the check returns **N/A with that reason** rather
-    than scoring 0 — the N/A-not-FAIL rule. Adding ``TABLE_SCHEMA`` to that one
-    existing query (no new endpoint, no new resource) plus a re-crawl is what
-    turns this check on.
+    **What it cannot determine.** Whether the schema *names* carry the domain
+    meaning their owners intended - ``dbo`` versus ``sales`` versus ``stg`` is
+    read as a structural signal, not a semantic one. The schema itself is now
+    read from ``INFORMATION_SCHEMA.TABLE_SCHEMA`` and recorded on every column,
+    so a snapshot taken before that change falls back to parsing the table key
+    and may still report no schema.
     """
     tables = ctx.workspace.tables
     if not tables:
@@ -2377,20 +2513,16 @@ _MAX_NAMED_SOURCES = 5
 def workspace_defines_a_view_layer_over_its_tables(ctx: CheckContext) -> Verdict:
     """Reports use a view/procedure layer, so a physical table can change without breaking them.
 
-    **What it can determine.** ``CREATE VIEW`` / ``CREATE OR ALTER VIEW`` /
-    ``CREATE PROCEDURE`` / ``CREATE FUNCTION`` statements in the T-SQL a pipeline
-    runs through its Script activities, and in notebook SQL. Those are
-    definitions the estate keeps *in code*, which is also the only form that can
-    be reviewed and promoted.
+    **What it can determine.** Views and stored procedures the SQL analytics
+    endpoint declares (``INFORMATION_SCHEMA.VIEWS`` / ``ROUTINES``, now read by
+    the crawl) - the authoritative answer, including objects created in the SQL
+    editor - plus ``CREATE VIEW`` / ``CREATE PROCEDURE`` statements in the T-SQL
+    a pipeline runs and in notebook SQL, which is the form that can be reviewed
+    and promoted through source control.
 
-    **What it cannot — and this is a real limit on the finding.** The crawl reads
-    table metadata from ``INFORMATION_SCHEMA.COLUMNS``, which returns view
-    columns alongside table columns but carries no ``TABLE_TYPE``, so a view
-    cannot be told from a table in the workspace's table map. Consequently a view
-    created interactively in the SQL editor and never expressed in code is
-    invisible to this check. A 0 therefore means "no abstraction layer is defined
-    in any readable pipeline or notebook", not "no views exist" — the evidence
-    says so, and a reviewer should confirm in the SQL editor before acting.
+    **What it cannot - and this is a real limit on the finding.** Whether the
+    semantic models actually *bind* to those views rather than to the physical
+    tables. It reports that an abstraction layer exists, not that it is used.
     """
     if not ctx.workspace.has(Resource.TABLE_SCHEMAS):
         return not_applicable(_NO_TABLES)
@@ -2399,10 +2531,26 @@ def workspace_defines_a_view_layer_over_its_tables(ctx: CheckContext) -> Verdict
 
     readable = [r for r in (Resource.PIPELINE_DEFINITIONS, Resource.NOTEBOOK_DEFINITIONS)
                 if ctx.workspace.has(r)]
+    # Views and procedures the endpoint itself declares - authoritative, and it
+    # includes objects created in the SQL editor that no pipeline or notebook
+    # mentions. This is what the check previously could not see.
+    declared_views = ctx.workspace.sql_views
+    declared_routines = ctx.workspace.sql_routines
+    if declared_views or declared_routines:
+        names = sorted({v.get("name", "") for v in declared_views})[:_SAMPLE_LIMIT]
+        return binary(
+            True,
+            f"{len(declared_views)} view(s) and {len(declared_routines)} stored "
+            f"procedure/function(s) are declared in the SQL analytics endpoint"
+            + (f" (e.g. {', '.join(n for n in names if n)})" if names else "")
+            + ". Whether the semantic models bind to them rather than to the "
+              "physical tables is not readable here",
+        )
+
     if not readable:
         return not_applicable(
-            "Neither pipeline nor notebook definitions could be read, and view metadata is "
-            "not fetched, so no abstraction layer is observable"
+            "Neither pipeline nor notebook definitions could be read, and the SQL "
+            "endpoint declared no view or routine, so no abstraction layer is observable"
         )
 
     pipelines = ctx.workspace.pipelines or {}
