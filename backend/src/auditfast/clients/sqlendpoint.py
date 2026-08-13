@@ -260,12 +260,19 @@ class SqlEndpointReader:
         Masking is applied. It is read with a ``LEFT JOIN`` so a Lakehouse
         endpoint - where the catalog view may be absent or empty - still returns
         every column, just with ``is_masked`` false.
+
+        ``schema`` carries ``INFORMATION_SCHEMA.TABLE_SCHEMA``. It is recorded on
+        the column rather than folded into the table key: the key is the join
+        point between this reader and the REST item listing, and re-shaping it to
+        ``schema.table`` would invalidate every snapshot already in the knowledge
+        base. Checks that need the schema read it off any column.
         """
         rows = self._query(endpoint, """
             SELECT c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE,
                    c.CHARACTER_MAXIMUM_LENGTH, c.NUMERIC_PRECISION, c.NUMERIC_SCALE,
                    c.IS_NULLABLE, c.ORDINAL_POSITION,
-                   COALESCE(sc.is_masked, 0) AS is_masked
+                   COALESCE(sc.is_masked, 0) AS is_masked,
+                   c.TABLE_SCHEMA
             FROM INFORMATION_SCHEMA.COLUMNS AS c
             LEFT JOIN sys.columns AS sc
                    ON sc.object_id = OBJECT_ID(
@@ -280,7 +287,7 @@ class SqlEndpointReader:
             rows = self._query(endpoint, """
                 SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE,
                        CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE,
-                       IS_NULLABLE, ORDINAL_POSITION, 0 AS is_masked
+                       IS_NULLABLE, ORDINAL_POSITION, 0 AS is_masked, TABLE_SCHEMA
                 FROM INFORMATION_SCHEMA.COLUMNS
                 ORDER BY TABLE_NAME, ORDINAL_POSITION
             """)
@@ -301,6 +308,8 @@ class SqlEndpointReader:
             # flag on every one of tens of thousands of columns.
             if len(row) > 8 and row[8]:
                 column["is_masked"] = True
+            if len(row) > 9 and row[9]:
+                column["schema"] = str(row[9])
             tables.setdefault(table, []).append(column)
         return tables
 
@@ -323,8 +332,56 @@ class SqlEndpointReader:
             for r in rows
         ]
 
-    def _query(self, endpoint: SqlEndpoint, sql: str) -> list[tuple] | None:
+    def metadata(self, endpoint: SqlEndpoint) -> dict[str, list[tuple]]:
+        """Every remaining catalog read for one endpoint, in a **single** connection.
+
+        **Why one batch.** A connection costs far more than a query here: each
+        pays a login handshake plus the Azure SQL gateway redirect, which is why
+        :meth:`_attempt` opens a fresh connection per call and why crawl time
+        tracks connection *count*, not row count. Issuing these reads separately
+        would multiply the expensive part by the number of statements. Sending
+        one batch and walking the result sets with ``nextset()`` pays the
+        handshake **once** and adds only query time - milliseconds each, since
+        every statement reads a catalog view rather than user data.
+
+        Returns ``{name: rows}`` for whatever the endpoint answered; a name is
+        absent when its statement returned nothing usable. Never raises: a
+        connection failure yields ``{}`` and is already recorded by
+        :meth:`_attempt`, because this is *additional* metadata - losing it must
+        not cost the column schemas that the same crawl depends on.
+        """
+        statements = _METADATA_STATEMENTS
+        if endpoint.kind == "Warehouse":
+            # Foreign keys and key constraints are documented for Fabric
+            # Warehouse only; a Lakehouse SQL endpoint does not expose them.
+            statements = statements + _WAREHOUSE_METADATA_STATEMENTS
+        batch = ";\n".join(sql.strip() for _name, sql in statements)
+        rows_per_set = self._query_batch(endpoint, batch, len(statements))
+        if rows_per_set is None:
+            return {}
+        return {
+            name: rows
+            for (name, _sql), rows in zip(statements, rows_per_set, strict=False)
+            if rows
+        }
+
+    def _query_batch(self, endpoint: SqlEndpoint, sql: str,
+                     expected: int) -> list[list[tuple]] | None:
+        """Run a multi-statement batch, returning one row list per result set.
+
+        Uses the same retry and token-refresh path as :meth:`_query`. A statement
+        the endpoint rejects aborts the batch, so this returns whatever arrived
+        before the failure rather than nothing - a Lakehouse endpoint missing one
+        view should still yield the reads that preceded it.
+        """
+        return self._query(endpoint, sql, multi=True, expected=expected)
+
+    def _query(self, endpoint: SqlEndpoint, sql: str, *, multi: bool = False,
+               expected: int = 1):
         """Run one read-only query, retrying a transient failure. None on failure.
+
+        With ``multi``, ``sql`` is a batch of statements and the result is a list
+        of row lists - one per result set - rather than a single row list.
 
         A transient failure - a throttle, a dropped connection, a slow gateway -
         previously lost a whole store's schema for the entire audit. Each attempt
@@ -338,8 +395,13 @@ class SqlEndpointReader:
         """
         last_reason = ""
         refreshed = False
+        # Only pass the batch kwargs when a batch was asked for. A plain read
+        # then calls ``_attempt`` with its original signature, so a test double
+        # (or any other caller) written against that signature keeps working -
+        # threading a new kwarg through unconditionally broke eight of them.
+        extra = {"multi": True, "expected": expected} if multi else {}
         for attempt in range(1, _MAX_ATTEMPTS + 1):
-            rows = self._attempt(endpoint, sql)
+            rows = self._attempt(endpoint, sql, **extra)
             if rows is not None:
                 if attempt > 1:
                     # The endpoint recovered, so it is no longer a failure.
@@ -380,8 +442,15 @@ class SqlEndpointReader:
         log.info("sql token refreshed, resuming endpoint reads")
         return True
 
-    def _attempt(self, endpoint: SqlEndpoint, sql: str) -> list[tuple] | None:
-        """One connection + query. Any failure returns None and records why."""
+    def _attempt(self, endpoint: SqlEndpoint, sql: str, *, multi: bool = False,
+                 expected: int = 1):
+        """One connection + query. Any failure returns None and records why.
+
+        With ``multi``, every result set in the batch is walked via ``nextset()``
+        and returned as a list of row lists. A statement that fails part-way
+        through aborts the batch, so what arrived before the failure is returned
+        rather than discarded - the reads are independent of one another.
+        """
         if not self.available:
             self.failures[endpoint.name] = self.unavailable_reason
             return None
@@ -414,7 +483,9 @@ class SqlEndpointReader:
             conn.timeout = _QUERY_TIMEOUT_SECONDS
             cursor = conn.cursor()
             cursor.execute(sql)
-            return [tuple(r) for r in cursor.fetchall()]
+            if not multi:
+                return [tuple(r) for r in cursor.fetchall()]
+            return _collect_result_sets(cursor, expected)
         except Exception as exc:  # noqa: BLE001 - every failure must degrade to N/A
             self.failures[endpoint.name] = _classify(exc)
             log.info("sql endpoint read failed for %s (%s): %s",
@@ -424,6 +495,119 @@ class SqlEndpointReader:
             if conn is not None:
                 with contextlib.suppress(Exception):
                     conn.close()
+
+
+def _collect_result_sets(cursor, expected: int) -> list[list[tuple]]:
+    """Every result set from a batch, as one row list each.
+
+    Walks ``nextset()`` until the cursor is exhausted. A statement that produced
+    no result set contributes an empty list, so the caller's zip against the
+    statement table stays aligned. Stops at ``expected`` sets so a stray extra
+    set cannot shift the mapping.
+    """
+    collected: list[list[tuple]] = []
+    while len(collected) < expected:
+        try:
+            collected.append([tuple(r) for r in cursor.fetchall()])
+        except Exception:  # noqa: BLE001 - a statement with no rows to fetch
+            collected.append([])
+        try:
+            if not cursor.nextset():
+                break
+        except Exception:  # noqa: BLE001 - no further sets
+            break
+    while len(collected) < expected:
+        collected.append([])
+    return collected
+
+
+#: Catalog reads issued against **every** endpoint kind, as ``(name, sql)``.
+#:
+#: All are metadata reads - catalog views, never user data - so their cost is
+#: dominated by the connection they share rather than by the queries themselves.
+#: Fetching them together means a future check finds its data already in the
+#: knowledge base instead of needing another crawl change.
+#:
+#: Availability was verified against Microsoft's Fabric T-SQL surface-area
+#: documentation. Deliberately **not** attempted, because Microsoft documents
+#: them as unavailable on Fabric Warehouse / SQL analytics endpoint:
+#: ``INFORMATION_SCHEMA.TABLE_CONSTRAINTS``, ``KEY_COLUMN_USAGE``,
+#: ``REFERENTIAL_CONSTRAINTS``, ``sys.indexes``, ``sys.index_columns``,
+#: ``sys.views``, ``sys.dm_db_partition_stats``, ``OBJECT_DEFINITION()``.
+_METADATA_STATEMENTS: tuple[tuple[str, str], ...] = (
+    # Object inventory: identifies views, procedures and constraints, and carries
+    # create/modify dates that INFORMATION_SCHEMA does not expose.
+    ("objects", """
+        SELECT o.object_id, s.name, o.name, o.type,
+               CONVERT(varchar(33), o.create_date, 126),
+               CONVERT(varchar(33), o.modify_date, 126)
+        FROM sys.objects AS o
+        JOIN sys.schemas AS s ON s.schema_id = o.schema_id
+        WHERE o.type IN ('U', 'V', 'P', 'FN', 'IF', 'TF', 'PK', 'F', 'UQ')
+    """),
+    # Approximate row counts from partition metadata - never by scanning rows.
+    # ``index_id IN (0, 1)`` is the heap/clustered row set; other index ids would
+    # count the same rows again.
+    ("row_counts", """
+        SELECT p.object_id, SUM(p.rows)
+        FROM sys.partitions AS p
+        WHERE p.index_id IN (0, 1)
+        GROUP BY p.object_id
+    """),
+    # View definitions, capped so one enormous view cannot bloat the snapshot.
+    ("views", """
+        SELECT TABLE_SCHEMA, TABLE_NAME, LEFT(VIEW_DEFINITION, 4000)
+        FROM INFORMATION_SCHEMA.VIEWS
+    """),
+    # Stored procedures and functions - the load logic the Warehouse checks want
+    # to inspect for TRY/CATCH, incremental patterns and statistics maintenance.
+    ("routines", """
+        SELECT ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_TYPE,
+               LEFT(ROUTINE_DEFINITION, 8000)
+        FROM INFORMATION_SCHEMA.ROUTINES
+    """),
+    # Statistics objects, for the statistics-maintenance checks.
+    ("stats", """
+        SELECT object_id, name, auto_created, user_created
+        FROM sys.stats
+    """),
+    # Database-scoped principals and role membership. Workspace role assignments
+    # come from Fabric REST and frequently need a permission the sign-in lacks;
+    # this is the database-level view of the same question, with no admin needed.
+    ("principals", """
+        SELECT principal_id, name, type_desc, authentication_type_desc
+        FROM sys.database_principals
+        WHERE type <> 'R'
+    """),
+    ("role_members", """
+        SELECT rm.role_principal_id, rm.member_principal_id
+        FROM sys.database_role_members AS rm
+    """),
+)
+
+#: Reads documented for Fabric **Warehouse** only - a Lakehouse SQL analytics
+#: endpoint does not expose foreign-key metadata, so asking there would fail
+#: every time. Splitting the tables keeps the batch honest rather than relying on
+#: an error path.
+_WAREHOUSE_METADATA_STATEMENTS: tuple[tuple[str, str], ...] = (
+    # Declared (NOT ENFORCED) foreign keys. This is the structural evidence for
+    # "which table is a fact and which is a dimension": a referenced table is a
+    # dimension, a referencing one a fact. It replaces guessing from a table name.
+    ("foreign_keys", """
+        SELECT fk.object_id, fk.parent_object_id, fk.referenced_object_id, fk.name
+        FROM sys.foreign_keys AS fk
+    """),
+    ("foreign_key_columns", """
+        SELECT fkc.constraint_object_id, fkc.parent_object_id, fkc.parent_column_id,
+               fkc.referenced_object_id, fkc.referenced_column_id
+        FROM sys.foreign_key_columns AS fkc
+    """),
+    # Declared primary/unique key constraints.
+    ("key_constraints", """
+        SELECT kc.object_id, kc.parent_object_id, kc.name, kc.type
+        FROM sys.key_constraints AS kc
+    """),
+)
 
 
 def _render_type(data_type: Any, max_len: Any, precision: Any, scale: Any) -> str:

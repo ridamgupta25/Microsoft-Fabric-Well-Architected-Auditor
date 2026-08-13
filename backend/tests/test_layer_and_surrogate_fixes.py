@@ -432,6 +432,67 @@ def test_2_1_1_still_judges_when_a_convention_is_configured():
     assert bad.score == 0
 
 
+# -- 4.4.1 Warehouse schema organisation --------------------------------------
+
+
+def _wh_table(schema: str, *names: str) -> dict:
+    """A Warehouse table whose columns declare ``schema``."""
+    return {
+        "store": "SalesWarehouse",
+        "store_kind": "Warehouse",
+        "columns": [
+            {"name": n, "type": "varchar(50)", "source_kind": "Warehouse", "schema": schema}
+            for n in names
+        ],
+    }
+
+
+def test_4_4_1_reads_the_schema_from_column_metadata():
+    """The reader now records TABLE_SCHEMA, so schema layout is finally readable.
+
+    Previously the schema was fetched and discarded, leaving the check to guess
+    from the table key - which carries the *store*, not the schema. On a real
+    estate that meant "none of 252 Warehouse tables carries a schema qualifier"
+    and a permanent N/A.
+    """
+    from auditfast.core.check.data_management_quality.data_storage.automated import (
+        _schema_qualifier,
+    )
+
+    table = _wh_table("sales", "order_id", "amount")
+    assert _schema_qualifier("fact_orders", table) == "sales"
+
+
+def test_4_4_1_falls_back_to_the_key_for_older_snapshots():
+    """A snapshot crawled before the reader captured the schema must still work."""
+    from auditfast.core.check.data_management_quality.data_storage.automated import (
+        _schema_qualifier,
+    )
+
+    legacy = {"store": "SalesWarehouse", "store_kind": "Warehouse",
+              "columns": [{"name": "order_id", "type": "int"}]}
+    assert _schema_qualifier("staging.fact_orders", legacy) == "staging"
+    # The store prefix is not a schema.
+    assert _schema_qualifier("SalesWarehouse.fact_orders", legacy) == ""
+
+
+def test_4_4_1_scores_a_warehouse_once_schemas_are_readable():
+    tables = {
+        "fact_orders": _wh_table("sales", "order_id", "amount"),
+        "dim_customer": _wh_table("sales", "customer_sk", "name"),
+        "raw_orders": _wh_table("staging", "order_id"),
+    }
+    verdict = _run("TB-WH-SCHEMAS", _ws(tables=tables), "ws", None)
+    assert verdict.score is not None, f"schema layout is now readable: {verdict.evidence}"
+
+
+def test_4_4_1_is_na_when_no_table_lives_in_a_warehouse():
+    """Schema organisation is a Warehouse question - a Lakehouse-only estate is N/A."""
+    tables = {"t": {"store": "LH", "store_kind": "Lakehouse",
+                    "columns": [{"name": "a", "type": "int"}]}}
+    assert _run("TB-WH-SCHEMAS", _ws(tables=tables), "ws", None).score is None
+
+
 # -- remediation --------------------------------------------------------------
 
 @pytest.mark.parametrize("ref", ["1.2.3", "1.2.5", "4.2.3", "4.2.4", "4.5.1", "4.5.6", "4.5.9"])

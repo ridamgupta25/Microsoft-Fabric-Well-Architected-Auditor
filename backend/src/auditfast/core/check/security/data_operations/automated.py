@@ -35,15 +35,58 @@ SECRET_PATTERNS = [
     requires=[Resource.ROLE_ASSIGNMENTS], required=True,
 )
 def roles_use_groups(ctx: CheckContext) -> Verdict:
-    """Workspace roles are granted to Entra security groups rather than named users."""
-    if not ctx.workspace.has(Resource.ROLE_ASSIGNMENTS):
+    """Access is granted to Entra security groups rather than to named users.
+
+    **Two sources, one question.** Workspace role assignments are the primary
+    evidence, but Fabric requires *Member or higher* to read them - on a
+    Viewer/Contributor sign-in they are simply unavailable. The SQL analytics
+    endpoint answers the same question at database scope from
+    ``sys.database_principals``, which needs no elevated role, so a workspace
+    whose roles could not be read is still assessed rather than skipped.
+
+    **What the fallback cannot determine.** Workspace-level roles (Admin /
+    Member / Contributor / Viewer) are not visible from the database, so the
+    fallback judges *who* holds access, never *what* they can do. The evidence
+    names which source was used so the two are never confused.
+    """
+    if ctx.workspace.has(Resource.ROLE_ASSIGNMENTS):
+        assignments = ctx.workspace.role_assignments
+        if assignments:
+            individuals = [a for a in assignments if a.is_individual]
+            return covered(
+                len(assignments) - len(individuals), len(assignments),
+                f"{len(individuals)} of {len(assignments)} role assignments are "
+                f"individual users",
+            )
+
+    principals = ctx.workspace.sql_principals
+    if not principals:
         return not_applicable(_ROLES_UNREADABLE)
-    assignments = ctx.workspace.role_assignments
-    individuals = [a for a in assignments if a.is_individual]
+    users = [p for p in principals if _is_individual_principal(p)]
     return covered(
-        len(assignments) - len(individuals), len(assignments),
-        f"{len(individuals)} of {len(assignments)} role assignments are individual users",
+        len(principals) - len(users), len(principals),
+        f"Workspace role assignments could not be read, so this uses the SQL "
+        f"analytics endpoint instead: {len(users)} of {len(principals)} database "
+        f"principal(s) are individual users rather than groups or service "
+        f"identities. Database scope only - workspace roles are not visible here",
     )
+
+
+#: A database principal that names one person. Fabric surfaces an Entra group as
+#: ``EXTERNAL_GROUP`` and a service principal as an application; anything else
+#: carrying a user-shaped login is an individual grant.
+_INDIVIDUAL_PRINCIPAL_TYPES: frozenset[str] = frozenset({
+    "EXTERNAL_USER", "SQL_USER", "WINDOWS_USER",
+})
+
+
+def _is_individual_principal(principal: dict) -> bool:
+    """True when a database principal is one person rather than a group."""
+    kind = str(principal.get("type") or "").strip().upper()
+    if kind in _INDIVIDUAL_PRINCIPAL_TYPES:
+        return True
+    # An email-shaped name is a person even where the type is ambiguous.
+    return "@" in str(principal.get("name") or "")
 
 
 @check(
@@ -92,12 +135,47 @@ def automation_identity(ctx: CheckContext) -> Verdict:
     requires=[Resource.ROLE_ASSIGNMENTS], required=True,
 )
 def no_guest_access(ctx: CheckContext) -> Verdict:
-    """No guest or external (#EXT#) principal holds a role on the workspace."""
-    if not ctx.workspace.has(Resource.ROLE_ASSIGNMENTS):
+    """No guest or external (#EXT#) principal holds access to this workspace.
+
+    **Two sources, one question.** Workspace role assignments are primary, but
+    reading them needs *Member or higher*. When they are unavailable, database
+    principals from the SQL analytics endpoint answer the same question without
+    any elevated role: a guest carries the ``#EXT#`` marker in either place.
+
+    **What the fallback cannot determine.** A guest granted a workspace role but
+    no database access is invisible to it, so a clean result from the fallback is
+    weaker evidence than a clean result from the role assignments. The evidence
+    names which source was used.
+    """
+    if ctx.workspace.has(Resource.ROLE_ASSIGNMENTS):
+        assignments = ctx.workspace.role_assignments
+        if assignments:
+            guests = [a for a in assignments if a.is_guest]
+            names = ", ".join(a.display_name or "?" for a in guests) or "none"
+            return binary(not guests, f"External/guest principals: {names}")
+
+    principals = ctx.workspace.sql_principals
+    if not principals:
         return not_applicable(_ROLES_UNREADABLE)
-    guests = [a for a in ctx.workspace.role_assignments if a.is_guest]
-    names = ", ".join(a.display_name or "?" for a in guests) or "none"
-    return binary(not guests, f"External/guest principals: {names}")
+    guests = [p for p in principals if _is_guest_principal(p)]
+    names = ", ".join(str(p.get("name") or "?") for p in guests[:5]) or "none"
+    return binary(
+        not guests,
+        f"Workspace role assignments could not be read, so this uses the SQL "
+        f"analytics endpoint instead: external/guest database principal(s): {names}. "
+        f"Database scope only - a guest holding a workspace role but no database "
+        f"access would not appear here",
+    )
+
+
+def _is_guest_principal(principal: dict) -> bool:
+    """True when a database principal is an external (guest) identity.
+
+    ``#EXT#`` is the Entra marker for a guest in a B2B tenant, and survives into
+    the database principal name.
+    """
+    name = str(principal.get("name") or "").upper()
+    return "#EXT#" in name
 
 
 @check(

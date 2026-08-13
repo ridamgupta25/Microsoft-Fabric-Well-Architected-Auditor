@@ -224,6 +224,13 @@ class PowerBIClient:
         (a Direct Lake or push model), so it yields ``(None, "")`` and the caller
         records it as *no schedule* rather than as unreadable.
 
+        A **transport failure is transient, not forbidden**, and the *last*
+        attempt decides. A DNS blip or a reset connection mid-crawl looks nothing
+        like a permission denial, but recording it as ``forbidden`` tells the
+        knowledge base "this will never work with this token" and stops the next
+        crawl from retrying. On a real crawl 7 DNS failures and 1 connection
+        reset were filed as 410 forbidden reads for exactly this reason.
+
         Only the schedule *configuration* is read. No refresh rows, no history.
         """
         paths = []
@@ -231,14 +238,25 @@ class PowerBIClient:
             paths.append(f"/groups/{group_id}/datasets/{dataset_id}/refreshSchedule")
         paths.append(f"/datasets/{dataset_id}/refreshSchedule")
         failure = "transient"
+        reason = "no attempt completed"
         for path in paths:
             status, body = self._get(path)
             if status == 200 and isinstance(body, dict):
                 return _refresh_schedule(body), ""
             if status in (400, 404):
-                return None, ""  # no schedule configured for this model — a real answer
-            if status in (401, 403):
-                failure = "forbidden"  # token rejected; the other form will fare no better
+                return None, ""  # no schedule configured for this model - a real answer
+            if status is None:
+                # Transport failure: DNS, reset, timeout. Retryable, and it says
+                # nothing about whether the token would have been accepted.
+                failure, reason = "transient", "transport error (DNS/reset/timeout)"
+            elif status in (401, 403):
+                failure, reason = "forbidden", f"HTTP {status}"
+            elif status == 429 or (status is not None and status >= 500):
+                failure, reason = "transient", f"HTTP {status}"
+            else:
+                failure, reason = "transient", f"HTTP {status}"
+        log.info("dataset %s refresh schedule unread (%s): %s",
+                 dataset_id, failure, reason)
         return None, failure
 
     def execute_queries(
