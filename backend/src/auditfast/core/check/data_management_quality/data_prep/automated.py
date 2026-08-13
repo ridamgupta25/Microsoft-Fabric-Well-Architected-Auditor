@@ -11,6 +11,7 @@ import re
 from auditfast.core.check._notebook import (
     NOTEBOOK_LAYERS,
     executable_code,
+    executable_code_no_strings,
     has_parameters_cell,
     layer_undetermined_evidence,
     markdown_sources,
@@ -305,9 +306,10 @@ def _has_default_timeout(node: object, defaults: frozenset[str]) -> bool:
 )
 def nb_structure(ctx: CheckContext) -> Verdict:
     """Documentation and imports up front — a parameters cell only when the notebook takes inputs."""
-    # Import detection runs on executable code (comments stripped) so a
-    # commented-out ``import`` never counts as structure.
-    has_imports = bool(_IMPORT_STMT.search(executable_code(ctx.obj)))
+    # Import detection runs on executable code with comments *and* string
+    # literals stripped, so neither a commented-out ``import`` nor an
+    # ``import``/``from`` that only appears inside a docstring counts as structure.
+    has_imports = bool(_IMPORT_STMT.search(executable_code_no_strings(ctx.obj)))
     has_markdown = bool(markdown_sources(ctx.obj))
     has_params = has_parameters_cell(ctx.obj)
 

@@ -107,6 +107,100 @@ class OneLakeClient:
 
         return _finalize_summary(summary), ""
 
+    def lakehouse_table_partitions(
+        self, workspace_id: str, item_id: str
+    ) -> tuple[dict[str, list[str]], str]:
+        """Return ``({table: [partition columns]}, failure)`` for ``<item_id>/Tables``.
+
+        A Delta table's partitioning is visible in OneLake as Hive-style
+        directories (``event_date=2026-08-01``) under the table root, so the
+        declared strategy is readable without opening ``_delta_log``. A table
+        present with an empty list is *known* to be unpartitioned; a table absent
+        from the map was never listed, which is not the same finding.
+        """
+        entries: list[list[str]] = []
+        continuation = ""
+        seen = 0
+        while True:
+            params = {
+                "recursive": "true",
+                "resource": "filesystem",
+                "directory": f"{item_id}/Tables",
+            }
+            if continuation:
+                params["continuation"] = continuation
+            url = f"{_ONELAKE_BASE}/{quote(workspace_id, safe='')}"
+            try:
+                response = self._session.get(url, params=params, timeout=self._timeout)
+            except Exception:
+                return {}, "transient"
+
+            if response.status_code in (401, 403):
+                return {}, "forbidden"
+            if response.status_code == 404:
+                return {}, ""
+            if response.status_code == 429 or response.status_code >= 500:
+                return {}, "transient"
+            if response.status_code != 200:
+                return {}, "transient"
+            try:
+                body = response.json()
+            except ValueError:
+                return {}, "transient"
+            paths = body.get("paths")
+            if not isinstance(paths, list):
+                return {}, "transient"
+
+            for entry in paths[: self._max_entries - seen]:
+                if not isinstance(entry, dict):
+                    continue
+                segments = str(entry.get("name") or "").split("/")
+                if "Tables" in segments:
+                    entries.append(segments[segments.index("Tables") + 1:])
+            seen += len(paths)
+            if seen >= self._max_entries:
+                break
+
+            continuation = (
+                response.headers.get("x-ms-continuation")
+                or body.get("continuation")
+                or ""
+            )
+            if not continuation:
+                break
+
+        return _partitions_from_paths(entries), ""
+
+
+def _partitions_from_paths(entries: list[list[str]]) -> dict[str, list[str]]:
+    """Reduce ``Tables``-relative path segments to ``{table: [partition columns]}``.
+
+    ``_delta_log`` is the anchor: it sits directly under every Delta table root,
+    so it identifies the table without having to guess whether a leading segment
+    is a schema or the table itself.
+    """
+    roots: dict[str, str] = {}
+    for segments in entries:
+        if "_delta_log" not in segments:
+            continue
+        index = segments.index("_delta_log")
+        if index >= 1:
+            roots["/".join(segments[:index])] = segments[index - 1]
+    if not roots:
+        return {}
+
+    found: dict[str, set[str]] = {root: set() for root in roots}
+    for segments in entries:
+        joined = "/".join(segments)
+        for root in roots:
+            if not joined.startswith(f"{root}/"):
+                continue
+            for segment in segments[len(root.split("/")):]:
+                if "=" in segment and not segment.startswith("_"):
+                    found[root].add(segment.split("=", 1)[0])
+            break
+    return {roots[root]: sorted(columns) for root, columns in found.items()}
+
 
 def empty_lakehouse_files_summary() -> dict:
     """Create the compact KB shape used for one Lakehouse's Files section."""

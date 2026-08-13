@@ -676,7 +676,8 @@ def bronze_silver_taxonomy(ctx: CheckContext) -> Verdict:
     id="TB-PARTITION-STRATEGY", ref="4.2.2",
     title="Partitioning or clustering strategy is defined for large tables",
     pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
+    layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.LAKEHOUSE_FILES],
+    required=True,
 )
 def table_partition_strategy(ctx: CheckContext) -> Verdict:
     """Large-table candidates should expose explicit partition/clustering metadata."""
@@ -695,18 +696,29 @@ def table_partition_strategy(ctx: CheckContext) -> Verdict:
     with_strategy: list[str] = []
     inspectable = 0
     hint_only: list[str] = []
+    without_strategy: list[str] = []
 
     for name, meta in large_candidates.items():
         table_meta = meta or {}
         cols = [str(c.get("name", "")).lower() for c in columns(table_meta)]
+        listed = bool(table_meta.get("partitions_listed"))
+        # Without columns and without a successful OneLake listing there is
+        # nothing to judge — that is N/A, not a table lacking a strategy.
+        if not cols and not listed:
+            continue
         explicit = any(table_meta.get(key) for key in _STRATEGY_METADATA_KEYS)
         hinted = any(col in _PARTITION_HINT_COLUMNS or col.endswith(("_date", "_dt", "_month", "_year")) for col in cols)
 
+        inspectable += 1
         if explicit:
-            inspectable += 1
-            with_strategy.append(name)
+            partition_columns = table_meta.get("partitionColumns") or []
+            with_strategy.append(
+                f"{name} ({', '.join(partition_columns)})" if partition_columns else name
+            )
         elif hinted:
             hint_only.append(name)
+        else:
+            without_strategy.append(name)
 
     if inspectable == 0:
         return not_applicable(
@@ -714,11 +726,14 @@ def table_partition_strategy(ctx: CheckContext) -> Verdict:
             + _ONELAKE_PERMISSION_HINT
         )
 
+    compliant = len(with_strategy) + len(hint_only)
     return covered(
-        len(with_strategy),
+        compliant,
         inspectable,
-        f"{len(with_strategy)} of {inspectable} large-table candidate(s) expose explicit partition/clustering strategy"
-        + (f"; explicit strategy: {', '.join(with_strategy[:5])}" if with_strategy else ""),
+        f"{compliant} of {inspectable} large-table candidate(s) expose a partition/clustering strategy"
+        + (f"; declared: {', '.join(with_strategy[:5])}" if with_strategy else "")
+        + (f"; partition-key column only: {', '.join(hint_only[:5])}" if hint_only else "")
+        + (f"; no strategy found: {', '.join(without_strategy[:5])}" if without_strategy else ""),
     )
 
 @check(
@@ -1592,21 +1607,37 @@ def audit_tables_separated(ctx: CheckContext) -> Verdict:
     for store, audit_names in sorted(audit_by_store.items()):
         if not audit_names:
             continue
-        business = len(by_store[store]) - len(audit_names)
+        # Every Fabric SQL endpoint exposes queryinsights and Delta-metadata
+        # views. Counting those as business data made a store holding nothing
+        # but audit tables read as mixed.
+        business_names = [
+            name for name in by_store[store]
+            if name not in set(audit_names) and not is_platform_table(name)
+        ]
+        business = len(business_names)
         # A store is an audit store when audit tables dominate it — a couple of
         # reference tables alongside the logs is "few", not a mixed store.
         dedicated = business <= len(audit_names) // 4
         if dedicated:
             separated += len(audit_names)
         detail.append(
-            f"{store}: {len(audit_names)} audit / {business} business table(s)"
-            f"{'' if dedicated else ' — mixed'}"
+            f"{store}: {len(audit_names)} audit ({_sample(audit_names)}) / "
+            f"{business} business"
+            + (f" ({_sample(business_names)})" if business else "")
+            + f" — {'dedicated' if dedicated else 'mixed'}"
         )
     return covered(
         separated, total_audit,
         f"{separated} of {total_audit} audit table(s) sit in a store dedicated to audit "
         f"data — {'; '.join(detail)}",
     )
+
+
+def _sample(names: list[str], limit: int = 3) -> str:
+    """Up to ``limit`` table names, with the remainder summarised as a count."""
+    shown = sorted(names)[:limit]
+    rest = len(names) - len(shown)
+    return ", ".join(shown) + (f", +{rest} more" if rest > 0 else "")
 
 
 @check(
