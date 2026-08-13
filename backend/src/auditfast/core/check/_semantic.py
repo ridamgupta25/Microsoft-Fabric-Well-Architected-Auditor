@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import re
 
-from ._tables import is_key_column, name_words
+from ._tables import name_words
 
 #: TMSL spells a denial as ``metadataPermission: "none"``; anything else grants.
 _DENIED = "none"
@@ -172,8 +172,76 @@ def high_cardinality_shape(column: dict) -> str:
 def is_row_identifier(column: dict) -> bool:
     """True when the column is a per-row identifier by declaration or by name.
 
-    ``isKey`` is the model saying so outright; the name test reuses the table
-    vocabulary (``customer_sk``, ``OrderID``) so an identity column imported
-    without being marked a key is still recognised.
+    ``isKey`` is the model saying so outright. The name test is deliberately
+    **narrower than** :func:`is_key_column`, which also counts ``code``, ``no``,
+    ``num`` and ``number``: that breadth is right where over-counting only makes a
+    check more lenient, but here it makes it more *accusatory*. ``PostalCode``,
+    ``OrderNumber`` and ``ProductCode`` are business attributes a report author
+    legitimately puts on a visual - flagging them as technical keys that must be
+    hidden produced a finding against a correctly built model.
+
+    What remains is the vocabulary of a *technical* key: an explicit surrogate
+    (``_sk``), a warehouse key suffix (``CustomerKey``), a GUID, or a bare
+    ``…Id``. Those are the columns a report consumer has no use for.
     """
-    return bool(column.get("is_key")) or is_key_column(str(column.get("name") or ""))
+    if column.get("is_key"):
+        return True
+    return _is_technical_key_name(str(column.get("name") or ""))
+
+
+#: Trailing words that mark a *technical* key. Narrower than ``_KEY_WORDS`` in
+#: ``_tables.py`` on purpose - see :func:`is_row_identifier`.
+_TECHNICAL_KEY_WORDS: frozenset[str] = frozenset({
+    "sk", "key", "id", "guid", "uuid", "pk", "fk",
+})
+
+
+def _is_technical_key_name(name: str) -> bool:
+    """True when the *last word* of ``name`` is a technical-key token.
+
+    Word-splitting is what makes this safe. ``CustomerKey`` and ``customer_key``
+    both split to ``[customer, key]``; requiring the *trailing* word also keeps
+    ``key_account_manager`` out.
+
+    Glued lower-case spellings are real and common - ``customerid`` appears 73
+    times and ``customerkey`` 294 times on the reference estate - so they are
+    matched too. The cost is that ordinary words which merely *end* in a key
+    token (``monkey``, ``turkey``) would qualify, which is why they are named in
+    :data:`_KEY_LOOKALIKES`. A short blocklist is honest about being a list of
+    exceptions; widening the pattern instead would silently drop real keys.
+    """
+    words = _ordered_name_words(name)
+    if not words:
+        return False
+    if words[-1] in _TECHNICAL_KEY_WORDS:
+        return True
+    if len(words) != 1:
+        return False
+    word = words[0]
+    return word not in _KEY_LOOKALIKES and bool(_GLUED_TECHNICAL_KEY.match(word))
+
+
+#: A single all-lower-case word ending in a key token - ``customerid``,
+#: ``orderguid``, ``customerkey``. Only reached for a name with no separator and
+#: no camelCase boundary; anything else is answered by the word test above.
+_GLUED_TECHNICAL_KEY = re.compile(r"^[a-z0-9]{3,}(?:sk|key|guid|uuid|id)$", re.IGNORECASE)
+
+#: Ordinary words that end in a key token without being keys. Matched against the
+#: whole single-word name, so ``monkey_id`` (two words) is unaffected.
+_KEY_LOOKALIKES: frozenset[str] = frozenset({
+    "monkey", "turkey", "donkey", "hockey", "jockey", "whiskey", "key",
+    "valid", "invalid", "paid", "unpaid", "void", "avoid", "grid", "hybrid",
+    "rapid", "solid", "acid", "said", "raid", "bid", "mid", "kid", "lid", "aid",
+    "squid", "druid", "fluid", "humid", "timid", "vivid", "candid", "morbid",
+})
+_NAME_WORD_SPLIT = re.compile(r"[^A-Za-z0-9]+")
+_NAME_CAMEL_SPLIT = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _ordered_name_words(name: str) -> list[str]:
+    """Lower-cased words of a column name, in order, split on separators and camelCase."""
+    words: list[str] = []
+    for chunk in _NAME_WORD_SPLIT.split(name or ""):
+        if chunk:
+            words.extend(part.lower() for part in _NAME_CAMEL_SPLIT.split(chunk) if part)
+    return words

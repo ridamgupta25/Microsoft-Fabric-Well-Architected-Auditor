@@ -435,13 +435,20 @@ EVENT_SOURCE_TYPES: frozenset[str] = frozenset({
     layers=(Layer.OPERATIONS,), requires=[Resource.ITEMS], required=True,
 )
 def activator_configured(ctx: CheckContext) -> Verdict:
-    """An operational workspace owns a Data Activator item to react to critical events.
+    """The workspace has *some* event-driven alerting on its operational items.
 
-    Item-inventory level, and deliberately distinct from ``PL-NOTIFY`` (2.4.5),
-    which asks whether one *pipeline* ends in a notification activity. This asks
-    whether the workspace has event-driven alerting at all — a Reflex/Activator
-    item watching its data and jobs. The rule counts items, so it is unaffected
-    by whether a pipeline definition could be read.
+    **Not Activator-only.** Microsoft documents several Fabric-native ways to be
+    told when something fails, and a workspace using any of them has met the
+    point: an Activator/Reflex item, a pipeline ending in a Teams or Outlook
+    activity (which Microsoft's own "create alerts for pipeline runs" guidance
+    recommends), or scheduled-job failure emails. Requiring a Reflex item failed
+    workspaces that alert exactly the way the documentation suggests.
+
+    **What it cannot determine.** Whether the alert routes to someone who acts on
+    it, and whether *scheduled-job failure notifications* are switched on - that
+    setting is not exposed on the items listing. So a workspace with no readable
+    alerting is reported as *none found*, with the alternatives named, rather
+    than as a definite absence.
     """
     if not ctx.workspace.has(Resource.ITEMS):
         return not_applicable("Workspace items could not be read from Fabric")
@@ -457,8 +464,55 @@ def activator_configured(ctx: CheckContext) -> Verdict:
         names = ", ".join(sorted(i.display_name or i.id for i in activators)[:3])
         return binary(True, f"{len(activators)} Data Activator item(s) present ({names}) "
                             f"watching {len(sources)} operational item(s)")
-    return binary(False, f"No Data Activator (Reflex) item in a workspace with "
-                         f"{len(sources)} operational item(s) — critical events raise no trigger")
+
+    # No Activator item - but a pipeline that ends in a Teams/Outlook notification
+    # is the alternative Microsoft documents, and counts just as well.
+    notifying = _pipelines_with_notification(ctx)
+    if notifying:
+        return binary(
+            True,
+            f"No Data Activator item, but {len(notifying)} pipeline(s) alert through a "
+            f"Teams/Outlook/webhook activity ({', '.join(notifying[:3])}) - the "
+            f"alternative Microsoft's pipeline-alerting guidance recommends"
+        )
+    return binary(
+        False,
+        f"No event-driven alerting found for {len(sources)} operational item(s): no "
+        f"Data Activator item, and no pipeline ends in a Teams/Outlook/webhook "
+        f"notification. Fabric's scheduled-job failure emails are not readable from "
+        f"the items listing, so confirm those separately before treating this as a gap"
+    )
+
+
+def _pipelines_with_notification(ctx: CheckContext) -> list[str]:
+    """Names of pipelines that end in a notification activity (empty when unreadable).
+
+    The vocabulary is duplicated from ``PL-NOTIFY`` (ref 2.4.5) rather than
+    imported: one check package importing another's private constants couples
+    them, and the loader imports each leaf module independently.
+    """
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return []
+    out: list[str] = []
+    for name, definition in (ctx.workspace.pipelines or {}).items():
+        for activity in walk_activities(definition):
+            activity_type = activity.get("type")
+            if activity_type in _ALERT_ACTIVITY_TYPES or (
+                activity_type in _ALERT_CALL_TYPES
+                and _ALERT_NAME_RE.search(activity.get("name", ""))
+            ):
+                out.append(name)
+                break
+    return sorted(out)
+
+
+#: Activity types that notify a person directly.
+_ALERT_ACTIVITY_TYPES = frozenset({
+    "Teams", "Office365Outlook", "Outlook365", "SendEmail", "WebHook",
+})
+#: Generic call activities that only count as an alert when their *name* says so.
+_ALERT_CALL_TYPES = frozenset({"Web", "WebActivity", "AzureFunctionActivity", "Function"})
+_ALERT_NAME_RE = re.compile(r"notif|alert|email|teams", re.IGNORECASE)
 
 
 # =============================================================================
