@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 
-from auditfast.core.check._notebook import notebook_code
+from auditfast.core.check._notebook import executable_code, notebook_code
 from auditfast.core.check.helpers import Verdict, binary, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import LAYER_ITEM_TYPES, Layer, Pillar, Resource, Scope, Severity
@@ -85,11 +85,6 @@ _DATE_STANDARDIZATION = re.compile(
 _CODE_STANDARDIZATION = re.compile(
     r"\.str\.?(?:upper|lower|strip)|\b(?:upper|lower|trim|ltrim|rtrim)\s*\(|"
     r"regexp_replace\s*\(|normalize[_ ]?code|standardize[_ ]?code|clean[_ ]?code",
-    re.IGNORECASE,
-)
-_REFERENCE_MAPPING = re.compile(
-    r"reference[_ ]?(?:map|mapping|table)|code[_ ]?(?:map|mapping)|lookup|"
-    r"map(?:ping)?[_ ]?table|join\s*\([^\n]{0,160}(?:code|reference|lookup)",
     re.IGNORECASE,
 )
 
@@ -201,27 +196,45 @@ def notebook_format_validation(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-STANDARDIZE", ref="5.3.5",
-    title="Standardization: consistent formatting (dates, codes, reference mappings)",
+    title="Standardization: consistent formatting (dates, codes)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def notebook_standardization(ctx: CheckContext) -> Verdict:
-    """Notebook transformations standardize dates, codes, and reference mappings."""
+    """Notebook transformations standardize incoming dates and codes.
+
+    Reference mapping was deliberately dropped from this point (commit 7ce7af1):
+    a ``lookup``/``join`` against a code table is too common a shape to read as
+    evidence of *standardisation*, and requiring it produced false failures.
+
+    Reads ``executable_code`` so a commented-out ``to_date(...)`` cannot pass.
+    """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
-    code = notebook_code(ctx.obj)
+    code = executable_code(ctx.obj)
     if not _INPUT_READ.search(code):
         return not_applicable("Notebook has no recognizable incoming file or JSON read")
 
     checks = {
         "date formatting": bool(_DATE_STANDARDIZATION.search(code)),
         "code formatting": bool(_CODE_STANDARDIZATION.search(code)),
-        "reference mapping": bool(_REFERENCE_MAPPING.search(code)),
     }
-    missing = [name for name, present in checks.items() if not present]
-    return binary(
-        not missing,
-        "Dates, codes, and reference values are standardized"
-        if not missing else
-        f"Standardization missing: {', '.join(missing)}",
-    )
+    present = [name for name, ok in checks.items() if ok]
+    missing = [name for name, ok in checks.items() if not ok]
+    if not missing:
+        return binary(True, (
+            "Incoming data is standardized — date formatting (to_date / to_timestamp / "
+            "date_format / cast to date) and code formatting (upper / lower / trim / "
+            "regexp_replace) are both present"
+        ))
+    hints = {
+        "date formatting":
+            "to_date / to_timestamp / date_format / strptime / cast to date or timestamp",
+        "code formatting":
+            "upper / lower / trim / ltrim / rtrim / regexp_replace / normalize_code",
+    }
+    missing_desc = "; ".join(f"{m} (looked for {hints[m]})" for m in missing)
+    found_desc = ", ".join(present) if present else "none"
+    return binary(False, (
+        f"Standardization missing: {missing_desc}. Present: {found_desc}"
+    ))

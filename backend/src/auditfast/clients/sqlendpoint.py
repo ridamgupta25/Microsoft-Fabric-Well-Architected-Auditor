@@ -255,14 +255,35 @@ class SqlEndpointReader:
         ``decimal(18,2)``, ``int``. ``source_kind`` travels with every column so a
         check can tell a Lakehouse's forced ``varchar(8000)`` from a width a
         Warehouse author actually chose.
+
+        ``is_masked`` comes from ``sys.columns`` and records whether Dynamic Data
+        Masking is applied. It is read with a ``LEFT JOIN`` so a Lakehouse
+        endpoint - where the catalog view may be absent or empty - still returns
+        every column, just with ``is_masked`` false.
         """
         rows = self._query(endpoint, """
-            SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE,
-                   CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE,
-                   IS_NULLABLE, ORDINAL_POSITION
-            FROM INFORMATION_SCHEMA.COLUMNS
-            ORDER BY TABLE_NAME, ORDINAL_POSITION
+            SELECT c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE,
+                   c.CHARACTER_MAXIMUM_LENGTH, c.NUMERIC_PRECISION, c.NUMERIC_SCALE,
+                   c.IS_NULLABLE, c.ORDINAL_POSITION,
+                   COALESCE(sc.is_masked, 0) AS is_masked
+            FROM INFORMATION_SCHEMA.COLUMNS AS c
+            LEFT JOIN sys.columns AS sc
+                   ON sc.object_id = OBJECT_ID(
+                          QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME))
+                  AND sc.name = c.COLUMN_NAME
+            ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION
         """)
+        if rows is None:
+            # ``sys.columns`` is not guaranteed on every endpoint kind. Fall back
+            # to the plain projection rather than losing every column schema:
+            # masking is one check, columns feed a dozen.
+            rows = self._query(endpoint, """
+                SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE,
+                       CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE,
+                       IS_NULLABLE, ORDINAL_POSITION, 0 AS is_masked
+                FROM INFORMATION_SCHEMA.COLUMNS
+                ORDER BY TABLE_NAME, ORDINAL_POSITION
+            """)
         if rows is None:
             return None
         tables: dict[str, list[dict[str, Any]]] = {}
@@ -270,12 +291,17 @@ class SqlEndpointReader:
             table = str(row[0] or "")
             if not table:
                 continue
-            tables.setdefault(table, []).append({
+            column: dict[str, Any] = {
                 "name": str(row[1] or ""),
                 "type": _render_type(row[2], row[3], row[4], row[5]),
                 "nullable": str(row[6] or "").upper() == "YES",
                 "source_kind": endpoint.kind,
-            })
+            }
+            # Only recorded when true, so a snapshot does not grow by a false
+            # flag on every one of tens of thousands of columns.
+            if len(row) > 8 and row[8]:
+                column["is_masked"] = True
+            tables.setdefault(table, []).append(column)
         return tables
 
     def security_policies(self, endpoint: SqlEndpoint) -> list[dict[str, Any]] | None:

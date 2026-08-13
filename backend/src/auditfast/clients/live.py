@@ -409,20 +409,22 @@ class LiveFabricProvider:
 
         endpoints = discover_endpoints(get_json, workspace_id)
         if not endpoints:
-            if want_columns:
-                ctx.unavailable.add(Resource.TABLE_COLUMNS)
-            if want_security:
-                ctx.unavailable.add(Resource.WAREHOUSE_SECURITY)
+            reason = ("no provisioned SQL analytics endpoint was discovered in this "
+                      "workspace (a newly created Lakehouse/Warehouse provisions one "
+                      "asynchronously, and a paused capacity serves none)")
+            self._record_environment_gap(ctx, wanted, reason, len(endpoints))
             log.info("fetch %s: no provisioned SQL endpoints discovered", workspace_id)
             return
 
         reader = SqlEndpointReader(self._sql_token,
                                    token_provider=self._sql_token_refresher)
         if not reader.available:
-            if want_columns:
-                ctx.unavailable.add(Resource.TABLE_COLUMNS)
-            if want_security:
-                ctx.unavailable.add(Resource.WAREHOUSE_SECURITY)
+            # The reason lives on the reader, and used to reach the log only - so
+            # the single most common cause of "no Lakehouse columns" (a server with
+            # no ODBC driver) produced a snapshot that could not explain itself.
+            # Persisting it means the report says *why*, with no log to scrape.
+            self._record_environment_gap(
+                ctx, wanted, reader.unavailable_reason, len(endpoints))
             log.warning("fetch %s: SQL endpoint unavailable - %s",
                         workspace_id, reader.unavailable_reason)
             return
@@ -670,6 +672,34 @@ class LiveFabricProvider:
             ctx.read_failures[resource.value] = stat
             if read == 0:
                 ctx.unavailable.add(resource)
+
+    @staticmethod
+    def _record_environment_gap(ctx: WorkspaceContext, wanted: set[Resource],
+                                reason: str, endpoints: int) -> None:
+        """Persist a whole-resource SQL gap, with its reason, onto the context.
+
+        Distinct from :meth:`_record_failures`, which reports per-item outcomes.
+        Here nothing was attempted at all - the reader could not start - so the
+        count is the number of endpoints that *would* have been read. Recording it
+        the same way means the report's crawl-completeness section explains the
+        gap ("no ODBC driver installed") instead of silently showing no columns.
+
+        This matters most where the operator cannot see the server console: a
+        hosted deployment, or a colleague running the tool on another machine.
+        """
+        for resource in (Resource.TABLE_COLUMNS, Resource.WAREHOUSE_SECURITY):
+            if resource not in wanted:
+                continue
+            ctx.unavailable.add(resource)
+            ctx.read_failures[resource.value] = {
+                "attempted": endpoints,
+                "read": 0,
+                "failed": endpoints,
+                "forbidden": 0,
+                "transient": 0,
+                "empty": 0,
+                "reasons": {reason: endpoints or 1},
+            }
 
     def _run_stamps(self, workspace_id: str, item_id: str) -> tuple[list[str], str]:
         """Return one item's job-run timestamps (newest first) and a failure classifier.

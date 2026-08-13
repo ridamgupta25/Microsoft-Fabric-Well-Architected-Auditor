@@ -46,6 +46,12 @@ PENDING_LABEL = "Pending validation"
 #: the working-checklist order and has no effect; the ref (the key) is all that
 #: drives the flag. Keys are unique — one line per ref.
 VALIDATED_CHECKLIST: dict[str, str] = {
+  "6.2.1":  "Row-Level Security (RLS) implemented on the Gold Warehouse and/or semantic models where required",
+  "14.2.6": "Gold Warehouse structured to serve the model efficiently (no expensive per-query transformations)",
+  "5.3.2":  "Referential integrity: FK values exist in corresponding dimension/lookup tables",
+  "2.2.4":  "Watermark / control values persisted reliably in the Metadata DB (not volatile locations)",
+  "2.3.2":  "Operation type column/flag preserved in Bronze for auditability where the source provides it",
+  "2.5.3":  "Run control tables capture batch ID, status, row counts, start/end timestamps",
     "6.4.2":  "No secrets in notebook code, pipeline expressions, or Spark config",
     "3.1.3":  "No hardcoded paths, connection strings, secrets, or environment-specific values",
     "2.4.1":  "All pipeline activities have appropriate retry policies configured (copy, notebook, lookup, web, ForEach)",
@@ -122,7 +128,6 @@ VALIDATED_CHECKLIST: dict[str, str] = {
     "14.1.1": "Star schema followed in the semantic model (single-direction relationships, no unnecessary bidirectional filters)",
     "14.1.3": "Measures centralized (no duplicated calculation logic across reports)",
     "14.1.4": "DAX follows good practices (variables, no repeated sub-expressions, avoids expensive iterators)",
-    "5.3.2":  "Range / domain validation: values fall within expected ranges and allowed value sets",
     "1.1.8":  "Single source of truth per data domain (no duplicate stores serving the same purpose)",
     "2.6.5":  "SQL-source Copy activities are tuned (source read folded, partitioned, sink batch size set)",
     "9.3.3":  "Transaction boundaries defined so a part-way failure leaves no inconsistent set of targets",
@@ -186,6 +191,16 @@ VALIDATED_CHECKLIST: dict[str, str] = {
     "4.6.5": "Append to the audit tables and never rewrite them: replace UPDATE / DELETE / TRUNCATE / MERGE and overwrite-mode writes against audit, log and DQ tables with inserts (append mode), and correct a wrong row by writing a new corrective row rather than editing history.",
     "4.6.8": "Design the audit tables for operational queries: a run/batch identifier, a run timestamp, and typed columns for counts and status, rather than a free-text or JSON payload column that has to be parsed before it can be filtered.",
     "4.4.2": "Agree one naming convention for the Warehouse -- snake_case or PascalCase, either is fine -- and apply it to every table and column, including the ones inherited from an imported spreadsheet or an external source. Rename the outliers (or expose them through views that use the house style) so consumers do not have to guess the spelling of a column.",
+    "7.2.3": "Turn on SQL auditing for the Warehouse holding financial data and configure an action group that records executed statements (BATCH_COMPLETED_GROUP), not only the authentication groups: auditing that captures logins alone cannot say what changed. Add the object/schema change groups alongside it so DDL and permission changes are covered too, and route the output to a store retained for as long as your finance policy requires.",
+    "7.4.6": "Enable SQL auditing on every Warehouse that holds sensitive schemas (settings > SQL audit, or the sqlAudit setting via API), set a retention that matches your policy, and confirm the audit output lands somewhere durable -- the setting is per Warehouse, so a sensitive schema is only covered when the Warehouse holding it has auditing on.",
+    "5.4.7": "Agree a freshness SLA for the serving (Gold) layer and make the refresh meet it: schedule the Warehouse/Lakehouse load and the semantic-model refresh so every serving item updates inside the window, alert when a scheduled run does not complete, and set gold_freshness_sla_hours in the project settings to the window you actually committed to (default 48h). An item that has not run for days is serving yesterday's numbers as today's.",
+    "5.3.8": "Add a run-over-run volume control: read the previous run's row count back from the audit/control table, compare this run's count against it (an absolute delta or a percentage change against an agreed tolerance), and fail or alert on an unexplained shrinkage. Reconciling against the source in the same run (5.2.5) does not cover this -- both sides can shrink together.",
+    "5.5.5": "Pin categorical and code columns to their expected domain before the write: test membership against a named allowed-value set (status.isin(VALID_STATUSES)) or anti-join the load against the reference/lookup/dimension table that owns the code list, and route the rows carrying an unknown code to a quarantine table instead of writing them onward. Keep the allowed values in one declared place (a constant or a reference table) rather than repeating literals per notebook, so a retired code is removed once. This is distinct from the Boolean/Flag point (5.5.7): a Y/N test does not constrain a multi-valued code column.",
+    "4.3.2": "Organise Lakehouse Files paths with a source/domain folder and a date hierarchy (yyyy/mm/dd, yyyy-mm-dd, or year=/month=/day=) so raw files can be pruned, retained and replayed by source and date.",
+    "4.3.3": "Compact or repartition Lakehouse data files so most analytical files land in the 128MB-1GB target band; exclude Delta logs, CRC files, metadata and zero-byte markers from the data-file target.",
+    "4.4.7": "Put a view (or stored procedure) layer between the physical tables and the semantic models/reports, and keep those definitions in source-controlled code -- a pipeline Script activity or a notebook -- rather than typing them into the SQL editor, so a column rename or retype is absorbed by the view instead of breaking every downstream report. Note that view metadata is not fetched by this auditor, so confirm existing views in the SQL editor before acting on a low score.",
+    "10.4.2": "Increase the run frequency of the jobs behind the monitoring data to hourly or better -- the cadence observed in their run history is what the dashboard actually reflects, regardless of what the schedule says. Where hourly batch is impractical, move the monitoring model to DirectQuery over the Eventhouse/KQL database, and check the runs are actually completing rather than silently failing.",
+    "10.4.4": "Give the monitoring semantic model the mechanics a trend needs: a proper date/calendar table marked as the date table, and measures using DAX time intelligence (DATEADD, SAMEPERIODLASTYEAR, TOTALYTD, DATESINPERIOD) so period-over-period comparison is possible instead of current-state-only reporting.",
 }
 
 #: The set of validated refs, derived from the checklist above — what the flag
