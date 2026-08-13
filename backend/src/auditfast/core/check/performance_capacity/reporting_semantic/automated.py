@@ -287,8 +287,10 @@ def sm_query_transform(ctx: CheckContext) -> Verdict:
 
     transforming = sorted(n for n, f in bound.items() if f.get("native_query_partitions"))
     clean = len(bound) - len(transforming)
-    evidence = (f"{clean} of {len(bound)} table(s) bind directly to a warehouse "
-                f"table/view rather than inline query logic")
+    evidence = (f"Semantic model '{ctx.obj_name}': {clean} of {len(bound)} table(s) "
+                "bind directly to a warehouse table/view rather than inline query logic")
     if transforming:
         evidence += f" — inline transformation in: {', '.join(transforming)}"
+    evidence += (". This verdict inspects saved semantic-model partition metadata; it "
+                 "does not measure SQL, DAX, refresh, or interactive query performance")
     return covered(clean, len(bound), evidence)
