@@ -61,6 +61,7 @@ class AuditRunner:
         token: str | None = None,
         organization_id: str | None = None,
         auth_session: str | None = None,
+        weight_by_environment: bool = False,
     ) -> AuditJob:
         """Accept an audit and start it in the background."""
         job = AuditJob(
@@ -71,6 +72,7 @@ class AuditRunner:
                 "project": project_path,
                 "pillars": pillars or [],
                 "workspaces": workspaces or [],
+                "weight_by_environment": weight_by_environment,
             },
             questionnaire=questionnaire_service.build_questionnaire(pillars, workspaces),
         )
@@ -85,6 +87,7 @@ class AuditRunner:
                 out_dir=out_dir,
                 token=token,
                 auth_session=auth_session,
+                weight_by_environment=weight_by_environment,
                 parent_correlation_id=correlation_id.get(),
             )
         )
@@ -102,6 +105,7 @@ class AuditRunner:
         out_dir: str | None,
         token: str | None,
         auth_session: str | None = None,
+        weight_by_environment: bool = False,
         parent_correlation_id: str = "-",
     ) -> None:
         """Run one audit to completion, recording success or failure."""
@@ -144,6 +148,7 @@ class AuditRunner:
                     sql_token=sql_token,
                     storage_token=storage_token,
                     sql_token_refresher=sql_token_refresher,
+                    weight_by_environment=weight_by_environment,
                 )
                 report: dict[str, Any] = audit_service.to_json(run)
                 report["audit_id"] = job.id
@@ -176,6 +181,7 @@ class AuditRunner:
                     out_dir=out_dir,
                     token=token,
                     auth_session=auth_session,
+                    weight_by_environment=weight_by_environment,
                     parent_correlation_id=parent_correlation_id,
                 )
             )
@@ -192,6 +198,7 @@ class AuditRunner:
         out_dir: str | None,
         token: str | None,
         auth_session: str | None = None,
+        weight_by_environment: bool = False,
         parent_correlation_id: str = "-",
     ) -> None:
         """Re-crawl the tenant live, rebuild the KB, and update the report.
@@ -227,6 +234,7 @@ class AuditRunner:
                         sql_token=sql_token,
                         storage_token=storage_token,
                         sql_token_refresher=sql_token_refresher,
+                        weight_by_environment=weight_by_environment,
                     )
                 )
                 report = audit_service.to_json(run)

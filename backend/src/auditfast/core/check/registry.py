@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Sequence
 
 from ..enums import Automation, Layer, Pillar, Resource, Scope, Severity
-from ..models import CheckContext, CheckOption, CheckSpec
+from ..models import CheckContext, CheckOption, CheckSpec, GroupCheckSpec, GroupContext
 
 
 class DuplicateCheckError(ValueError):
@@ -257,3 +257,104 @@ def questionnaire_check(
         options=options,
         registry=registry,
     )(lambda ctx: _manual_verdict())
+
+
+# -- cross-workspace (group) checks -------------------------------------------
+
+class GroupCheckRegistry:
+    """An ordered, id-keyed collection of :class:`GroupCheckSpec`.
+
+    Kept separate from :class:`CheckRegistry` because a group check has a
+    different signature (it takes a :class:`GroupContext`, not a
+    :class:`CheckContext`) and a different dispatch (once per project group, not
+    per object). Keeping them apart means the per-workspace engine loop can never
+    accidentally run a group check, so single-workspace behaviour is untouched.
+    """
+
+    def __init__(self) -> None:
+        self._specs: dict[str, GroupCheckSpec] = {}
+
+    def register(self, spec: GroupCheckSpec) -> None:
+        if spec.id in self._specs:
+            raise DuplicateCheckError(
+                f"group check id {spec.id!r} is already registered by "
+                f"{self._specs[spec.id].fn.__module__}"
+            )
+        self._specs[spec.id] = spec
+
+    def __len__(self) -> int:
+        return len(self._specs)
+
+    def __iter__(self):
+        return iter(self._specs.values())
+
+    def all(self) -> list[GroupCheckSpec]:
+        return list(self._specs.values())
+
+    def get(self, check_id: str) -> GroupCheckSpec | None:
+        return self._specs.get(check_id)
+
+    def select(self, *, pillars: Iterable[Pillar] | None = None) -> list[GroupCheckSpec]:
+        """Return the group checks matching the pillar filter (None = all)."""
+        wanted = set(pillars) if pillars is not None else None
+        return [
+            spec for spec in self._specs.values()
+            if wanted is None or spec.pillar in wanted
+        ]
+
+    @staticmethod
+    def required_resources(specs: Iterable[GroupCheckSpec]) -> set[Resource]:
+        """Union of what the given group checks need fetched, per member."""
+        needed: set[Resource] = set()
+        for spec in specs:
+            needed |= spec.requires
+        return needed
+
+
+#: The process-wide group-check registry. Empty until a group check is imported,
+#: so an ordinary audit runs no cross-workspace checks and is unchanged.
+GROUP_REGISTRY = GroupCheckRegistry()
+
+
+def group_check(
+    *,
+    id: str,
+    ref: str,
+    title: str,
+    pillar: Pillar,
+    severity: Severity = Severity.MEDIUM,
+    requires: Sequence[Resource] = (),
+    weight: float = 1.0,
+    description: str = "",
+    required: bool = True,
+    registry: GroupCheckRegistry | None = None,
+) -> Callable:
+    """Register a cross-workspace (group) check and return it unchanged.
+
+    The decorated function takes a :class:`GroupContext` — the group's readable
+    member workspaces, dev → prod — and returns a
+    :class:`~auditfast.core.check.helpers.Verdict` for the project. It must obey
+    the same rules as every check: pure, deterministic, and **N/A-not-FAIL** when
+    the data needed to compare is missing.
+    """
+
+    def decorate(fn: Callable[[GroupContext], object]):
+        target = registry if registry is not None else GROUP_REGISTRY
+        target.register(
+            GroupCheckSpec(
+                id=id,
+                ref=ref,
+                title=title,
+                pillar=pillar,
+                fn=fn,
+                severity=severity,
+                requires=frozenset(requires),
+                weight=weight,
+                description=description,
+                required=required,
+            )
+        )
+        return fn
+
+    return decorate
+
