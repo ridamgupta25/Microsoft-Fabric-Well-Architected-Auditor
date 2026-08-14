@@ -272,7 +272,8 @@ def test_1_2_5_still_fails_a_silver_notebook_without_cleansing():
     assert verdict.score == 0
 
 
-def test_1_2_5_passes_a_silver_notebook_with_cleansing():
+def test_1_2_5_scores_a_silver_notebook_on_how_many_aspects_it_applies():
+    """Dedup + a cast is 2 of the 4 aspects the point names, so a partial."""
     code = (
         "df = df.dropDuplicates(['id']).withColumn('d', to_date('d'))\n"
         "df.write.saveAsTable('silver.dim_customer')\n"
@@ -280,7 +281,32 @@ def test_1_2_5_passes_a_silver_notebook_with_cleansing():
     defn = _notebook(code)
     ws = _ws(notebooks={"nb": defn})
     verdict = _run("NB-SILVER-QUALITY", ws, "nb", defn)
-    assert verdict.score == 3
+    assert verdict.score is not None and 0 < verdict.score < 3
+    assert "2 of 4" in verdict.evidence
+
+
+def test_1_2_3_and_1_2_5_use_the_highest_layer_a_notebook_writes():
+    """A Bronze-to-Silver promotion notebook produces *silver*.
+
+    It writes a bronze staging table first, so taking the first matching write
+    target classified every promotion notebook as bronze - on a real estate 8 of
+    8 notebooks resolved to bronze, which failed Silver notebooks against the
+    Bronze raw-capture rule and left 1.2.5 with nothing to judge.
+    """
+    code = (
+        "raw.write.saveAsTable('bronze.stg_customer')\n"
+        "clean = raw.dropDuplicates(['id']).withColumn('d', to_date('d'))\n"
+        "clean.write.saveAsTable('silver.dim_customer')\n"
+    )
+    defn = _notebook(code)
+    ws = _ws(notebooks={"nb": defn})
+
+    bronze = _run("NB-BRONZE-METADATA", ws, "nb", defn)
+    assert bronze.score is None, "a silver producer is not judged by the Bronze rule"
+
+    silver = _run("NB-SILVER-QUALITY", ws, "nb", defn)
+    assert silver.score is not None, "the silver branch must be reachable"
+    assert "silver.dim_customer" in silver.evidence
 
 
 @pytest.mark.parametrize("check_id", ["NB-BRONZE-METADATA", "NB-SILVER-QUALITY"])

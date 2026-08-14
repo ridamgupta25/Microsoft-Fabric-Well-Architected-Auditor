@@ -44,8 +44,16 @@ FIXTURE_SETTINGS = {
 #: The overall score the recorded tenant must produce. Pinned to the value the
 #: engine returns for the fixture, so any change to a check, a band, or the
 #: roll-up fails loudly here.
-EXPECTED_OVERALL = 47.712418300653596
-EXPECTED_SCORED_CHECKS = 153
+#:
+#: 14 Aug: 47.712418300653596 -> 47.22222222222222, and scored 153 -> 156.
+#: Three checks that previously declined now reach a verdict on the fixture:
+#: 2.4.4 (dead-letter, judged structurally instead of by keyword), 4.5.9 (SCD2,
+#: matched by column *role* rather than one exact spelling) and 1.2.5 (Silver
+#: quality, scored per aspect). The score falls because those verdicts are
+#: mostly partial or failing - the fixture genuinely lacks the practices, which
+#: the old checks were unable to see.
+EXPECTED_OVERALL = 47.22222222222222
+EXPECTED_SCORED_CHECKS = 156
 EXPECTED_RESULT_ROWS = 372
 
 #: A session id the auth-service patch below always resolves to a token.
