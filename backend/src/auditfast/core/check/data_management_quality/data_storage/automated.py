@@ -116,10 +116,6 @@ _SHORTCUTS_PATH = re.compile(r"(?:^|/)shortcuts(?:/|$)", re.IGNORECASE)
 _BRONZE_TOKEN = re.compile(r"(?:^|[/_\-.])bronze(?:[/_\-.]|$)", re.IGNORECASE)
 _SILVER_TOKEN = re.compile(r"(?:^|[/_\-.])silver(?:[/_\-.]|$)", re.IGNORECASE)
 
-_PARTITION_HINT_COLUMNS = (
-    "event_date", "business_date", "partition_date", "load_date",
-    "event_dt", "load_dt", "year", "month", "day",
-)
 _STRATEGY_METADATA_KEYS = (
     "partitionBy", "partitionColumns", "partition_keys",
     "clusterBy", "clusteredBy", "clusteringColumns", "zOrderBy",
@@ -743,7 +739,20 @@ def bronze_silver_taxonomy(ctx: CheckContext) -> Verdict:
     required=True,
 )
 def table_partition_strategy(ctx: CheckContext) -> Verdict:
-    """Large-table candidates should expose explicit partition/clustering metadata."""
+    """Large-table candidates should expose explicit partition/clustering metadata.
+
+    **What it can determine.** Whether a table *declares* a partitioning or
+    clustering strategy - ``partitionBy``, ``clusterBy``, ``zOrderBy`` and the
+    like, read from the table listing.
+
+    **What it cannot.** Whether a table without that metadata is partitioned.
+    Fabric's table listing carries no partition keys - verified against a real
+    1,845-table crawl, where ``partitionBy``/``partitionColumns`` appear only
+    inside notebook source, never on a table. A date-ish column name says a table
+    *could* be partitioned, never that it *is*, so such tables are excluded from
+    the denominator rather than scored on a guess. That keeps this a statement
+    about what was read, not about what was inferred.
+    """
     tables = ctx.workspace.tables
     if not tables:
         return not_applicable(_NO_TABLES)
@@ -757,45 +766,32 @@ def table_partition_strategy(ctx: CheckContext) -> Verdict:
         return not_applicable("No large-table naming candidates found to assess partition/clustering strategy")
 
     with_strategy: list[str] = []
-    inspectable = 0
-    hint_only: list[str] = []
     without_strategy: list[str] = []
 
     for name, meta in large_candidates.items():
         table_meta = meta or {}
-        cols = [str(c.get("name", "")).lower() for c in columns(table_meta)]
-        listed = bool(table_meta.get("partitions_listed"))
-        # Without columns and without a successful OneLake listing there is
-        # nothing to judge — that is N/A, not a table lacking a strategy.
-        if not cols and not listed:
-            continue
-        explicit = any(table_meta.get(key) for key in _STRATEGY_METADATA_KEYS)
-        hinted = any(col in _PARTITION_HINT_COLUMNS or col.endswith(("_date", "_dt", "_month", "_year")) for col in cols)
-
-        inspectable += 1
-        if explicit:
+        if any(table_meta.get(key) for key in _STRATEGY_METADATA_KEYS):
             partition_columns = table_meta.get("partitionColumns") or []
             with_strategy.append(
                 f"{name} ({', '.join(partition_columns)})" if partition_columns else name
             )
-        elif hinted:
-            hint_only.append(name)
-        else:
+        elif table_meta.get("partitions_listed"):
+            # OneLake listing succeeded and showed no partitioning: a readable
+            # absence, so this one is a genuine finding rather than a blind spot.
             without_strategy.append(name)
 
+    inspectable = len(with_strategy) + len(without_strategy)
     if inspectable == 0:
         return not_applicable(
             "Large-table candidates were found but no partition/clustering metadata was available to verify strategy. "
             + _ONELAKE_PERMISSION_HINT
         )
 
-    compliant = len(with_strategy) + len(hint_only)
     return covered(
-        compliant,
+        len(with_strategy),
         inspectable,
-        f"{compliant} of {inspectable} large-table candidate(s) expose a partition/clustering strategy"
+        f"{len(with_strategy)} of {inspectable} large-table candidate(s) expose a partition/clustering strategy"
         + (f"; declared: {', '.join(with_strategy[:5])}" if with_strategy else "")
-        + (f"; partition-key column only: {', '.join(hint_only[:5])}" if hint_only else "")
         + (f"; no strategy found: {', '.join(without_strategy[:5])}" if without_strategy else ""),
     )
 
