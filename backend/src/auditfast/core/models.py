@@ -335,6 +335,55 @@ class CheckContext:
 
 
 @dataclass(frozen=True, slots=True)
+class GroupMemberContext:
+    """One workspace inside a project group, with the environment it represents.
+
+    ``environment_level`` is the 1..10 position the reviewer gave it (1 =
+    dev/least critical, 10 = prod/most critical), so a cross-workspace check can
+    tell *which* member is production without reading its name.
+    """
+
+    workspace: WorkspaceContext
+    environment_level: int
+    layer: Layer
+
+
+@dataclass(frozen=True, slots=True)
+class GroupContext:
+    """Everything a cross-workspace (group) check is handed.
+
+    Holds the already-fetched contexts of the group's *readable* members, sorted
+    by environment level (dev -> prod). A group check compares them and returns a
+    single :class:`~auditfast.core.check.helpers.Verdict` for the project. It must
+    still obey N/A-not-FAIL: when fewer than two members are readable there is
+    nothing to compare, and the engine reports N/A rather than a low score.
+    """
+
+    name: str
+    members: tuple[GroupMemberContext, ...]
+    settings: dict
+
+    def setting(self, key: str, default: Any = None) -> Any:
+        """Read a tunable from the project YAML's ``project:`` block."""
+        return self.settings.get(key, default)
+
+    @property
+    def workspaces(self) -> tuple[WorkspaceContext, ...]:
+        """The member workspace contexts, dev -> prod."""
+        return tuple(member.workspace for member in self.members)
+
+    @property
+    def lowest(self) -> GroupMemberContext | None:
+        """The least production-like readable member (min environment level)."""
+        return self.members[0] if self.members else None
+
+    @property
+    def highest(self) -> GroupMemberContext | None:
+        """The most production-like readable member (max environment level)."""
+        return self.members[-1] if self.members else None
+
+
+@dataclass(frozen=True, slots=True)
 class CheckOption:
     """One selectable answer for an interactive (self-assessed) check.
 
@@ -435,6 +484,50 @@ class CheckSpec:
             # Whether this check's checklist point has completed Phase 1
             # validation. Keyed by ref; source of truth:
             # auditfast.core.validation.VALIDATED_CHECKLIST.
+            "validated": is_validated(self.ref),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class GroupCheckSpec:
+    """Metadata for a cross-workspace (group) check.
+
+    Unlike :class:`CheckSpec` it has no ``scope`` or ``layers``: a group check is
+    not dispatched per object or per layer, but once per project group, receiving
+    a :class:`GroupContext` of the group's readable members. ``requires`` lists
+    the resources each member workspace must have fetched for the comparison.
+    """
+
+    id: str
+    ref: str
+    title: str
+    pillar: Pillar
+    fn: Callable[[GroupContext], Any]
+    severity: Severity = Severity.MEDIUM
+    requires: frozenset[Resource] = frozenset()
+    weight: float = 1.0
+    description: str = ""
+    required: bool = True
+
+    def to_dict(self) -> dict:
+        """Serializable form -- used by the catalog API and the MCP tools."""
+        return {
+            "id": self.id,
+            "ref": self.ref,
+            "title": self.title,
+            "pillar": self.pillar.value,
+            "scope": "group",
+            "severity": self.severity.value,
+            "layers": ["*"],
+            "requires": sorted(r.value for r in self.requires),
+            "weight": self.weight,
+            "required": self.required,
+            "manual": False,
+            "automation": Automation.AUTOMATED.value,
+            "interactive": False,
+            "question": self.title,
+            "options": [],
+            "description": self.description or (self.fn.__doc__ or "").strip(),
             "validated": is_validated(self.ref),
         }
 

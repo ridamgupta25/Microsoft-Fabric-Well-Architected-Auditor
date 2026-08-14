@@ -142,6 +142,11 @@ class Scope(StrEnum):
     SEMANTIC_MODEL = "semantic_model"
     REPORT = "report"
     EVENTHOUSE = "eventhouse"
+    #: A cross-workspace comparison spanning a whole project group. Not dispatched
+    #: per object like the others; a group check runs once per group over its
+    #: members' contexts. Kept last so the per-workspace dispatch order is
+    #: unchanged.
+    GROUP = "group"
 
 
 class Resource(StrEnum):
