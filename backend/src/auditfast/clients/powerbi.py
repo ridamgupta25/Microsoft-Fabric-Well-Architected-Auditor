@@ -121,8 +121,19 @@ class PowerBIClient:
         is what lets the report-reuse checks report N/A instead of a false
         finding. Each row carries ``datasetId`` — the report's semantic-model
         binding — except for paginated (RDL) reports, which bind to none.
+
+        The personal **"My workspace"** is not a group, so ``/groups/{id}/reports``
+        fails for it; when — and only when — ``group_id`` is not a group the token
+        can see, its reports are read from the ``myorg`` root ``/reports`` instead.
+        A *named* workspace whose group listing fails (permission/transient) is
+        left unreadable, never silently swapped for the personal one.
         """
-        return self._values_known(f"/groups/{group_id}/reports")
+        rows, readable = self._values_known(f"/groups/{group_id}/reports")
+        if readable:
+            return rows, readable
+        if group_id not in {g.get("id") for g in self.list_groups()}:
+            return self._values_known("/reports")
+        return rows, readable
 
     def get_report(self, report_id: str, group_id: str | None = None) -> dict | None:
         """Fetch one report's properties, or ``None`` if it is not accessible."""
