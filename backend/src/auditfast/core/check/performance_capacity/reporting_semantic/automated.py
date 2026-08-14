@@ -32,6 +32,13 @@ MODEL_LAYERS = (Layer.REPORTING, Layer.MIXED)
 #: to the source. ``dual`` lets the engine pick per query.
 _REAL_MODES = {"directlake", "import", "directquery", "dual"}
 
+#: Metadata proxies for a "performance-critical" (large) model in SM-AGGREGATIONS.
+#: Real size (rows, VertiPaq footprint, cardinality) is never in the KB, so a
+#: model counts as large if it carries an incremental-refresh policy, is wide
+#: (this many column declarations), or has at least this many tables.
+_WIDE_MODEL_COLUMNS = 100
+_LARGE_MODEL_TABLES = 5
+
 
 def _model(ctx: CheckContext) -> dict | None:
     """The parsed TMSL for the model under inspection, if it was read."""
@@ -150,11 +157,24 @@ def sm_aggregations(ctx: CheckContext) -> Verdict:
         return binary(True, f"{len(aggregations)} aggregation column(s) declared on: "
                             f"{', '.join(tables)}")
     # Absence is only meaningful once the model is big enough to care about.
-    if len(model.get("tables") or []) < 5:
-        return not_applicable(f"Small model ({len(model.get('tables') or [])} tables) — "
-                              f"aggregations are not warranted")
-    return binary(False, f"Import/DirectQuery model with {len(model.get('tables') or [])} "
-                         f"tables and no aggregation tables — every visual scans detail rows")
+    # "Big" is judged from metadata proxies, not row counts: an incremental-
+    # refresh policy is only set on tables too large to fully reload, and a wide
+    # column footprint drives VertiPaq cost far more than table count alone.
+    table_count = len(model.get("tables") or [])
+    column_count = len(model.get("columns") or [])
+    incremental = model.get("refresh_policies") or []
+    signals: list[str] = []
+    if incremental:
+        signals.append(f"{len(incremental)} incremental-refresh policy(ies)")
+    if column_count >= _WIDE_MODEL_COLUMNS:
+        signals.append(f"{column_count} columns")
+    if table_count >= _LARGE_MODEL_TABLES:
+        signals.append(f"{table_count} tables")
+    if not signals:
+        return not_applicable(f"Small model ({table_count} tables, {column_count} columns, "
+                              f"no incremental refresh) — aggregations are not warranted")
+    return binary(False, f"Performance-critical Import/DirectQuery model ({'; '.join(signals)}) "
+                         f"with no aggregation tables — every visual scans detail rows")
 
 
 @check(
