@@ -199,6 +199,11 @@ def default_lakehouse_name(definition: dict) -> str:
     return str(lakehouse.get("default_lakehouse_name") or "")
 
 
+#: Medallion tiers in flow order. A notebook that writes more than one is a
+#: promotion step, and the layer it *produces* is the highest one it writes.
+_LAYER_ORDER: tuple[str, ...] = ("bronze", "silver", "gold")
+
+
 def medallion_layer(definition: dict, code: str) -> tuple[str, str]:
     """Best-evidence medallion layer for a notebook.
 
@@ -206,14 +211,28 @@ def medallion_layer(definition: dict, code: str) -> tuple[str, str]:
     ``"gold"`` or ``""`` when it could not be determined, and ``how`` names the
     evidence so a verdict can explain itself.
 
-    The write target wins over the attached lakehouse: a notebook attached to a
-    ``Bronze`` lakehouse that writes ``silver.dim_customer`` is producing silver,
-    and judging it as bronze is exactly the false FAIL this ordering prevents.
+    **The highest layer written wins.** A promotion notebook typically writes a
+    staging/bronze table before its real output, so taking the *first* matching
+    write target classified every Bronze-to-Silver mapping as bronze - measured
+    on a real estate, 8 of 8 notebooks came back bronze, which left the Silver
+    check with nothing to judge and failed Silver notebooks against the Bronze
+    raw-capture rule. What a notebook *produces* is the furthest-along layer it
+    writes, not the first one it touches.
+
+    The write target still wins over the attached lakehouse: a notebook attached
+    to a ``Bronze`` lakehouse that writes ``silver.dim_customer`` is producing
+    silver, and judging it as bronze is exactly the false FAIL this prevents.
     """
+    best = ""
+    best_target = ""
     for target in write_targets(code):
         layer = _layer_of_name(target)
-        if layer:
-            return layer, f"writes to '{target}'"
+        if not layer:
+            continue
+        if not best or _LAYER_ORDER.index(layer) > _LAYER_ORDER.index(best):
+            best, best_target = layer, target
+    if best:
+        return best, f"writes to '{best_target}'"
 
     lakehouse = default_lakehouse_name(definition)
     layer = _layer_of_name(lakehouse)

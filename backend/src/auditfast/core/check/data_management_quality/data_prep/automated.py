@@ -974,6 +974,28 @@ _BRONZE_METADATA = re.compile(
     r"current_timestamp\s*\(",
     re.IGNORECASE,
 )
+#: The four Silver disciplines the checklist point names, kept separate so the
+#: verdict can say *which* are present. A single pattern could only answer
+#: "something was found", which reported "applies cleansing, deduplication,
+#: conforming and type standardization" on a notebook doing none of the dedup.
+_SILVER_ASPECTS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("deduplication", re.compile(
+        r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.distinct\s*\(\)|dedup|"
+        r"row_number\s*\(\s*\)\s*over|qualify\b",
+        re.IGNORECASE)),
+    ("type standardization", re.compile(
+        r"\.cast\s*\(|to_date\s*\(|to_timestamp\s*\(|astype\s*\(|"
+        r"CAST\s*\(|CONVERT\s*\(",
+        re.IGNORECASE)),
+    ("cleansing", re.compile(
+        r"regexp_replace\s*\(|\btrim\s*\(|\blower\s*\(|\bupper\s*\(|"
+        r"fillna\s*\(|na\.fill|coalesce\s*\(|cleanse|cleansing",
+        re.IGNORECASE)),
+    ("conforming", re.compile(
+        r"standardi[sz]e|conform|\.withColumnRenamed\s*\(|\balias\s*\(|mapping",
+        re.IGNORECASE)),
+)
+
 _SILVER_QUALITY = re.compile(
     r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.distinct\s*\(\)|"
     r"\.cast\s*\(|to_date\s*\(|to_timestamp\s*\(|regexp_replace\s*\(|"
@@ -1098,11 +1120,27 @@ _BOOLEAN_LITERALS = re.compile(
     re.IGNORECASE,
 )
 
-_DQ_RULE = re.compile(
-    r"assert\b|validation|validate|quality|quarantine|reject|invalid|"
-    r"dropDuplicates|drop_duplicates|left_anti|isNull|isin\s*\(|"
-    r"StructType|StructField|expected[_ ]?(?:schema|columns|values)",
-    re.IGNORECASE,
+#: The distinct data-quality disciplines 5.1.2 asks for, kept separate so the
+#: verdict can say *which* are codified. Bundling them into one pattern meant a
+#: notebook calling ``drop_duplicates`` once scored full marks for "DQ rules
+#: codified in code/config" - one line of tidy-up read as a rule framework.
+_DQ_ASPECTS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("assertions / expectations", re.compile(
+        r"\bassert\b|expect_|expectation|great_expectations|\bdeequ\b|"
+        r"\braise\s+\w*(?:Error|Exception)|pytest\.raises",
+        re.IGNORECASE)),
+    ("schema validation", re.compile(
+        r"StructType|StructField|expected[_ ]?(?:schema|columns|values)|"
+        r"\.schema\s*==|enforceSchema|mergeSchema\s*=\s*False",
+        re.IGNORECASE)),
+    ("null / domain checks", re.compile(
+        r"isNull|isNotNull|\bisin\s*\(|\bbetween\s*\(|dropna\s*\(|"
+        r"\.filter\s*\([^)]*(?:null|isin)|not\s+in\s*\(",
+        re.IGNORECASE)),
+    ("quarantine / rejection", re.compile(
+        r"quarantine|reject|invalid|bad[_ ]?record|badRecordsPath|"
+        r"error[_ ]?table|dead[_ -]?letter|left_anti",
+        re.IGNORECASE)),
 )
 
 
@@ -1911,15 +1949,23 @@ def nb_bronze_metadata(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_silver_quality(ctx: CheckContext) -> Verdict:
-    """Silver writes apply at least one explicit cleansing, deduplication, or type-conformance transformation.
+    """Silver writes apply cleansing, deduplication, conforming and type standardization.
 
     **Only Silver notebooks are judged**, decided by what the notebook writes to
     rather than by the word "silver" appearing anywhere in it - a Gold notebook
     that *reads* a silver table was previously judged as though it produced one.
 
-    **What it cannot determine.** That the transformation is *correct*, only that
-    an explicit cleansing/dedup/conformance step is present. When no signal
-    identifies a layer the notebook is reported N/A rather than failed.
+    **Scored per aspect.** The point names four disciplines, and a notebook doing
+    three of them is not the same as one doing all four. An earlier version
+    matched any one pattern and then claimed all four in its evidence, which
+    reported deduplication on notebooks that performed none. The verdict now
+    names which aspects were found and which were not, and scores the ratio, so
+    the evidence can be checked against the code.
+
+    **What it cannot determine.** That a transformation is *correct*, or that an
+    absent aspect was unnecessary - a source with a guaranteed-unique key needs
+    no dedup. The named gaps are for a reviewer to confirm, and the write target
+    is named so the reader knows which lakehouse was judged.
     """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
@@ -1934,12 +1980,14 @@ def nb_silver_quality(ctx: CheckContext) -> Verdict:
             f"Notebook produces the {layer} layer ({how}), so the Silver "
             "cleansing rule does not apply"
         )
-    ok = bool(_SILVER_QUALITY.search(code))
-    return binary(
-        ok,
-        f"Silver write ({how}) applies cleansing/deduplication/conformance/type standardization"
-        if ok else
-        f"Silver write ({how}) has no recognizable quality transformation",
+
+    present = [name for name, pattern in _SILVER_ASPECTS if pattern.search(code)]
+    missing = [name for name, _ in _SILVER_ASPECTS if name not in present]
+    return covered(
+        len(present), len(_SILVER_ASPECTS),
+        f"Silver write ({how}) applies {len(present)} of {len(_SILVER_ASPECTS)} "
+        f"quality aspect(s): {', '.join(present) if present else 'none'}"
+        + (f". Not found: {', '.join(missing)}" if missing else ""),
     )
 
 
@@ -2205,23 +2253,42 @@ def nb_categorical_domain(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_dq_rules(ctx: CheckContext) -> Verdict:
-    """Notebook data-quality rules are expressed as executable, repeatable logic."""
+    """Notebook data-quality rules are expressed as executable, repeatable logic.
+
+    **Scored per discipline, not on a single token.** An earlier version passed
+    on any one match from a bundled pattern, so a notebook whose only quality
+    logic was ``drop_duplicates`` scored full marks for "DQ rules codified in
+    code/config" - and said so in its evidence. Deduplication is housekeeping;
+    it is not a rule that decides whether a record is fit to use.
+
+    Four disciplines are looked for separately - assertions/expectations, schema
+    validation, null/domain checks, and quarantine of rejected rows - and the
+    ratio is scored, so the verdict distinguishes a notebook with one incidental
+    call from one that actually validates what it loads. The evidence names both
+    what was found and what was not, so it can be checked against the code.
+
+    Comments are stripped first: a rule that exists only in a comment is not a
+    codified rule.
+
+    **What it cannot determine.** Whether the rules are *correct* or cover the
+    fields that matter - only that they are executable and repeatable rather
+    than performed by hand.
+    """
     code = executable_code(ctx.obj)
     if not (_INPUT_READ.search(code) or _WRITE_PATTERN.search(code)):
         return not_applicable("Notebook has no recognizable data-ingestion or write operation")
-    found = _matched_tokens(_DQ_RULE, code)
-    if found:
-        return binary(True, (
-            "Data-quality rule logic is codified in notebook code/config — matched: "
-            + ", ".join(found)
-        ))
-    return binary(False, (
-        "Data movement (read/write) present but no recognizable codified data-quality "
-        "rule — searched for: assertions (assert), validation/quality wording, "
-        "quarantine/reject/invalid handling, dedup (dropDuplicates), null / isin / "
-        "anti-join tests, an explicit schema (StructType/StructField), or "
-        "expected schema/columns/values"
-    ))
+
+    present: list[str] = []
+    missing: list[str] = []
+    for label, pattern in _DQ_ASPECTS:
+        (present if pattern.search(code) else missing).append(label)
+
+    return covered(
+        len(present), len(_DQ_ASPECTS),
+        f"{len(present)} of {len(_DQ_ASPECTS)} data-quality discipline(s) are codified "
+        f"in executable notebook code: {', '.join(present) if present else 'none'}"
+        + (f". Not found: {', '.join(missing)}" if missing else ""),
+    )
 
 
 

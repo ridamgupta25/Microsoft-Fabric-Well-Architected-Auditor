@@ -314,10 +314,33 @@ raw.write.saveAsTable('bronze_events')
     assert nb_bronze_metadata(_ctx(_nb(code))).score == _PASS
 
 
-def test_silver_quality_passes_with_dedup_and_type_conformance():
+def test_silver_quality_scores_each_aspect_separately():
+    """Two of four aspects is a partial, not a pass.
+
+    The point names cleansing, deduplication, conforming *and* type
+    standardization. An earlier version passed on any one of them and then
+    claimed all four in its evidence, which reported deduplication on notebooks
+    performing none. Scoring the ratio is what makes the evidence checkable.
+    """
     code = """
 silver = spark.read.table('bronze_events')
 silver = silver.dropDuplicates(['event_id']).withColumn('event_date', to_date('event_date'))
+silver.write.saveAsTable('silver_events')
+"""
+    verdict = nb_silver_quality(_ctx(_nb(code)))
+    assert verdict.score is not None and verdict.score < _PASS
+    assert "2 of 4" in verdict.evidence
+    assert "deduplication" in verdict.evidence
+    assert "Not found: cleansing, conforming" in verdict.evidence
+
+
+def test_silver_quality_passes_when_every_aspect_is_present():
+    code = """
+silver = spark.read.table('bronze_events')
+silver = (silver.dropDuplicates(['event_id'])
+          .withColumn('event_date', to_date('event_date'))
+          .withColumn('name', trim(col('name')))
+          .withColumnRenamed('src_id', 'source_id'))
 silver.write.saveAsTable('silver_events')
 """
     assert nb_silver_quality(_ctx(_nb(code))).score == _PASS
@@ -372,8 +395,36 @@ def test_bulk_move_evidence_names_the_activity_and_reason():
 
 # -- DQ RULES / RESTART / AUDIT LOG / FAILURE ALERT ---------------------------
 
-def test_dq_rules_are_codified():
+def test_dq_rules_are_scored_per_discipline():
+    """One assertion is not a rule framework, so it is a partial, not a pass.
+
+    An earlier version passed on any single token from a bundled pattern, which
+    scored full marks for "DQ rules codified in code/config" on a notebook whose
+    only quality logic was ``drop_duplicates``.
+    """
     code = "df = spark.read.json('Files/input.json')\nassert df.filter(df.id.isNull()).count() == 0"
+    verdict = nb_dq_rules(_ctx(_nb(code)))
+    assert verdict.score is not None and verdict.score < _PASS
+    assert "assertions / expectations" in verdict.evidence
+    assert "null / domain checks" in verdict.evidence
+
+
+def test_dq_rules_do_not_pass_on_deduplication_alone():
+    """Deduplication is housekeeping, not a rule that judges a record."""
+    code = "df = spark.read.json('Files/in.json')\ndf = df.drop_duplicates()\ndf.write.saveAsTable('t')"
+    verdict = nb_dq_rules(_ctx(_nb(code)))
+    assert verdict.score is not None and verdict.score < _PASS
+
+
+def test_dq_rules_pass_when_every_discipline_is_codified():
+    code = (
+        "from pyspark.sql.types import StructType, StructField\n"
+        "df = spark.read.schema(StructType([])).json('Files/in.json')\n"
+        "assert df.count() > 0\n"
+        "clean = df.filter(df.id.isNotNull() & df.status.isin(['A', 'B']))\n"
+        "rejected = df.join(clean, 'id', 'left_anti')\n"
+        "rejected.write.saveAsTable('quarantine_rows')\n"
+    )
     assert nb_dq_rules(_ctx(_nb(code))).score == _PASS
 
 

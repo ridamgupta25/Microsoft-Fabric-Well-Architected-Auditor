@@ -84,9 +84,15 @@ def test_result_and_scored_counts_are_unchanged(provider):
 def test_status_counts_are_unchanged(provider):
     agg = aggregate(_run(provider))
     assert agg["counts"][Status.PASS] == 65
-    assert agg["counts"][Status.PARTIAL] == 21
-    assert agg["counts"][Status.FAIL] == 67
-    assert agg["counts"][Status.NA] == 208
+    # 14 Aug: 21 -> 22. 1.2.5 now scores four Silver aspects separately, so a
+    # notebook applying some of them is a partial rather than an outright pass.
+    assert agg["counts"][Status.PARTIAL] == 22
+    # 14 Aug: 67 -> 69. 5.1.2 no longer passes on a single token from a bundled
+    # pattern; a notebook whose only quality logic is a dedup call now fails.
+    assert agg["counts"][Status.FAIL] == 69
+    # 14 Aug: 208 -> 205. 2.4.4, 4.5.9 and 1.2.5 each used to decline on the
+    # fixture and now reach a verdict, so three N/As became scored results.
+    assert agg["counts"][Status.NA] == 205
     assert agg["counts"][Status.INFO] == 11
 
 

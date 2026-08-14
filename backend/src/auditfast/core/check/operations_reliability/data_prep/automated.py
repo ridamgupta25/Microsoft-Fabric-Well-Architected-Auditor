@@ -432,6 +432,48 @@ def notebook_idempotent(ctx: CheckContext) -> Verdict:
     )
 
 
+#: Copy-activity settings that *are* a dead-letter route. Fabric writes skipped
+#: rows to the location named in ``redirectIncompatibleRowSettings`` /
+#: ``logSettings``, so their presence is the feature being configured, not a
+#: word that happens to appear in the JSON.
+_SKIP_SETTINGS = (
+    "redirectincompatiblerowsettings", "logsettings", "skiperrorfile",
+)
+
+#: Activity types that can serve as a quarantine sink on a ``[Failed]`` branch.
+_QUARANTINE_SINK_TYPES = frozenset({
+    "Copy", "SqlServerStoredProcedure", "Script", "TridentNotebook",
+    "Lookup", "AzureFunctionActivity", "WebActivity", "Web",
+})
+
+
+def _redirects_bad_rows(activity: dict) -> bool:
+    """True when a Copy activity is configured to *retain* incompatible rows.
+
+    ``enableSkipIncompatibleRow`` on its own silently drops them, which is the
+    very failure this point is about; it counts only when paired with a redirect
+    or log destination that keeps them.
+    """
+    props = activity.get("typeProperties") or {}
+    keys = {str(k).lower() for k in props}
+    if not (keys & set(_SKIP_SETTINGS)):
+        return False
+    return bool(props.get("enableSkipIncompatibleRow", True))
+
+
+def _failure_branch_targets(acts: list[dict]) -> list[str]:
+    """Names of activities that run *because* another activity failed."""
+    targets = []
+    for activity in acts:
+        for dep in activity.get("dependsOn") or []:
+            conditions = {str(c).lower() for c in (dep.get("dependencyConditions") or [])}
+            if conditions & {"failed", "skipped"}:
+                name = str(activity.get("name") or "").strip()
+                if name and (activity.get("type") or "") in _QUARANTINE_SINK_TYPES:
+                    targets.append(name)
+    return targets
+
+
 @check(
     id="PL-DEADLETTER", ref="2.4.4",
     title="Failed records captured to dead-letter / quarantine area (not silently dropped or halting good records)",
@@ -439,21 +481,58 @@ def notebook_idempotent(ctx: CheckContext) -> Verdict:
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def pl_deadletter(ctx: CheckContext) -> Verdict:
-    """Invalid records are routed to a retained dead-letter or quarantine output."""
+    """Invalid records are routed to a retained dead-letter or quarantine output.
+
+    **Judged structurally, never by keyword.** An earlier version searched the
+    whole pipeline JSON for words like ``error`` and ``reject``. On a real estate
+    that matched *column names* streaming from the source - ``REJECT_CODE``,
+    ``ERROR_DESC``, ``AUTHORIZATION_REJECTED`` - inside ``source.name`` /
+    ``sink.name`` column mappings, and scored a PASS on pipelines that had no
+    error handling whatsoever. Business data that happens to describe rejections
+    is not a rejection route.
+
+    What counts, all of them things Fabric actually configures:
+
+    * a Copy activity that redirects incompatible rows to a retained location
+      (``redirectIncompatibleRowSettings`` / ``logSettings`` / ``skipErrorFile``);
+    * an activity that runs on a ``[Failed]`` dependency - the quarantine branch;
+    * an activity whose own *name* marks it as the reject/quarantine step.
+
+    **What it cannot determine.** Whether the redirected rows are ever reviewed,
+    or whether a downstream notebook quarantines records the pipeline handed it.
+    """
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
     acts = activities(ctx.obj)
     data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
     if not data_acts:
         return not_applicable("No data-movement activity to assess for failed records")
-    blob = json.dumps(ctx.obj)
-    if not _RECORD_ERROR.search(blob):
-        return not_applicable("No record-validation or error-routing pattern found")
-    ok = any(_RECORD_ERROR.search(json.dumps(a)) for a in acts)
+
+    redirecting = [
+        str(a.get("name") or "?") for a in data_acts if _redirects_bad_rows(a)
+    ]
+    failure_targets = _failure_branch_targets(acts)
+    named_sinks = [
+        str(a.get("name") or "?") for a in acts
+        if _RECORD_ERROR.search(str(a.get("name") or ""))
+    ]
+
+    if redirecting:
+        return binary(True, f"Incompatible rows are redirected to a retained "
+                            f"location by: {', '.join(redirecting[:5])}")
+    if named_sinks:
+        return binary(True, f"A quarantine/reject step is present: {', '.join(named_sinks[:5])}")
+    if failure_targets:
+        return graded(2, f"{len(failure_targets)} activity(ies) run on a [Failed] "
+                         f"dependency ({', '.join(failure_targets[:5])}), so a failure path "
+                         f"exists - but nothing names a record-level quarantine sink, so "
+                         f"whether the bad *rows* are retained could not be confirmed")
     return binary(
-        ok,
-        "Failed/invalid records have an explicit error or quarantine route" if ok
-        else "Record errors are mentioned but no activity-level quarantine route was found",
+        False,
+        f"None of the {len(data_acts)} data-movement activity(ies) redirects incompatible "
+        f"rows, and no activity runs on a [Failed] dependency - a bad record either halts "
+        f"the run or is dropped. Column names containing 'error'/'reject' are source data, "
+        f"not an error route, and are not counted",
     )
 
 
