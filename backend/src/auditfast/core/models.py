@@ -158,6 +158,12 @@ class WorkspaceContext:
     #: top-level folder sample, depth/date counts, and truncation flags. Individual
     #: file names/paths are deliberately never persisted in the KB.
     lakehouse_files: dict[str, dict] = field(default_factory=dict)
+    #: Per-Data-Activator (Reflex) rule summary, keyed by item display name:
+    #: ``{"rules": int, "active_rules": int, "sources": int, "actions": int}``,
+    #: parsed from the item's ``ReflexEntities.json`` definition. An Activator
+    #: absent from the map had no readable definition (N/A); one present with
+    #: ``rules=0`` is a real finding — an empty Activator with no trigger.
+    activators: dict[str, dict] = field(default_factory=dict)
     #: The Git provider connection details (provider, org, repo, branch, dir) when
     #: the workspace is Git-connected — the authoritative source for item code.
     git_details: dict = field(default_factory=dict)
@@ -265,6 +271,7 @@ class WorkspaceContext:
             "connections": self.connections,
             "reports": self.reports,
             "lakehouse_files": self.lakehouse_files,
+            "activators": self.activators,
             "git_details": self.git_details,
             "sql_views": self.sql_views,
             "sql_routines": self.sql_routines,
@@ -298,6 +305,7 @@ class WorkspaceContext:
             connections=list(data.get("connections", [])),
             reports=list(data.get("reports", [])),
             lakehouse_files=dict(data.get("lakehouse_files", {})),
+            activators=dict(data.get("activators", {})),
             git_details=dict(data.get("git_details", {})),
             sql_views=list(data.get("sql_views", [])),
             sql_routines=list(data.get("sql_routines", [])),

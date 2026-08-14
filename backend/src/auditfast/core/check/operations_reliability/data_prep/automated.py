@@ -596,13 +596,15 @@ _TXN_ATOMIC_WRITE = re.compile(
     r"\bCREATE\s+OR\s+REPLACE\s+TABLE\b",
     re.IGNORECASE,
 )
-#: An explicit T-SQL transaction — the real thing, available when the notebook
-#: drives a Warehouse or SQL database over JDBC/pyodbc.
-_TXN_EXPLICIT = re.compile(
-    r"\bBEGIN\s+TRAN(?:SACTION)?\b|\bSET\s+IMPLICIT_TRANSACTIONS\b|"
-    r"\bconn(?:ection)?\.commit\s*\(|\.rollback\s*\(|\bautocommit\s*=\s*False\b",
+#: An explicit transaction requires both an opener and a completion operation.
+#: A stray ``commit()``/``rollback()`` may belong to unrelated setup code.
+_TXN_BEGIN = re.compile(
+    r"\bBEGIN\s+TRAN(?:SACTION)?\b|\bSET\s+IMPLICIT_TRANSACTIONS\s+ON\b|"
+    r"\bautocommit\s*=\s*False\b",
     re.IGNORECASE,
 )
+_TXN_END = re.compile(r"\bCOMMIT(?:\s+TRAN(?:SACTION)?)?\b|\bROLLBACK\b|\.commit\s*\(|\.rollback\s*\(", re.IGNORECASE)
+_TXN_CONTEXT = re.compile(r"\bwith\s+[^\n:]{0,120}?\.begin\s*\([^\n:]*\)\s*:", re.IGNORECASE)
 #: Stage everything aside, then swap it in with one atomic rename/replace.
 #: ``_tmp``/``_temp`` are deliberately absent — they are ordinary variable
 #: suffixes, so including them would let any notebook holding a ``df_tmp`` pass
@@ -614,17 +616,33 @@ _TXN_STAGING_SWAP = re.compile(
     r"\bCREATE\s+OR\s+REPLACE\s+TABLE\b|\bREPLACE\s+TABLE\b|\bSWAP\b)",
     re.IGNORECASE,
 )
-#: A caught failure that undoes or cleans up the partial work — the hand-rolled
-#: compensating transaction. Bare words like "restore" or "revert" are excluded:
-#: a log message mentioning one is not a compensation, so only an operation that
-#: actually reverses or removes the partial write counts.
+#: A caught failure that undoes or cleans up partial work. The operation must be
+#: inside the indented ``except`` suite; a later DROP/DELETE is normal notebook
+#: logic and does not compensate for the failed sequence.
 _TXN_COMPENSATION = re.compile(
-    r"\bexcept\b[\s\S]{0,800}?"
-    r"(?:\brollback\b|compensat|"
-    r"\bRESTORE\s+TABLE\b|VERSION\s+AS\s+OF|restoreToVersion|"
-    r"\bDROP\s+TABLE\b|\bDELETE\s+FROM\b|\bTRUNCATE\s+TABLE\b|fs\.rm\s*\()",
+    r"\brollback\b|compensat|\bRESTORE\s+TABLE\b|VERSION\s+AS\s+OF|"
+    r"restoreToVersion|\bDROP\s+TABLE\b|\bDELETE\s+FROM\b|"
+    r"\bTRUNCATE\s+TABLE\b|fs\.rm\s*\(",
     re.IGNORECASE,
 )
+_EXCEPT_SUITE = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)except\b[^\n]*:\s*\n"
+    r"(?P<body>(?:(?P=indent)[ \t]+[^\n]*(?:\n|$))+)",
+)
+
+
+def _transaction_compensation(code: str) -> str:
+    """Return the compensating operation found inside an exception suite."""
+    for suite in _EXCEPT_SUITE.finditer(code):
+        match = _TXN_COMPENSATION.search(suite.group("body"))
+        if match:
+            return " ".join(match.group(0).split())
+    return ""
+
+
+def _explicit_transaction(code: str) -> bool:
+    """Whether code proves a transaction lifecycle, not just a stray commit."""
+    return bool(_TXN_CONTEXT.search(code) or (_TXN_BEGIN.search(code) and _TXN_END.search(code)))
 
 
 @check(
@@ -650,32 +668,39 @@ def notebook_transaction_boundary(ctx: CheckContext) -> Verdict:
     writes = _TXN_WRITE_OP.findall(code)
     if len(writes) < 2:
         return not_applicable(
-            f"Notebook performs {len(writes)} write operation(s) — no multi-step "
-            f"operation to bound"
+            f"Notebook '{ctx.obj_name}' performs {len(writes)} terminal write "
+            f"operation(s); at least 2 are required for a multi-step transaction "
+            f"boundary assessment"
         )
 
-    if _TXN_EXPLICIT.search(code):
-        return graded(3, f"{len(writes)} writes bounded by an explicit transaction "
-                         f"(BEGIN/COMMIT/ROLLBACK or a managed connection commit)")
+    if _explicit_transaction(code):
+        return graded(3, f"Notebook '{ctx.obj_name}' has {len(writes)} writes bounded "
+                         f"by an explicit transaction (BEGIN/COMMIT/ROLLBACK or a "
+                         f"managed connection commit)")
     if _TXN_STAGING_SWAP.search(code):
-        return graded(3, f"{len(writes)} writes staged and swapped in atomically, so a "
-                         f"mid-sequence failure leaves the published tables untouched")
-    if _TXN_COMPENSATION.search(code):
-        return graded(3, f"{len(writes)} writes bounded by failure compensation — the "
-                         f"partial work is rolled back, restored, or cleaned up on error")
+        return graded(3, f"Notebook '{ctx.obj_name}' has {len(writes)} writes staged "
+                         f"and swapped in atomically, so a mid-sequence failure leaves "
+                         f"the published tables untouched")
+    compensation = _transaction_compensation(code)
+    if compensation:
+        return graded(3, f"Notebook '{ctx.obj_name}' has {len(writes)} writes bounded "
+                         f"by failure compensation inside an exception handler "
+                         f"(matched '{compensation}')")
 
     atomic = len(_TXN_ATOMIC_WRITE.findall(code))
     if atomic >= len(writes):
         return graded(
             1,
-            f"All {len(writes)} writes are individually atomic (merge/overwrite/replace) "
-            f"but the sequence is unbounded — a failure part-way leaves the set of "
-            f"targets inconsistent",
+            f"Notebook '{ctx.obj_name}': all {len(writes)} writes are individually "
+            f"atomic (merge/overwrite/replace), but the sequence is unbounded: it has "
+            f"no transaction, staging swap, or exception-handler compensation; a "
+            f"failure part-way leaves the target set inconsistent",
         )
     return graded(
         0,
-        f"{len(writes)} dependent writes with no transaction, staging swap, or "
-        f"compensation — a failure part-way through leaves the load half-applied",
+        f"Notebook '{ctx.obj_name}': {len(writes)} dependent writes have no explicit "
+        f"transaction, staging swap, or compensation inside an exception handler; "
+        f"a failure part-way through leaves the load half-applied",
     )
 
 
@@ -739,26 +764,74 @@ def nb_retry_backoff(ctx: CheckContext) -> Verdict:
 
 
 # -- 9.3.4 data integrity validated across layers after failures --------------
-#: The notebook is written to run after something went wrong.
-_RECOVERY_CONTEXT = re.compile(
-    r"\brecover\w*|\brestart\w*|\breprocess\w*|\breplay\b|\bbackfill\b|"
-    r"\bresume\b|failed[_ -]?run|after[_ -]?failure|repair\b|reconcile[_ -]?after",
+#: The notebook is written to run after something went wrong. Patterns allow
+#: Python/SQL identifier separators, such as ``backfill_mode`` and ``failed_run``.
+_RECOVERY_CONTEXTS = (
+    ("recovery", re.compile(r"(?:^|\W|_)recover\w*", re.I)),
+    ("restart", re.compile(r"(?:^|\W|_)restart\w*", re.I)),
+    ("reprocessing", re.compile(r"(?:^|\W|_)reprocess\w*", re.I)),
+    ("replay", re.compile(r"(?:^|\W|_)replay(?:\W|_|$)", re.I)),
+    ("backfill", re.compile(r"(?:^|\W|_)backfill(?:\W|_|$)", re.I)),
+    ("resume", re.compile(r"(?:^|\W|_)resume(?:\W|_|$)", re.I)),
+    ("failed run", re.compile(r"failed[_ -]?run", re.I)),
+    ("after failure", re.compile(r"after[_ -]?failure", re.I)),
+    ("repair", re.compile(r"(?:^|\W|_)repair(?:\W|_|$)", re.I)),
+    ("post-failure reconciliation", re.compile(r"reconcile[_ -]?after", re.I)),
+)
+#: Common names for adjacent or explicitly compared data layers. Each pair is
+#: bounded so unrelated mentions elsewhere in a large notebook do not qualify.
+_CROSS_LAYER_PAIRS = (
+    ("Bronze", "Silver", re.compile(r"bronze[\s\S]{0,400}?silver|silver[\s\S]{0,400}?bronze", re.I)),
+    ("Silver", "Gold", re.compile(r"silver[\s\S]{0,400}?gold|gold[\s\S]{0,400}?silver", re.I)),
+    ("Source", "Target", re.compile(r"source[\s\S]{0,400}?target|target[\s\S]{0,400}?source", re.I)),
+    ("Staging", "Final", re.compile(r"staging[\s\S]{0,400}?final|final[\s\S]{0,400}?staging", re.I)),
+    ("Raw", "Curated", re.compile(
+        r"(?:^|\W|_)raw(?:\W|_)[\s\S]{0,400}?curated|"
+        r"curated[\s\S]{0,400}?(?:^|\W|_)raw(?:\W|_|$)",
+        re.I,
+    )),
+    ("Landing", "Curated", re.compile(r"landing[\s\S]{0,400}?curated|curated[\s\S]{0,400}?landing", re.I)),
+)
+_COUNT_COMPARISON = re.compile(
+    r"\.count\s*\(\s*\)\s*(?:==|!=|<|>|<=|>=)|"
+    r"\b\w*count\w*\s*(?:==|!=|<|>|<=|>=)\s*\w*count\w*",
     re.IGNORECASE,
 )
-#: It proves the layers agree before letting the run continue.
-_INTEGRITY_ASSERT = re.compile(
-    r"assert\b|\braise\s+\w*(?:Error|Exception)|"
-    r"\.count\s*\(\s*\)\s*(?:==|!=|<|>)|"
-    r"if\s+\w*count\w*\s*(?:==|!=|<|>)|"
-    r"mismatch|out[_ -]?of[_ -]?sync|integrity[_ -]?check|validate[_ -]?(?:layer|integrity)",
+_KEY_SET_COMPARISON = re.compile(
+    r"left[_ -]?anti|exceptAll\s*\(|\.subtract\s*\(|mismatch|out[_ -]?of[_ -]?sync",
     re.IGNORECASE,
 )
-#: …and it looks at more than one layer while doing so.
-_CROSS_LAYER = re.compile(
-    r"bronze[\s\S]{0,400}?silver|silver[\s\S]{0,400}?gold|"
-    r"source[\s\S]{0,400}?target|staging[\s\S]{0,400}?final",
+_VALUE_COMPARISON = re.compile(
+    r"checksum|hash[_ -]?(?:diff|compare|match)|compare[_ -]?(?:values|columns)|"
+    r"validate[_ -]?(?:layer|integrity)",
     re.IGNORECASE,
 )
+_INTEGRITY_ENFORCEMENT = re.compile(
+    r"\bassert\b|\braise\s+\w*(?:Error|Exception)",
+    re.IGNORECASE,
+)
+
+
+def _cross_layer_pair(code: str) -> tuple[str, str] | None:
+    for first, second, pattern in _CROSS_LAYER_PAIRS:
+        if pattern.search(code):
+            return first, second
+    return None
+
+
+def _recovery_contexts(code: str) -> list[str]:
+    return [label for label, pattern in _RECOVERY_CONTEXTS if pattern.search(code)]
+
+
+def _integrity_methods(code: str) -> list[str]:
+    methods: list[str] = []
+    if _COUNT_COMPARISON.search(code):
+        methods.append("row-count comparison")
+    if _KEY_SET_COMPARISON.search(code):
+        methods.append("key/set mismatch comparison")
+    if _VALUE_COMPARISON.search(code):
+        methods.append("value/checksum validation")
+    return methods
 
 
 @check(
@@ -777,17 +850,48 @@ def nb_post_failure_integrity(ctx: CheckContext) -> Verdict:
     """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
-    code = notebook_code(ctx.obj)
-    if not _RECOVERY_CONTEXT.search(code):
-        return not_applicable("Notebook implements no recovery / restart / replay path")
-    if not _CROSS_LAYER.search(code):
-        return not_applicable("Recovery path touches only one layer — nothing to "
-                              "cross-check against")
-    ok = bool(_INTEGRITY_ASSERT.search(code))
-    return binary(ok, "Recovery path validates integrity across layers before continuing"
-                  if ok else
-                  "Recovery/replay path reprocesses across layers but never asserts the "
-                  "layers agree — a partially-written layer is trusted as complete")
+    code = executable_code(ctx.obj)
+    recovery_contexts = _recovery_contexts(code)
+    if not recovery_contexts:
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' contains no executable recovery, restart, replay, "
+            "reprocessing, backfill, or failed-run path"
+        )
+    layer_pair = _cross_layer_pair(code)
+    if not layer_pair:
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' has a {', '.join(recovery_contexts)} path but no recognized "
+            "cross-layer pair (Bronze/Silver, Silver/Gold, Source/Target, Staging/Final, "
+            "Raw/Curated, or Landing/Curated) to compare"
+        )
+
+    methods = _integrity_methods(code)
+    enforced = bool(_INTEGRITY_ENFORCEMENT.search(code))
+    first_layer, second_layer = layer_pair
+    subject = (
+        f"Notebook '{ctx.obj_name}' declares post-failure context(s) "
+        f"[{', '.join(recovery_contexts)}] and compares the {first_layer} and "
+        f"{second_layer} layers"
+    )
+    if not methods:
+        return binary(
+            False,
+            f"{subject}, but no row-count, key/set, value, or checksum comparison is "
+            "implemented. The recovery can trust a partially written layer as complete",
+        )
+    method_detail = ", ".join(methods)
+    if not enforced:
+        return binary(
+            False,
+            f"{subject} using {method_detail}, but no assertion or raised exception blocks "
+            "continuation on a mismatch. Differences can therefore be detected and ignored",
+        )
+    return binary(
+        True,
+        f"{subject} using {method_detail}. An assertion or raised exception blocks "
+        "continuation when the layers disagree. This verdict verifies saved notebook logic, "
+        "not the current data values or the pipeline's failure dependency",
+    )
 
 
 # -- 9.3.2 — the write itself is a keyed upsert --------------------------------

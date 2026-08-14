@@ -351,6 +351,13 @@ def test_date_quality_is_na_without_dates():
     assert verdict.status is Status.NA
 
 
+def test_date_quality_is_na_for_date_columns_in_create_table_only():
+    verdict = notebook_date_quality(_nb_ctx(
+        'spark.sql("CREATE TABLE dim_calendar (calendar_date DATE, label STRING)")\n'
+    ))
+    assert verdict.status is Status.NA
+
+
 # =============================================================================
 # 5.5.2 — money precision and currency codes
 # =============================================================================
@@ -390,6 +397,16 @@ def test_money_precision_is_partial_when_no_numeric_typing_is_declared():
 
 def test_money_precision_is_na_without_monetary_values():
     verdict = notebook_money_precision(_nb_ctx('df.write.saveAsTable("dim_customer")\n'))
+    assert verdict.status is Status.NA
+
+
+def test_money_precision_ignores_financial_keywords_in_sql_comments():
+    verdict = notebook_money_precision(_nb_ctx(
+        'spark.sql("""\n'
+        '-- SELECT CAST(amount AS FLOAT), currency_code FROM payments\n'
+        'CREATE TABLE dim_customer (customer_id BIGINT)\n'
+        '""")\n'
+    ))
     assert verdict.status is Status.NA
 
 
