@@ -450,6 +450,35 @@ def in_raw_store(table: dict) -> bool:
     return bool(tokens & _RAW_STORE_WORDS)
 
 
+def _referenced_names(tables: dict[str, dict] | None) -> frozenset[str]:
+    """Every table named as an FK target by some *other* table.
+
+    Built once per call rather than re-scanned per table: the naive form made
+    :func:`table_role` O(n) in the table count, :func:`facts_in` O(n^2), and a
+    check calling ``facts_in`` inside a per-table loop O(n^3). On a 1,845-table
+    estate that is billions of comparisons - the audit simply stopped.
+    """
+    if not tables:
+        return frozenset()
+    out: set[str] = set()
+    for other in tables.values():
+        out.update(str(r) for r in ((other or {}).get("references") or ()))
+    return frozenset(out)
+
+
+def table_roles(tables: dict[str, dict]) -> dict[str, str]:
+    """``{table name: role}`` for every table, computed in one pass.
+
+    Prefer this over calling :func:`table_role` in a loop: it shares the
+    foreign-key reverse index across every table instead of rebuilding it.
+    """
+    referenced = _referenced_names(tables)
+    return {
+        name: _role(name, table, referenced)
+        for name, table in tables.items()
+    }
+
+
 def table_role(name: str, table: dict | None = None,
                tables: dict[str, dict] | None = None) -> str:
     """``"fact"``, ``"dimension"`` or ``"unknown"`` for one table.
@@ -499,20 +528,18 @@ def table_role(name: str, table: dict | None = None,
     ``table`` and ``tables`` are optional: with neither, this degrades to the
     naming test, which is what the old helpers did.
     """
+    return _role(name, table, _referenced_names(tables))
+
+
+def _role(name: str, table: dict | None, referenced: frozenset[str]) -> str:
+    """:func:`table_role` with the FK reverse index passed in, not rebuilt."""
     if is_platform_table(name):
         return "unknown"
     meta = table or {}
 
     # 1. Declared constraints - the only evidence that is not an inference.
-    referenced_by = 0
-    if tables:
-        for other_name, other in tables.items():
-            if other_name == name:
-                continue
-            if name in ((other or {}).get("references") or ()):
-                referenced_by += 1
-    references = len((meta.get("references") or ()))
-    if referenced_by and not references:
+    references = len(meta.get("references") or ())
+    if name in referenced and not references:
         return "dimension"
     if references >= 2:
         return "fact"
@@ -547,12 +574,14 @@ def table_role(name: str, table: dict | None = None,
 
 def facts_in(tables: dict[str, dict]) -> dict[str, dict]:
     """Every fact-role table, by structure then name. Empty when none is identifiable."""
-    return {n: t for n, t in tables.items() if table_role(n, t, tables) == "fact"}
+    roles = table_roles(tables)
+    return {n: t for n, t in tables.items() if roles[n] == "fact"}
 
 
 def dimensions_in(tables: dict[str, dict]) -> dict[str, dict]:
     """Every dimension-role table, by structure then name."""
-    return {n: t for n, t in tables.items() if table_role(n, t, tables) == "dimension"}
+    roles = table_roles(tables)
+    return {n: t for n, t in tables.items() if roles[n] == "dimension"}
 
 
 #: Trailing words that mark a column as a *key*. Matched against the final word of

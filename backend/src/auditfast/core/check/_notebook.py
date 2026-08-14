@@ -176,6 +176,41 @@ def _layer_of_name(name: str) -> str:
     return matched[0] if len(matched) == 1 else ""
 
 
+def layer_words_in(text: str) -> frozenset[str]:
+    """Which medallion layers ``text`` names anywhere - ``{"bronze", "gold"}``.
+
+    Splits on non-alphanumerics first, so ``bronze_raw_orders``,
+    ``silver.dim_customer`` and ``LH_Gold`` all yield their layer. A ``\\b``
+    regex cannot do this: in ``bronze_raw_orders`` the character after
+    ``bronze`` is ``_``, which *is* a word character, so ``\\bbronze\\b`` does
+    not match - the exact naming convention these checks look for was the one
+    they could not see.
+
+    Unlike :func:`_layer_of_name` this does not resolve ambiguity: a notebook
+    mentioning two layers returns both, and the caller decides what that means.
+    """
+    tokens = {t.lower() for t in _TOKEN_SPLIT.split(text or "") if t}
+    if not tokens:
+        return frozenset()
+    return frozenset(
+        layer for layer, words in _LAYER_WORDS.items() if tokens & set(words)
+    )
+
+
+def writes_layer(code: str, layer: str) -> tuple[bool, str]:
+    """Does ``code`` write a table belonging to ``layer``? ``(yes, target)``.
+
+    Judged from the *write targets*, so a notebook that merely reads a bronze
+    table is not treated as producing one. Unlike :func:`medallion_layer` this
+    answers about one layer rather than picking a single winner, so a notebook
+    writing several layers is correctly seen as writing each of them.
+    """
+    for target in write_targets(code):
+        if layer in layer_words_in(target):
+            return True, target
+    return False, ""
+
+
 def write_targets(code: str) -> list[str]:
     """Every table/path the notebook writes to, in source order."""
     out: list[str] = []

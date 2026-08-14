@@ -25,7 +25,6 @@ from auditfast.core.check._tables import (
     is_audit_column,
     is_audit_table,
     is_dimension,
-    is_fact,
     is_key_column,
     is_platform_table,
     is_snake_case,
@@ -35,7 +34,7 @@ from auditfast.core.check._tables import (
     name_words,
     purpose_tokens,
     store_of,
-    table_role,
+    table_roles,
     tables_by_store,
 )
 from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable, note
@@ -1767,9 +1766,10 @@ def warehouse_is_modeled(ctx: CheckContext) -> Verdict:
         return not_applicable(_NO_STORE)
 
     modeled, detail = [], []
+    roles = table_roles(tables)
     for store, store_tables in sorted(by_store.items()):
-        facts = [n for n in store_tables if n in facts_in(tables)]
-        dims = [n for n in store_tables if n in dimensions_in(tables)]
+        facts = [n for n in store_tables if roles.get(n) == "fact"]
+        dims = [n for n in store_tables if roles.get(n) == "dimension"]
         if facts and dims:
             modeled.append(store)
             detail.append(f"{store}: {len(facts)} fact / {len(dims)} dimension table(s)")
@@ -1895,9 +1895,10 @@ def conformed_dimensions(ctx: CheckContext) -> Verdict:
 
     stores_by_purpose: dict[tuple[str, ...], set[str]] = {}
     judged = 0
+    roles = table_roles(tables)
     for store, store_tables in by_store.items():
         for name in store_tables:
-            if table_role(name, store_tables.get(name), tables) != "dimension":
+            if roles.get(name) != "dimension":
                 continue
             purpose = purpose_tokens(name)
             if not purpose:
@@ -1951,8 +1952,8 @@ def fact_tables_have_no_descriptive_attributes(ctx: CheckContext) -> Verdict:
     tables = ctx.workspace.tables
     if not tables:
         return not_applicable(_NO_TABLES)
-    facts = {n: t for n, t in tables.items()
-             if n in facts_in(tables) and any(c.get("type") for c in columns(t))}
+    facts = {n: t for n, t in facts_in(tables).items()
+             if any(c.get("type") for c in columns(t))}
     if not facts:
         return not_applicable(
             "No fact table with readable column types â€” nothing to judge for "

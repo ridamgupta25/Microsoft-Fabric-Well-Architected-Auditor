@@ -14,11 +14,13 @@ from auditfast.core.check._notebook import (
     executable_code_no_strings,
     has_parameters_cell,
     layer_undetermined_evidence,
+    layer_words_in,
     markdown_sources,
     medallion_layer,
     notebook_code,
     strip_sql_comments,
     write_targets,
+    writes_layer,
 )
 from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities, script_sql, walk_activities
 from auditfast.core.check._tables import (
@@ -978,7 +980,7 @@ _BRONZE_METADATA = re.compile(
 #: verdict can say *which* are present. A single pattern could only answer
 #: "something was found", which reported "applies cleansing, deduplication,
 #: conforming and type standardization" on a notebook doing none of the dedup.
-_SILVER_ASPECTS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+_SILVER_ASPECTS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("deduplication", re.compile(
         r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.distinct\s*\(\)|dedup|"
         r"row_number\s*\(\s*\)\s*over|qualify\b",
@@ -996,12 +998,6 @@ _SILVER_ASPECTS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
         re.IGNORECASE)),
 )
 
-_SILVER_QUALITY = re.compile(
-    r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.distinct\s*\(\)|"
-    r"\.cast\s*\(|to_date\s*\(|to_timestamp\s*\(|regexp_replace\s*\(|"
-    r"trim\s*\(|standardize|conform|cleanse|cleansing|dedup",
-    re.IGNORECASE,
-)
 _BULK_ACTIVITY = re.compile(
     r"parallelCopies|batchCount|batch[_ -]?size|bulk|copy activity|"
     r"COPY\s+INTO|write\.mode|saveAsTable|repartition|coalesce",
@@ -1124,7 +1120,7 @@ _BOOLEAN_LITERALS = re.compile(
 #: verdict can say *which* are codified. Bundling them into one pattern meant a
 #: notebook calling ``drop_duplicates`` once scored full marks for "DQ rules
 #: codified in code/config" - one line of tidy-up read as a rule framework.
-_DQ_ASPECTS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+_DQ_ASPECTS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("assertions / expectations", re.compile(
         r"\bassert\b|expect_|expectation|great_expectations|\bdeequ\b|"
         r"\braise\s+\w*(?:Error|Exception)|pytest\.raises",
@@ -1542,9 +1538,6 @@ _UNKNOWN_MEMBER_USE = re.compile(
     r"when\s*\([^\n]{0,80}?-1",
     re.IGNORECASE,
 )
-#: Names of the medallion layers, to spot a notebook that spans two of them.
-_SILVER_REF = re.compile(r"\bsilver\b", re.IGNORECASE)
-_GOLD_REF = re.compile(r"\bgold\b", re.IGNORECASE)
 
 #: A genuine fact→dimension lookup, distinct from a Python ``str.join``. A Spark
 #: DataFrame join (``df.join(``) is never written ``"literal".join(``, so a
@@ -1658,7 +1651,11 @@ def nb_layer_recon(ctx: CheckContext) -> Verdict:
     should be accounted for in Gold, allowing for aggregation.
     """
     code = strip_sql_comments(executable_code(ctx.obj))
-    if not (_SILVER_REF.search(code) and _GOLD_REF.search(code)):
+    # Token-split rather than ``\bsilver\b``: an underscore is a word character,
+    # so a boundary regex cannot see ``silver_dim_customer`` - the very naming
+    # convention this looks for.
+    layers = layer_words_in(code)
+    if not ({"silver", "gold"} <= layers):
         return not_applicable(
             f"Notebook '{ctx.obj_name}' has no executable Silver-to-Gold flow"
         )
@@ -2682,7 +2679,6 @@ def pl_watermark_store(ctx: CheckContext) -> Verdict:
 
 
 # -- 2.3.2 operation type flag preserved in Bronze ----------------------------
-_BRONZE = re.compile(r"\bbronze\b|\braw\b|\blanding\b|pre[_ -]?bronze", re.IGNORECASE)
 _OP_TYPE_COLUMN = re.compile(
     r"(?P<column>operation[_ -]?type|op[_ -]?type|change[_ -]?type|_change_type|"
     r"__\$operation|cdc[_ -]?operation|dml[_ -]?action|record[_ -]?type|\bopcode\b|"
@@ -2693,11 +2689,6 @@ _CDC_SOURCE_SIGNAL = re.compile(
     r"change[_ -]?data[_ -]?capture|\bcdc\b|change[_ -]?(?:feed|stream|events?|records?)|"
     r"source[_ -]?changes?|readChangeFeed|readChangeData|startingVersion|startingTimestamp|"
     r"_change_type|__\$operation|sys_change_operation|dml[_ -]?action",
-    re.IGNORECASE,
-)
-_NOTEBOOK_WRITE_TARGET = re.compile(
-    r"(?:saveAsTable\s*\(\s*|INSERT\s+(?:INTO|OVERWRITE(?:\s+TABLE)?)\s+)"
-    r"[\"'`\[]?(?P<table>[A-Za-z_][\w$.]*(?:\.[A-Za-z_][\w$]*)*)",
     re.IGNORECASE,
 )
 
@@ -2714,15 +2705,22 @@ def nb_operation_type(ctx: CheckContext) -> Verdict:
     Read from the notebook that writes Bronze rather than from table columns:
     the Fabric REST API returns table metadata without columns, so a
     column-based test would be N/A on every live run.
+
+    **The Bronze test is on the write target, not a keyword.** An earlier version
+    searched the whole notebook for ``\\bbronze\\b``, which cannot match
+    ``bronze_raw_orders`` - the character after ``bronze`` is ``_``, a word
+    character, so there is no word boundary. The convention the check exists to
+    find was the one convention it could not see, and it reported "does not write
+    a Bronze/raw table" on a notebook that plainly did. Matching the write target
+    also stops a notebook that merely *reads* Bronze being judged as producing it.
     """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
     code = executable_code(ctx.obj)
-    if not _WRITE_PATTERN.search(code) or not _BRONZE.search(code):
+    writes_bronze, bronze_target = writes_layer(code, "bronze")
+    if not writes_bronze:
         return not_applicable("Notebook does not write a Bronze/raw table")
-    targets = list(dict.fromkeys(
-        match.group("table") for match in _NOTEBOOK_WRITE_TARGET.finditer(code)
-    ))
+    targets = [bronze_target]
     flags = list(dict.fromkeys(
         match.group("column") for match in _OP_TYPE_COLUMN.finditer(code)
     ))
