@@ -129,6 +129,17 @@ def test_unset_delta_options_are_na_not_a_finding(check_id):
     assert _run(check_id, _DELTA_WRITE).score is None
 
 
+def test_explicitly_disabled_vorder_fails():
+    code = (
+        "spark.conf.set('spark.sql.parquet.vorder.enabled', 'false')\n"
+        f"{_DELTA_WRITE}"
+    )
+    verdict = _run("DELTA-VORDER", code)
+
+    assert verdict.score == 0
+    assert "disabled" in verdict.evidence.lower()
+
+
 @pytest.mark.parametrize("check_id", ["DELTA-VORDER", "DELTA-TBLPROPS", "DELTA-RETENTION"])
 def test_delta_checks_ignore_a_notebook_that_writes_no_delta(check_id):
     assert _run(check_id, "print('hello')\n").score is None

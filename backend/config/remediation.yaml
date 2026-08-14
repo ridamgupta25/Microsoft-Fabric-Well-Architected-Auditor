@@ -30,6 +30,7 @@
 "10.5.1": "Create a Data Activator (Reflex) item in the workspace and define triggers for the critical events it owns - pipeline/notebook failure, refresh failure, SLA breach, or a threshold on the data itself - with actions routed to Teams or email so a critical event reaches an owner."
 "10.3.1": "Land high-volume or real-time telemetry in an Eventhouse / KQL database rather than only in a Lakehouse or Warehouse: create the Eventhouse, point the Eventstream at its KQL database, and keep the batch store for the aggregated history."
 "10.3.2": "Save the KQL you run during an investigation as a KQL queryset (or a Real-Time Dashboard) in the workspace instead of an ad-hoc browser tab, and connect the workspace to Git so those querysets are versioned and reviewable."
+"10.3.3": "Configure an explicit retention policy for each Eventhouse based on operational and compliance needs, balancing investigation history against storage cost."
 "14.5.4": "Ship reporting content through both mechanics: connect the reporting workspace to Git (Azure DevOps/GitHub) so semantic models and reports have a diff and an author, and assign it to a Fabric deployment pipeline so content reaches QA and Prod by promotion rather than by being re-published by hand."
 "IMPL-15": "Assign the workspace to a Fabric capacity appropriate for its environment."
 "12.3.4": "Review and remove or archive orphaned items (no recent run/refresh) to reduce clutter and cost."
