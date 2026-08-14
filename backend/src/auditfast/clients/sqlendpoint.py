@@ -249,7 +249,11 @@ class SqlEndpointReader:
     # -- queries --------------------------------------------------------------
 
     def columns(self, endpoint: SqlEndpoint) -> dict[str, list[dict[str, Any]]] | None:
-        """``table name -> [{name, type, ...}]`` for one endpoint, or None.
+        """``table key -> [{name, type, ...}]`` for one endpoint, or None.
+
+        Warehouse keys retain their SQL schema as ``<schema>.<table>``. A
+        Lakehouse keeps its bare table name so SQL columns merge with the table
+        inventory already read from the Fabric REST API.
 
         ``type`` is rendered the way the table checks expect: ``varchar(8000)``,
         ``decimal(18,2)``, ``int``. ``source_kind`` travels with every column so a
@@ -268,7 +272,7 @@ class SqlEndpointReader:
         base. Checks that need the schema read it off any column.
         """
         rows = self._query(endpoint, """
-            SELECT c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE,
+            SELECT c.TABLE_SCHEMA, c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE,
                    c.CHARACTER_MAXIMUM_LENGTH, c.NUMERIC_PRECISION, c.NUMERIC_SCALE,
                    c.IS_NULLABLE, c.ORDINAL_POSITION,
                    COALESCE(sc.is_masked, 0) AS is_masked,
@@ -278,35 +282,41 @@ class SqlEndpointReader:
                    ON sc.object_id = OBJECT_ID(
                           QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME))
                   AND sc.name = c.COLUMN_NAME
-            ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION
+            ORDER BY c.TABLE_SCHEMA, c.TABLE_NAME, c.ORDINAL_POSITION
         """)
         if rows is None:
             # ``sys.columns`` is not guaranteed on every endpoint kind. Fall back
             # to the plain projection rather than losing every column schema:
             # masking is one check, columns feed a dozen.
             rows = self._query(endpoint, """
-                SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE,
+                SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
                        CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE,
                        IS_NULLABLE, ORDINAL_POSITION, 0 AS is_masked, TABLE_SCHEMA
                 FROM INFORMATION_SCHEMA.COLUMNS
-                ORDER BY TABLE_NAME, ORDINAL_POSITION
+                ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
             """)
         if rows is None:
             return None
         tables: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
-            table = str(row[0] or "")
-            if not table:
+            schema = str(row[0] or "")
+            table_name = str(row[1] or "")
+            if not table_name:
                 continue
+            table = (
+                f"{schema}.{table_name}"
+                if endpoint.kind == "Warehouse" and schema
+                else table_name
+            )
             column: dict[str, Any] = {
-                "name": str(row[1] or ""),
-                "type": _render_type(row[2], row[3], row[4], row[5]),
-                "nullable": str(row[6] or "").upper() == "YES",
+                "name": str(row[2] or ""),
+                "type": _render_type(row[3], row[4], row[5], row[6]),
+                "nullable": str(row[7] or "").upper() == "YES",
                 "source_kind": endpoint.kind,
             }
             # Only recorded when true, so a snapshot does not grow by a false
             # flag on every one of tens of thousands of columns.
-            if len(row) > 8 and row[8]:
+            if len(row) > 9 and row[9]:
                 column["is_masked"] = True
             if len(row) > 9 and row[9]:
                 column["schema"] = str(row[9])

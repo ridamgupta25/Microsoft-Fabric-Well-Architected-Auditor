@@ -237,18 +237,35 @@ def test_1_2_3_still_fails_a_real_bronze_notebook_without_metadata():
     ws = _ws(notebooks={"nb": defn})
     verdict = _run("NB-BRONZE-METADATA", ws, "nb", defn)
     assert verdict.score == 0
-    assert "no ingestion/source/batch" in verdict.evidence
+    assert "missing: ingestion timestamp, source identity, batch identifier" in verdict.evidence
 
 
 def test_1_2_3_passes_a_bronze_notebook_with_metadata():
     code = (
         "df = df.withColumn('ingestion_timestamp', current_timestamp())\n"
+        "df = df.withColumn('source_system', lit('crm'))\n"
+        "df = df.withColumn('batch_id', lit(run_id))\n"
         "df.write.saveAsTable('bronze.raw_orders')\n"
     )
     defn = _notebook(code)
     ws = _ws(notebooks={"nb": defn})
     verdict = _run("NB-BRONZE-METADATA", ws, "nb", defn)
     assert verdict.score == 3
+
+
+def test_1_2_3_awards_partial_credit_for_incomplete_bronze_audit_metadata():
+    code = (
+        "df = df.withColumn('ingestion_timestamp', current_timestamp())\n"
+        "df = df.withColumn('source_system', lit('crm'))\n"
+        "df.write.saveAsTable('bronze.raw_orders')\n"
+    )
+    defn = _notebook(code)
+    ws = _ws(notebooks={"nb": defn})
+    verdict = _run("NB-BRONZE-METADATA", ws, "nb", defn)
+
+    assert verdict.score == 2
+    assert "present: ingestion timestamp, source identity" in verdict.evidence
+    assert "missing: batch identifier" in verdict.evidence
 
 
 def test_1_2_5_does_not_judge_a_gold_notebook_that_reads_silver():
@@ -274,13 +291,42 @@ def test_1_2_5_still_fails_a_silver_notebook_without_cleansing():
 
 def test_1_2_5_passes_a_silver_notebook_with_cleansing():
     code = (
-        "df = df.dropDuplicates(['id']).withColumn('d', to_date('d'))\n"
+        "df = df.dropDuplicates(['id']).dropna(subset=['id'])\n"
+        "df = df.withColumnRenamed('CustomerID', 'customer_id')\n"
+        "df = df.withColumn('d', to_date('d'))\n"
         "df.write.saveAsTable('silver.dim_customer')\n"
     )
     defn = _notebook(code)
     ws = _ws(notebooks={"nb": defn})
     verdict = _run("NB-SILVER-QUALITY", ws, "nb", defn)
     assert verdict.score == 3
+
+
+def test_1_2_5_awards_partial_credit_when_only_deduplication_is_missing():
+    """The MLC Silver mapping cleans, conforms, and casts but does not deduplicate."""
+    code = (
+        "df = df.dropna(subset=['customer_id'])\n"
+        "df = df.withColumnRenamed('CustomerID', 'customer_id')\n"
+        "df = df.withColumn('event_date', to_date('event_date'))\n"
+        "df.write.saveAsTable('Silver_MLC_Lakehouse.dim_customer')\n"
+    )
+    defn = _notebook(code)
+    ws = _ws(notebooks={"CC_Mapping_Bronze_to_Silver": defn})
+    verdict = _run("NB-SILVER-QUALITY", ws, "CC_Mapping_Bronze_to_Silver", defn)
+
+    assert verdict.score == 2
+    assert "present: cleansing, conforming, type standardization" in verdict.evidence
+    assert "missing: deduplication" in verdict.evidence
+
+
+def test_1_2_5_lists_all_missing_controls_for_an_untreated_silver_write():
+    code = "df.write.saveAsTable('silver.dim_customer')\n"
+    defn = _notebook(code)
+    ws = _ws(notebooks={"nb": defn})
+    verdict = _run("NB-SILVER-QUALITY", ws, "nb", defn)
+
+    assert verdict.score == 0
+    assert "missing: cleansing, deduplication, conforming, type standardization" in verdict.evidence
 
 
 @pytest.mark.parametrize("check_id", ["NB-BRONZE-METADATA", "NB-SILVER-QUALITY"])
