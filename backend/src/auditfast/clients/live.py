@@ -671,6 +671,67 @@ class LiveFabricProvider:
             return name
         return f"{name} ({item_id[:8]})"
 
+    def _reflex_definition(self, workspace_id: str, item_id: str) -> tuple[dict | None, str]:
+        """Read a Data Activator (Reflex) definition and reduce it to rule counts.
+
+        Returns ``(summary, failure)`` — see :meth:`_definition_parts`. The
+        ``ReflexEntities.json`` part is a flat list of typed entities; only the
+        bounded counts a check needs are kept, never the rule bodies.
+        """
+        parts, failure = self._definition_parts(workspace_id, item_id)
+        for part in parts:
+            if not str(part.get("path") or "").endswith("ReflexEntities.json"):
+                continue
+            try:
+                payload = base64.b64decode(part["payload"]).decode("utf-8")
+                entities = json.loads(payload)
+            except Exception:
+                return None, ""
+            if isinstance(entities, list):
+                return self._reflex_summary(entities), ""
+            return None, ""
+        return None, failure
+
+    @staticmethod
+    def _reflex_summary(entities: list) -> dict:
+        """Count rules, active rules, sources and actions in a ReflexEntities list."""
+        rules = active = sources = actions = 0
+        for entity in entities:
+            if not isinstance(entity, dict):
+                continue
+            etype = str(entity.get("type") or "")
+            payload = entity.get("payload") if isinstance(entity.get("payload"), dict) else {}
+            if etype == "timeSeriesView-v1":
+                definition = payload.get("definition") if isinstance(payload.get("definition"), dict) else {}
+                if str(definition.get("type") or "") == "Rule":
+                    rules += 1
+                    settings = definition.get("settings") if isinstance(definition.get("settings"), dict) else {}
+                    if settings.get("shouldRun"):
+                        active += 1
+            elif etype.endswith("Source-v1"):
+                sources += 1
+            elif etype == "fabricItemAction-v1":
+                actions += 1
+        return {"rules": rules, "active_rules": active, "sources": sources, "actions": actions}
+
+    @staticmethod
+    def _annotate_partitions(ctx: WorkspaceContext, onelake, workspace_id: str, item) -> None:
+        """Record each Delta table's partition columns, and that we managed to look.
+
+        ``partitions_listed`` is what lets a check treat "no partition columns" as
+        a finding rather than as missing data.
+        """
+        partitions, failure = onelake.lakehouse_table_partitions(workspace_id, item.id)
+        if failure:
+            return
+        store = item.display_name or item.id
+        for table_name, partition_columns in partitions.items():
+            entry = ctx.tables.get(table_name) or ctx.tables.get(f"{store}.{table_name}")
+            if entry is None:
+                continue
+            entry["partitionColumns"] = partition_columns
+            entry["partitions_listed"] = True
+
     @staticmethod
     def _record_failures(ctx: WorkspaceContext, resource: Resource,
                          attempted: int, read: int, forbidden: int, transient: int,
@@ -1188,6 +1249,7 @@ class LiveFabricProvider:
             Resource.ITEM_RUN_HISTORY,
             Resource.WAREHOUSE_AUDIT,
             Resource.LAKEHOUSE_FILES,
+            Resource.ACTIVATOR_DEFINITIONS,
         }:
             rows, known = self._values(f"/workspaces/{workspace_id}/items")
             ctx.items = [Item.from_api(row) for row in rows]
@@ -1360,6 +1422,7 @@ class LiveFabricProvider:
                             ctx.lakehouse_files, item.display_name or item.id, item.id
                         )
                         ctx.lakehouse_files[key] = summary
+                        self._annotate_partitions(ctx, onelake, workspace_id, item)
             self._record_failures(ctx, Resource.LAKEHOUSE_FILES,
                                   attempted, read, forbidden, transient)
             log.info("fetch %s: lakehouse Files summaries read for %d of %d lakehouse(s)",
@@ -1390,6 +1453,33 @@ class LiveFabricProvider:
             self._record_failures(ctx, Resource.WAREHOUSE_AUDIT,
                                   attempted, read, forbidden, transient, empty)
             log.info("fetch %s: sql audit settings read for %d of %d warehouse(s)",
+                     workspace_id, read, attempted)
+
+        # Data Activator (Reflex) rule definitions — one getDefinition per Reflex
+        # item, decoded to bounded rule counts. Same Item.ReadWrite scope as any
+        # getDefinition; when it is denied the definitions are unreadable and the
+        # trigger-depth check reports N/A rather than failing a present Activator.
+        if Resource.ACTIVATOR_DEFINITIONS in wanted:
+            reflexes = [i for i in ctx.items if i.type in ("Reflex", "Activator")]
+            attempted = read = forbidden = transient = empty = 0
+            for item in reflexes:
+                attempted += 1
+                summary, failure = self._reflex_definition(workspace_id, item.id)
+                if failure == "forbidden":
+                    forbidden += 1
+                elif failure == "transient":
+                    transient += 1
+                elif summary is not None:
+                    read += 1
+                    key = self._unique_key(
+                        ctx.activators, item.display_name or item.id, item.id
+                    )
+                    ctx.activators[key] = summary
+                else:
+                    empty += 1
+            self._record_failures(ctx, Resource.ACTIVATOR_DEFINITIONS,
+                                  attempted, read, forbidden, transient, empty)
+            log.info("fetch %s: activator definitions read for %d of %d reflex item(s)",
                      workspace_id, read, attempted)
 
         # OneLake shortcuts per lakehouse (governance/lineage: external references).

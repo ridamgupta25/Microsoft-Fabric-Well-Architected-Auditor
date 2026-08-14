@@ -22,10 +22,13 @@ from auditfast.core.check.data_management_quality.data_prep.automated import (
     _KEY_QUALITY,
     _TYPE_CAST,
     nb_dedup,
+    nb_grain_unique,
     nb_key_quality,
+    nb_layer_recon,
     nb_merge_valid,
     nb_orphan_detect,
     nb_type_cast,
+    nb_unknown_monitored,
 )
 from auditfast.core.check.data_management_quality.data_storage.automated import (
     _shadow_reason,
@@ -413,6 +416,7 @@ def test_orphans_detected_but_dropped_score_in_the_middle():
     """Computing the unmatched set and never using it satisfies half the point."""
     verdict = nb_orphan_detect(_nb_ctx('orphans = src.join(dim, "k", "left_anti")\n'))
     assert verdict.score == 1
+    assert "Notebook 'nb'" in verdict.evidence
     assert "not handled" in verdict.evidence
 
 
@@ -440,6 +444,24 @@ def test_an_unrelated_reject_column_is_not_orphan_handling():
 
 def test_orphan_check_is_na_without_a_join():
     assert nb_orphan_detect(_nb_ctx("print(1)\n")).status is Status.NA
+
+
+@pytest.mark.parametrize("source", [
+    'columns = ", ".join(df.columns)',
+    'message = "\\n".join(lines)',
+    'path = os.path.join(root, "errors.json")',
+    'instructions = " ".join(values)',
+])
+def test_string_and_path_joins_are_not_data_joins(source: str):
+    assert nb_orphan_detect(_nb_ctx(source)).status is Status.NA
+
+
+@pytest.mark.parametrize("source", [
+    'result = facts.join(dimensions, "customer_id", "inner")',
+    'SELECT * FROM facts f LEFT JOIN dimensions d ON f.customer_id = d.customer_id',
+])
+def test_dataframe_and_sql_joins_remain_in_scope(source: str):
+    assert nb_orphan_detect(_nb_ctx(source)).score == 0
 
 
 def test_a_multiline_sql_anti_join_still_binds_to_its_variable():
@@ -627,11 +649,44 @@ def test_environment_isolation_is_na_when_the_name_declares_no_tier():
 
 # --- 10.5.1 Data Activator ---------------------------------------------------
 
-def test_a_reflex_item_satisfies_the_activator_check():
-    ctx = _ws_ctx(id="w", items=_items(("DataPipeline", "PL_Load"), ("Reflex", "RX_Alerts")))
+def test_an_activator_with_a_live_rule_satisfies_the_check():
+    ctx = _ws_ctx(
+        id="w",
+        items=_items(("DataPipeline", "PL_Load"), ("Reflex", "RX_Alerts")),
+        activators={"RX_Alerts": {"rules": 1, "active_rules": 1, "sources": 1, "actions": 1}},
+    )
     verdict = activator_configured(ctx)
     assert verdict.score == 3
     assert "RX_Alerts" in verdict.evidence
+
+
+def test_an_empty_activator_with_no_rules_does_not_pass():
+    """A Reflex item created but carrying no rule triggers nothing — the reviewer's gap."""
+    ctx = _ws_ctx(
+        id="w",
+        items=_items(("DataPipeline", "PL_Load"), ("Reflex", "RX_Empty")),
+        activators={"RX_Empty": {"rules": 0, "active_rules": 0, "sources": 0, "actions": 0}},
+    )
+    assert activator_configured(ctx).score == 0
+
+
+def test_an_activator_with_only_paused_rules_does_not_pass():
+    ctx = _ws_ctx(
+        id="w",
+        items=_items(("DataPipeline", "PL_Load"), ("Reflex", "RX_Paused")),
+        activators={"RX_Paused": {"rules": 2, "active_rules": 0, "sources": 1, "actions": 1}},
+    )
+    assert activator_configured(ctx).score == 0
+
+
+def test_activator_is_na_when_its_definition_could_not_be_read():
+    """A present Activator whose rules are unreadable is unverified, never a FAIL."""
+    ctx = _ws_ctx(
+        id="w",
+        items=_items(("DataPipeline", "PL_Load"), ("Reflex", "RX_Alerts")),
+        unavailable={Resource.ACTIVATOR_DEFINITIONS},
+    )
+    assert activator_configured(ctx).status is Status.NA
 
 
 def test_operational_items_without_an_activator_fail():
@@ -668,6 +723,15 @@ def test_an_ad_hoc_branch_name_matches_no_strategy():
     ctx = _ws_ctx(id="w", display_name="MLC-Dev-Ops", git_connected=True,
                   git_details={"connected": True, "branch": "anmol-scratch"})
     assert branching_strategy(ctx).score == 0
+
+
+def test_a_dev_prefixed_branch_follows_the_development_strategy():
+    ctx = _ws_ctx(id="w", display_name="Explore Fabric - NOIDA", git_connected=True,
+                  git_details={"connected": True, "branch": "DEV_FABRIC"})
+    verdict = branching_strategy(ctx)
+    assert verdict.score == 3
+    assert "DEV_FABRIC" in verdict.evidence
+    assert "develop branch" in verdict.evidence
 
 
 def test_a_dev_workspace_on_a_feature_branch_is_isolated():
@@ -1233,6 +1297,11 @@ def test_an_explicit_tsql_transaction_bounds_the_sequence():
     assert "explicit transaction" in verdict.evidence
 
 
+def test_a_stray_commit_without_transaction_opener_is_not_a_boundary():
+    verdict = notebook_transaction_boundary(_nb_ctx(_TWO_WRITES + "conn.commit()\n"))
+    assert verdict.score == 0
+
+
 def test_a_staging_swap_bounds_the_sequence():
     code = ('a.write.saveAsTable("gold.dim_stg")\n'
             'b.write.saveAsTable("gold.fact_stg")\n'
@@ -1246,6 +1315,14 @@ def test_failure_compensation_bounds_the_sequence():
     verdict = notebook_transaction_boundary(_nb_ctx(code))
     assert verdict.score == 3
     assert "compensation" in verdict.evidence
+
+
+def test_unrelated_cleanup_after_except_is_not_failure_compensation():
+    code = ("try:\n    risky_call()\nexcept Exception:\n    print('failed')\n\n" +
+            _TWO_WRITES + 'spark.sql("DROP TABLE old_backup")\n')
+    verdict = notebook_transaction_boundary(_nb_ctx(code))
+    assert verdict.score == 0
+    assert "Notebook 'nb'" in verdict.evidence
 
 
 def test_individually_atomic_writes_without_a_boundary_are_partial():
@@ -1273,6 +1350,71 @@ def test_transaction_boundary_is_na_without_notebook_definitions():
     ctx = CheckContext(workspace=workspace, settings={}, obj_name="nb",
                        obj=_nb(_TWO_WRITES))
     assert notebook_transaction_boundary(ctx).status is Status.NA
+
+
+# =============================================================================
+# Data Management & Quality · Data Prep — dimensional control precision
+# =============================================================================
+
+def test_generic_unknown_value_is_not_an_unknown_dimension_member():
+    code = ('df = df.fillna({"city": "Unknown"})\n'
+            'df.write.mode("overwrite").saveAsTable("silver.customer")\n')
+    assert nb_unknown_monitored(_nb_ctx(code)).status is Status.NA
+
+
+def test_unknown_dimension_member_without_monitoring_fails_with_location():
+    code = ('fact = fact.join(dim, "customer_id", "left")\n'
+            'fact = fact.withColumn("customer_key", '
+            'coalesce(col("customer_key"), lit(-1)))\n')
+    verdict = nb_unknown_monitored(_nb_ctx(code))
+    assert verdict.score == 0
+    assert "Notebook 'nb'" in verdict.evidence
+    assert "coalesce" in verdict.evidence
+
+
+def test_unknown_dimension_member_with_monitoring_passes():
+    code = ('fact = fact.join(dim, "customer_id", "left")\n'
+            'fact = fact.withColumn("customer_key", '
+            'coalesce(col("customer_key"), lit(-1)))\n'
+            'unknown_count = fact.filter(col("customer_key") == -1).count()\n')
+    verdict = nb_unknown_monitored(_nb_ctx(code))
+    assert verdict.score == 3
+    assert "unknown_count" in verdict.evidence
+
+
+def test_layer_names_in_comments_do_not_create_reconciliation_scope():
+    code = ('# Read from Silver before writing Gold\n'
+            'df.write.mode("overwrite").saveAsTable("gold.fact_sales")\n')
+    assert nb_layer_recon(_nb_ctx(code)).status is Status.NA
+
+
+def test_executable_silver_to_gold_without_reconciliation_fails():
+    code = ('df = spark.read.table("silver.fact_sales")\n'
+            'df.write.mode("overwrite").saveAsTable("gold.fact_sales")\n')
+    verdict = nb_layer_recon(_nb_ctx(code))
+    assert verdict.score == 0
+    assert "Notebook 'nb'" in verdict.evidence
+
+
+def test_dimension_only_write_is_outside_fact_grain_check():
+    code = ('# Tiny city dimension\n'
+            'df.write.mode("overwrite").saveAsTable("gold.dim_city")\n')
+    assert nb_grain_unique(_nb_ctx(code)).status is Status.NA
+
+
+def test_reading_fact_but_writing_dimension_is_outside_fact_grain_check():
+    code = ('source = spark.read.table("silver.fact_sales")\n'
+            'dim.write.mode("overwrite").saveAsTable("gold.dim_city")\n')
+    assert nb_grain_unique(_nb_ctx(code)).status is Status.NA
+
+
+def test_fact_write_with_duplicate_guard_has_detailed_pass_evidence():
+    code = ('fact_sales = source.dropDuplicates(["sale_id"])\n'
+            'fact_sales.write.mode("overwrite").saveAsTable("gold.fact_sales")\n')
+    verdict = nb_grain_unique(_nb_ctx(code))
+    assert verdict.score == 3
+    assert "Notebook 'nb'" in verdict.evidence
+    assert "dropDuplicates" in verdict.evidence
 
 
 # =============================================================================

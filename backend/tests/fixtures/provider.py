@@ -61,6 +61,7 @@ class RecordedProvider:
             semantic_models=dict(raw.get("semanticModels") or {}),
             reports=list(raw.get("reports") or []),
             lakehouse_files=dict(raw.get("lakehouseFiles") or {}),
+            activators=dict(raw.get("activators") or {}),
         )
 
     def list_workspaces(self) -> list[dict]:

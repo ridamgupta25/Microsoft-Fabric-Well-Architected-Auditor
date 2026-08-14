@@ -75,54 +75,115 @@ def rls_on_semantic_models(ctx: CheckContext) -> list[Verdict]:
     Returns the scored workspace verdict followed by one unscored detail row per
     object without RLS, so the report names *which* ones fail, not just how many.
     """
-    if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
-        return [not_applicable("Semantic model definitions could not be read from Fabric")]
-    models = ctx.workspace.semantic_models
-    warehouses = [i.display_name for i in ctx.workspace.items if i.type == "Warehouse"]
+    models_available = ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS)
+    items_available = ctx.workspace.has(Resource.ITEMS)
+    security_available = ctx.workspace.has(Resource.WAREHOUSE_SECURITY)
+    models = ctx.workspace.semantic_models if models_available else {}
+    warehouses = (
+        [i.display_name for i in ctx.workspace.items if i.type == "Warehouse"]
+        if items_available else []
+    )
     if not models and not warehouses:
+        unavailable = []
+        if not models_available:
+            unavailable.append("semantic model definitions")
+        if not items_available:
+            unavailable.append("workspace item inventory")
+        if unavailable:
+            return [not_applicable(
+                f"RLS could not be assessed because {', '.join(unavailable)} could not "
+                "be read from Fabric"
+            )]
         return [not_applicable("No semantic models or Warehouses in this workspace")]
 
-    protected: list[str] = []
-    failing: list[tuple[str, str]] = []
-    for name, defn in models.items():
+    protected_models: list[str] = []
+    failing_models: list[tuple[str, str]] = []
+    for name, defn in sorted(models.items()):
         filtering, defined = rls_roles(defn)
         if filtering:
-            protected.append(name)
+            protected_models.append(name)
         elif defined:
-            failing.append((name, f"Defines {defined} role(s) but none carries a filter expression"))
+            failing_models.append((name, f"Defines {defined} role(s) but none carries a filter expression"))
         else:
-            failing.append((name, "Defines no RLS role"))
+            failing_models.append((name, "Defines no RLS role"))
 
     # Warehouses: assessed only when the SQL analytics endpoint answered.
     security = ctx.workspace.warehouse_security or {}
-    assessed_warehouses = 0
-    for warehouse in warehouses:
-        policies = security.get(warehouse)
+    protected_warehouses: list[str] = []
+    failing_warehouses: list[tuple[str, str]] = []
+    unread_warehouses: list[str] = []
+    for warehouse in sorted(warehouses):
+        policies = security.get(warehouse) if security_available else None
         if policies is None:
-            continue                      # unreadable - excluded, not failed
-        assessed_warehouses += 1
+            unread_warehouses.append(warehouse)
+            continue
         if any(p.get("enabled") for p in policies):
-            protected.append(warehouse)
+            protected_warehouses.append(warehouse)
         else:
-            failing.append((warehouse, "Warehouse defines no enabled security policy"))
+            failing_warehouses.append((warehouse, "Defines no enabled security policy"))
 
+    assessed_warehouses = len(protected_warehouses) + len(failing_warehouses)
     total = len(models) + assessed_warehouses
     if not total:
         return [not_applicable(
             "No semantic models, and Warehouse security policies could not be read "
             "from the SQL analytics endpoint"
         )]
-    unread = len(warehouses) - assessed_warehouses
-    caveat = (f"; {unread} Warehouse(s) were not assessed - the SQL analytics "
-              f"endpoint could not be read") if unread else ""
-    scope_note = (f"{len(models)} semantic model(s) and {assessed_warehouses} Warehouse(s)"
-                  if assessed_warehouses else f"{len(models)} semantic model(s)")
+
+    def names(values: list[str]) -> str:
+        return ", ".join(values) if values else "none"
+
+    def issues(values: list[tuple[str, str]]) -> str:
+        return "; ".join(f"{name}: {reason}" for name, reason in values) if values else "none"
+
+    protected = len(protected_models) + len(protected_warehouses)
+    not_protected = len(failing_models) + len(failing_warehouses)
+    evidence = (
+        f"Checked {total} objects: {len(models)} semantic model(s) and "
+        f"{assessed_warehouses} Warehouse(s). RLS is enabled on {protected} object(s) "
+        f"and not enabled on {not_protected} object(s). "
+        f"RLS ENABLED - Semantic models: {names(protected_models)}. "
+        f"RLS ENABLED - Warehouses: {names(protected_warehouses)}. "
+        f"RLS NOT ENABLED - Semantic models: {issues(failing_models)}. "
+        f"RLS NOT ENABLED - Warehouses: {issues(failing_warehouses)}. "
+        f"NOT ASSESSED - Warehouses: {names(unread_warehouses)}. "
+        f"NOT ASSESSED - Semantic model inventory: "
+        f"{'none' if models_available else 'definitions unavailable'}. "
+        f"NOT ASSESSED - Warehouse inventory: "
+        f"{'none' if items_available else 'workspace items unavailable'}. "
+        "A semantic model is marked enabled when at least one defined role contains a "
+        "row-filter expression. A Warehouse is marked enabled when it has an enabled "
+        "SQL security policy. Reports are not listed separately because they inherit "
+        "RLS from their backing semantic model or Warehouse."
+    )
     verdicts = [covered(
-        len(protected), total,
-        f"{len(protected)} of {total} objects define row-level security "
-        f"({scope_note}){caveat}",
+        protected, total, evidence,
     )]
-    verdicts += [note(reason, obj=name) for name, reason in sorted(failing)]
+    verdicts += [
+        note(reason, obj=f"Semantic model: {name}")
+        for name, reason in failing_models
+    ]
+    verdicts += [
+        note(reason, obj=f"Warehouse: {name}")
+        for name, reason in failing_warehouses
+    ]
+    verdicts += [
+        not_applicable(
+            "Security policies could not be read from the SQL analytics endpoint",
+            obj=f"Warehouse: {name}",
+        )
+        for name in unread_warehouses
+    ]
+    if not models_available:
+        verdicts.append(not_applicable(
+            "Semantic model definitions could not be read from Fabric",
+            obj="Semantic model inventory",
+        ))
+    if not items_available:
+        verdicts.append(not_applicable(
+            "Workspace items could not be read, so Warehouses could not be enumerated",
+            obj="Warehouse inventory",
+        ))
     return verdicts
 
 

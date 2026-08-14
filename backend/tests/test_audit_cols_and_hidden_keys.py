@@ -67,6 +67,7 @@ def test_platform_tables_are_excluded_from_the_audit_column_population():
     "frequently_run_queries",
     "long_running_queries",
     "managed_delta_tables",
+    "external_delta_tables",
     "sql_pool_insights",
 ])
 def test_queryinsights_views_are_platform_tables(name):
