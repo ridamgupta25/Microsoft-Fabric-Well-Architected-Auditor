@@ -49,7 +49,12 @@ def rls_on_reporting_models(ctx: CheckContext) -> list[Verdict]:
         complete, len(models),
         f"{complete} of {len(models)} semantic models filter on every role they define{gap}",
     )]
-    verdicts += [note(reason, obj=name) for name, reason in sorted(failing)]
+    # A model defining no RLS role at all is reported as N/A, not an Info detail.
+    for name, reason in sorted(failing):
+        if reason == "Defines no RLS role":
+            verdicts.append(not_applicable(reason, obj=name))
+        else:
+            verdicts.append(note(reason, obj=name))
     return verdicts
 
 

@@ -5,7 +5,7 @@ import re
 
 from auditfast.core.check._semantic import hidden_columns, rls_roles
 from auditfast.core.check._tables import TABLE_LAYERS, columns, in_warehouse
-from auditfast.core.check.helpers import Verdict, covered, not_applicable, note
+from auditfast.core.check.helpers import Verdict, binary, covered, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
@@ -193,12 +193,12 @@ def rls_on_semantic_models(ctx: CheckContext) -> list[Verdict]:
     layers=[Layer.STORAGE], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
 def ols_on_semantic_models(ctx: CheckContext) -> list[Verdict]:
-    """A column permission denies a column, so column-level security is in force.
+    """One PASS/FAIL per model: a column permission must deny at least one column.
 
     Which fields count as sensitive is a business classification, so this reports
-    whether the control exists — not whether it covers the right columns. The
-    scored workspace verdict is followed by one unscored detail row per model
-    applying no column-level security.
+    whether the control exists — not whether it covers the right columns. Each
+    model is reported as its own scored result: it passes when it denies at least
+    one column and fails when it denies none.
     """
     if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
         return [not_applicable("Semantic model definitions could not be read from Fabric")]
@@ -206,18 +206,21 @@ def ols_on_semantic_models(ctx: CheckContext) -> list[Verdict]:
     if not models:
         return [not_applicable("No semantic models in this workspace")]
 
-    restricted = [name for name, defn in models.items() if hidden_columns(defn)]
-    failing = [name for name in models if name not in set(restricted)]
-    verdicts = [covered(
-        len(restricted), len(models),
-        f"{len(restricted)} of {len(models)} semantic models deny at least one column "
-        f"through a column-level security permission; which fields need protecting is a "
-        f"business judgement this check does not make",
-    )]
-    verdicts += [
-        note("No column-level security permission denies any column", obj=name)
-        for name in sorted(failing)
-    ]
+    verdicts: list[Verdict] = []
+    for name, defn in sorted(models.items()):
+        if hidden_columns(defn):
+            verdicts.append(binary(
+                True,
+                "Denies at least one column through a column-level security permission; "
+                "which fields need protecting is a business judgement this check does not make",
+                obj=name,
+            ))
+        else:
+            verdicts.append(binary(
+                False,
+                "No column-level security permission denies any column",
+                obj=name,
+            ))
     return verdicts
 
 
