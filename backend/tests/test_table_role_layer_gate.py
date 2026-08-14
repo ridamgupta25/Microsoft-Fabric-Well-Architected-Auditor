@@ -14,7 +14,12 @@ dimensional check then graded a landing zone against star-schema rules.
 """
 from __future__ import annotations
 
-from auditfast.core.check._tables import dimensions_in, facts_in, table_role
+from auditfast.core.check._tables import (
+    dimensions_in,
+    facts_in,
+    table_role,
+    table_roles,
+)
 
 
 def _col(name: str, dtype: str = "varchar(50)") -> dict:
@@ -87,6 +92,42 @@ def test_facts_and_dimensions_exclude_raw_store_guesses():
     }
     assert list(facts_in(tables)) == ["curated_sales"]
     assert not dimensions_in(tables)
+
+
+def test_role_detection_stays_linear_on_a_large_estate():
+    """A real 1,845-table crawl must not take minutes to classify.
+
+    ``table_role`` originally rebuilt the foreign-key reverse index on every
+    call, making it O(n) per table, :func:`facts_in` O(n^2), and a check calling
+    ``facts_in`` inside a per-store loop O(n^3). On the largest estate available
+    that was billions of comparisons and the audit appeared to hang. The shared
+    index in :func:`table_roles` is what keeps this linear, so this test fails
+    loudly if anyone reintroduces the per-call rebuild.
+    """
+    import time
+
+    tables = {}
+    for n in range(2000):
+        tables[f"tbl_{n}"] = {
+            "columns": [_col(f"c{c}_KEY", "int") for c in range(3)]
+                       + [_col(f"m{c}", "decimal(18,2)") for c in range(3)],
+            "store": "LH_Gold",
+            "store_kind": "Lakehouse",
+            # A tenth of them declare a foreign key, so the index is real work.
+            "references": [f"tbl_{(n + 1) % 2000}"] if n % 10 == 0 else [],
+        }
+
+    start = time.perf_counter()
+    roles = table_roles(tables)
+    facts_in(tables)
+    dimensions_in(tables)
+    elapsed = time.perf_counter() - start
+
+    assert len(roles) == 2000
+    assert elapsed < 5.0, (
+        f"classifying 2000 tables took {elapsed:.1f}s - the foreign-key index is "
+        f"being rebuilt per table again"
+    )
 
 
 def test_a_very_wide_table_is_never_a_fact():
