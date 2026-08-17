@@ -80,6 +80,11 @@ _RECORD_ERROR = re.compile(
     r"failed[_ -]?records?|_corrupt|_rejected|_quarantine",
     re.IGNORECASE,
 )
+_ERROR_ROUTE_NAME = re.compile(
+    r"quarantin|reject|dead.?letter|bad.?record|invalid|"
+    r"(?:log|capture|write|route).*(?:fail|error)|(?:fail|error).*(?:log|capture|write|route)",
+    re.IGNORECASE,
+)
 _IDEMPOTENT_PATTERN = re.compile(
     r"\bmerge\b|\bupsert\b|overwrite|replace|delete[_ -]?then[_ -]?insert|"
     r"dedup|dropduplicates|drop_duplicates|idempotent|batch[_ -]?id|run[_ -]?id|"
@@ -337,29 +342,70 @@ def retry_values(ctx: CheckContext) -> Verdict:
     count does mean is a long tail of failure: the threshold below is a
     house opinion, not a platform limit, and is settable per project.
     """
-    with_retry = [a for a in activities(ctx.obj)
-                  if (a.get("policy") or {}).get("retry", 0) >= 1]
-    if not with_retry:
-        return not_applicable("No activity declares a retry policy")
-
     limit = ctx.setting("max_retry_count", _DEFAULT_MAX_RETRY)
     try:
         limit = int(limit)
     except (TypeError, ValueError):
         limit = _DEFAULT_MAX_RETRY
 
-    def sane(activity: dict) -> bool:
+    def positive_retry(activity: dict) -> bool:
         policy = activity.get("policy") or {}
-        count = policy.get("retry", 0)
-        interval = policy.get("retryIntervalInSeconds", 0)
-        return 1 <= count <= limit and bool(interval) and interval > 0
+        if "retry" not in policy:
+            return False
+        try:
+            return int(policy["retry"]) >= 1
+        except (TypeError, ValueError):
+            return True
 
-    good = [a for a in with_retry if sane(a)]
+    with_retry = [a for a in walk_activities(ctx.obj) if positive_retry(a)]
+    if not with_retry:
+        return not_applicable(
+            f"Pipeline '{ctx.obj_name}' has no activity with a positive retry count; "
+            f"whether activities should retry is assessed by PL-RETRY (ref 2.4.1)"
+        )
+
+    def issues(activity: dict) -> list[str]:
+        policy = activity.get("policy") or {}
+        raw_count = policy.get("retry")
+        raw_interval = policy.get("retryIntervalInSeconds")
+        problems = []
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            problems.append(f"invalid retry count {raw_count!r}")
+        else:
+            if count < 1:
+                problems.append(f"count {count} is not positive")
+            elif count > limit:
+                problems.append(f"count {count} exceeds maximum {limit}")
+        try:
+            interval = int(raw_interval)
+        except (TypeError, ValueError):
+            interval = 0
+        if interval <= 0:
+            problems.append("missing or non-positive interval")
+        return problems
+
+    assessed = [(activity, issues(activity)) for activity in with_retry]
+    good = [activity for activity, problems in assessed if not problems]
+    invalid = [
+        f"{activity.get('name', '?')}: {', '.join(problems)}"
+        for activity, problems in assessed if problems
+    ]
+    if invalid:
+        return covered(
+            len(good), len(with_retry),
+            f"{len(good)} of {len(with_retry)} retrying activities use a bounded "
+            f"count (1-{limit}) and positive interval; invalid settings: "
+            f"{'; '.join(invalid)}",
+        )
+
+    names = ", ".join(sorted(a.get("name", "?") for a in good))
     return covered(
         len(good), len(with_retry),
-        f"{len(good)} of {len(with_retry)} retrying activities set a bounded count "
-        f"(1-{limit}) and a positive interval. Fabric allows 1-1000 and has no "
-        f"infinite option, so the upper bound here is a project convention",
+        f"All {len(good)} retrying activities set a bounded count (1-{limit}) and "
+        f"positive interval: {names}. Fabric allows 1-1000 and has no infinite "
+        f"option; the upper bound is the project convention",
     )
 
 
@@ -439,37 +485,94 @@ def notebook_idempotent(ctx: CheckContext) -> Verdict:
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def pl_deadletter(ctx: CheckContext) -> Verdict:
-    """Invalid records are routed to a retained dead-letter or quarantine output."""
+    """Invalid records are structurally routed to a retained error output."""
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
-    acts = activities(ctx.obj)
+    acts = walk_activities(ctx.obj)
     data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
     if not data_acts:
         return not_applicable("No data-movement activity to assess for failed records")
-    blob = json.dumps(ctx.obj)
-    if not _RECORD_ERROR.search(blob):
-        return not_applicable("No record-validation or error-routing pattern found")
-    ok = any(_RECORD_ERROR.search(json.dumps(a)) for a in acts)
+
+    def copy_redirect(activity: dict) -> bool:
+        if (activity.get("type") or "") != "Copy":
+            return False
+        properties = activity.get("typeProperties") or {}
+        redirected_rows = (
+            properties.get("enableSkipIncompatibleRow") is True
+            and bool(properties.get("redirectIncompatibleRowSettings"))
+        )
+        logged_or_skipped_file = any(bool(properties.get(key)) for key in COPY_LOG_KEYS)
+        logged_or_skipped_file |= bool(properties.get("skipErrorFile"))
+        return redirected_rows or logged_or_skipped_file
+
+    def explicit_error_sink(activity: dict) -> bool:
+        if _ERROR_ROUTE_NAME.search(str(activity.get("name") or "")):
+            return True
+        properties = activity.get("typeProperties") or {}
+        sink = properties.get("sink") or {}
+        outputs = activity.get("outputs") or []
+        targets = [sink, *outputs]
+        return any(_ERROR_ROUTE_NAME.search(json.dumps(target)) for target in targets)
+
+    redirected = [a for a in acts if copy_redirect(a)]
+    if redirected:
+        names = ", ".join(str(a.get("name") or "?") for a in redirected)
+        return binary(True, f"Copy activity redirects incompatible rows or logs/skips error files: {names}")
+
+    failed_routes = [
+        activity for activity in acts
+        if any(
+            "Failed" in (dependency.get("dependencyConditions") or [])
+            for dependency in (activity.get("dependsOn") or [])
+        ) and explicit_error_sink(activity)
+    ]
+    if failed_routes:
+        names = ", ".join(str(a.get("name") or "?") for a in failed_routes)
+        return binary(True, f"Failed dependency routes to an explicit logging/quarantine activity: {names}")
+
+    sinks = [a for a in acts if explicit_error_sink(a)]
+    if sinks:
+        names = ", ".join(str(a.get("name") or "?") for a in sinks)
+        return binary(True, f"Explicit reject/quarantine sink activity found: {names}")
+
+    if not _RECORD_ERROR.search(json.dumps(ctx.obj)):
+        return not_applicable(
+            f"Pipeline '{ctx.obj_name}' has no failed-record validation or routing signal to assess"
+        )
+
     return binary(
-        ok,
-        "Failed/invalid records have an explicit error or quarantine route" if ok
-        else "Record errors are mentioned but no activity-level quarantine route was found",
+        False,
+        f"Pipeline '{ctx.obj_name}' moves data but has no structural failed-record route "
+        "(no incompatible-row redirect/logging, Failed dependency quarantine path, or "
+        "explicit reject sink); error/reject words in column mappings do not count",
     )
 
 
-#: A *genuine* dead-letter sink names its target, so keyword co-occurrence alone
-#: can no longer score a pass. Three real forms — a PySpark write to an
-#: error-named literal target (``saveAsTable``/``insertInto``/``.save``), a SQL
-#: ``INSERT``/``INSERT OVERWRITE`` into an error-named table, and an error-named
-#: DataFrame being written (``rejected_df.write``, ``exclusions_df.write``).
+#: A *genuine* dead-letter route is evidenced by either the DataFrame being
+#: written (``rejected_df.write``) or the literal sink receiving it
+#: (``saveAsTable("dq.quarantine")`` / SQL ``INSERT INTO dq.quarantine``).
 _ERR_SINK = (
     r"(?:reject|invalid|quarantin|dead[_ -]?letter|error|bad[_ -]?rec|"
     r"fail(?:ed|ure)|corrupt|discard|exclus|violation|exception)"
 )
-_ERR_TABLE_WRITE = re.compile(
-    r"""(?:saveastable|insertinto|\.save)\s*\(\s*[fr]?["'`][^"'`)]*""" + _ERR_SINK + r"|"
-    r"""insert\s+(?:into|overwrite)\s+(?:table\s+)?[\w.`"']*""" + _ERR_SINK + r"|"
-    r"\b\w*" + _ERR_SINK + r"\w*\.\s*write\b",
+_DATAFRAME_WRITE = re.compile(
+    r"\b(?P<dataframe>[A-Za-z_]\w*)\s*\.\s*write\b",
+    re.IGNORECASE,
+)
+_DATAFRAME_ASSIGNMENT = re.compile(
+    r"(?m)^\s*(?P<dataframe>[A-Za-z_]\w*)\s*=",
+)
+_FAILED_ROW_OPERATION = re.compile(
+    r"(?:filter|where)\s*\([^)]{0,240}(?:is_valid\s*(?:=|==)\s*false|"
+    + _ERR_SINK + r")|"
+    r"dropmalformed|badrecordspath|columnnameofcorruptrecord",
+    re.IGNORECASE | re.DOTALL,
+)
+_ERROR_TARGET_WRITE = re.compile(
+    r"(?:saveastable|insertinto|\.save)\s*\(\s*[fr]?[\"'`]"
+    r"(?P<target>[^\"'`)]*" + _ERR_SINK + r"[^\"'`]*)[\"'`]"
+    r"|insert\s+(?:into|overwrite)\s+(?:table\s+)?"
+    r"(?P<sql_target>[\w.`\"']*" + _ERR_SINK + r"[\w.`\"']*)",
     re.IGNORECASE,
 )
 #: Any persist — a table write, insert, or file write. Distinguishes "wrote the
@@ -515,12 +618,24 @@ def nb_deadletter(ctx: CheckContext) -> Verdict:
     # string literals are kept so a table name or embedded SQL still counts.
     code = strip_sql_comments(executable_code(ctx.obj))
 
-    hit = _ERR_TABLE_WRITE.search(code)
-    if hit:
+    dataframe_writes = [match.group("dataframe") for match in _DATAFRAME_WRITE.finditer(code)]
+    error_dataframe_writes = [
+        name for name in dataframe_writes if re.search(_ERR_SINK, name, re.IGNORECASE)
+    ]
+    target_hit = _ERROR_TARGET_WRITE.search(code)
+    if error_dataframe_writes or target_hit:
+        evidence_parts: list[str] = []
+        if error_dataframe_writes:
+            evidence_parts.append(
+                "failed-record DataFrame(s) written: "
+                + ", ".join(sorted(set(error_dataframe_writes)))
+            )
+        if target_hit:
+            target = target_hit.group("target") or target_hit.group("sql_target") or "?"
+            evidence_parts.append(f"error/quarantine sink written: {target}")
         return binary(
             True,
-            "Executable code writes failed/invalid records to a distinctly-named "
-            f"error / quarantine / reject sink (matched: {hit.group(0).strip()[:80]})",
+            "Executable code retains failed/invalid records — " + "; ".join(evidence_parts),
         )
 
     if not _RECORD_ERROR.search(code):
@@ -532,6 +647,32 @@ def nb_deadletter(ctx: CheckContext) -> Verdict:
             "quarantine / reject table (saveAsTable / INSERT INTO an error-named target) in "
             "the uncommented code and SQL queries but found none — the quarantine pattern "
             "is documented but not implemented",
+        )
+
+    assigned_error_dataframes = sorted({
+        match.group("dataframe")
+        for match in _DATAFRAME_ASSIGNMENT.finditer(code)
+        if re.search(_ERR_SINK, match.group("dataframe"), re.IGNORECASE)
+    })
+    if not (
+        assigned_error_dataframes
+        or error_dataframe_writes
+        or target_hit
+        or _FAILED_ROW_OPERATION.search(code)
+    ):
+        return not_applicable(
+            "Notebook mentions error/reject vocabulary only in table schemas, column "
+            "names, or ordinary data writes; no structural failed-record detection or "
+            "routing operation was found"
+        )
+
+    abandoned = sorted(set(assigned_error_dataframes) - set(dataframe_writes))
+    if abandoned:
+        return binary(
+            False,
+            "Executable code creates failed/rejected DataFrame(s) that are not written: "
+            f"{', '.join(abandoned)}. Writes of clean/main DataFrames do not "
+            "prove that dropped records were retained",
         )
 
     if _ANY_WRITE.search(code):

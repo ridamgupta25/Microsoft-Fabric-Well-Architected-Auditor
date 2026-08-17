@@ -206,6 +206,44 @@ def test_no_columns_at_all_is_na():
     assert verdict.status is Status.NA
 
 
+def test_warehouse_columns_retain_schema_qualified_table_keys(monkeypatch):
+    reader = SqlEndpointReader("token")
+    endpoint = SqlEndpoint("Warehouse", "Mart", "host")
+    rows = [
+        ("sales", "orders", "order_id", "bigint", None, 19, 0, "NO", 1, 0),
+        ("stg", "orders", "order_id", "bigint", None, 19, 0, "YES", 1, 0),
+        ("sys", "catalog", "name", "varchar", 128, None, None, "YES", 1, 0),
+    ]
+    monkeypatch.setattr(reader, "_query", lambda _endpoint, _sql: rows)
+
+    tables = reader.columns(endpoint)
+
+    assert tables is not None
+    assert set(tables) == {"sales.orders", "stg.orders", "sys.catalog"}
+    assert tables["sales.orders"][0]["name"] == "order_id"
+
+
+def test_lakehouse_columns_keep_bare_keys_for_rest_inventory_merge(monkeypatch):
+    reader = SqlEndpointReader("token")
+    endpoint = SqlEndpoint("Lakehouse", "Bronze", "host")
+    rows = [("dbo", "orders", "order_id", "bigint", None, 19, 0, "NO", 1, 0)]
+    monkeypatch.setattr(reader, "_query", lambda _endpoint, _sql: rows)
+
+    assert set(reader.columns(endpoint) or {}) == {"orders"}
+
+
+def test_plain_column_query_fallback_also_retains_warehouse_schema(monkeypatch):
+    reader = SqlEndpointReader("token")
+    endpoint = SqlEndpoint("Warehouse", "Mart", "host")
+    calls = iter([
+        None,
+        [("finance", "accounts", "account_id", "bigint", None, 19, 0, "NO", 1, 0)],
+    ])
+    monkeypatch.setattr(reader, "_query", lambda _endpoint, _sql: next(calls))
+
+    assert set(reader.columns(endpoint) or {}) == {"finance.accounts"}
+
+
 # --- WorkspaceContext round trip ---------------------------------------------
 
 def test_warehouse_security_survives_the_kb_cache():
