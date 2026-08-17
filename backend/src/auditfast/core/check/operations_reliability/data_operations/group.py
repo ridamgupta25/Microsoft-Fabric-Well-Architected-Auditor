@@ -8,11 +8,13 @@ when the data needed to compare is missing.
 """
 from __future__ import annotations
 
+import json
+
 from auditfast.core.check import _xw
 from auditfast.core.check.helpers import Verdict, covered, not_applicable
 from auditfast.core.check.registry import group_check
 from auditfast.core.enums import Pillar, Resource, Severity
-from auditfast.core.models import GroupContext, GroupMemberContext
+from auditfast.core.models import GroupContext, GroupMemberContext, WorkspaceContext
 
 
 def _table_signatures(member: GroupMemberContext) -> dict[str, frozenset[tuple[str, str]]] | None:
@@ -101,7 +103,7 @@ def schema_drift(ctx: GroupContext) -> Verdict:
 
 @group_check(
     id="XW-MEDALLION-CONSIST", ref="1.1.5",
-    title="Medallion architecture properly implemented (Bronze Lakehouse -> Silver Lakehouse -> Gold Warehouse) with clear layer boundaries",
+    title="Medallion architecture (Bronze -> Silver -> Gold) implemented consistently across environments",
     pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, requires=[Resource.ITEMS],
     required=False,
 )
@@ -124,7 +126,7 @@ def medallion_consistent(ctx: GroupContext) -> Verdict:
 
 @group_check(
     id="XW-PIPELINE-SLA", ref="9.4.2",
-    title="Pipeline completion SLAs set and monitored",
+    title="Pipeline completion SLAs are monitored consistently across environments",
     pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM,
     requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=False,
 )
@@ -147,7 +149,7 @@ def pipeline_sla_monitored(ctx: GroupContext) -> Verdict:
 
 @group_check(
     id="XW-SLA-ALERTS", ref="9.4.3",
-    title="SLA breach triggers alerts (Data Activator, email, Teams)",
+    title="SLA breaches trigger alerts (Data Activator) consistently across environments",
     pillar=Pillar.OPERATIONS, severity=Severity.HIGH,
     requires=[Resource.ACTIVATOR_DEFINITIONS], required=False,
 )
@@ -170,7 +172,7 @@ def sla_alerts_consistent(ctx: GroupContext) -> Verdict:
 
 @group_check(
     id="XW-SLA-HISTORY", ref="9.4.4",
-    title="Historical SLA compliance tracked and reported",
+    title="Historical SLA compliance is tracked consistently across environments",
     pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM,
     requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=False,
 )
@@ -192,7 +194,7 @@ def sla_history_consistent(ctx: GroupContext) -> Verdict:
 
 @group_check(
     id="XW-TIER-SEP", ref="11.3.1",
-    title="Separate workspaces for Dev, QA, and Production per layer (9 total)",
+    title="Each environment in the group declares a distinct Dev/QA/Prod tier",
     pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM,
     requires=[Resource.WORKSPACE], required=False,
 )
@@ -214,7 +216,7 @@ def tier_separation(ctx: GroupContext) -> Verdict:
 
 @group_check(
     id="XW-MEDALLION-DRIFT", ref="11.4.3",
-    title="Schema drift between environments is detectable and reconciled",
+    title="Medallion tiers are present in every environment (no tier drift)",
     pillar=Pillar.OPERATIONS, severity=Severity.HIGH, requires=[Resource.ITEMS],
     required=False,
 )
@@ -231,4 +233,101 @@ def medallion_no_drift(ctx: GroupContext) -> Verdict:
         signature=_xw.medallion_tiers,
         practice="carries every medallion tier the group declares",
         data_name="medallion tiers",
+    )
+
+
+#: Resources scanned for a cross-environment workspace reference.
+_ISOLATION_RESOURCES = (
+    Resource.PIPELINE_DEFINITIONS,
+    Resource.NOTEBOOK_DEFINITIONS,
+    Resource.SHORTCUTS,
+)
+
+
+def _inspectable(ws: WorkspaceContext) -> bool:
+    """True when the member has an id and at least one scannable definition set."""
+    return bool(ws.id) and any(ws.has(r) for r in _ISOLATION_RESOURCES)
+
+
+def _reference_blob(ws: WorkspaceContext) -> str:
+    """The member's pipeline/notebook/shortcut definitions as one lower-cased string.
+
+    Workspace references inside a definition are GUIDs, so a single-workspace
+    crawl cannot tell whose workspace they point at. In a group we hold every
+    member's id, so a substring match resolves the reference — the exact gap the
+    per-workspace ``WS-ENV-ISOLATION`` check documents it cannot close.
+    """
+    parts: list[str] = []
+    if ws.has(Resource.PIPELINE_DEFINITIONS):
+        parts.append(json.dumps(ws.pipelines))
+    if ws.has(Resource.NOTEBOOK_DEFINITIONS):
+        parts.append(json.dumps(ws.notebooks))
+    if ws.has(Resource.SHORTCUTS):
+        parts.append(json.dumps(ws.shortcuts))
+    return " ".join(parts).lower()
+
+
+@group_check(
+    id="XW-ENV-ISOLATION", ref="1.1.3",
+    title="Environment isolation: no environment's artifacts depend on another "
+          "environment's workspace (cross-env dependency)",
+    pillar=Pillar.OPERATIONS, severity=Severity.HIGH,
+    requires=[
+        Resource.WORKSPACE, Resource.PIPELINE_DEFINITIONS,
+        Resource.NOTEBOOK_DEFINITIONS, Resource.SHORTCUTS,
+    ],
+    required=False,
+)
+def environment_isolation_consistent(ctx: GroupContext) -> Verdict:
+    """No environment's definitions reference another group member's workspace id.
+
+    Where ``WS-ENV-ISOLATION`` can only match environment *names* in one
+    workspace's pipelines, this compares across the group: it searches each
+    member's pipeline, notebook and shortcut definitions for the workspace GUID
+    of any *other* member. A Prod artifact that points at the Dev workspace (or
+    vice versa) is a cross-environment dependency — promotion changes behaviour
+    and a lower environment can move higher-environment data. N/A when fewer than
+    two members have inspectable definitions.
+    """
+    members = [m for m in ctx.members if _inspectable(m.workspace)]
+    if len(members) < 2:
+        return not_applicable(
+            "fewer than two environments in this group had readable pipeline, "
+            "notebook or shortcut definitions to compare for cross-environment "
+            "dependencies"
+        )
+
+    id_to_label = {
+        m.workspace.id.lower(): _xw.env_label(m) for m in members
+    }
+    blobs = {m.workspace.id.lower(): _reference_blob(m.workspace) for m in members}
+
+    offenders: dict[str, list[str]] = {}
+    for member in members:
+        own_id = member.workspace.id.lower()
+        blob = blobs[own_id]
+        referenced = sorted(
+            id_to_label[other_id]
+            for other_id in id_to_label
+            if other_id != own_id and other_id in blob
+        )
+        if referenced:
+            offenders[_xw.env_label(member)] = referenced
+
+    total = len(members)
+    if not offenders:
+        return covered(
+            total, total,
+            f"all {total} environment(s) are isolated: no member's pipelines, "
+            f"notebooks or shortcuts reference another environment's workspace",
+        )
+
+    detail = "; ".join(
+        f"{label} depends on {', '.join(refs)}"
+        for label, refs in sorted(offenders.items())[:3]
+    )
+    return covered(
+        total - len(offenders), total,
+        f"{len(offenders)} of {total} environment(s) have a cross-environment "
+        f"dependency: {detail}",
     )
