@@ -860,6 +860,19 @@ def _is_scratch_table(name: str, table: dict) -> bool:
     cols = [str(c.get("name") or "") for c in columns(table)]
     return bool(cols) and all(_UNNAMED_COLUMN.match(c) for c in cols)
 
+def _models(ctx: CheckContext) -> dict[str, dict]:
+    """Semantic models to resolve declared table roles from, when readable.
+
+    Passed to :func:`facts_in` / :func:`dimensions_in` so a role the modeller
+    *declared* through a relationship outranks one inferred from column shape.
+    Empty when the definitions were not read - the classifier then falls back to
+    its own evidence exactly as before.
+    """
+    if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
+        return {}
+    return ctx.workspace.semantic_models or {}
+
+
 def _table_stores(ctx: CheckContext) -> str:
     """Name the lakehouse/warehouse(s) whose tables a workspace check inspected.
 
@@ -913,8 +926,8 @@ def table_star_schema(ctx: CheckContext) -> Verdict:
     if not tables:
         return not_applicable(_NO_TABLES)
     stores = _table_stores(ctx)
-    facts = facts_in(tables)
-    dims = dimensions_in(tables)
+    facts = facts_in(tables, _models(ctx))
+    dims = dimensions_in(tables, _models(ctx))
 
     if facts and dims:
         return binary(
@@ -1052,7 +1065,8 @@ def table_surrogate_generated(ctx: CheckContext) -> Verdict:
     """
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
-    dims = {n: t for n, t in dimensions_in(ctx.workspace.tables).items() if columns(t)}
+    dims = {n: t for n, t in dimensions_in(ctx.workspace.tables, _models(ctx)).items()
+            if columns(t)}
     if not dims:
         return not_applicable(_NO_DIMS)
 
@@ -1101,7 +1115,7 @@ def table_relationships_declared(ctx: CheckContext) -> Verdict:
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
 
-    facts = list(facts_in(ctx.workspace.tables))
+    facts = list(facts_in(ctx.workspace.tables, _models(ctx)))
     if not facts:
         return not_applicable("No fact-like tables found to assess for declared FK relationships")
 
@@ -1284,7 +1298,8 @@ def table_surrogate_keys(ctx: CheckContext) -> Verdict:
     """
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
-    dims = {n: t for n, t in dimensions_in(ctx.workspace.tables).items() if columns(t)}
+    dims = {n: t for n, t in dimensions_in(ctx.workspace.tables, _models(ctx)).items()
+            if columns(t)}
     if not dims:
         return not_applicable(_NO_DIMS)
 
@@ -1660,7 +1675,8 @@ def table_scd2(ctx: CheckContext) -> Verdict:
     """
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
-    dims = {n: t for n, t in dimensions_in(ctx.workspace.tables).items() if columns(t)}
+    dims = {n: t for n, t in dimensions_in(ctx.workspace.tables, _models(ctx)).items()
+            if columns(t)}
     if not dims:
         # Distinguish "no columns to look at" from "columns read, no SCD2 here":
         # the reason string is the whole value of an N/A.
@@ -1766,7 +1782,7 @@ def warehouse_is_modeled(ctx: CheckContext) -> Verdict:
         return not_applicable(_NO_STORE)
 
     modeled, detail = [], []
-    roles = table_roles(tables)
+    roles = table_roles(tables, _models(ctx))
     for store, store_tables in sorted(by_store.items()):
         facts = [n for n in store_tables if roles.get(n) == "fact"]
         dims = [n for n in store_tables if roles.get(n) == "dimension"]
@@ -1895,7 +1911,7 @@ def conformed_dimensions(ctx: CheckContext) -> Verdict:
 
     stores_by_purpose: dict[tuple[str, ...], set[str]] = {}
     judged = 0
-    roles = table_roles(tables)
+    roles = table_roles(tables, _models(ctx))
     for store, store_tables in by_store.items():
         for name in store_tables:
             if roles.get(name) != "dimension":
@@ -1952,7 +1968,7 @@ def fact_tables_have_no_descriptive_attributes(ctx: CheckContext) -> Verdict:
     tables = ctx.workspace.tables
     if not tables:
         return not_applicable(_NO_TABLES)
-    facts = {n: t for n, t in facts_in(tables).items()
+    facts = {n: t for n, t in facts_in(tables, _models(ctx)).items()
              if any(c.get("type") for c in columns(t))}
     if not facts:
         return not_applicable(
@@ -2006,7 +2022,7 @@ def dimensions_are_denormalized(ctx: CheckContext) -> Verdict:
     tables = ctx.workspace.tables
     if not tables:
         return not_applicable(_NO_TABLES)
-    dims = {n: t for n, t in dimensions_in(tables).items() if columns(t)}
+    dims = {n: t for n, t in dimensions_in(tables, _models(ctx)).items() if columns(t)}
     if not dims:
         return not_applicable(_NO_DIMS)
 
@@ -2090,7 +2106,7 @@ def scd_strategy_per_dimension(ctx: CheckContext) -> Verdict:
     tables = ctx.workspace.tables
     if not tables:
         return not_applicable(_NO_TABLES)
-    dims = {n: t for n, t in dimensions_in(tables).items() if columns(t)}
+    dims = {n: t for n, t in dimensions_in(tables, _models(ctx)).items() if columns(t)}
     if not dims:
         return not_applicable(_NO_DIMS)
 
@@ -2202,7 +2218,7 @@ def fact_grain_is_identifiable(ctx: CheckContext) -> Verdict:
     tables = ctx.workspace.tables
     if not tables:
         return not_applicable(_NO_TABLES)
-    facts = {n: t for n, t in facts_in(tables).items() if columns(t)}
+    facts = {n: t for n, t in facts_in(tables, _models(ctx)).items() if columns(t)}
     if not facts:
         return not_applicable(
             "No fact table with readable column metadata â€” there is no grain to read"
@@ -2280,7 +2296,7 @@ def degenerate_and_junk_dimension_candidates(ctx: CheckContext) -> Verdict:
     tables = ctx.workspace.tables
     if not tables:
         return not_applicable(_NO_TABLES)
-    facts = {n: t for n, t in facts_in(tables).items() if columns(t)}
+    facts = {n: t for n, t in facts_in(tables, _models(ctx)).items() if columns(t)}
     if not facts:
         return not_applicable(
             "No fact table with readable column metadata â€” no degenerate or junk "
@@ -2288,7 +2304,7 @@ def degenerate_and_junk_dimension_candidates(ctx: CheckContext) -> Verdict:
         )
 
     dimension_purposes = {
-        purpose_tokens(n) for n in dimensions_in(tables) if purpose_tokens(n)
+        purpose_tokens(n) for n in dimensions_in(tables, _models(ctx)) if purpose_tokens(n)
     }
 
     degenerate: list[str] = []

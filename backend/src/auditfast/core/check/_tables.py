@@ -466,17 +466,124 @@ def _referenced_names(tables: dict[str, dict] | None) -> frozenset[str]:
     return frozenset(out)
 
 
-def table_roles(tables: dict[str, dict]) -> dict[str, str]:
+#: Table names normalised for cross-source matching. A semantic model names a
+#: table as the modeller typed it ("Sales Order"), the SQL endpoint as the store
+#: holds it ("sales_order", or "dbo.sales_order"), so the two only meet once
+#: separators and the schema prefix are normalised away.
+def normalise_table_name(name: str) -> str:
+    """A table name reduced to a form comparable across sources."""
+    text = (name or "").strip().lower()
+    text = text.split(".")[-1]                      # drop a schema/db prefix
+    return re.sub(r"[\s\-_]+", "", text)
+
+
+#: ``dataCategory`` values that name a table as descriptive reference data.
+#: From the TMSL table object: 1-TIME, 6-ACCOUNTS, 7-CUSTOMERS, 8-PRODUCTS,
+#: 15-ORGANIZATION, 17-GEOGRAPHY. Power BI sets "Time" automatically when a
+#: table is marked as the date table, which makes it the one commonly present.
+_DIMENSION_DATA_CATEGORIES: frozenset[str] = frozenset({
+    "time", "accounts", "customers", "products", "organization", "geography",
+    "scenario", "quantitative", "utility", "channel", "promotion",
+})
+
+
+def declared_roles(
+    tables: dict[str, dict] | None,
+    semantic_models: dict[str, dict] | None,
+) -> dict[str, str]:
+    """``{normalised table name: role}`` from what the estate *declares*.
+
+    **Why this outranks every inference.** Microsoft's star-schema guidance is
+    explicit that no property marks a table as a fact or a dimension - *"It's in
+    fact determined by the model relationships"* - and that in a one-to-many
+    relationship *"the 'one' side is always a dimension table while the 'many'
+    side is always a fact table"*
+    (``learn.microsoft.com/power-bi/guidance/star-schema``). A semantic-model
+    relationship is therefore not a hint about the role: it *is* the role, stated
+    by whoever built the model.
+
+    Two declarative sources are read, and a table named by both must agree:
+
+    * **Relationship cardinality.** ``from_table`` is the many side (fact),
+      ``to_table`` the one side (dimension). Power BI's auto date/time tables are
+      already dropped by the TMSL parser, so they cannot pollute this.
+    * **``dataCategory``.** "Time", "Customers", "Products", "Geography" and
+      friends are a modeller stating that a table is reference data.
+
+    **A table appearing on both sides is left out.** A dimension that is itself a
+    fact's target *and* references another dimension (a snowflake outrigger) is
+    genuinely both, and guessing between them would be worse than saying nothing:
+    it is excluded so the caller falls back to other evidence rather than
+    inheriting a coin flip.
+
+    Returns an empty mapping when no model is readable - which is the normal case
+    for a Bronze/landing workspace, and the caller must treat it as "no
+    declarative evidence", never as "no dimensional model exists".
+    """
+    if not tables or not semantic_models:
+        return {}
+
+    known = {normalise_table_name(name) for name in tables}
+    fact_side: set[str] = set()
+    dimension_side: set[str] = set()
+    categorised: dict[str, str] = {}
+
+    for model in semantic_models.values():
+        if not isinstance(model, dict):
+            continue
+        for rel in model.get("relationships") or []:
+            if not isinstance(rel, dict):
+                continue
+            # An inactive relationship is still a declared structural link; it is
+            # inactive for filter propagation, not untrue.
+            many = normalise_table_name(str(rel.get("from_table") or rel.get("fromTable") or ""))
+            one = normalise_table_name(str(rel.get("to_table") or rel.get("toTable") or ""))
+            if many and many in known:
+                fact_side.add(many)
+            if one and one in known:
+                dimension_side.add(one)
+
+        for table_name, category in (model.get("data_categories") or {}).items():
+            key = normalise_table_name(str(table_name))
+            if key in known and str(category).strip().lower() in _DIMENSION_DATA_CATEGORIES:
+                categorised[key] = "dimension"
+
+    roles: dict[str, str] = {}
+    for name in dimension_side - fact_side:
+        roles[name] = "dimension"
+    for name in fact_side - dimension_side:
+        roles[name] = "fact"
+    # dataCategory only fills gaps: a relationship is the stronger statement.
+    for name, role in categorised.items():
+        roles.setdefault(name, role)
+    return roles
+
+
+def table_roles(
+    tables: dict[str, dict],
+    semantic_models: dict[str, dict] | None = None,
+) -> dict[str, str]:
     """``{table name: role}`` for every table, computed in one pass.
 
     Prefer this over calling :func:`table_role` in a loop: it shares the
     foreign-key reverse index across every table instead of rebuilding it.
+
+    ``semantic_models`` is optional and additive. When supplied, a role the model
+    *declares* (see :func:`declared_roles`) wins over anything inferred from the
+    table's own shape - so an estate that models its star schema in Power BI is
+    judged on what it stated, and one that does not is unaffected.
     """
     referenced = _referenced_names(tables)
-    return {
-        name: _role(name, table, referenced)
-        for name, table in tables.items()
-    }
+    declared = declared_roles(tables, semantic_models)
+    roles: dict[str, str] = {}
+    for name, table in tables.items():
+        stated = declared.get(normalise_table_name(name))
+        # Platform tables are never given a role, even if a model names them.
+        if stated and not is_platform_table(name):
+            roles[name] = stated
+        else:
+            roles[name] = _role(name, table, referenced)
+    return roles
 
 
 def table_role(name: str, table: dict | None = None,
@@ -572,16 +679,43 @@ def _role(name: str, table: dict | None, referenced: frozenset[str]) -> str:
     return "unknown"
 
 
-def facts_in(tables: dict[str, dict]) -> dict[str, dict]:
-    """Every fact-role table, by structure then name. Empty when none is identifiable."""
-    roles = table_roles(tables)
+def facts_in(tables: dict[str, dict],
+             semantic_models: dict[str, dict] | None = None) -> dict[str, dict]:
+    """Every fact-role table: declared by a model where possible, else inferred.
+
+    ``semantic_models`` is optional so existing callers keep working; passing it
+    lets a relationship the modeller declared outrank a shape guess.
+    """
+    roles = table_roles(tables, semantic_models)
     return {n: t for n, t in tables.items() if roles[n] == "fact"}
 
 
-def dimensions_in(tables: dict[str, dict]) -> dict[str, dict]:
-    """Every dimension-role table, by structure then name."""
-    roles = table_roles(tables)
+def dimensions_in(tables: dict[str, dict],
+                  semantic_models: dict[str, dict] | None = None) -> dict[str, dict]:
+    """Every dimension-role table: declared by a model where possible, else inferred."""
+    roles = table_roles(tables, semantic_models)
     return {n: t for n, t in tables.items() if roles[n] == "dimension"}
+
+
+def role_evidence(tables: dict[str, dict],
+                  semantic_models: dict[str, dict] | None = None) -> dict[str, int]:
+    """How many roles came from a declaration versus an inference.
+
+    Lets a check say *how* it knows what it knows: a verdict over roles the
+    estate declared is a different quality of finding from one over roles this
+    code guessed, and the evidence should not pretend otherwise.
+    """
+    declared = declared_roles(tables, semantic_models)
+    roles = table_roles(tables, semantic_models)
+    modelled = sum(1 for n in tables
+                   if normalise_table_name(n) in declared and not is_platform_table(n))
+    assigned = sum(1 for r in roles.values() if r != "unknown")
+    return {
+        "declared": modelled,
+        "inferred": max(0, assigned - modelled),
+        "assigned": assigned,
+        "total": len(tables),
+    }
 
 
 #: Trailing words that mark a column as a *key*. Matched against the final word of
