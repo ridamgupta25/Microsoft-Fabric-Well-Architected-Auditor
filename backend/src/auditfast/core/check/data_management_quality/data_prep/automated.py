@@ -970,10 +970,8 @@ _KEY_QUALITY = re.compile(
     r"drop_duplicates\s*\(\s*(?:subset\s*=\s*)?\[|"
     r"dropna\s*\([^\n]*subset",
 )
-_BRONZE_METADATA = re.compile(
-    r"ingest(?:ed|ion)[_ ]?(?:timestamp|time|date)|ingested_at|"
-    r"source[_ ]?(?:system|file|path)|input_file_name\s*\(|batch[_ ]?(?:id|key)|"
-    r"current_timestamp\s*\(",
+_BRONZE_INGESTION = re.compile(
+    r"ingest(?:ed|ion)[_ ]?(?:timestamp|time|date)|ingested_at",
     re.IGNORECASE,
 )
 #: The four Silver disciplines the checklist point names, kept separate so the
@@ -1003,9 +1001,24 @@ _BULK_ACTIVITY = re.compile(
     r"COPY\s+INTO|write\.mode|saveAsTable|repartition|coalesce",
     re.IGNORECASE,
 )
-_ROW_BY_ROW = re.compile(
-    r"ForEach|foreach|row[_ -]?by[_ -]?row|insert\s+into|execute\s+query|"
-    r"SqlServerStoredProcedure|\bScript\b",
+_SILVER_CLEANSING = re.compile(
+    r"\.dropna\s*\(|\.fillna\s*\(|\.replace\s*\(|"
+    r"regexp_replace\s*\(|\btrim\s*\(|\bcleanse\w*\s*\(",
+    re.IGNORECASE,
+)
+_SILVER_CONFORMING = re.compile(
+    r"withColumnRenamed\s*\(|\.withColumnsRenamed\s*\(|"
+    r"\.selectExpr\s*\([^)]*\bAS\b|\b(?:standardize|conform)\w*\s*\(",
+    re.IGNORECASE,
+)
+_EXPLICIT_ROW_BY_ROW = re.compile(
+    r"row[_ -]?by[_ -]?row|record[_ -]?by[_ -]?record|per[_ -]?(?:row|record)|"
+    r"\bCURSOR\b|\bFETCH\s+NEXT\b|\.iterrows\s*\(|\.itertuples\s*\(",
+    re.IGNORECASE,
+)
+_SET_BASED_SCRIPT = re.compile(
+    r"\bCOPY\s+INTO\b|\bINSERT\s+INTO\b[\s\S]{0,500}?\bSELECT\b|"
+    r"\bCREATE\s+TABLE\b[\s\S]{0,500}?\bAS\s+SELECT\b",
     re.IGNORECASE,
 )
 _EAM_JSON = re.compile(
@@ -1505,6 +1518,8 @@ def pl_idempotent_load(ctx: CheckContext) -> Verdict:
 # -- MLC Cat-1: dimensional load quality (4.5.10, 5.4.4, 5.4.6) ---------------
 #: The notebook is doing dimensional work at all — otherwise these checks have
 #: nothing to judge and must report N/A rather than fail a Bronze ingest.
+_DIM_REF = re.compile(r"\bdim[_\s.]|\bdimension\b", re.IGNORECASE)
+_FACT_REF = re.compile(r"\bfact[_\s.]|\bfct[_\s.]", re.IGNORECASE)
 _DIM_CONTEXT = re.compile(r"\bdim[_\s.]|\bdimension\b|\bfact[_\s.]|\bfct[_\s.]", re.IGNORECASE)
 
 #: A late-arriving fact is given an inferred / unknown member instead of being
@@ -1548,11 +1563,36 @@ _FACT_DIM_JOIN = re.compile(
     r"\b(?:left|right|full|inner|cross)?\s*join\b[^\n;]{0,200}?\bon\b",
     re.IGNORECASE | re.DOTALL,
 )
-#: A dimension is being *built* (SCD upsert / MERGE), not looked up by a fact —
-#: the inferred-member fallback belongs in the fact load, so such a notebook is
-#: N/A rather than FAIL when it never references a fact.
-_DIM_UPSERT = re.compile(r"\bmerge\b|\bupsert\b|when\s+matched|whenmatched", re.IGNORECASE)
-_FACT_REF = re.compile(r"\bfact[_\s.]|\bfct[_\s.]", re.IGNORECASE)
+
+#: The inferred row is later updated when the real dimension member arrives.
+#: Accept explicit lifecycle names and statically identifiable Delta/SQL merges
+#: into a dimension; a generic MERGE elsewhere is not backfill evidence.
+_INFERRED_MEMBER_BACKFILL = re.compile(
+    r"backfill[_\s]?(?:dimension|member)|"
+    r"update[_\s]?(?:inferred|unknown)[_\s]?member|"
+    r"DeltaTable\.forName\s*\([^\n]{0,160}?dim[_\s.]?[A-Za-z0-9_]*[^\n]{0,160}?\)"
+    r"[\s\S]{0,500}?\.merge\s*\([\s\S]{0,500}?whenMatchedUpdate|"
+    r"merge\s+into\s+(?:[`\[\]\w]+\.)*[`\[]?dim[_\s.]?[A-Za-z0-9_`\]]*"
+    r"[\s\S]{0,500}?when\s+matched[\s\S]{0,120}?update",
+    re.IGNORECASE,
+)
+
+_FACT_WRITE_RECEIVER = re.compile(
+    r"\b(?:fact|fct)(?:_[A-Za-z0-9]+)*\s*\.write\b",
+    re.IGNORECASE,
+)
+
+
+def _fact_write_evidence(code: str) -> str:
+    """Describe a provable fact write, or return empty when only reads are seen."""
+    targets = write_targets(code)
+    fact_targets = [target for target in targets if _FACT_REF.search(target)]
+    if fact_targets:
+        return f"write target '{fact_targets[0]}'"
+    receiver = _FACT_WRITE_RECEIVER.search(code)
+    if receiver:
+        return f"write receiver '{' '.join(receiver.group(0).split())}'"
+    return ""
 
 
 # NB-LATE-ARRIVING (4.5.10): flags a fact→dimension load with no unknown/inferred-member
@@ -1564,7 +1604,8 @@ _FACT_REF = re.compile(r"\bfact[_\s.]|\bfct[_\s.]", re.IGNORECASE)
     id="NB-LATE-ARRIVING", ref="4.5.10",
     title="Late-arriving dimensions and facts handled (unknown/inferred member pattern)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
-    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+    layers=(*NOTEBOOK_LAYERS, Layer.STORAGE),
+    requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_late_arriving(ctx: CheckContext) -> Verdict:
     """A fact arriving before its dimension gets an inferred member, not dropped.
@@ -1580,23 +1621,44 @@ def nb_late_arriving(ctx: CheckContext) -> Verdict:
     conventional ``-1`` surrogate key substituted when the lookup misses.
     """
     code = strip_sql_comments(executable_code(ctx.obj))
-    if not _DIM_CONTEXT.search(code):
-        return not_applicable("Notebook does not load or join dimensional tables")
-    if not _FACT_DIM_JOIN.search(code):
+    fact_write = _fact_write_evidence(code)
+    dimensional_lookup = bool(
+        _FACT_REF.search(code) and _DIM_REF.search(code) and _FACT_DIM_JOIN.search(code)
+    )
+    if not (fact_write or dimensional_lookup):
         return not_applicable(
-            "Notebook performs no fact-to-dimension lookup — no DataFrame or SQL "
-            "join is present (a Python string join does not count)"
+            f"Notebook '{ctx.obj_name}' has no provable dimensional fact load: no "
+            f"fact-named write target/receiver or fact-to-dimension lookup. Generic "
+            f"JSON-to-Delta ingestion and audit row counts do not establish that "
+            f"late-arriving member handling applies"
         )
-    if _DIM_UPSERT.search(code) and not _FACT_REF.search(code):
-        return not_applicable(
-            "Notebook builds/updates a dimension table (SCD upsert/merge), not a "
-            "fact-to-dimension lookup — the inferred-member fallback belongs in the "
-            "fact load"
+
+    fallback = _LATE_ARRIVING.search(code)
+    backfill = _INFERRED_MEMBER_BACKFILL.search(code)
+    scope = fact_write or "fact-to-dimension lookup"
+    if fallback and backfill:
+        fallback_signal = " ".join(fallback.group(0).split())
+        backfill_signal = " ".join(backfill.group(0).split())
+        return binary(
+            True,
+            f"Notebook '{ctx.obj_name}' has {scope}, routes unresolved dimension "
+            f"keys through fallback '{fallback_signal}', and backfills inferred "
+            f"members (matched '{backfill_signal}')",
         )
-    ok = bool(_LATE_ARRIVING.search(code))
-    return binary(ok, "Late-arriving rows get an inferred/unknown member" if ok
-                  else "Joins dimensions with no inferred/unknown member fallback — "
-                       "late-arriving facts are dropped or fail the load")
+
+    missing = []
+    if not dimensional_lookup:
+        missing.append("a dimension-key lookup")
+    if not fallback:
+        missing.append("an unknown/inferred-member fallback such as surrogate key -1")
+    if not backfill:
+        missing.append("backfill of inferred members when dimension rows arrive")
+    return binary(
+        False,
+        f"Notebook '{ctx.obj_name}' has {scope} but lacks {', '.join(missing)}; "
+        f"late-arriving facts can be dropped, fail the load, or remain permanently "
+        f"assigned to an unknown member",
+    )
 
 
 @check(
@@ -1683,24 +1745,6 @@ _GRAIN_GUARD = re.compile(
     r"having\s+count\s*\(\s*\*?\s*\)\s*>\s*1|duplicate[_\s]?(?:check|count|test)",
     re.IGNORECASE,
 )
-_FACT_WRITE_RECEIVER = re.compile(
-    r"\b(?:fact|fct)(?:_[A-Za-z0-9]+)*\s*\.write\b",
-    re.IGNORECASE,
-)
-
-
-def _fact_write_evidence(code: str) -> str:
-    """Describe a provable fact write, or return empty when only reads are seen."""
-    targets = write_targets(code)
-    fact_targets = [target for target in targets if _FACT_REF.search(target)]
-    if fact_targets:
-        return f"write target '{fact_targets[0]}'"
-    receiver = _FACT_WRITE_RECEIVER.search(code)
-    if receiver:
-        return f"write receiver '{' '.join(receiver.group(0).split())}'"
-    return ""
-
-
 @check(
     id="NB-GRAIN-UNIQUE", ref="5.4.9",
     title="No duplicate grain: fact tables contain unique records per defined grain",
@@ -1934,9 +1978,18 @@ def nb_bronze_metadata(ctx: CheckContext) -> Verdict:
             f"Notebook produces the {layer} layer ({how}), so the Bronze "
             "raw-capture rule does not apply"
         )
-    if not _BRONZE_METADATA.search(code):
-        return binary(False, f"Bronze write ({how}) has no ingestion/source/batch audit metadata")
-    return binary(True, f"Bronze write ({how}) captures ingestion/source/batch audit metadata")
+    controls = {
+        "ingestion timestamp": bool(_BRONZE_INGESTION.search(code)),
+        "source identity": bool(_BRONZE_SOURCE.search(code)),
+        "batch identifier": bool(_BRONZE_BATCH.search(code)),
+    }
+    present = [name for name, found in controls.items() if found]
+    missing = [name for name, found in controls.items() if not found]
+    score = {0: 0, 1: 1, 2: 2, 3: 3}[len(present)]
+    evidence = f"Bronze write ({how}); present: {', '.join(present) if present else 'none'}"
+    if missing:
+        evidence += f"; missing: {', '.join(missing)}"
+    return graded(score, evidence)
 
 
 @check(
@@ -2022,27 +2075,71 @@ def pl_bulk_move(ctx: CheckContext) -> Verdict:
             "control tables (Lookup), or invokes child pipelines, so any data "
             "movement is judged where it happens, not in this pipeline"
         )
-    blob = json.dumps(ctx.obj)
     moved = _data_move_summary(movers)
-    bulk = _matched_tokens(_BULK_ACTIVITY, blob)
-    row_by_row = _matched_tokens(_ROW_BY_ROW, blob)
-    if row_by_row and not bulk:
+
+    def configured(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value > 0
+        return bool(value)
+
+    def copy_signals(activity: dict) -> list[str]:
+        props = activity.get("typeProperties") or {}
+        sink = props.get("sink") or {}
+        signals: list[str] = []
+        if props.get("enableStaging") is True:
+            signals.append("enableStaging=true")
+        if sink.get("allowCopyCommand") is True:
+            signals.append("allowCopyCommand=true")
+        if configured(props.get("parallelCopies")):
+            signals.append(f"parallelCopies={props['parallelCopies']}")
+        for key in ("writeBatchSize", "batchSize"):
+            if configured(sink.get(key)):
+                signals.append(f"{key}={sink[key]}")
+        return signals
+
+    row_by_row = [
+        str(activity.get("name") or "?")
+        for activity in walk_activities(ctx.obj)
+        if _EXPLICIT_ROW_BY_ROW.search(json.dumps(activity))
+    ]
+    if row_by_row:
         return binary(
             False,
-            f"{moved}: row-by-row / serial execution ({', '.join(row_by_row)}) with no "
-            f"bulk/batch pattern — replace per-row iteration with a set-based bulk Copy, "
-            f"COPY INTO, or batched write (parallelCopies, batchCount, batch size)",
+            f"{moved}: explicit row-by-row / record-by-record logic found in "
+            f"{', '.join(row_by_row[:5])} — replace it with a set-based Copy, COPY INTO, "
+            "or INSERT ... SELECT operation",
         )
-    if bulk:
-        return binary(
-            True,
-            f"{moved}: bulk/batch data-movement pattern present ({', '.join(bulk)})",
-        )
-    return binary(
-        False,
-        f"{moved}: no bulk/batch data-movement pattern found — none of parallelCopies, "
-        f"batchCount, batch size, bulk, COPY INTO, write.mode, saveAsTable, repartition "
-        f"or coalesce is present to confirm the movement is set-based rather than row-by-row",
+
+    tuned: list[str] = []
+    untuned: list[str] = []
+    for activity in movers:
+        name = str(activity.get("name") or "?")
+        activity_type = activity.get("type") or "?"
+        if activity_type == "Copy":
+            signals = copy_signals(activity)
+            if signals:
+                tuned.append(f"{name} ({', '.join(signals)})")
+            else:
+                untuned.append(f"{name} (default Copy settings)")
+        elif activity_type == "Script" and _SET_BASED_SCRIPT.search(json.dumps(activity)):
+            tuned.append(f"{name} (set-based SQL)")
+        else:
+            untuned.append(f"{name} ({activity_type} internals not provable)")
+
+    if tuned and not untuned:
+        return graded(3, f"{moved}: every data movement activity has a genuine bulk/"
+                         f"set-based signal: {'; '.join(tuned)}")
+    if tuned:
+        return graded(2, f"{moved}: bulk controls are present for {'; '.join(tuned)}, but "
+                         f"not for {'; '.join(untuned)}")
+    return graded(
+        1,
+        f"{moved}: warning — no explicit row-by-row logic was found, but the movement "
+        f"uses default or unverifiable settings: {'; '.join(untuned)}. Configure Copy "
+        "staging, Copy Command, parallelCopies, or a sink write batch size where the "
+        "connector and workload support it",
     )
 
 

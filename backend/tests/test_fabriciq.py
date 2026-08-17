@@ -275,6 +275,32 @@ def test_client_values_reads_collection():
     assert client.list_groups() == [{"id": "g1"}]
 
 
+def test_list_reports_falls_back_to_root_for_personal_workspace():
+    """"My workspace" is not a group; its reports come from the myorg root."""
+    base = PowerBIClient.BASE
+    personal = "personal-ws"
+    client = _client_with(_FakeSession(get_map={
+        f"{base}/groups/{personal}/reports": _FakeResponse(403, None),
+        f"{base}/groups?$top=5000": _FakeResponse(200, {"value": [{"id": "g1"}]}),
+        f"{base}/reports": _FakeResponse(200, {"value": [{"id": "r1", "datasetId": "ds-1"}]}),
+    }))
+    rows, readable = client.list_reports_known(personal)
+    assert readable is True
+    assert rows == [{"id": "r1", "datasetId": "ds-1"}]
+
+
+def test_list_reports_does_not_fall_back_for_a_known_named_workspace():
+    """A named workspace whose group listing fails stays unreadable, never swapped."""
+    base = PowerBIClient.BASE
+    client = _client_with(_FakeSession(get_map={
+        f"{base}/groups/g1/reports": _FakeResponse(403, None),
+        f"{base}/groups?$top=5000": _FakeResponse(200, {"value": [{"id": "g1"}]}),
+    }))
+    rows, readable = client.list_reports_known("g1")
+    assert readable is False
+    assert rows == []
+
+
 def test_client_execute_queries_raises_on_error():
     base = PowerBIClient.BASE
     url = f"{base}/groups/g/datasets/d/executeQueries"

@@ -45,6 +45,43 @@ def test_merge_single_statement_passes():
 def test_merge_sequential_dml_fails():
     v = delta_merge(_ctx(_nb("spark.sql('DELETE FROM t WHERE 1=1')\nspark.sql('INSERT INTO t SELECT * FROM s')")))
     assert v.score == 0
+    assert "t (DELETE + INSERT)" in v.evidence
+
+
+def test_merge_dml_on_different_targets_is_na():
+    v = delta_merge(_ctx(_nb(
+        "spark.sql('DELETE FROM old_orders WHERE expired = true')\n"
+        "spark.sql('INSERT INTO audit_log SELECT * FROM changes')"
+    )))
+    assert v.status is Status.NA
+
+
+def test_merge_insert_and_update_on_same_qualified_target_fails():
+    v = delta_merge(_ctx(_nb(
+        "spark.sql('INSERT INTO [Gold].[Customer] SELECT * FROM staging')\n"
+        "spark.sql('UPDATE gold.customer SET active = 1')"
+    )))
+    assert v.score == 0
+    assert "gold.customer (INSERT + UPDATE)" in v.evidence
+
+
+def test_merge_does_not_mask_separate_dml_on_another_target():
+    v = delta_merge(_ctx(_nb(
+        "spark.sql('MERGE INTO gold.customer t USING staging s ON t.id = s.id')\n"
+        "spark.sql('DELETE FROM gold.orders WHERE expired = true')\n"
+        "spark.sql('INSERT INTO gold.orders SELECT * FROM replacements')"
+    )))
+    assert v.score == 0
+    assert "gold.orders (DELETE + INSERT)" in v.evidence
+
+
+def test_merge_spark_insert_into_matches_sql_delete_target():
+    v = delta_merge(_ctx(_nb(
+        "spark.sql('DELETE FROM `gold`.`orders` WHERE expired = true')\n"
+        "df.write.insertInto('GOLD.ORDERS')"
+    )))
+    assert v.score == 0
+    assert "gold.orders (DELETE + INSERT)" in v.evidence
 
 
 def test_merge_absent_is_na():

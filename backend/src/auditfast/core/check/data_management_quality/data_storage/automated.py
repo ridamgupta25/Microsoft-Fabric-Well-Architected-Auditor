@@ -1245,18 +1245,57 @@ def stats_strategy_defined(ctx: CheckContext) -> Verdict:
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.ITEMS], required=False,
 )
 def table_date_dimension(ctx: CheckContext) -> Verdict:
-    """A dedicated date/calendar dimension backs time-based analytics."""
+    """Each assessable data store has its own dedicated date/calendar dimension."""
     tables = ctx.workspace.tables
     if not tables:
         return not_applicable(_NO_TABLES)
+
+    def is_date_dimension_name(name: str) -> bool:
+        leaf = name.rsplit(".", 1)[-1].lower()
+        compact = re.sub(r"[^a-z0-9]", "", leaf)
+        return bool(re.search(
+            r"dim(?:ension)?(?:date|calendar)|(?:date|calendar)dim(?:ension)?|"
+            r"datedimension|calendar",
+            compact,
+        ))
+
+    grouped = {
+        store: {
+            name: table for name, table in store_tables.items()
+            if not is_platform_table(name)
+        }
+        for store, store_tables in tables_by_store(tables).items()
+    }
+    grouped = {store: store_tables for store, store_tables in grouped.items() if store_tables}
+
+    if grouped:
+        found_by_store = {
+            store: sorted(name for name in store_tables if is_date_dimension_name(name))
+            for store, store_tables in grouped.items()
+        }
+        compliant = {store: names for store, names in found_by_store.items() if names}
+        missing = sorted(set(grouped) - set(compliant))
+        found_detail = "; ".join(
+            f"{store}: {', '.join(names[:3])}"
+            for store, names in sorted(compliant.items())
+        ) or "none"
+        missing_detail = ", ".join(missing) or "none"
+        return covered(
+            len(compliant),
+            len(grouped),
+            f"{len(compliant)} of {len(grouped)} data store(s) have a date/time "
+            f"dimension. Found — {found_detail}. Missing — {missing_detail}",
+            obj=", ".join(sorted(grouped)),
+        )
+
     stores = _table_stores(ctx)
-    found = any(
-        ("date" in n.lower() or "calendar" in n.lower())
-        and (is_dimension(n) or "dim" in n.lower() or "calendar" in n.lower())
-        for n in tables
-    )
+    found = sorted(name for name in tables if is_date_dimension_name(name))
     if found:
-        return binary(True, "A date/time dimension table exists", obj=stores)
+        return binary(
+            True,
+            f"A date/time dimension table exists: {', '.join(found[:3])}",
+            obj=stores,
+        )
     names = sorted(tables)
     sample = ", ".join(names[:_SAMPLE_LIMIT])
     if len(names) > _SAMPLE_LIMIT:
@@ -2369,6 +2408,11 @@ _STAGING_SCHEMA_WORDS: frozenset[str] = frozenset({
 #: sit here has taken no organisational decision at all.
 _DEFAULT_SCHEMA = "dbo"
 
+# Fabric catalog schemas are platform metadata, not business-domain organization.
+_SYSTEM_SCHEMAS: frozenset[str] = frozenset({
+    "sys", "information_schema", "queryinsights", "query_insights",
+})
+
 
 def _schema_qualifier(key: str, table: dict) -> str:
     """The SQL schema a Warehouse table belongs to, or ``""`` when unknown.
@@ -2433,8 +2477,10 @@ def warehouse_schema_organization(ctx: CheckContext) -> Verdict:
     meaning their owners intended - ``dbo`` versus ``sales`` versus ``stg`` is
     read as a structural signal, not a semantic one. The schema itself is now
     read from ``INFORMATION_SCHEMA.TABLE_SCHEMA`` and recorded on every column,
-    so a snapshot taken before that change falls back to parsing the table key
-    and may still report no schema.
+    with the schema-qualified table key as a fallback. Older snapshots created
+    before either source retained ``TABLE_SCHEMA`` contain bare names; those
+    remain N/A rather than being misread as a badly organised Warehouse. A
+    fresh crawl upgrades the evidence.
     """
     tables = ctx.workspace.tables
     if not tables:
@@ -2449,13 +2495,23 @@ def warehouse_schema_organization(ctx: CheckContext) -> Verdict:
 
     by_store: dict[str, dict[str, int]] = {}
     qualified = 0
+    excluded_system = 0
     for name, table in warehouse_tables.items():
         schema = _schema_qualifier(name, table).lower()
+        if schema in _SYSTEM_SCHEMAS:
+            excluded_system += 1
+            continue
         if schema:
             qualified += 1
         store = store_of(table) or "(unnamed warehouse)"
         counts = by_store.setdefault(store, {})
         counts[schema] = counts.get(schema, 0) + 1
+
+    if not by_store:
+        return not_applicable(
+            f"All {len(warehouse_tables)} Warehouse table(s) belong to Fabric system "
+            "schemas, so there is no business schema layout to judge"
+        )
 
     if not qualified:
         return not_applicable(
@@ -2466,6 +2522,7 @@ def warehouse_schema_organization(ctx: CheckContext) -> Verdict:
         )
 
     scores = {store: _schema_score(counts) for store, counts in by_store.items()}
+    business_tables = len(warehouse_tables) - excluded_system
     detail = "; ".join(
         f"'{store}': " + ", ".join(
             f"{schema or '(unqualified)'} ({count} table(s))"
@@ -2478,7 +2535,8 @@ def warehouse_schema_organization(ctx: CheckContext) -> Verdict:
         f"{len(by_store)} Warehouse(s) judged on schema layout â€” {detail}. "
         f"{qualified} of {len(warehouse_tables)} Warehouse table(s) carry a schema "
         f"qualifier; a Warehouse holding everything in dbo, or with no staging "
-        f"schema separate from its presentation schemas, scores below full.",
+        f"schema separate from its presentation schemas, scores below full. "
+        f"Excluded {excluded_system} Fabric system-schema table(s).",
     )
 
 
