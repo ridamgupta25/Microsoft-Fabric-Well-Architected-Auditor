@@ -219,6 +219,9 @@ def test_storage_is_populated_per_table():
     assert "import" in storage["FactSales"]["modes"]
     assert storage["FactSales"]["native_query_partitions"] == 1, \
         "an M partition carrying its own query text is an in-model transformation"
+    assert storage["FactSales"]["native_query_expressions"] == [
+        "let Source = Sql.Database(...)"
+    ], "the partition query text is kept so a check can classify it"
 
 
 def test_direct_lake_mode_is_derived_from_the_source_type():
@@ -253,8 +256,10 @@ def test_a_model_with_no_partitions_still_parses():
     """The original fixture has no partitions at all - it must not raise."""
     model = parse_tmsl(_TMSL)
     assert model["storage"] == {"Sales": {"modes": [], "source_types": [],
-                                          "native_query_partitions": 0},
+                                          "native_query_partitions": 0,
+                                          "native_query_expressions": []},
                                 "Date": {"modes": [], "source_types": [],
-                                         "native_query_partitions": 0}}
+                                         "native_query_partitions": 0,
+                                         "native_query_expressions": []}}
     assert model["refresh_policies"] == []
     assert model["aggregations"] == []
