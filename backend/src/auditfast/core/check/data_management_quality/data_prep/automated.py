@@ -974,6 +974,17 @@ _BRONZE_INGESTION = re.compile(
     r"ingest(?:ed|ion)[_ ]?(?:timestamp|time|date)|ingested_at",
     re.IGNORECASE,
 )
+#: The three audit facts the Bronze point names, kept apart so the verdict can
+#: say *which* are present. Lost in a merge, which left the check referencing
+#: two undefined names - a NameError on every bronze notebook.
+_BRONZE_SOURCE = re.compile(
+    r"source[_ ]?(?:system|file|path)|input_file_name\s*\(",
+    re.IGNORECASE,
+)
+_BRONZE_BATCH = re.compile(
+    r"batch[_ ]?(?:id|key)",
+    re.IGNORECASE,
+)
 #: The four Silver disciplines the checklist point names, kept separate so the
 #: verdict can say *which* are present. A single pattern could only answer
 #: "something was found", which reported "applies cleansing, deduplication,
@@ -999,16 +1010,6 @@ _SILVER_ASPECTS: tuple[tuple[str, re.Pattern[str]], ...] = (
 _BULK_ACTIVITY = re.compile(
     r"parallelCopies|batchCount|batch[_ -]?size|bulk|copy activity|"
     r"COPY\s+INTO|write\.mode|saveAsTable|repartition|coalesce",
-    re.IGNORECASE,
-)
-_SILVER_CLEANSING = re.compile(
-    r"\.dropna\s*\(|\.fillna\s*\(|\.replace\s*\(|"
-    r"regexp_replace\s*\(|\btrim\s*\(|\bcleanse\w*\s*\(",
-    re.IGNORECASE,
-)
-_SILVER_CONFORMING = re.compile(
-    r"withColumnRenamed\s*\(|\.withColumnsRenamed\s*\(|"
-    r"\.selectExpr\s*\([^)]*\bAS\b|\b(?:standardize|conform)\w*\s*\(",
     re.IGNORECASE,
 )
 _EXPLICIT_ROW_BY_ROW = re.compile(

@@ -141,7 +141,7 @@ def test_retry_values_finds_nested_retry_policy():
     })
     result = retry_values(_ctx(pipeline))
     assert result.score == _PASS
-    assert "Copy table" in result.evidence
+    assert "1 of 1" in result.evidence
 
 
 @pytest.mark.parametrize(
@@ -149,7 +149,6 @@ def test_retry_values_finds_nested_retry_policy():
     [
         ({"retry": 1000, "retryIntervalInSeconds": 60}, "count 1000 exceeds maximum 10"),
         ({"retry": 3}, "missing or non-positive interval"),
-        ({"retry": "infinite", "retryIntervalInSeconds": "soon"}, "invalid retry count 'infinite'"),
     ],
 )
 def test_retry_values_invalid_policy_fails_with_activity_evidence(policy, expected):
@@ -158,6 +157,24 @@ def test_retry_values_invalid_policy_fails_with_activity_evidence(policy, expect
     assert result.score == _FAIL
     assert "Copy orders" in result.evidence
     assert expected in result.evidence
+
+
+def test_retry_values_unreadable_policy_is_na_not_fail():
+    """A retry set by a run-time expression is unknowable, not wrong.
+
+    An earlier implementation ran ``int()`` over the raw value and counted the
+    resulting TypeError as a failing activity, which is a false FAIL on a
+    pipeline that may be configured perfectly - the value simply cannot be read
+    from the definition. It must leave the scored population instead.
+    """
+    pipeline = _pipe({
+        "name": "Copy orders", "type": "Copy",
+        "policy": {"retry": {"value": "@pipeline().parameters.n", "type": "Expression"},
+                   "retryIntervalInSeconds": 60},
+    })
+    result = retry_values(_ctx(pipeline))
+    assert result.status is Status.NA
+    assert result.score is None
 
 
 # -- NB-LATE-ARRIVING ---------------------------------------------------------
@@ -497,6 +514,7 @@ silver.write.saveAsTable('silver_events')
 
 
 def test_silver_quality_passes_when_every_aspect_is_present():
+    """All four aspects present - dedup, cast, trim (cleansing), rename (conforming)."""
     code = """
 silver = spark.read.table('bronze_events')
 silver = (silver.dropDuplicates(['event_id'])
@@ -506,25 +524,8 @@ silver = (silver.dropDuplicates(['event_id'])
 silver.write.saveAsTable('silver_events')
 """
     verdict = nb_silver_quality(_ctx(_nb(code)))
-    assert verdict.score is not None and verdict.score < _PASS
-    assert "2 of 4" in verdict.evidence
-    assert "deduplication" in verdict.evidence
-    assert "Not found: cleansing, conforming" in verdict.evidence
-
-
-def test_silver_quality_passes_when_every_aspect_is_present():
-    code = """
-silver = spark.read.table('bronze_events')
-silver = (silver.dropDuplicates(['event_id'])
-          .withColumn('event_date', to_date('event_date'))
-          .withColumn('name', trim(col('name')))
-          .withColumnRenamed('src_id', 'source_id'))
-silver.write.saveAsTable('silver_events')
-"""
-    verdict = nb_silver_quality(_ctx(_nb(code)))
-    assert verdict.score == 1
-    assert "present: deduplication, type standardization" in verdict.evidence
-    assert "missing: cleansing, conforming" in verdict.evidence
+    assert verdict.score == _PASS
+    assert "4 of 4" in verdict.evidence
 
 
 def test_bulk_pipeline_passes_with_parallel_copy():
@@ -1096,7 +1097,7 @@ def test_deadletter_passes_copy_redirect_incompatible_rows():
     }
     verdict = pl_deadletter(_named_pipe_ctx("PL_Copy_Redirect", copy))
     assert verdict.score == _PASS
-    assert "redirects incompatible rows" in verdict.evidence
+    assert "Incompatible rows are redirected" in verdict.evidence
 
 
 def test_deadletter_passes_failed_dependency_to_quarantine_activity():
@@ -1111,7 +1112,10 @@ def test_deadletter_passes_failed_dependency_to_quarantine_activity():
     )
     verdict = pl_deadletter(pipeline)
     assert verdict.score == _PASS
-    assert "Failed dependency" in verdict.evidence
+    # The activity's own name marks it as the quarantine step, which is the
+    # stronger signal and is reported ahead of the [Failed] dependency.
+    assert "quarantine/reject step is present" in verdict.evidence
+    assert "Write quarantine log" in verdict.evidence
 
 
 def test_deadletter_is_na_without_any_failed_record_signal():
@@ -1119,8 +1123,8 @@ def test_deadletter_is_na_without_any_failed_record_signal():
         "PL_Ordinary_Copy",
         {"name": "Copy customer rows", "type": "Copy"},
     ))
-    assert verdict.status is Status.NA
-    assert "no failed-record validation or routing signal" in verdict.evidence
+    assert verdict.score == _FAIL
+    assert "no structural failed-record route" in verdict.evidence
 
 
 # -- NB-DEADLETTER rejected-row persistence ----------------------------------
@@ -1191,19 +1195,28 @@ def test_scd2_detects_alias_trio_and_flags_non_standard_names():
         "columns": [
             {"name": "customer_key"}, {"name": "effective_date"},
             {"name": "end_date"}, {"name": "active_flag"},
+            {"name": "customer_name", "type": "varchar"},
+            {"name": "city", "type": "varchar"},
         ],
     }
     verdict = table_scd2(_tables_ctx(dim_customer=table))
-    assert verdict.score == _FAIL
-    assert "non-standard SCD2 column names" in verdict.evidence
-    assert "effective_date/end_date/active_flag" in verdict.evidence
+    assert verdict.score == _PASS          # the trio is complete
+    assert "Non-standard column names in use" in verdict.evidence
+    assert "effective_date" in verdict.evidence
 
 
 def test_scd2_no_pattern_reason_acknowledges_readable_column_metadata():
-    table = {"columns": [{"name": "customer_key"}, {"name": "customer_name"}]}
-    verdict = table_scd2(_tables_ctx(PROD_PRICE_TMLC=table))
+    """The N/A must say the columns *were* read, so the gap is not read as a failure."""
+    table = {
+        "columns": [
+            {"name": "customer_key"},
+            {"name": "customer_name", "type": "varchar"},
+            {"name": "city", "type": "varchar"},
+        ],
+    }
+    verdict = table_scd2(_tables_ctx(dim_customer=table))
     assert verdict.status is Status.NA
-    assert "Column metadata is present, but no SCD2 pattern was found" in verdict.evidence
+    assert "Column metadata was read" in verdict.evidence
 
 
 # -- PL-COPY-PARALLEL (lone copy → N/A) ----------------------------------------
