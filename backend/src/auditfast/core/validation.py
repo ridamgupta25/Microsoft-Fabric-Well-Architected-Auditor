@@ -203,6 +203,20 @@ VALIDATED_CHECKLIST: dict[str, str] = {
     "5.4.6":  "Cross-layer reconciliation: Gold record counts reconcile with Silver (accounting for aggregation)",
     "5.4.9":  "No duplicate grain: fact tables contain unique records per defined grain",
     "14.5.4": "Semantic models and reports are source-controlled and deployed via pipeline (Dev -> QA -> Prod)",
+    "4.2.3":  "Column naming is consistent and self-documenting",
+    "4.5.1":  "Star schema implemented (fact + dimension tables, not flat/wide tables)",
+    "4.5.6":  "Surrogate keys used for dimension tables (not business keys as PKs in facts)",
+    "1.1.9":  "Data Prep workspaces (`MLC_DATAPREP_*`) contain only Pipelines and Notebooks — no Lakehouses or Warehouses (all storage resides in the Data Store workspace)",
+    "3.1.2":  "Notebooks are parameterized using Fabric notebook parameters or widgets",
+    "14.2.4": "Aggregations / summarizations used for performance-critical reports where needed",
+    "14.5.2": "Incremental refresh configured for large Import models where applicable",
+    "2.2.2":  "Full load reserved only for small reference/dimension tables or initial loads",
+    "5.1.4":  "DQ scores computed per table/dataset and trended over time (via Audit Lakehouse)",
+    "5.1.9":  "DQ failures halt pipeline progression where critical (bad data does not silently flow downstream)",
+    "2.6.4":  "Pipeline scheduling avoids capacity contention (staggered across domains, not all at once)",
+    "9.3.2":  "Merge/upsert patterns prevent duplicates on re-execution",
+    "14.1.2": "Relationships correctly defined (cardinality, active/inactive) with no ambiguous paths",
+    "2.1.4":  "Pipeline activities are logically grouped, annotated, and self-documenting",
 }
 
 #: The set of validated refs, derived from the checklist above — what the flag
