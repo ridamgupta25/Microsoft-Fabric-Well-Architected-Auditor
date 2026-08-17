@@ -47,6 +47,11 @@ _SOURCE_TYPE_MODE = {
     "calculationgroup": "calculationGroup",
 }
 
+#: A native SQL / M partition expression is kept (capped) so a check can tell a
+#: plain source read apart from an inline transformation. Never row data — the
+#: query *text* only, and only up to this many characters.
+_MAX_QUERY_EXPRESSION_CHARS = 4000
+
 
 def _table_storage(table: dict) -> dict:
     """Storage facts for one table, read from its partitions.
@@ -58,6 +63,7 @@ def _table_storage(table: dict) -> dict:
     modes: set[str] = set()
     source_types: set[str] = set()
     native_queries = 0
+    native_expressions: list[str] = []
     for part in table.get("partitions") or []:
         if not isinstance(part, dict):
             continue
@@ -66,15 +72,21 @@ def _table_storage(table: dict) -> dict:
         if source_type:
             source_types.add(source_type)
         # A native SQL / M partition that carries its own query text is a
-        # per-refresh transformation living in the model rather than upstream.
-        if source_type in {"query", "m"} and _expression(source.get("expression")).strip():
-            native_queries += 1
+        # per-refresh transformation *candidate* living in the model rather than
+        # upstream. The query text is kept (capped) so a check can tell a plain
+        # source read apart from a genuine transform.
+        if source_type in {"query", "m"}:
+            expression = _expression(source.get("expression")).strip()
+            if expression:
+                native_queries += 1
+                native_expressions.append(expression[:_MAX_QUERY_EXPRESSION_CHARS])
         mode = str(part.get("mode") or "").strip()
         modes.add(mode or _SOURCE_TYPE_MODE.get(source_type, ""))
     return {
         "modes": sorted(m for m in modes if m),
         "source_types": sorted(source_types),
         "native_query_partitions": native_queries,
+        "native_query_expressions": native_expressions,
     }
 
 
