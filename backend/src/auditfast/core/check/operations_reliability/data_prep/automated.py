@@ -406,7 +406,10 @@ def retry_values(ctx: CheckContext) -> Verdict:
                 f"parameterise a retry interval but set retry to 0, so the interval "
                 f"can never take effect"
             )
-        return not_applicable("No activity declares a retry policy")
+        return not_applicable(
+            f"Pipeline '{ctx.obj_name}' has no activity with a positive retry count; "
+            f"whether activities should retry at all is PL-RETRY's question (ref 2.4.1)"
+        )
 
     limit = ctx.setting("max_retry_count", _DEFAULT_MAX_RETRY)
     try:
@@ -414,19 +417,32 @@ def retry_values(ctx: CheckContext) -> Verdict:
     except (TypeError, ValueError):
         limit = _DEFAULT_MAX_RETRY
 
-    def sane(activity: dict) -> bool:
+    def faults(activity: dict) -> list[str]:
+        """Why this activity's retry settings are unsound, named so they can be fixed."""
+        problems: list[str] = []
         count = _retry_count(activity)
         interval = _retry_interval(activity)
-        if count is None or interval is None:
-            return False
-        return 1 <= count <= limit and interval > 0
+        if count is not None and count > limit:
+            problems.append(f"count {count:g} exceeds maximum {limit}")
+        if interval is None or interval <= 0:
+            problems.append("missing or non-positive interval")
+        return problems
 
-    good = [a for a in with_retry if sane(a)]
+    assessed = [(a, faults(a)) for a in with_retry]
+    good = [a for a, problems in assessed if not problems]
+    offenders = [
+        f"{a.get('name') or '?'}: {', '.join(problems)}"
+        for a, problems in assessed if problems
+    ]
     evidence = (
         f"{len(good)} of {len(with_retry)} retrying activities set a bounded count "
         f"(1-{limit}) and a positive interval. Fabric allows 1-1000 and has no "
         f"infinite option, so the upper bound here is a project convention"
     )
+    if offenders:
+        evidence += f". Unsound: {'; '.join(sorted(offenders)[:_MAX_NAMED_OFFENDERS])}"
+        if len(offenders) > _MAX_NAMED_OFFENDERS:
+            evidence += f" (+{len(offenders) - _MAX_NAMED_OFFENDERS} more)"
     if dynamic:
         evidence += (
             f". A further {len(dynamic)} activity(ies) set retry behaviour through a "
@@ -434,6 +450,11 @@ def retry_values(ctx: CheckContext) -> Verdict:
         )
     evidence += inert_note
     return covered(len(good), len(with_retry), evidence)
+
+
+#: Offending activities named before the evidence turns into a wall of text. The
+#: count is always reported, so nothing is hidden - only the naming is capped.
+_MAX_NAMED_OFFENDERS = 5
 
 
 #: Retry attempts above which a failure takes long enough to look like a hang.
@@ -634,14 +655,11 @@ def pl_deadletter(ctx: CheckContext) -> Verdict:
                          f"whether the bad *rows* are retained could not be confirmed")
     return binary(
         False,
-        f"None of the {len(data_acts)} data-movement activity(ies) redirects incompatible "
-        f"rows, and no activity runs on a [Failed] dependency - a bad record either halts "
-        f"the run or is dropped. Column names containing 'error'/'reject' are source data, "
-        f"not an error route, and are not counted",
-        False,
-        f"Pipeline '{ctx.obj_name}' moves data but has no structural failed-record route "
-        "(no incompatible-row redirect/logging, Failed dependency quarantine path, or "
-        "explicit reject sink); error/reject words in column mappings do not count",
+        f"Pipeline '{ctx.obj_name}' moves data but has no structural failed-record route: "
+        f"none of the {len(data_acts)} data-movement activity(ies) redirects incompatible "
+        f"rows, no activity runs on a [Failed] dependency, and no activity names a reject "
+        f"sink - so a bad record either halts the run or is dropped. Column names "
+        f"containing 'error'/'reject' are source data, not an error route, and do not count",
     )
 
 

@@ -24,7 +24,6 @@ from auditfast.core.check._tables import (
     in_warehouse,
     is_audit_column,
     is_audit_table,
-    is_dimension,
     is_key_column,
     is_platform_table,
     is_snake_case,
@@ -2522,7 +2521,6 @@ def warehouse_schema_organization(ctx: CheckContext) -> Verdict:
         )
 
     scores = {store: _schema_score(counts) for store, counts in by_store.items()}
-    business_tables = len(warehouse_tables) - excluded_system
     detail = "; ".join(
         f"'{store}': " + ", ".join(
             f"{schema or '(unqualified)'} ({count} table(s))"
