@@ -83,17 +83,11 @@ def test_result_and_scored_counts_are_unchanged(provider):
 
 def test_status_counts_are_unchanged(provider):
     agg = aggregate(_run(provider))
-    assert agg["counts"][Status.PASS] == 65
-    # 14 Aug: 21 -> 22. 1.2.5 now scores four Silver aspects separately, so a
-    # notebook applying some of them is a partial rather than an outright pass.
-    assert agg["counts"][Status.PARTIAL] == 22
-    # 14 Aug: 67 -> 69. 5.1.2 no longer passes on a single token from a bundled
-    # pattern; a notebook whose only quality logic is a dedup call now fails.
-    assert agg["counts"][Status.FAIL] == 69
-    # 14 Aug: 208 -> 205. 2.4.4, 4.5.9 and 1.2.5 each used to decline on the
-    # fixture and now reach a verdict, so three N/As became scored results.
-    assert agg["counts"][Status.NA] == 205
-    assert agg["counts"][Status.INFO] == 11
+    assert agg["counts"][Status.PASS] == 66
+    assert agg["counts"][Status.PARTIAL] == 23
+    assert agg["counts"][Status.FAIL] == 65
+    assert agg["counts"][Status.NA] == 210
+    assert agg["counts"][Status.INFO] == 10
 
 
 def test_mixed_layer_runs_every_layers_checks():
@@ -291,9 +285,9 @@ def test_progress_callback_fires_per_workspace(provider):
 
 
 def test_registry_is_fully_populated():
-    """225 checks are evaluated; remaining roadmap checks are not loaded."""
+    """226 checks are evaluated; remaining roadmap checks are not loaded."""
     evaluated = [s for s in REGISTRY if s.automation is Automation.AUTOMATED]
-    assert len(evaluated) == 225
+    assert len(evaluated) == 226
     assert len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == 102
     assert len([s for s in evaluated if s.scope is Scope.PIPELINE]) == 32
     assert len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == 84
@@ -355,7 +349,7 @@ def test_explicit_registry_is_isolated_from_the_global_one():
     assert registry.get("X-ISOLATED") is not None
     assert REGISTRY.get("X-ISOLATED") is None, "test check leaked into the global registry"
     before = len([s for s in REGISTRY if s.automation is Automation.AUTOMATED])
-    assert before == 225
+    assert before == 226
 
 # -- selection and dispatch ----------------------------------------------------
 

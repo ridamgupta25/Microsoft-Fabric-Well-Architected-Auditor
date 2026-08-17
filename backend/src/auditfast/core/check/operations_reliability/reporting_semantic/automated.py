@@ -103,6 +103,12 @@ _LOAD_ACTIVITY_TYPES = {
     "Copy", "Script", "TridentNotebook", "SqlServerStoredProcedure",
 }
 
+#: Metadata proxies for a "large" Import model in SM-INCREMENTAL-REFRESH. Row
+#: counts are never in the KB, so a full reload is judged expensive when the
+#: model has this many Import tables or this many column declarations.
+_LARGE_IMPORT_TABLES = 5
+_WIDE_MODEL_COLUMNS = 100
+
 
 @check(
     id="SM-REFRESH-ORCHESTRATED", ref="14.5.1",
@@ -311,15 +317,17 @@ def _pipelines_with_guarded_refresh(ctx: CheckContext) -> list[str]:
     title="Incremental refresh configured for large Import models",
     pillar=Pillar.OPERATIONS, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
     layers=MODEL_LAYERS,
-    requires=[Resource.SEMANTIC_MODEL_DEFINITIONS, Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE],
+    requires=[Resource.SEMANTIC_MODEL_DEFINITIONS],
     required=False,
 )
 def sm_incremental_refresh(ctx: CheckContext) -> Verdict:
-    """An Import model refreshes on a schedule; a Direct Lake model is N/A.
+    """A large Import model declares an incremental-refresh policy; else N/A.
 
-    Direct Lake tables have no refresh to schedule, so their absence of one is
-    correct rather than a finding. An Import model with an enabled refresh
-    schedule passes; one with no enabled schedule fails.
+    Incremental refresh only applies to Import tables — Direct Lake / DirectQuery
+    read the source directly and have nothing to reload — and it only pays on a
+    table large enough that a full reload costs. "Large" is judged from metadata
+    proxies (Import-table and column counts), never row counts, which the audit
+    never reads.
     """
     if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
         return not_applicable("Semantic model definitions could not be read from Fabric")
@@ -331,19 +339,21 @@ def sm_incremental_refresh(ctx: CheckContext) -> Verdict:
     import_tables = [n for n, f in storage.items()
                      if any(m.lower() == "import" for m in f.get("modes") or [])]
     if not import_tables:
-        return not_applicable("Model has no Import tables (Direct Lake / non-import) — "
-                              "scheduled refresh does not apply")
+        return not_applicable("Model has no Import tables (Direct Lake / DirectQuery) — "
+                              "incremental refresh does not apply")
 
-    if not ctx.workspace.has(Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE):
-        return not_applicable(
-            "Refresh schedule configuration could not be read — it needs a Power BI-audience "
-            "token, which this run did not have, so whether the model refreshes on a schedule "
-            "cannot be determined"
-        )
+    policy_tables = {p.get("table") for p in model.get("refresh_policies") or [] if p.get("table")}
+    covered_imports = sorted(t for t in import_tables if t in policy_tables)
+    if covered_imports:
+        return binary(True, f"{len(covered_imports)} Import table(s) carry an incremental-refresh "
+                            f"policy: {', '.join(covered_imports)}")
 
-    schedule = (ctx.workspace.refresh_schedules or {}).get(ctx.obj_name) or {}
-    if schedule.get("enabled"):
-        return binary(True, f"{len(import_tables)} Import table(s) and an enabled refresh "
-                            f"schedule is configured")
-    return binary(False, f"{len(import_tables)} Import table(s) and no enabled refresh "
-                         f"schedule — the model does not refresh on its own schedule")
+    # No Import table refreshes incrementally — a finding only once the model is
+    # big enough that a full reload actually costs.
+    column_count = len(model.get("columns") or [])
+    if len(import_tables) < _LARGE_IMPORT_TABLES and column_count < _WIDE_MODEL_COLUMNS:
+        return not_applicable(f"Small Import model ({len(import_tables)} Import table(s), "
+                              f"{column_count} columns) — incremental refresh is not warranted")
+    return binary(False, f"Large Import model ({len(import_tables)} Import table(s), {column_count} "
+                         f"columns) with no incremental-refresh policy — every refresh fully "
+                         f"reloads each table")

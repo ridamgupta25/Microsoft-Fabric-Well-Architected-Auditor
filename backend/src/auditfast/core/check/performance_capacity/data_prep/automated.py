@@ -33,17 +33,28 @@ from ._spark import NOTEBOOK_LAYERS, pip_targets, unpinned_targets, writes_delta
 @check(
     id="DELTA-MERGE", ref="3.3.1", title="Single `MERGE INTO` handles I/U/D atomically — not separate sequential DELETE/INSERT/UPDATE",
     pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
-    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+    layers=(*NOTEBOOK_LAYERS, Layer.STORAGE),
+    requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def delta_merge(ctx: CheckContext) -> Verdict:
     """A single ``MERGE INTO`` handles insert/update/delete, not sequential DML."""
     # Ignore commented-out DML: strip Python "#" and SQL "--" / "/* */" comments so
     # a disabled DELETE/INSERT does not count as a real sequential-DML upsert.
     code = strip_sql_comments(executable_code(ctx.obj))
+    operations = _spark.sequential_dml_by_target(code)
+    violations = {
+        target: sorted(target_operations)
+        for target, target_operations in operations.items()
+        if len(target_operations) > 1
+    }
+    if violations:
+        evidence = "; ".join(
+            f"{target} ({' + '.join(target_operations).upper()})"
+            for target, target_operations in sorted(violations.items())
+        )
+        return graded(0, f"Separate DML targets the same table instead of a single MERGE: {evidence}")
     if _spark.MERGE.search(code):
         return binary(True, "Uses MERGE INTO for atomic upserts")
-    if _spark.SEQ_DELETE.search(code) and _spark.SEQ_INSERT.search(code):
-        return graded(0, "Separate DELETE + INSERT detected instead of a single MERGE")
     return not_applicable("Notebook performs no upsert/merge logic")
 
 
@@ -109,8 +120,14 @@ def delta_vorder(ctx: CheckContext) -> Verdict:
     code = executable_code(ctx.obj)
     if not writes_delta(code):
         return not_applicable("Notebook does not write Delta tables")
+    if _spark.VORDER_DISABLED.search(code):
+        return binary(False, "V-Order is explicitly disabled for a Delta write")
+    if _spark.VORDER_ENABLED.search(code):
+        return binary(True, "V-Order is explicitly enabled for a Delta write")
     if _spark.VORDER.search(code):
-        return binary(True, "Explicit V-Order configuration found")
+        return not_applicable(
+            "V-Order is referenced, but its effective value is not a static true/false setting"
+        )
     return not_applicable(
         "No explicit V-Order config; Fabric enables V-Order by default "
         "(cannot verify the effective setting from code)"

@@ -287,6 +287,34 @@ def test_warehouse_schemas_are_partial_without_a_staging_schema():
     assert warehouse_schema_organization(ctx).score == 2
 
 
+def test_warehouse_schemas_exclude_fabric_system_schemas():
+    ctx = _ctx(tables={
+        "mtd.fact_orders": _wh_table("order_id", store="WH_Gold"),
+        "mtd.dim_account": _wh_table("account_id", store="WH_Gold"),
+        "sys.managed_delta_tables": _wh_table("name", store="WH_Gold"),
+        "sys.external_delta_tables": _wh_table("name", store="WH_Gold"),
+        "INFORMATION_SCHEMA.COLUMNS": _wh_table("TABLE_NAME", store="WH_Gold"),
+    })
+    verdict = warehouse_schema_organization(ctx)
+
+    assert verdict.score == 1
+    assert "mtd (2 table(s))" in verdict.evidence
+    assert "sys (" not in verdict.evidence.lower()
+    assert "information_schema (" not in verdict.evidence.lower()
+    assert "Excluded 3 Fabric system-schema table(s)" in verdict.evidence
+
+
+def test_warehouse_schemas_are_na_when_only_fabric_system_schemas_exist():
+    ctx = _ctx(tables={
+        "sys.managed_delta_tables": _wh_table("name", store="WH_Gold"),
+        "INFORMATION_SCHEMA.COLUMNS": _wh_table("TABLE_NAME", store="WH_Gold"),
+    })
+    verdict = warehouse_schema_organization(ctx)
+
+    assert verdict.status is Status.NA
+    assert "belong to Fabric system schemas" in verdict.evidence
+
+
 def test_warehouse_schemas_are_na_when_no_schema_qualifier_was_read():
     """The SQL reader records TABLE_NAME without TABLE_SCHEMA — unknown, not a defect."""
     ctx = _ctx(tables={"fact_orders": _wh_table("order_id")})

@@ -32,6 +32,45 @@ MERGE = re.compile(r"\bMERGE\s+INTO\b|\.merge\s*\(", re.IGNORECASE)
 SEQ_DELETE = re.compile(r"\bDELETE\s+FROM\b", re.IGNORECASE)
 SEQ_INSERT = re.compile(r"\bINSERT\s+(?:INTO|OVERWRITE)\b|insertInto", re.IGNORECASE)
 
+_SQL_IDENTIFIER_PART = r'(?:`[^`]+`|\[[^\]]+\]|"[^"]+"|[A-Za-z_][\w$-]*)'
+_SQL_IDENTIFIER = rf"{_SQL_IDENTIFIER_PART}(?:\s*\.\s*{_SQL_IDENTIFIER_PART})*"
+_SQL_DML_TARGETS = {
+    "delete": re.compile(
+        rf"\bDELETE\s+FROM\s+(?P<target>{_SQL_IDENTIFIER})", re.IGNORECASE
+    ),
+    "insert": re.compile(
+        rf"\bINSERT\s+(?:INTO|OVERWRITE)\s+(?:TABLE\s+)?"
+        rf"(?P<target>{_SQL_IDENTIFIER})",
+        re.IGNORECASE,
+    ),
+    "update": re.compile(
+        rf"\bUPDATE\s+(?P<target>{_SQL_IDENTIFIER})", re.IGNORECASE
+    ),
+}
+_SPARK_INSERT_TARGET = re.compile(
+    r"\binsertInto\s*\(\s*(?:[fr]{0,2})?[\"'](?P<target>[^\"']+)[\"']",
+    re.IGNORECASE,
+)
+
+
+def _normalize_sql_target(target: str) -> str:
+    """Return a stable comparison key for a SQL multipart identifier."""
+    parts = re.split(r"\s*\.\s*", target.strip())
+    return ".".join(part.strip('`[]"').casefold() for part in parts)
+
+
+def sequential_dml_by_target(code: str) -> dict[str, set[str]]:
+    """Map each statically identifiable target to its separate DML operations."""
+    operations: dict[str, set[str]] = {}
+    for operation, pattern in _SQL_DML_TARGETS.items():
+        for match in pattern.finditer(code or ""):
+            target = _normalize_sql_target(match.group("target"))
+            operations.setdefault(target, set()).add(operation)
+    for match in _SPARK_INSERT_TARGET.finditer(code or ""):
+        target = _normalize_sql_target(match.group("target"))
+        operations.setdefault(target, set()).add("insert")
+    return operations
+
 # -- Delta maintenance ---------------------------------------------------------
 # The Delta ``OPTIMIZE`` SQL command (``OPTIMIZE <table>`` — a table token must
 # follow the keyword) or the ``deltaTable.optimize()`` Python API. Requiring a
@@ -42,6 +81,16 @@ VACUUM = re.compile(r"\bVACUUM\b|\.vacuum\s*\(", re.IGNORECASE)
 ZORDER = re.compile(r"ZORDER\s+BY|\.zorderBy\s*\(|executeZOrderBy", re.IGNORECASE)
 VORDER = re.compile(
     r"v-?order|parquet\.vorder|spark\.sql\.parquet\.vorder", re.IGNORECASE
+)
+VORDER_ENABLED = re.compile(
+    r"(?:v-?order|parquet\.vorder|spark\.sql\.parquet\.vorder)"
+    r"[^,=)\n]{0,80}(?:,|=)\s*[\"']?true\b",
+    re.IGNORECASE,
+)
+VORDER_DISABLED = re.compile(
+    r"(?:v-?order|parquet\.vorder|spark\.sql\.parquet\.vorder)"
+    r"[^,=)\n]{0,80}(?:,|=)\s*[\"']?false\b",
+    re.IGNORECASE,
 )
 TBLPROPS = re.compile(
     r"TBLPROPERTIES|delta\.autoOptimize|delta\.autoCompact|optimizeWrite|"

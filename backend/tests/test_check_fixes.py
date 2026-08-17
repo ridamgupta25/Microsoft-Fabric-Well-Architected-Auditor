@@ -29,6 +29,7 @@ from auditfast.core.check.data_management_quality.data_prep.automated import (
     nb_eam_ingest,
     nb_flag_domain,
     nb_language,
+    nb_late_arriving,
     nb_no_display,
     nb_no_udf,
     nb_silver_quality,
@@ -45,6 +46,7 @@ from auditfast.core.check.data_management_quality.data_prep.automated import (
 from auditfast.core.check.data_management_quality.data_storage.automated import (
     table_audit_columns,
     table_date_dimension,
+    table_scd2,
 )
 from auditfast.core.check.operations_reliability.data_logs.automated import (
     audit_tables_capture_quality_logs,
@@ -53,15 +55,20 @@ from auditfast.core.check.operations_reliability.data_logs.automated import (
 from auditfast.core.check.operations_reliability.data_prep.automated import (
     explicit_timeouts,
     failure_notification,
+    nb_deadletter,
     pipeline_idempotent,
+    pl_deadletter,
     restart_from_failure,
+    retry_values,
 )
 from auditfast.core.check.performance_capacity.data_prep.automated import (
     copy_parallelism,
     delta_optimize,
     spark_env,
 )
-from auditfast.core.enums import Status
+from auditfast.core.check.registry import REGISTRY, CheckRegistry
+from auditfast.core.engine import run_audit
+from auditfast.core.enums import Layer, Status
 from auditfast.core.models import CheckContext, Item, WorkspaceContext
 
 
@@ -77,6 +84,15 @@ def _pipe(*activities: dict) -> dict:
     return {"properties": {"activities": list(activities)}}
 
 
+class _WorkspaceProvider:
+    def __init__(self, workspace: WorkspaceContext):
+        self.workspace = workspace
+
+    def fetch(self, workspace_id, layer, resources):
+        self.workspace.layer = layer
+        return self.workspace
+
+
 def _tables_ctx(**tables: dict) -> CheckContext:
     ws = WorkspaceContext(id="w", tables=tables)
     return CheckContext(workspace=ws, settings={}, obj_name="w", obj=None)
@@ -86,6 +102,121 @@ def _tables_ctx(**tables: dict) -> CheckContext:
 #: from the score later, so a passing/failing verdict is asserted via ``score``
 #: (3 = pass, 0 = fail, 1 = partial); only N/A carries a ``status`` at this stage.
 _PASS, _FAIL = 3, 0
+
+
+# -- PL-RETRY-VALUES ---------------------------------------------------------
+
+def test_retry_values_no_pipeline_is_visible_na():
+    workspace = WorkspaceContext(id="w", display_name="MLC - CNCR", pipelines={})
+    registry = CheckRegistry()
+    registry.register(REGISTRY.get("PL-RETRY-VALUES"))
+
+    results = run_audit(
+        _WorkspaceProvider(workspace), [("w", Layer.PREP)], {}, registry=registry,
+    )
+
+    assert len(results) == 1
+    assert results[0].status is Status.NA
+    assert results[0].score is None
+    assert results[0].evidence == "No data pipelines were found in this workspace"
+
+
+def test_retry_values_pipeline_without_retry_is_na_and_names_pipeline():
+    result = retry_values(CheckContext(
+        workspace=WorkspaceContext(id="w"), settings={}, obj_name="PL_No_Retry",
+        obj=_pipe({"name": "Copy orders", "type": "Copy", "policy": {"retry": 0}}),
+    ))
+    assert result.status is Status.NA
+    assert "PL_No_Retry" in result.evidence
+    assert "PL-RETRY" in result.evidence
+
+
+def test_retry_values_finds_nested_retry_policy():
+    pipeline = _pipe({
+        "name": "For each table", "type": "ForEach",
+        "typeProperties": {"activities": [{
+            "name": "Copy table", "type": "Copy",
+            "policy": {"retry": 3, "retryIntervalInSeconds": 60},
+        }]},
+    })
+    result = retry_values(_ctx(pipeline))
+    assert result.score == _PASS
+    assert "Copy table" in result.evidence
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected"),
+    [
+        ({"retry": 1000, "retryIntervalInSeconds": 60}, "count 1000 exceeds maximum 10"),
+        ({"retry": 3}, "missing or non-positive interval"),
+        ({"retry": "infinite", "retryIntervalInSeconds": "soon"}, "invalid retry count 'infinite'"),
+    ],
+)
+def test_retry_values_invalid_policy_fails_with_activity_evidence(policy, expected):
+    pipeline = _pipe({"name": "Copy orders", "type": "Copy", "policy": policy})
+    result = retry_values(_ctx(pipeline))
+    assert result.score == _FAIL
+    assert "Copy orders" in result.evidence
+    assert expected in result.evidence
+
+
+# -- NB-LATE-ARRIVING ---------------------------------------------------------
+
+def test_late_arriving_generic_delta_ingest_is_not_dimensional_scope():
+    code = """
+raw = spark.read.json(source_path)
+normalised = raw.withColumn("DATAFIELD", upper(col("DATAFIELD")))
+typed = apply_data_types(normalised)
+typed.write.format("delta").mode("overwrite").saveAsTable(target_table)
+insert_count = typed.count()
+update_count = 0
+delete_count = 0
+"""
+    result = nb_late_arriving(_ctx(_nb(code)))
+    assert result.status is Status.NA
+    assert "no provable dimensional fact load" in result.evidence.lower()
+
+
+def test_late_arriving_fact_lookup_without_fallback_fails_with_specific_evidence():
+    code = """
+fact_sales = source.alias("f").join(dim_customer.alias("d"), col("f.customer_id") == col("d.customer_id"), "left")
+fact_sales.write.mode("append").saveAsTable("gold.fact_sales")
+"""
+    result = nb_late_arriving(_ctx(_nb(code)))
+    assert result.score == _FAIL
+    assert "unknown/inferred-member fallback" in result.evidence
+    assert "backfill" in result.evidence
+
+
+def test_late_arriving_unknown_member_and_backfill_passes():
+    code = """
+fact_sales = source.alias("f").join(dim_customer.alias("d"), col("f.customer_id") == col("d.customer_id"), "left")
+fact_sales = fact_sales.withColumn("customer_key", coalesce(col("d.customer_key"), lit(-1)))
+fact_sales.write.mode("append").saveAsTable("gold.fact_sales")
+DeltaTable.forName(spark, "gold.dim_customer").alias("target").merge(
+    source.alias("source"), "target.customer_id = source.customer_id"
+).whenMatchedUpdateAll().execute()
+"""
+    result = nb_late_arriving(_ctx(_nb(code)))
+    assert result.score == _PASS
+    assert "fallback" in result.evidence.lower()
+    assert "backfill" in result.evidence.lower()
+
+
+def test_late_arriving_fallback_without_backfill_fails():
+    code = """
+fact_sales = source.alias("f").join(dim_customer.alias("d"), col("f.customer_id") == col("d.customer_id"), "left")
+fact_sales = fact_sales.withColumn("customer_key", coalesce(col("d.customer_key"), lit(-1)))
+fact_sales.write.mode("append").saveAsTable("gold.fact_sales")
+"""
+    result = nb_late_arriving(_ctx(_nb(code)))
+    assert result.score == _FAIL
+    assert "backfill" in result.evidence.lower()
+
+
+def test_late_arriving_check_applies_to_data_storage():
+    spec = next(spec for spec in REGISTRY if spec.id == "NB-LATE-ARRIVING")
+    assert spec.applies_to(Layer.STORAGE)
 
 
 # -- PL-NOTIFY -----------------------------------------------------------------
@@ -193,6 +324,37 @@ def test_no_date_dimension_fails_not_matches_fact_with_date_in_name():
         dim_customer={"type": "Managed", "format": "Delta"},
     )
     assert table_date_dimension(ctx).score == _FAIL
+
+
+def test_date_dimension_is_judged_per_store_not_masked_by_an_unrelated_warehouse():
+    ctx = _tables_ctx(
+        **{
+            "DimDate": {"store": "EMPN2000_101Test", "store_kind": "Warehouse"},
+            "WH_Gold.dim_customer": {
+                "store": "WH_Gold", "store_kind": "Warehouse",
+            },
+            "test_Lakehouse.fact_sales": {
+                "store": "test_Lakehouse", "store_kind": "Lakehouse",
+            },
+        },
+    )
+    verdict = table_date_dimension(ctx)
+
+    assert verdict.score == _FAIL
+    assert "1 of 3" in verdict.evidence
+    assert "EMPN2000_101Test: DimDate" in verdict.evidence
+    assert "WH_Gold" in verdict.evidence
+    assert "test_Lakehouse" in verdict.evidence
+
+
+def test_date_dimension_partial_when_one_of_two_stores_has_one():
+    ctx = _tables_ctx(
+        **{
+            "sales.dim_date": {"store": "WH_Gold", "store_kind": "Warehouse"},
+            "bronze.orders": {"store": "LH_Bronze", "store_kind": "Lakehouse"},
+        },
+    )
+    assert table_date_dimension(ctx).score == 1
 
 
 # -- SPARK-ENV -----------------------------------------------------------------
@@ -343,7 +505,26 @@ silver = (silver.dropDuplicates(['event_id'])
           .withColumnRenamed('src_id', 'source_id'))
 silver.write.saveAsTable('silver_events')
 """
-    assert nb_silver_quality(_ctx(_nb(code))).score == _PASS
+    verdict = nb_silver_quality(_ctx(_nb(code)))
+    assert verdict.score is not None and verdict.score < _PASS
+    assert "2 of 4" in verdict.evidence
+    assert "deduplication" in verdict.evidence
+    assert "Not found: cleansing, conforming" in verdict.evidence
+
+
+def test_silver_quality_passes_when_every_aspect_is_present():
+    code = """
+silver = spark.read.table('bronze_events')
+silver = (silver.dropDuplicates(['event_id'])
+          .withColumn('event_date', to_date('event_date'))
+          .withColumn('name', trim(col('name')))
+          .withColumnRenamed('src_id', 'source_id'))
+silver.write.saveAsTable('silver_events')
+"""
+    verdict = nb_silver_quality(_ctx(_nb(code)))
+    assert verdict.score == 1
+    assert "present: deduplication, type standardization" in verdict.evidence
+    assert "missing: cleansing, conforming" in verdict.evidence
 
 
 def test_bulk_pipeline_passes_with_parallel_copy():
@@ -369,7 +550,7 @@ def test_layer_specific_checks_return_na_when_not_applicable():
     assert nb_bronze_metadata(notebook).status is Status.NA
     assert nb_silver_quality(notebook).status is Status.NA
     assert nb_eam_ingest(notebook).status is Status.NA
-    assert pl_bulk_move(pipeline).score == _FAIL
+    assert pl_bulk_move(pipeline).score == 1
 
 
 def test_bulk_move_is_na_for_notebook_only_pipeline():
@@ -384,13 +565,50 @@ def test_bulk_move_is_na_for_notebook_only_pipeline():
 
 
 def test_bulk_move_evidence_names_the_activity_and_reason():
-    # A Copy with no bulk-tuning token fails, and the evidence must name the
-    # data-move activity and say which patterns it looked for.
+    # Default Copy settings are a warning, not proof of row-by-row movement.
     pipeline = _pipe({"name": "Move rows", "type": "Copy"})
     verdict = pl_bulk_move(_ctx(pipeline))
-    assert verdict.score == _FAIL
+    assert verdict.score == 1
     assert "1 Copy" in verdict.evidence
     assert "parallelCopies" in verdict.evidence
+
+
+def test_bulk_move_ignores_foreach_batch_count_as_copy_evidence():
+    pipeline = _pipe({
+        "name": "Load metadata tables", "type": "ForEach",
+        "typeProperties": {
+            "batchCount": 50,
+            "items": {"value": "@activity('Lookup').output.value", "type": "Expression"},
+            "activities": [{"name": "Copy table", "type": "Copy", "typeProperties": {}}],
+        },
+    })
+    verdict = pl_bulk_move(_ctx(pipeline))
+    assert verdict.score == 1
+    assert "batchCount" not in verdict.evidence
+
+
+def test_bulk_move_passes_with_staging_and_copy_command():
+    pipeline = _pipe({
+        "name": "Warehouse bulk load", "type": "Copy",
+        "typeProperties": {
+            "enableStaging": True,
+            "sink": {"type": "DataWarehouseSink", "allowCopyCommand": True},
+        },
+    })
+    verdict = pl_bulk_move(_ctx(pipeline))
+    assert verdict.score == _PASS
+    assert "enableStaging=true" in verdict.evidence
+    assert "allowCopyCommand=true" in verdict.evidence
+
+
+def test_bulk_move_fails_only_explicit_row_by_row_logic():
+    pipeline = _pipe({
+        "name": "Insert row by row", "type": "Script",
+        "typeProperties": {"script": "-- row-by-row load\nINSERT INTO target VALUES (1)"},
+    })
+    verdict = pl_bulk_move(_ctx(pipeline))
+    assert verdict.score == _FAIL
+    assert "explicit row-by-row" in verdict.evidence
 
 
 # -- DQ RULES / RESTART / AUDIT LOG / FAILURE ALERT ---------------------------
@@ -834,6 +1052,158 @@ def test_historical_separation_no_historical_signal_is_na():
     verdict = pl_historical_separation(_named_pipe_ctx("PL_Daily_Load", _COPY))
     assert verdict.status is Status.NA
     assert "PL_Daily_Load" in verdict.evidence
+
+
+@pytest.mark.parametrize("name", [
+    "PL_IN_WHITMPK_TBL_FullLoad",
+    "PL_IN_WHITM_TBL_FullLoad",
+])
+def test_historical_separation_full_load_name_alone_is_na(name):
+    verdict = pl_historical_separation(_named_pipe_ctx(
+        name,
+        {"name": "Copy_IN_WHITM_INCROQ", "type": "Copy"},
+    ))
+    assert verdict.status is Status.NA
+    assert "no historical/backfill load signal" in verdict.evidence
+
+
+# -- PL-DEADLETTER structural routing ----------------------------------------
+
+def test_deadletter_ignores_error_words_inside_copy_column_mappings():
+    pipeline = _pipe({
+        "name": "Copy IFS rows",
+        "type": "Copy",
+        "typeProperties": {
+            "translator": {"mappings": [
+                {"source": {"name": "ERROR_DESC"}, "sink": {"name": "ERROR_DESC"}},
+                {"source": {"name": "REJECT_CODE"}, "sink": {"name": "REJECT_CODE"}},
+            ]},
+        },
+    })
+    verdict = pl_deadletter(_named_pipe_ctx("PL_Copy_Business_Error_Columns", *pipeline["properties"]["activities"]))
+    assert verdict.score == _FAIL
+    assert "no structural failed-record route" in verdict.evidence
+
+
+def test_deadletter_passes_copy_redirect_incompatible_rows():
+    copy = {
+        "name": "Copy with incompatible-row redirect",
+        "type": "Copy",
+        "typeProperties": {
+            "enableSkipIncompatibleRow": True,
+            "redirectIncompatibleRowSettings": {"linkedServiceName": "RejectStore"},
+        },
+    }
+    verdict = pl_deadletter(_named_pipe_ctx("PL_Copy_Redirect", copy))
+    assert verdict.score == _PASS
+    assert "redirects incompatible rows" in verdict.evidence
+
+
+def test_deadletter_passes_failed_dependency_to_quarantine_activity():
+    pipeline = _named_pipe_ctx(
+        "PL_Failed_Dependency_Route",
+        {"name": "Copy source", "type": "Copy"},
+        {
+            "name": "Write quarantine log", "type": "Script",
+            "dependsOn": [{"activity": "Copy source", "dependencyConditions": ["Failed"]}],
+            "typeProperties": {"scripts": [{"text": "INSERT INTO quarantine.failed_rows SELECT 1"}]},
+        },
+    )
+    verdict = pl_deadletter(pipeline)
+    assert verdict.score == _PASS
+    assert "Failed dependency" in verdict.evidence
+
+
+def test_deadletter_is_na_without_any_failed_record_signal():
+    verdict = pl_deadletter(_named_pipe_ctx(
+        "PL_Ordinary_Copy",
+        {"name": "Copy customer rows", "type": "Copy"},
+    ))
+    assert verdict.status is Status.NA
+    assert "no failed-record validation or routing signal" in verdict.evidence
+
+
+# -- NB-DEADLETTER rejected-row persistence ----------------------------------
+
+def test_notebook_deadletter_fails_when_rejected_dataframe_is_not_written():
+    code = """
+rejected_df = source.filter("is_valid = false")
+clean_df = source.filter("is_valid = true")
+clean_df.write.mode("append").saveAsTable("silver.clean_orders")
+"""
+    verdict = nb_deadletter(_ctx(_nb(code)))
+
+    assert verdict.score == _FAIL
+    assert "rejected_df" in verdict.evidence
+    assert "not written" in verdict.evidence
+
+
+def test_notebook_deadletter_passes_when_rejected_dataframe_is_written():
+    code = """
+rejected_df = source.filter("is_valid = false")
+rejected_df.write.mode("append").saveAsTable("ops.records")
+"""
+    verdict = nb_deadletter(_ctx(_nb(code)))
+
+    assert verdict.score == _PASS
+    assert "rejected_df" in verdict.evidence
+
+
+def test_notebook_deadletter_passes_when_sink_name_identifies_quarantine():
+    code = """
+failed_rows = source.filter("is_valid = false")
+failed_rows.write.mode("append").saveAsTable("dq.order_quarantine")
+"""
+    verdict = nb_deadletter(_ctx(_nb(code)))
+
+    assert verdict.score == _PASS
+    assert "order_quarantine" in verdict.evidence
+
+
+def test_notebook_deadletter_ignores_error_words_in_table_schema_columns():
+    code = '''
+spark.sql("""
+CREATE OR REPLACE TABLE mlc_mapping_source (
+    sale_id BIGINT,
+    ERROR_DESC STRING,
+    REJECT_CODE STRING
+) USING DELTA
+""")
+spark.sql("""
+CREATE OR REPLACE TABLE mlc_mapping_sink (
+    sale_id BIGINT,
+    ERROR_DESC STRING,
+    REJECT_CODE STRING
+) USING DELTA
+""")
+spark.sql("INSERT INTO mlc_mapping_source VALUES (1, 'message', 'R01')")
+'''
+    verdict = nb_deadletter(_ctx(_nb(code)))
+
+    assert verdict.status is Status.NA
+    assert "no structural failed-record" in verdict.evidence
+
+
+# -- TB-SCD2 aliases ---------------------------------------------------------
+
+def test_scd2_detects_alias_trio_and_flags_non_standard_names():
+    table = {
+        "columns": [
+            {"name": "customer_key"}, {"name": "effective_date"},
+            {"name": "end_date"}, {"name": "active_flag"},
+        ],
+    }
+    verdict = table_scd2(_tables_ctx(dim_customer=table))
+    assert verdict.score == _FAIL
+    assert "non-standard SCD2 column names" in verdict.evidence
+    assert "effective_date/end_date/active_flag" in verdict.evidence
+
+
+def test_scd2_no_pattern_reason_acknowledges_readable_column_metadata():
+    table = {"columns": [{"name": "customer_key"}, {"name": "customer_name"}]}
+    verdict = table_scd2(_tables_ctx(PROD_PRICE_TMLC=table))
+    assert verdict.status is Status.NA
+    assert "Column metadata is present, but no SCD2 pattern was found" in verdict.evidence
 
 
 # -- PL-COPY-PARALLEL (lone copy → N/A) ----------------------------------------

@@ -31,6 +31,7 @@ import json
 import re
 from datetime import datetime, timezone
 from statistics import median
+from typing import Any
 
 from auditfast.core.check._dax import time_intelligence_calls, uses_time_intelligence
 from auditfast.core.check._notebook import executable_code
@@ -884,3 +885,58 @@ def monitoring_refresh_cadence(ctx: CheckContext) -> Verdict:
     if overall <= _DAILY_HOURS:
         return graded(1, detail + " — roughly daily, so a problem is seen a day late")
     return graded(0, detail + " — weekly or less, too slow to act on")
+
+
+# ---------------------------------------------------------------------------
+# 10.3.3 — Eventhouse retention configured
+# ---------------------------------------------------------------------------
+
+
+def _retention_policy(eventhouse: Any) -> Any:
+    """Read retention metadata from either a normalized dict or provider object."""
+    if isinstance(eventhouse, dict):
+        return eventhouse.get("retention_policy", eventhouse.get("retentionPolicy"))
+    return getattr(eventhouse, "retention_policy", None)
+
+
+@check(
+    id="EVENTHOUSE-RETENTION",
+    ref="10.3.3",
+    title="Eventhouse retention configured",
+    pillar=Pillar.OPERATIONS,
+    scope=Scope.EVENTHOUSE,
+    layers=[Layer.LOGS],
+    severity=Severity.MEDIUM,
+    requires=[Resource.ITEMS],
+    required=True,
+)
+def eventhouse_retention_configured(ctx: CheckContext) -> Verdict:
+    """Verify that each readable Eventhouse has explicit retention metadata.
+
+    The current Fabric item inventory does not expose retention policy details.
+    In that case this check is intentionally N/A rather than treating an
+    unreadable policy as a misconfiguration.
+    """
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Eventhouse inventory could not be read from Fabric")
+
+    eventhouses = [
+        item for item in ctx.workspace.items
+        if item.type == "Eventhouse"
+    ]
+    if not eventhouses:
+        return not_applicable("No Eventhouse artifacts were found in the workspace")
+
+    unreadable = [
+        item.display_name or item.id
+        for item in eventhouses
+        if _retention_policy(item) is None
+    ]
+    if unreadable:
+        return not_applicable(
+            "Retention policy metadata is unavailable for Eventhouse(s): "
+            + ", ".join(unreadable)
+        )
+
+    names = ", ".join(item.display_name or item.id for item in eventhouses)
+    return binary(True, f"Retention policy is configured for Eventhouse(s): {names}")

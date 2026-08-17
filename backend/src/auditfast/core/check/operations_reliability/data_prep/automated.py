@@ -80,6 +80,11 @@ _RECORD_ERROR = re.compile(
     r"failed[_ -]?records?|_corrupt|_rejected|_quarantine",
     re.IGNORECASE,
 )
+_ERROR_ROUTE_NAME = re.compile(
+    r"quarantin|reject|dead.?letter|bad.?record|invalid|"
+    r"(?:log|capture|write|route).*(?:fail|error)|(?:fail|error).*(?:log|capture|write|route)",
+    re.IGNORECASE,
+)
 _IDEMPOTENT_PATTERN = re.compile(
     r"\bmerge\b|\bupsert\b|overwrite|replace|delete[_ -]?then[_ -]?insert|"
     r"dedup|dropduplicates|drop_duplicates|idempotent|batch[_ -]?id|run[_ -]?id|"
@@ -603,7 +608,7 @@ def pl_deadletter(ctx: CheckContext) -> Verdict:
     """
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
-    acts = activities(ctx.obj)
+    acts = walk_activities(ctx.obj)
     data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
     if not data_acts:
         return not_applicable("No data-movement activity to assess for failed records")
@@ -633,22 +638,38 @@ def pl_deadletter(ctx: CheckContext) -> Verdict:
         f"rows, and no activity runs on a [Failed] dependency - a bad record either halts "
         f"the run or is dropped. Column names containing 'error'/'reject' are source data, "
         f"not an error route, and are not counted",
+        False,
+        f"Pipeline '{ctx.obj_name}' moves data but has no structural failed-record route "
+        "(no incompatible-row redirect/logging, Failed dependency quarantine path, or "
+        "explicit reject sink); error/reject words in column mappings do not count",
     )
 
 
-#: A *genuine* dead-letter sink names its target, so keyword co-occurrence alone
-#: can no longer score a pass. Three real forms — a PySpark write to an
-#: error-named literal target (``saveAsTable``/``insertInto``/``.save``), a SQL
-#: ``INSERT``/``INSERT OVERWRITE`` into an error-named table, and an error-named
-#: DataFrame being written (``rejected_df.write``, ``exclusions_df.write``).
+#: A *genuine* dead-letter route is evidenced by either the DataFrame being
+#: written (``rejected_df.write``) or the literal sink receiving it
+#: (``saveAsTable("dq.quarantine")`` / SQL ``INSERT INTO dq.quarantine``).
 _ERR_SINK = (
     r"(?:reject|invalid|quarantin|dead[_ -]?letter|error|bad[_ -]?rec|"
     r"fail(?:ed|ure)|corrupt|discard|exclus|violation|exception)"
 )
-_ERR_TABLE_WRITE = re.compile(
-    r"""(?:saveastable|insertinto|\.save)\s*\(\s*[fr]?["'`][^"'`)]*""" + _ERR_SINK + r"|"
-    r"""insert\s+(?:into|overwrite)\s+(?:table\s+)?[\w.`"']*""" + _ERR_SINK + r"|"
-    r"\b\w*" + _ERR_SINK + r"\w*\.\s*write\b",
+_DATAFRAME_WRITE = re.compile(
+    r"\b(?P<dataframe>[A-Za-z_]\w*)\s*\.\s*write\b",
+    re.IGNORECASE,
+)
+_DATAFRAME_ASSIGNMENT = re.compile(
+    r"(?m)^\s*(?P<dataframe>[A-Za-z_]\w*)\s*=",
+)
+_FAILED_ROW_OPERATION = re.compile(
+    r"(?:filter|where)\s*\([^)]{0,240}(?:is_valid\s*(?:=|==)\s*false|"
+    + _ERR_SINK + r")|"
+    r"dropmalformed|badrecordspath|columnnameofcorruptrecord",
+    re.IGNORECASE | re.DOTALL,
+)
+_ERROR_TARGET_WRITE = re.compile(
+    r"(?:saveastable|insertinto|\.save)\s*\(\s*[fr]?[\"'`]"
+    r"(?P<target>[^\"'`)]*" + _ERR_SINK + r"[^\"'`]*)[\"'`]"
+    r"|insert\s+(?:into|overwrite)\s+(?:table\s+)?"
+    r"(?P<sql_target>[\w.`\"']*" + _ERR_SINK + r"[\w.`\"']*)",
     re.IGNORECASE,
 )
 #: Any persist — a table write, insert, or file write. Distinguishes "wrote the
@@ -694,12 +715,24 @@ def nb_deadletter(ctx: CheckContext) -> Verdict:
     # string literals are kept so a table name or embedded SQL still counts.
     code = strip_sql_comments(executable_code(ctx.obj))
 
-    hit = _ERR_TABLE_WRITE.search(code)
-    if hit:
+    dataframe_writes = [match.group("dataframe") for match in _DATAFRAME_WRITE.finditer(code)]
+    error_dataframe_writes = [
+        name for name in dataframe_writes if re.search(_ERR_SINK, name, re.IGNORECASE)
+    ]
+    target_hit = _ERROR_TARGET_WRITE.search(code)
+    if error_dataframe_writes or target_hit:
+        evidence_parts: list[str] = []
+        if error_dataframe_writes:
+            evidence_parts.append(
+                "failed-record DataFrame(s) written: "
+                + ", ".join(sorted(set(error_dataframe_writes)))
+            )
+        if target_hit:
+            target = target_hit.group("target") or target_hit.group("sql_target") or "?"
+            evidence_parts.append(f"error/quarantine sink written: {target}")
         return binary(
             True,
-            "Executable code writes failed/invalid records to a distinctly-named "
-            f"error / quarantine / reject sink (matched: {hit.group(0).strip()[:80]})",
+            "Executable code retains failed/invalid records — " + "; ".join(evidence_parts),
         )
 
     if not _RECORD_ERROR.search(code):
@@ -711,6 +744,32 @@ def nb_deadletter(ctx: CheckContext) -> Verdict:
             "quarantine / reject table (saveAsTable / INSERT INTO an error-named target) in "
             "the uncommented code and SQL queries but found none — the quarantine pattern "
             "is documented but not implemented",
+        )
+
+    assigned_error_dataframes = sorted({
+        match.group("dataframe")
+        for match in _DATAFRAME_ASSIGNMENT.finditer(code)
+        if re.search(_ERR_SINK, match.group("dataframe"), re.IGNORECASE)
+    })
+    if not (
+        assigned_error_dataframes
+        or error_dataframe_writes
+        or target_hit
+        or _FAILED_ROW_OPERATION.search(code)
+    ):
+        return not_applicable(
+            "Notebook mentions error/reject vocabulary only in table schemas, column "
+            "names, or ordinary data writes; no structural failed-record detection or "
+            "routing operation was found"
+        )
+
+    abandoned = sorted(set(assigned_error_dataframes) - set(dataframe_writes))
+    if abandoned:
+        return binary(
+            False,
+            "Executable code creates failed/rejected DataFrame(s) that are not written: "
+            f"{', '.join(abandoned)}. Writes of clean/main DataFrames do not "
+            "prove that dropped records were retained",
         )
 
     if _ANY_WRITE.search(code):
