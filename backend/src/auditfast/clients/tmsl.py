@@ -181,6 +181,12 @@ def parse_tmsl(document: dict) -> dict:
     storage: dict[str, dict] = {}
     refresh_policies: list[dict] = []
     aggregations: list[dict] = []
+    #: Per-table ``dataCategory``. Microsoft's star-schema guidance is explicit
+    #: that no property marks a table as fact or dimension - role is determined
+    #: by relationships - but ``dataCategory`` is a *declared* hint when a
+    #: modeller sets it ("Time" on a date table is set automatically by Power BI).
+    #: Stored so the role classifier can prefer a stated intent over a guess.
+    data_categories: dict[str, str] = {}
     for table in tables:
         if not isinstance(table, dict):
             continue
@@ -189,6 +195,9 @@ def parse_tmsl(document: dict) -> dict:
             continue  # skip Power BI auto date/time hidden tables
         table_names.append(table_name)
         model_columns.extend(_table_columns(table, table_name))
+        category = str(table.get("dataCategory") or "")
+        if category:
+            data_categories[table_name] = category
         # Partition modes, incremental-refresh policy and aggregation columns.
         # These three were previously initialised and returned but never filled,
         # so refs 14.2.1, 14.2.2, 14.2.4, 14.2.6 and 14.5.2 read an empty
@@ -257,6 +266,9 @@ def parse_tmsl(document: dict) -> dict:
         "measures": measures,
         "relationships": relationships,
         "roles": roles,
+        #: Declared ``dataCategory`` per table ("Time", "Customers", ...), when
+        #: the modeller set one. Empty for every table on most models.
+        "data_categories": data_categories,
         #: Per-table partition modes / source types (structure, not rows).
         "storage": storage,
         #: Tables carrying an incremental-refresh policy.

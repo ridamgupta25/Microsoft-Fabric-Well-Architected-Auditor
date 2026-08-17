@@ -336,10 +336,71 @@ def retry_values(ctx: CheckContext) -> Verdict:
     so an unbounded retry is not something a pipeline *can* configure. What a high
     count does mean is a long tail of failure: the threshold below is a
     house opinion, not a platform limit, and is settable per project.
+
+    **On the interval.** Fabric itself rejects a Copy-activity interval outside
+    30-86400 ("retryIntervalInSeconds cannot be '0'"), so for Copy activities the
+    positive-interval test is a floor the platform already enforces and will
+    essentially never fail. It is kept because it is not free everywhere: the
+    property can be absent entirely, other activity types are not known to share
+    the same validation, and a definition can reach the tenant through the REST
+    API, Git sync or a deployment pipeline without passing portal validation.
+    Treat a real failure here as a signal about *how the pipeline was authored*.
+    In practice the discriminating half of this check is the retry-count bound.
+
+    **What this cannot determine.** A retry count or interval supplied as a
+    pipeline expression (``@pipeline().parameters.retries``) resolves only at run
+    time, so its value is not readable from the definition. Those activities are
+    excluded from the ratio and reported, rather than guessed at or scored 0.
+    (The Fabric portal exposes retry only as a numeric spinner, so this shape
+    arrives through the API/Git rather than the UI.)
+
+    An activity with an explicit ``retry: 0`` but a parameterised interval is
+    reported separately as inert configuration: the back-off was made dynamic and
+    the retry never enabled, so the interval can never take effect. It is not
+    scored here - whether an activity should retry at all is PL-RETRY's question.
     """
-    with_retry = [a for a in activities(ctx.obj)
-                  if (a.get("policy") or {}).get("retry", 0) >= 1]
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    # walk_activities, not activities: a Copy inside a ForEach/If/Switch/Until is
+    # the commonest Fabric shape, and judging only the top level both misses bad
+    # nested retries and reports N/A for a pipeline that does configure them.
+    acts = walk_activities(ctx.obj)
+
+    # Partition in one pass. An activity whose retry *or* interval is a run-time
+    # expression cannot be judged either way, so it leaves the scored population
+    # rather than failing it.
+    with_retry: list[dict] = []
+    dynamic: list[dict] = []
+    inert: list[dict] = []
+    for activity in acts:
+        count = _retry_count(activity)
+        if _retry_is_dynamic(activity):
+            if count == 0:
+                inert.append(activity)      # a dynamic back-off that can never run
+            else:
+                dynamic.append(activity)
+        elif count is not None and count >= 1:
+            with_retry.append(activity)
+
+    inert_note = (
+        f". A further {len(inert)} activity(ies) parameterise a retry interval but set "
+        f"retry to 0, so the interval can never take effect"
+    ) if inert else ""
+
     if not with_retry:
+        if dynamic:
+            return not_applicable(
+                f"{len(dynamic)} activity(ies) set retry behaviour through a pipeline "
+                f"expression, which resolves only at run time and cannot be read from "
+                f"the definition" + inert_note
+            )
+        if inert:
+            return not_applicable(
+                f"No activity declares a retry policy. {len(inert)} activity(ies) "
+                f"parameterise a retry interval but set retry to 0, so the interval "
+                f"can never take effect"
+            )
         return not_applicable("No activity declares a retry policy")
 
     limit = ctx.setting("max_retry_count", _DEFAULT_MAX_RETRY)
@@ -349,23 +410,62 @@ def retry_values(ctx: CheckContext) -> Verdict:
         limit = _DEFAULT_MAX_RETRY
 
     def sane(activity: dict) -> bool:
-        policy = activity.get("policy") or {}
-        count = policy.get("retry", 0)
-        interval = policy.get("retryIntervalInSeconds", 0)
-        return 1 <= count <= limit and bool(interval) and interval > 0
+        count = _retry_count(activity)
+        interval = _retry_interval(activity)
+        if count is None or interval is None:
+            return False
+        return 1 <= count <= limit and interval > 0
 
     good = [a for a in with_retry if sane(a)]
-    return covered(
-        len(good), len(with_retry),
+    evidence = (
         f"{len(good)} of {len(with_retry)} retrying activities set a bounded count "
         f"(1-{limit}) and a positive interval. Fabric allows 1-1000 and has no "
-        f"infinite option, so the upper bound here is a project convention",
+        f"infinite option, so the upper bound here is a project convention"
     )
+    if dynamic:
+        evidence += (
+            f". A further {len(dynamic)} activity(ies) set retry behaviour through a "
+            f"run-time expression and are not judged here"
+        )
+    evidence += inert_note
+    return covered(len(good), len(with_retry), evidence)
 
 
 #: Retry attempts above which a failure takes long enough to look like a hang.
 #: Fabric permits up to 1000; this is a house convention, overridable per project.
 _DEFAULT_MAX_RETRY = 10
+
+
+def _policy_number(activity: dict, key: str) -> float | None:
+    """A numeric activity-policy value, or ``None`` when it is not statically known.
+
+    Fabric accepts either a literal or an expression object
+    (``{"value": "@pipeline().parameters.retries", "type": "Expression"}``) for
+    ``retry`` and ``retryIntervalInSeconds``. Comparing the latter with ``<=``
+    raises, so the two cases are separated here: a real number, or "not readable
+    from the definition". Booleans are rejected because ``True`` is an ``int``.
+    """
+    value = (activity.get("policy") or {}).get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+def _retry_count(activity: dict) -> float | None:
+    return _policy_number(activity, "retry")
+
+
+def _retry_interval(activity: dict) -> float | None:
+    return _policy_number(activity, "retryIntervalInSeconds")
+
+
+def _retry_is_dynamic(activity: dict) -> bool:
+    """True when retry behaviour is set, but only as a run-time expression."""
+    policy = activity.get("policy") or {}
+    return any(
+        key in policy and _policy_number(activity, key) is None
+        for key in ("retry", "retryIntervalInSeconds")
+    )
 
 
 @check(
