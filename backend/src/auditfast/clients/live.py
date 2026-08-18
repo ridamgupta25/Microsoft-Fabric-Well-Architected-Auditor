@@ -324,6 +324,32 @@ class LiveFabricProvider:
             return {"cells": [{"cell_type": "code", "source": payload}]}, ""
         return None, failure
 
+    def _spark_settings(self, workspace_id: str) -> dict:
+        """The workspace's default Spark runtime, from the Spark settings API.
+
+        ``GET /workspaces/{id}/spark/settings`` returns
+        ``environment.runtimeVersion`` - the runtime a notebook inherits when it
+        binds to no named Environment, which is the commonest setup. Documented
+        as an ordinary delegated read (Viewer is enough), not tenant-admin.
+
+        Only the runtime and the default-environment name are kept: pool sizes
+        and session timeouts are settings no check reads, and the KB must not
+        grow with data nobody uses. A failure yields ``{}`` so the runtime check
+        falls back to its other evidence rather than raising.
+        """
+        status, body = self._get(f"/workspaces/{workspace_id}/spark/settings")
+        if status != 200 or not isinstance(body, dict):
+            log.info("workspace spark settings unavailable for %s (status %s) - "
+                     "notebooks with no bound Environment will have no runtime",
+                     workspace_id, status)
+            return {}
+        environment = body.get("environment") or {}
+        settings = {
+            "runtime_version": str(environment.get("runtimeVersion") or ""),
+            "default_environment": str(environment.get("name") or ""),
+        }
+        return settings if settings["runtime_version"] else {}
+
     def _environment_definition(self, workspace_id: str, item_id: str) -> tuple[dict | None, str]:
         """Read an Environment's Sparkcompute settings from its definition."""
         parts, failure = self._definition_parts(workspace_id, item_id)
@@ -1302,6 +1328,15 @@ class LiveFabricProvider:
                         ctx.environments[item.display_name] = record
             self._record_failures(ctx, Resource.ENVIRONMENT_DEFINITIONS,
                                   attempted, read, forbidden, transient)
+
+        # The workspace's *default* Spark runtime, for notebooks that bind to no
+        # named Environment. Deliberately outside the ENVIRONMENT_DEFINITIONS
+        # block above: a workspace with no Environment items still has a default
+        # runtime, and that is exactly the case this exists to answer. Keyed on
+        # the notebook resource because it is the notebook checks that read it.
+        # One call per workspace, not per item.
+        if Resource.NOTEBOOK_DEFINITIONS in wanted or Resource.ENVIRONMENT_DEFINITIONS in wanted:
+            ctx.spark_settings = self._spark_settings(workspace_id)
 
         # The expensive one — one call per pipeline. Only paid for when a
         # selected check actually reads a pipeline definition.

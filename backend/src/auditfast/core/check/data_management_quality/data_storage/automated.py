@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
-from auditfast.core.check._notebook import executable_code, notebook_code
+from auditfast.core.check._notebook import NOTEBOOK_LAYERS, executable_code
 from auditfast.core.check._pipeline import activities as pipeline_activities
 from auditfast.core.check._pipeline import script_sql
 from auditfast.core.check._recency import parse_stamp
@@ -58,18 +58,42 @@ _NO_COLS = "No lakehouse/warehouse table column metadata available"
 _DATE_NAME = re.compile(r"(date|timestamp|_dt$|_time$)", re.IGNORECASE)
 
 
-# T-SQL cursor and pandas row-by-row iteration anti-patterns (3.6.7).
-# Note: .collect()/.toPandas() are separately caught by NB-COLLECT; this
-# targets explicit SQL cursor syntax and pandas row iterators that are
-# semantically cursor-equivalent.
-_CURSOR = re.compile(
-    r"\bDECLARE\s+\w+\s+CURSOR\b"    # T-SQL cursor declaration
-    r"|\bFETCH\s+NEXT\b"               # T-SQL cursor fetch
-    r"|\bWHILE\s+@@FETCH_STATUS\b"     # T-SQL cursor loop
-    r"|\.iterrows\s*\(\s*\)"           # pandas row-by-row iteration
-    r"|\.itertuples\s*\(\s*\)",        # pandas tuple-by-tuple iteration
-    re.IGNORECASE,
+#: Row-by-row processing, in the two languages a Fabric notebook actually uses.
+#:
+#: **T-SQL cursors** belong to Warehouse routines, not notebooks - a Fabric
+#: notebook is Spark - so those patterns are applied to ``sql_routines`` by the
+#: Warehouse checks and are deliberately absent here.
+#:
+#: **The Spark anti-patterns** are what a notebook can genuinely do wrong:
+#: pulling a distributed DataFrame onto the driver and then looping over it.
+#: ``collect()`` and ``toPandas()`` alone are not enough - both are legitimate
+#: for a small result - so each is paired with the iteration that follows it,
+#: which is what turns a materialisation into row-by-row processing.
+_ROW_BY_ROW = (
+    ("pandas .iterrows()", re.compile(r"\.iterrows\s*\(\s*\)")),
+    ("pandas .itertuples()", re.compile(r"\.itertuples\s*\(\s*\)")),
+    # ``for row in df.collect():`` - the classic driver-side loop. The receiver
+    # is matched loosely because a real call is chained
+    # (``spark.table('x').collect()``), not a bare name.
+    ("loop over collect()", re.compile(
+        r"for\s+\w+\s+in\s+[^\n:]*?\.collect\s*\(\s*\)", re.IGNORECASE)),
+    ("loop over toPandas()", re.compile(
+        r"for\s+\w+\s+in\s+[^\n:]*?\.toPandas\s*\(\s*\)", re.IGNORECASE)),
+    # ``for i in range(df.count()):`` then indexing - iteration by row number.
+    ("loop over row count", re.compile(
+        r"for\s+\w+\s+in\s+range\s*\(\s*[^\n:]*?\.count\s*\(\s*\)", re.IGNORECASE)),
+    # ``.rdd.map(...)`` with a Python lambda is per-row Python, not set-based.
+    ("rdd row map", re.compile(r"\.rdd\s*\.\s*(?:map|foreach)\s*\(", re.IGNORECASE)),
 )
+
+#: A ``collect()``/``toPandas()`` whose result is *assigned* and then iterated a
+#: few lines later - the same anti-pattern spread over two statements, which a
+#: single-line pattern misses. The right-hand side is matched loosely because a
+#: real call is chained (``spark.table('silver.sales').collect()``), not a bare
+#: name: an earlier ``[\w.]*`` version matched only the simplest possible form
+#: and silently missed every realistic one.
+_COLLECT_ASSIGNED = re.compile(
+    r"(\w+)\s*=\s*[^\n=]*?\.(?:collect|toPandas)\s*\(\s*\)", re.IGNORECASE)
 
 #: Table/schema name patterns that indicate a staging area.
 #: Keys in ctx.workspace.tables are either plain lakehouse names ("StagingTemp")
@@ -265,19 +289,55 @@ def wh_load_pattern(ctx: CheckContext) -> Verdict:
     id="NB-NO-CURSOR", ref="3.6.2",
     title="Silver-to-Gold transformations are set-based (no row-by-row cursors)",
     pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_no_cursor(ctx: CheckContext) -> Verdict:
-    """Set-based SQL and DataFrame operations rather than T-SQL cursors or pandas row iteration."""
+    """Transformations run set-based rather than looping over rows on the driver.
+
+    **Scoped to what a notebook can actually do.** An earlier version searched
+    notebook code for T-SQL cursor syntax (``DECLARE ... CURSOR``,
+    ``FETCH NEXT``, ``WHILE @@FETCH_STATUS``). A Fabric notebook is Spark, so
+    that syntax cannot appear in one and those patterns could never fire; the
+    cursor question belongs to Warehouse routines and is asked there. What is
+    checked here is the Spark equivalent: materialising a distributed DataFrame
+    on the driver and then iterating it.
+
+    ``collect()`` and ``toPandas()`` on their own are **not** flagged - both are
+    legitimate for a small result, and ``NB-COLLECT`` already judges unbounded
+    materialisation. The signal is the *iteration*: a loop over the collected
+    result, whether written inline or one statement later.
+
+    **What it cannot determine.** Whether a small driver-side loop is
+    justified - iterating 12 month names is not the anti-pattern this describes.
+    The evidence names the construct found so a reviewer can judge the scale.
+    """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
-    code = notebook_code(ctx.obj)
-    hits = _CURSOR.findall(code)
+    code = executable_code(ctx.obj)
+    if not code.strip():
+        return not_applicable("Notebook has no executable code to assess")
+
+    found: list[str] = []
+    for label, pattern in _ROW_BY_ROW:
+        hits = pattern.findall(code)
+        if hits:
+            found.append(f"{label} x{len(hits)}")
+
+    # A collect()/toPandas() assigned to a name, then looped over separately.
+    for match in _COLLECT_ASSIGNED.finditer(code):
+        variable = re.escape(match.group(1))
+        if re.search(rf"for\s+\w+\s+in\s+{variable}\b", code):
+            found.append("loop over a collected DataFrame")
+            break
+
+    if not found:
+        return binary(True, "No row-by-row iteration found - transformations run "
+                            "set-based on the Spark engine")
     return binary(
-        not hits,
-        f"{len(hits)} cursor/row-iteration pattern(s) detected "
-        "(T-SQL CURSOR / .iterrows() / .itertuples())" if hits
-        else "No T-SQL cursors or row-by-row iteration patterns â€” set-based transformations",
+        False,
+        f"Row-by-row processing found ({', '.join(sorted(set(found)))}). Each pulls "
+        f"rows onto the driver and loops over them, so the work runs single-threaded "
+        f"instead of across the cluster; confirm the volume justifies it",
     )
 
 
@@ -314,17 +374,23 @@ def wh_staging_pattern(ctx: CheckContext) -> Verdict:
 def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
     """Load SQL wraps transactional changes in TRY...CATCH.
 
-    **Two sources of SQL.** Stored procedures and functions declared in the
-    Warehouse, now read from ``INFORMATION_SCHEMA.ROUTINES`` - which is where a
-    ``SqlServerStoredProcedure`` activity's logic actually lives - plus the
-    inline T-SQL a pipeline runs through a Script activity. Before the routine
-    bodies were fetched, a pipeline that called a stored procedure was recorded
-    as an *opaque* load and the whole check reported N/A: the logic existed, it
-    simply had not been read.
+    **Only readable SQL is judged.** Two sources carry it: stored procedures and
+    functions declared in the Warehouse (read from ``INFORMATION_SCHEMA.ROUTINES``,
+    which is where a ``SqlServerStoredProcedure`` activity's logic actually lives)
+    and the inline T-SQL a pipeline runs through a Script activity.
 
-    **What it cannot determine.** Whether a ``Copy`` activity's implicit load is
-    transactional - it runs no SQL of its own - so those are still counted as
-    opaque and named in the evidence rather than judged.
+    **A Copy activity is out of scope, not un-judged.** It runs no SQL of its own -
+    Fabric generates the load internally and the pipeline definition contains
+    nothing to read - so there is no error handling for this check to find, ever.
+    Counting Copy activities as unreadable loads made the check look blind on
+    estates that simply do not use SQL for loading: on one workspace 109 of 114
+    "loads" were Copy activities, and the verdict read as though 96% of the estate
+    were hidden. They are now excluded from the population entirely and reported
+    separately as context.
+
+    **When nothing readable exists the answer is N/A, never FAIL.** A workspace
+    that loads exclusively through Copy activities has no SQL error-handling
+    practice to assess - that is not the same finding as having a bad one.
     """
     if not ctx.workspace.has(Resource.ITEMS):
         return not_applicable("Workspace items could not be read from Fabric")
@@ -337,7 +403,8 @@ def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
         return not_applicable("No Warehouse/Lakehouse items found in this workspace")
 
     inspected: list[tuple[str, bool]] = []
-    opaque_loads: list[str] = []
+    copy_loads: list[str] = []
+    unread_routines: list[str] = []
 
     # Stored procedures and functions declared in the Warehouse itself.
     for routine in ctx.workspace.sql_routines:
@@ -349,6 +416,10 @@ def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
             marker,
             bool(_TRY_CATCH_SQL.search(text)) and bool(_TXN_SQL.search(text)),
         ))
+
+    declared_routines = {
+        str(r.get("name") or "").lower() for r in ctx.workspace.sql_routines
+    }
 
     if ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         for pipeline_name, pipeline_def in ctx.workspace.pipelines.items():
@@ -366,28 +437,47 @@ def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
                     inspected.append((marker, has_try_catch and has_transaction))
                     continue
 
-                if activity_type in ("SqlServerStoredProcedure", "StoredProcedure", "Copy"):
-                    opaque_loads.append(marker)
+                if activity_type == "Copy":
+                    # No SQL exists to read, by design - not a gap in the crawl.
+                    copy_loads.append(marker)
+                    continue
+
+                if activity_type in ("SqlServerStoredProcedure", "StoredProcedure"):
+                    # The body lives in the Warehouse. If the routine list did not
+                    # carry it, that *is* a gap worth reporting - unlike a Copy.
+                    called = str((activity.get("typeProperties") or {}).get(
+                        "storedProcedureName") or "").split(".")[-1].strip("[]").lower()
+                    if not called or called not in declared_routines:
+                        unread_routines.append(marker)
 
     if not inspected:
-        if opaque_loads:
+        if unread_routines:
             return not_applicable(
-                f"{len(opaque_loads)} load activity/activities run through a stored "
-                "procedure or Copy whose SQL is not in this snapshot, and the "
-                "Warehouse declared no routine body to read, so TRY...CATCH "
-                "handling cannot be verified. " + _SQL_PERMISSION_HINT
+                f"{len(unread_routines)} pipeline activity/activities call a stored "
+                f"procedure whose body is not in this snapshot, so TRY...CATCH "
+                f"handling cannot be verified. " + _SQL_PERMISSION_HINT
             )
-        return not_applicable("No inspectable scripted SQL load activity was found")
+        if copy_loads:
+            return not_applicable(
+                f"This workspace loads through {len(copy_loads)} Copy activity/activities "
+                f"and declares no SQL load routine. A Copy activity runs no SQL of its "
+                f"own - Fabric generates the load internally - so there is no error "
+                f"handling to assess, which is not the same as having none"
+            )
+        return not_applicable("No SQL load routine or Script activity was found to assess")
 
     compliant = [name for name, ok in inspected if ok]
     evidence = (
-        f"{len(compliant)} of {len(inspected)} inspectable SQL load(s) use "
-        "TRY...CATCH and BEGIN/COMMIT/ROLLBACK transaction handling"
+        f"{len(compliant)} of {len(inspected)} readable SQL load(s) use TRY...CATCH "
+        "and BEGIN/COMMIT/ROLLBACK transaction handling"
         + (f"; compliant: {', '.join(compliant[:5])}" if compliant else "")
     )
-    if opaque_loads:
-        evidence += (f". {len(opaque_loads)} Copy/stored-procedure activity/activities "
-                     f"run no readable SQL and are not judged")
+    if copy_loads:
+        evidence += (f". A further {len(copy_loads)} Copy activity/activities load without "
+                     f"SQL and are out of scope for this check")
+    if unread_routines:
+        evidence += (f". {len(unread_routines)} activity/activities call a stored procedure "
+                     f"whose body could not be read")
     return covered(len(compliant), len(inspected), evidence)
 
 @check(

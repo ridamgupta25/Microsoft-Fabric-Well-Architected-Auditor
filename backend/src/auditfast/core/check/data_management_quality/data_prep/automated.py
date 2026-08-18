@@ -2465,6 +2465,55 @@ _OVERWRITE_BEHAVIOUR = re.compile(
     re.IGNORECASE,
 )
 
+#: ``tableActionOption`` values that replace a Lakehouse table's contents.
+#: ``Append`` and ``Upsert`` add to it; ``Overwrite``/``OverwriteSchema`` do not.
+_OVERWRITE_TABLE_ACTIONS = frozenset({"overwrite", "overwriteschema"})
+
+
+def _copy_sinks(definition: dict) -> list[dict]:
+    """Every Copy activity's ``sink`` block, including those inside containers."""
+    sinks: list[dict] = []
+    for activity in walk_activities(definition):
+        if (activity.get("type") or "") != "Copy":
+            continue
+        sink = (activity.get("typeProperties") or {}).get("sink")
+        if isinstance(sink, dict):
+            sinks.append(sink)
+    return sinks
+
+
+def _sink_table(sink: dict) -> str:
+    """The table a Copy sink writes to, or "" when it is not statically known.
+
+    Fabric embeds the target inline rather than in a separate dataset artifact,
+    but one level deeper than the activity's own ``typeProperties``:
+    ``sink.datasetSettings.typeProperties.table``. Reading only the activity
+    level - which this check used to do - found nothing and reported every
+    Copy-driven reload as an unnamed target.
+
+    Returns "" when the name is a pipeline *expression*
+    (``{"value": "@{item().TABLE_NAME}", "type": "Expression"}``), because a
+    ForEach-driven copy genuinely has no single target until run time.
+    """
+    props = (sink.get("datasetSettings") or {}).get("typeProperties") or {}
+    table = props.get("table")
+    if isinstance(table, str):
+        return table
+    return ""      # expression object, or absent
+
+
+def _sink_overwrites(sink: dict) -> bool:
+    """True when this sink replaces the table's contents rather than adding to it."""
+    action = str(sink.get("tableActionOption") or "").strip().lower()
+    if action in _OVERWRITE_TABLE_ACTIONS:
+        return True
+    if str(sink.get("writeBehavior") or "").strip().lower() == "overwrite":
+        return True
+    # A pre-copy TRUNCATE/DELETE is a full reload however the write is spelled.
+    pre_copy = sink.get("preCopyScript")
+    return bool(isinstance(pre_copy, str)
+                and re.search(r"\b(?:TRUNCATE|DELETE)\b", pre_copy, re.IGNORECASE))
+
 
 def _bare_table(name: str) -> str:
     """The table name without schema qualifier, brackets, or quotes."""
@@ -2505,31 +2554,74 @@ def _is_initial_load_context(ctx: CheckContext) -> bool:
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def pl_full_load(ctx: CheckContext) -> Verdict:
-    """Wholesale reloads target lookup/dimension tables, or are a one-time initial load."""
+    """Wholesale reloads target lookup/dimension tables, or are a one-time initial load.
+
+    **Three sources of a reload target**, all read from the definition itself:
+    inline T-SQL (``TRUNCATE`` / ``INSERT OVERWRITE`` / ``DROP TABLE``) in a
+    Script activity, and - for a Copy activity - the sink's own declared
+    behaviour and target. Fabric embeds the sink inline rather than in a separate
+    dataset artifact, so ``tableActionOption`` (``Overwrite`` / ``OverwriteSchema``
+    vs ``Append``), ``writeBehavior``, ``preCopyScript`` and the target
+    ``schema``/``table`` are all in the pipeline JSON. Reading only the SQL - which
+    this check used to do - reported every Copy-driven reload as an unnamed target.
+
+    **What it cannot determine.** The target of a Copy whose table name is a
+    pipeline expression (``@{item().TABLE_NAME}`` in a ForEach), because it has no
+    single target until run time. That is N/A: an unresolvable name is a gap in
+    what the definition exposes, not evidence that a fact table is reloaded.
+    """
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
     sql = script_sql(ctx.obj)
-    blob = json.dumps(ctx.obj)
 
     targets: list[str] = []
     for pattern in _FULL_LOAD_TARGETS:
         targets.extend(_bare_table(m) for m in pattern.findall(sql))
-    overwrite_copy = bool(_OVERWRITE_BEHAVIOUR.search(blob))
+
+    # Copy activities: the sink states whether it overwrites, and what it writes to.
+    overwriting_sinks = [s for s in _copy_sinks(ctx.obj) if _sink_overwrites(s)]
+    dynamic_targets = 0
+    for sink in overwriting_sinks:
+        table = _sink_table(sink)
+        if table:
+            targets.append(_bare_table(table))
+        else:
+            dynamic_targets += 1
+
+    # The old catch-all: an overwrite signal somewhere in the JSON that the sink
+    # parse did not attribute to a table. Kept so a sink shape we do not model
+    # still counts as a reload rather than vanishing.
+    overwrite_copy = bool(overwriting_sinks) or bool(_OVERWRITE_BEHAVIOUR.search(json.dumps(ctx.obj)))
 
     if not targets and not overwrite_copy:
         return not_applicable("Pipeline runs no full-reload statement "
                               "(TRUNCATE / INSERT OVERWRITE / overwrite sink)")
 
-    # An initial / one-time load may reload anything, fact tables included — the
+    # An initial / one-time load may reload anything, fact tables included - the
     # checklist reserves full loads for small tables *or* initial loads.
     initial_load = _is_initial_load_context(ctx)
     if not targets:
         if initial_load:
             return binary(True, "A Copy activity overwrites its sink, but this is a dedicated "
                                 "initial/one-time load, which the standard permits")
-        return graded(1, "A Copy activity overwrites its sink, but the target table "
-                         "is not named in the definition — cannot confirm it is a "
-                         "small reference/dimension table")
+        # Undetermined is N/A, never a partial failure: scoring here marked a
+        # pipeline down for this tool's blind spot rather than for anything the
+        # team did.
+        if dynamic_targets:
+            return not_applicable(
+                f"{dynamic_targets} Copy activity/activities overwrite a table whose name "
+                f"is a pipeline expression resolved at run time (a metadata-driven "
+                f"ForEach), so which table is reloaded cannot be determined from the "
+                f"definition"
+            )
+        return not_applicable(
+            "A Copy activity overwrites its sink, but the target table is not named "
+            "in the definition, so whether the reload targets a small "
+            "reference/dimension table cannot be determined"
+        )
+
+    unresolved = (f". A further {dynamic_targets} overwrite target(s) are named by a "
+                  f"run-time expression and are not judged") if dynamic_targets else ""
 
     facts = sorted({t for t in targets if is_fact(t)})
     safe = sorted({t for t in targets if not is_fact(t)})
@@ -2537,11 +2629,12 @@ def pl_full_load(ctx: CheckContext) -> Verdict:
         if initial_load:
             return binary(True, f"Full reload targets fact table(s): {', '.join(facts)}, but "
                                 f"this is a dedicated initial/one-time load, which the standard "
-                                f"permits for fact tables")
+                                f"permits for fact tables" + unresolved)
         return binary(False, f"Full reload targets fact table(s): {', '.join(facts)} — "
-                             f"facts should load incrementally, not be replaced wholesale")
+                             f"facts should load incrementally, not be replaced wholesale"
+                             + unresolved)
     kind = "dimension/reference" if any(is_dimension(t) for t in safe) else "reference"
-    return binary(True, f"Full reload targets only {kind} table(s): {', '.join(safe)}")
+    return binary(True, f"Full reload targets only {kind} table(s): {', '.join(safe)}" + unresolved)
 
 
 # -- 2.2.3 historical (Adage) load separated from ongoing incremental ----------

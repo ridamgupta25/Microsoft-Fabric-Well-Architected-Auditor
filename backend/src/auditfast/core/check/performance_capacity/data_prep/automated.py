@@ -422,26 +422,62 @@ def spark_select(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS, Resource.ENVIRONMENT_DEFINITIONS], required=True,
 )
 def spark_runtime(ctx: CheckContext) -> Verdict:
-    """Compare the bound Environment runtime with the configured minimum."""
+    """The Spark runtime a notebook actually runs on is current and supported.
+
+    **Three sources, strongest first.** A notebook bound to a named Environment
+    runs that Environment's runtime; failing that, the workspace's *default*
+    runtime from ``/workspaces/{id}/spark/settings``, which is what a notebook
+    with no binding inherits and the commonest setup of all; failing that, a
+    Spark version captured in the notebook's own output.
+
+    Before the workspace default was read, a notebook that bound to no
+    Environment reported "no runtime found" - N/A on the majority configuration,
+    while the estates most worth auditing looked unassessable.
+
+    **What it cannot determine.** Whether a runtime is *supported today*: Fabric
+    retires runtimes on its own schedule, so the bar is the project's
+    ``minimum_spark_version`` rather than a live support matrix. An unrecognised
+    runtime is N/A, never a failure - a runtime newer than this code knows about
+    must not read as out of date.
+    """
     environment = ctx.obj.get("_auditfast_environment") if isinstance(ctx.obj, dict) else None
     configured = environment.get("runtime_version") if isinstance(environment, dict) else None
+    source = f"Environment {environment.get('name', 'bound Environment')}" if configured else ""
+
+    if not configured:
+        settings = ctx.workspace.spark_settings or {}
+        configured = settings.get("runtime_version") or ""
+        if configured:
+            named = settings.get("default_environment")
+            source = (f"workspace default runtime (Environment {named})" if named
+                      else "workspace default runtime")
+
     if configured:
         runtime = _spark.fabric_runtime_to_spark(str(configured))
         minimum = _spark.parse_version(ctx.setting("minimum_spark_version", "3.5"))
         if runtime is None:
-            return not_applicable(f"Bound Environment runtime {configured!r} is not recognized")
+            return not_applicable(
+                f"Runtime {configured!r} is not one this check knows how to map to a "
+                f"Spark version, so it is not judged - a runtime newer than this code "
+                f"must not read as out of date"
+            )
         if minimum is None:
             return not_applicable("Project minimum_spark_version is invalid; expected major.minor[.patch]")
         actual = ".".join(map(str, runtime))
         required = ".".join(map(str, minimum))
-        name = environment.get("name", "bound Environment")
         return binary(
             runtime >= minimum,
-            f"Environment {name} uses Fabric runtime {configured} (Spark {actual}); required minimum is {required}",
+            f"{source} is Fabric runtime {configured} (Spark {actual}); "
+            f"required minimum is {required}",
         )
+
     versions = _spark.captured_spark_versions(ctx.obj)
     if not versions:
-        return not_applicable("No bound Environment runtime or captured Spark runtime version")
+        return not_applicable(
+            "No Environment binding, no workspace default Spark runtime, and no "
+            "captured Spark version in the notebook output, so the runtime this "
+            "notebook runs on is not readable"
+        )
     minimum = _spark.parse_version(ctx.setting("minimum_spark_version", "3.5"))
     if minimum is None:
         return not_applicable("Project minimum_spark_version is invalid; expected major.minor[.patch]")
