@@ -552,6 +552,8 @@ class CheckResult:
     scope: Scope = Scope.WORKSPACE
     weight: float = 1.0
     scored: bool = True
+    #: Source of this check result: "automated" (from engine) or "external" (from CSV).
+    source: str = "automated"
 
     #: Kept as a class attribute so callers can reference ``CheckResult.MAX_SCORE``.
     MAX_SCORE = MAX_SCORE
@@ -584,6 +586,7 @@ class CheckResult:
             "scope": self.scope.value,
             "weight": self.weight,
             "scored": self.scored,
+            "source": self.source,
             # Workspace-level checks are common to every project regardless of
             # source system; the UI flags them as such.
             "common": self.scope is Scope.WORKSPACE,
@@ -618,4 +621,5 @@ class CheckResult:
             scope=Scope(data.get("scope", Scope.WORKSPACE.value)),
             weight=data.get("weight", 1.0),
             scored=data.get("scored", True),
+            source=data.get("source", "automated"),
         )
