@@ -80,7 +80,7 @@ def _near_pii(pattern: re.Pattern, code: str, window: int = 160) -> bool:
 @check(
     id="NB-PII-TOKENISED", ref="5.5.4",
     title="**Sensitive data**: Masked/tokenized where required; format validation applied",
-    pillar=Pillar.SECURITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def notebook_pii_is_tokenised(ctx: CheckContext) -> Verdict:
