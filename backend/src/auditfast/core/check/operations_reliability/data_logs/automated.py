@@ -43,7 +43,7 @@ from auditfast.core.check._tables import (
     name_words,
     normalise_column,
 )
-from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable
+from auditfast.core.check.helpers import Verdict, binary, graded, not_applicable
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
@@ -555,6 +555,14 @@ def monitoring_models_support_trend_analysis(ctx: CheckContext) -> Verdict:
     the evidence rather than silently failed, because a report *can* trend a
     plain measure along a date axis without any time intelligence at all.
 
+    **How it scores.** The monitoring estate can express a historical trend as
+    soon as *one* model carries both mechanics, so the verdict grades the estate,
+    not every model: at least one model with a date table **and** a
+    time-intelligence measure passes fully (3); no such model but at least one
+    with a date table scores partial (1); no date table anywhere scores 0. A
+    multi-model workspace is not failed because a second, unrelated model happens
+    to lack the mechanics.
+
     **Sibling.** ``WS-RUN-HISTORY-EXPORT`` (ref 10.1.1) asks whether run history
     is *retained* long enough to have a trend; this asks whether the monitoring
     model can *express* one. Retention without mechanics, and mechanics without
@@ -571,7 +579,6 @@ def monitoring_models_support_trend_analysis(ctx: CheckContext) -> Verdict:
 
     full: list[str] = []
     axis_only: list[str] = []
-    neither: list[str] = []
     for name, model in sorted(models.items()):
         trend_measures = [
             measure.get("name") or "?"
@@ -590,25 +597,34 @@ def monitoring_models_support_trend_analysis(ctx: CheckContext) -> Verdict:
                         f"{', '.join(functions[:4])})")
         elif dated:
             axis_only.append(name)
-        else:
-            neither.append(name)
 
-    detail = ""
+    tail = (
+        ". Whether a report actually plots a trend is not readable: report visuals are "
+        "not fetched."
+    )
+    # The estate can express a historical trend as soon as *one* monitoring model
+    # carries the mechanics; demanding every model in a multi-model workspace have
+    # them would fail a workspace whose one dashboard model is perfectly capable.
+    if full:
+        return graded(
+            3,
+            f"{len(full)} of {len(models)} semantic model(s) carry both trend mechanics — a "
+            f"date/calendar table and a time-intelligence measure, so the monitoring estate "
+            f"can express a historical trend: {'; '.join(full[:2])}" + tail,
+        )
     if axis_only:
-        detail += (f"; {len(axis_only)} model(s) have a date/calendar table but no "
-                   f"time-intelligence measure ({', '.join(axis_only[:3])}) — a report can "
-                   f"still trend a plain measure along that axis, which is not readable here")
-    if neither:
-        detail += (f"; {len(neither)} model(s) have neither a date/calendar table nor a "
-                   f"time-intelligence measure ({', '.join(neither[:3])}) — current-state only")
-    return covered(
-        len(full), len(models),
-        f"{len(full)} of {len(models)} semantic model(s) carry both trend mechanics — a "
-        f"date/calendar table and a time-intelligence measure"
-        + (f": {'; '.join(full[:2])}" if full else "")
-        + detail
-        + ". Whether a report actually plots a trend is not readable: report visuals are "
-          "not fetched.",
+        return graded(
+            1,
+            f"No model carries a time-intelligence measure, but {len(axis_only)} of "
+            f"{len(models)} model(s) have a date/calendar table ({', '.join(axis_only[:3])}) — "
+            f"a report can still trend a plain measure along that axis, which is not readable "
+            f"here" + tail,
+        )
+    return graded(
+        0,
+        f"None of the {len(models)} semantic model(s) has a date/calendar table or a "
+        f"time-intelligence measure, so the monitoring estate can only show the current "
+        f"state, never a historical trend" + tail,
     )
 
 
@@ -758,10 +774,12 @@ def warehouse_loads_monitored(ctx: CheckContext) -> Verdict:
 # this measures what actually happened, not what was configured.
 
 #: An item whose job feeds the monitoring picture. Matched on the display name,
-#: which is the only description of purpose the item list carries.
+#: which is the only description of purpose the item list carries. ``alert``,
+#: ``refresh`` and ``dashboard`` are deliberately excluded: an alert/notification
+#: item (e.g. a Reflex or an email step) is not itself monitoring *data*, and
+#: those words match too much to identify the monitoring estate reliably.
 _MONITORING_NAME = re.compile(
-    r"monitor|observab|telemetr|audit|\blog\b|logs|metric|health|sla|alert|"
-    r"dashboard|refresh|heartbeat",
+    r"monitor|observab|telemetr|audit|\blog\b|logs|metric|health|sla|heartbeat",
     re.IGNORECASE,
 )
 
@@ -814,9 +832,10 @@ def monitoring_refresh_cadence(ctx: CheckContext) -> Verdict:
     between consecutive runs, taken from the job-run timestamps the scheduler
     history already returns for each item. Hourly or better passes; several times
     a day is partial; daily is weak; weekly or less scores nothing. Items are
-    selected by name (monitor / telemetry / audit / log / metric / SLA / refresh /
-    dashboard …); in a Data Logs workspace, where every runnable item is part of
-    the monitoring estate, all of them are used when no name matches.
+    selected by name (monitor / telemetry / audit / log / metric / SLA /
+    heartbeat …); an alert or notification item is not itself monitoring data, so
+    it is not selected. In a Data Logs workspace, where every runnable item is
+    part of the monitoring estate, all of them are used when no name matches.
 
     **What it cannot.** It does not read the *configured* schedule — the job
     scheduler's schedule API is not called — so a job configured hourly but

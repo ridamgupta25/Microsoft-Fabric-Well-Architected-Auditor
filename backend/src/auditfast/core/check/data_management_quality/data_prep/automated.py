@@ -14,11 +14,13 @@ from auditfast.core.check._notebook import (
     executable_code_no_strings,
     has_parameters_cell,
     layer_undetermined_evidence,
+    layer_words_in,
     markdown_sources,
     medallion_layer,
     notebook_code,
     strip_sql_comments,
     write_targets,
+    writes_layer,
 )
 from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities, script_sql, walk_activities
 from auditfast.core.check._tables import (
@@ -972,6 +974,9 @@ _BRONZE_INGESTION = re.compile(
     r"ingest(?:ed|ion)[_ ]?(?:timestamp|time|date)|ingested_at",
     re.IGNORECASE,
 )
+#: The three audit facts the Bronze point names, kept apart so the verdict can
+#: say *which* are present. Lost in a merge, which left the check referencing
+#: two undefined names - a NameError on every bronze notebook.
 _BRONZE_SOURCE = re.compile(
     r"source[_ ]?(?:system|file|path)|input_file_name\s*\(",
     re.IGNORECASE,
@@ -980,14 +985,31 @@ _BRONZE_BATCH = re.compile(
     r"batch[_ ]?(?:id|key)",
     re.IGNORECASE,
 )
-_SILVER_CLEANSING = re.compile(
-    r"\.dropna\s*\(|\.fillna\s*\(|\.replace\s*\(|"
-    r"regexp_replace\s*\(|\btrim\s*\(|\bcleanse\w*\s*\(",
-    re.IGNORECASE,
+#: The four Silver disciplines the checklist point names, kept separate so the
+#: verdict can say *which* are present. A single pattern could only answer
+#: "something was found", which reported "applies cleansing, deduplication,
+#: conforming and type standardization" on a notebook doing none of the dedup.
+_SILVER_ASPECTS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("deduplication", re.compile(
+        r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.distinct\s*\(\)|dedup|"
+        r"row_number\s*\(\s*\)\s*over|qualify\b",
+        re.IGNORECASE)),
+    ("type standardization", re.compile(
+        r"\.cast\s*\(|to_date\s*\(|to_timestamp\s*\(|astype\s*\(|"
+        r"CAST\s*\(|CONVERT\s*\(",
+        re.IGNORECASE)),
+    ("cleansing", re.compile(
+        r"regexp_replace\s*\(|\btrim\s*\(|\blower\s*\(|\bupper\s*\(|"
+        r"fillna\s*\(|na\.fill|coalesce\s*\(|cleanse|cleansing",
+        re.IGNORECASE)),
+    ("conforming", re.compile(
+        r"standardi[sz]e|conform|\.withColumnRenamed\s*\(|\balias\s*\(|mapping",
+        re.IGNORECASE)),
 )
-_SILVER_CONFORMING = re.compile(
-    r"withColumnRenamed\s*\(|\.withColumnsRenamed\s*\(|"
-    r"\.selectExpr\s*\([^)]*\bAS\b|\b(?:standardize|conform)\w*\s*\(",
+
+_BULK_ACTIVITY = re.compile(
+    r"parallelCopies|batchCount|batch[_ -]?size|bulk|copy activity|"
+    r"COPY\s+INTO|write\.mode|saveAsTable|repartition|coalesce",
     re.IGNORECASE,
 )
 _EXPLICIT_ROW_BY_ROW = re.compile(
@@ -1108,11 +1130,27 @@ _BOOLEAN_LITERALS = re.compile(
     re.IGNORECASE,
 )
 
-_DQ_RULE = re.compile(
-    r"assert\b|validation|validate|quality|quarantine|reject|invalid|"
-    r"dropDuplicates|drop_duplicates|left_anti|isNull|isin\s*\(|"
-    r"StructType|StructField|expected[_ ]?(?:schema|columns|values)",
-    re.IGNORECASE,
+#: The distinct data-quality disciplines 5.1.2 asks for, kept separate so the
+#: verdict can say *which* are codified. Bundling them into one pattern meant a
+#: notebook calling ``drop_duplicates`` once scored full marks for "DQ rules
+#: codified in code/config" - one line of tidy-up read as a rule framework.
+_DQ_ASPECTS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("assertions / expectations", re.compile(
+        r"\bassert\b|expect_|expectation|great_expectations|\bdeequ\b|"
+        r"\braise\s+\w*(?:Error|Exception)|pytest\.raises",
+        re.IGNORECASE)),
+    ("schema validation", re.compile(
+        r"StructType|StructField|expected[_ ]?(?:schema|columns|values)|"
+        r"\.schema\s*==|enforceSchema|mergeSchema\s*=\s*False",
+        re.IGNORECASE)),
+    ("null / domain checks", re.compile(
+        r"isNull|isNotNull|\bisin\s*\(|\bbetween\s*\(|dropna\s*\(|"
+        r"\.filter\s*\([^)]*(?:null|isin)|not\s+in\s*\(",
+        re.IGNORECASE)),
+    ("quarantine / rejection", re.compile(
+        r"quarantine|reject|invalid|bad[_ ]?record|badRecordsPath|"
+        r"error[_ ]?table|dead[_ -]?letter|left_anti",
+        re.IGNORECASE)),
 )
 
 
@@ -1516,9 +1554,6 @@ _UNKNOWN_MEMBER_USE = re.compile(
     r"when\s*\([^\n]{0,80}?-1",
     re.IGNORECASE,
 )
-#: Names of the medallion layers, to spot a notebook that spans two of them.
-_SILVER_REF = re.compile(r"\bsilver\b", re.IGNORECASE)
-_GOLD_REF = re.compile(r"\bgold\b", re.IGNORECASE)
 
 #: A genuine fact→dimension lookup, distinct from a Python ``str.join``. A Spark
 #: DataFrame join (``df.join(``) is never written ``"literal".join(``, so a
@@ -1679,7 +1714,11 @@ def nb_layer_recon(ctx: CheckContext) -> Verdict:
     should be accounted for in Gold, allowing for aggregation.
     """
     code = strip_sql_comments(executable_code(ctx.obj))
-    if not (_SILVER_REF.search(code) and _GOLD_REF.search(code)):
+    # Token-split rather than ``\bsilver\b``: an underscore is a word character,
+    # so a boundary regex cannot see ``silver_dim_customer`` - the very naming
+    # convention this looks for.
+    layers = layer_words_in(code)
+    if not ({"silver", "gold"} <= layers):
         return not_applicable(
             f"Notebook '{ctx.obj_name}' has no executable Silver-to-Gold flow"
         )
@@ -1961,15 +2000,23 @@ def nb_bronze_metadata(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_silver_quality(ctx: CheckContext) -> Verdict:
-    """Grade Silver writes across cleansing, deduplication, conformance, and type standardization.
+    """Silver writes apply cleansing, deduplication, conforming and type standardization.
 
     **Only Silver notebooks are judged**, decided by what the notebook writes to
     rather than by the word "silver" appearing anywhere in it - a Gold notebook
     that *reads* a silver table was previously judged as though it produced one.
 
-    **What it cannot determine.** That the transformation is *correct*, only that
-    an explicit cleansing/dedup/conformance step is present. When no signal
-    identifies a layer the notebook is reported N/A rather than failed.
+    **Scored per aspect.** The point names four disciplines, and a notebook doing
+    three of them is not the same as one doing all four. An earlier version
+    matched any one pattern and then claimed all four in its evidence, which
+    reported deduplication on notebooks that performed none. The verdict now
+    names which aspects were found and which were not, and scores the ratio, so
+    the evidence can be checked against the code.
+
+    **What it cannot determine.** That a transformation is *correct*, or that an
+    absent aspect was unnecessary - a source with a guaranteed-unique key needs
+    no dedup. The named gaps are for a reviewer to confirm, and the write target
+    is named so the reader knows which lakehouse was judged.
     """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
@@ -1984,19 +2031,15 @@ def nb_silver_quality(ctx: CheckContext) -> Verdict:
             f"Notebook produces the {layer} layer ({how}), so the Silver "
             "cleansing rule does not apply"
         )
-    controls = {
-        "cleansing": bool(_SILVER_CLEANSING.search(code)),
-        "deduplication": bool(_DEDUP_PATTERN.search(code)),
-        "conforming": bool(_SILVER_CONFORMING.search(code)),
-        "type standardization": bool(_TYPE_CAST.search(code)),
-    }
-    present = [name for name, found in controls.items() if found]
-    missing = [name for name, found in controls.items() if not found]
-    score = {0: 0, 1: 1, 2: 1, 3: 2, 4: 3}[len(present)]
-    evidence = f"Silver write ({how}); present: {', '.join(present) if present else 'none'}"
-    if missing:
-        evidence += f"; missing: {', '.join(missing)}"
-    return graded(score, evidence)
+
+    present = [name for name, pattern in _SILVER_ASPECTS if pattern.search(code)]
+    missing = [name for name, _ in _SILVER_ASPECTS if name not in present]
+    return covered(
+        len(present), len(_SILVER_ASPECTS),
+        f"Silver write ({how}) applies {len(present)} of {len(_SILVER_ASPECTS)} "
+        f"quality aspect(s): {', '.join(present) if present else 'none'}"
+        + (f". Not found: {', '.join(missing)}" if missing else ""),
+    )
 
 
 #: Activity types that actually move or transform *bulk data inside the pipeline*.
@@ -2305,23 +2348,42 @@ def nb_categorical_domain(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_dq_rules(ctx: CheckContext) -> Verdict:
-    """Notebook data-quality rules are expressed as executable, repeatable logic."""
+    """Notebook data-quality rules are expressed as executable, repeatable logic.
+
+    **Scored per discipline, not on a single token.** An earlier version passed
+    on any one match from a bundled pattern, so a notebook whose only quality
+    logic was ``drop_duplicates`` scored full marks for "DQ rules codified in
+    code/config" - and said so in its evidence. Deduplication is housekeeping;
+    it is not a rule that decides whether a record is fit to use.
+
+    Four disciplines are looked for separately - assertions/expectations, schema
+    validation, null/domain checks, and quarantine of rejected rows - and the
+    ratio is scored, so the verdict distinguishes a notebook with one incidental
+    call from one that actually validates what it loads. The evidence names both
+    what was found and what was not, so it can be checked against the code.
+
+    Comments are stripped first: a rule that exists only in a comment is not a
+    codified rule.
+
+    **What it cannot determine.** Whether the rules are *correct* or cover the
+    fields that matter - only that they are executable and repeatable rather
+    than performed by hand.
+    """
     code = executable_code(ctx.obj)
     if not (_INPUT_READ.search(code) or _WRITE_PATTERN.search(code)):
         return not_applicable("Notebook has no recognizable data-ingestion or write operation")
-    found = _matched_tokens(_DQ_RULE, code)
-    if found:
-        return binary(True, (
-            "Data-quality rule logic is codified in notebook code/config — matched: "
-            + ", ".join(found)
-        ))
-    return binary(False, (
-        "Data movement (read/write) present but no recognizable codified data-quality "
-        "rule — searched for: assertions (assert), validation/quality wording, "
-        "quarantine/reject/invalid handling, dedup (dropDuplicates), null / isin / "
-        "anti-join tests, an explicit schema (StructType/StructField), or "
-        "expected schema/columns/values"
-    ))
+
+    present: list[str] = []
+    missing: list[str] = []
+    for label, pattern in _DQ_ASPECTS:
+        (present if pattern.search(code) else missing).append(label)
+
+    return covered(
+        len(present), len(_DQ_ASPECTS),
+        f"{len(present)} of {len(_DQ_ASPECTS)} data-quality discipline(s) are codified "
+        f"in executable notebook code: {', '.join(present) if present else 'none'}"
+        + (f". Not found: {', '.join(missing)}" if missing else ""),
+    )
 
 
 
@@ -2715,7 +2777,6 @@ def pl_watermark_store(ctx: CheckContext) -> Verdict:
 
 
 # -- 2.3.2 operation type flag preserved in Bronze ----------------------------
-_BRONZE = re.compile(r"\bbronze\b|\braw\b|\blanding\b|pre[_ -]?bronze", re.IGNORECASE)
 _OP_TYPE_COLUMN = re.compile(
     r"(?P<column>operation[_ -]?type|op[_ -]?type|change[_ -]?type|_change_type|"
     r"__\$operation|cdc[_ -]?operation|dml[_ -]?action|record[_ -]?type|\bopcode\b|"
@@ -2726,11 +2787,6 @@ _CDC_SOURCE_SIGNAL = re.compile(
     r"change[_ -]?data[_ -]?capture|\bcdc\b|change[_ -]?(?:feed|stream|events?|records?)|"
     r"source[_ -]?changes?|readChangeFeed|readChangeData|startingVersion|startingTimestamp|"
     r"_change_type|__\$operation|sys_change_operation|dml[_ -]?action",
-    re.IGNORECASE,
-)
-_NOTEBOOK_WRITE_TARGET = re.compile(
-    r"(?:saveAsTable\s*\(\s*|INSERT\s+(?:INTO|OVERWRITE(?:\s+TABLE)?)\s+)"
-    r"[\"'`\[]?(?P<table>[A-Za-z_][\w$.]*(?:\.[A-Za-z_][\w$]*)*)",
     re.IGNORECASE,
 )
 
@@ -2747,15 +2803,22 @@ def nb_operation_type(ctx: CheckContext) -> Verdict:
     Read from the notebook that writes Bronze rather than from table columns:
     the Fabric REST API returns table metadata without columns, so a
     column-based test would be N/A on every live run.
+
+    **The Bronze test is on the write target, not a keyword.** An earlier version
+    searched the whole notebook for ``\\bbronze\\b``, which cannot match
+    ``bronze_raw_orders`` - the character after ``bronze`` is ``_``, a word
+    character, so there is no word boundary. The convention the check exists to
+    find was the one convention it could not see, and it reported "does not write
+    a Bronze/raw table" on a notebook that plainly did. Matching the write target
+    also stops a notebook that merely *reads* Bronze being judged as producing it.
     """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
     code = executable_code(ctx.obj)
-    if not _WRITE_PATTERN.search(code) or not _BRONZE.search(code):
+    writes_bronze, bronze_target = writes_layer(code, "bronze")
+    if not writes_bronze:
         return not_applicable("Notebook does not write a Bronze/raw table")
-    targets = list(dict.fromkeys(
-        match.group("table") for match in _NOTEBOOK_WRITE_TARGET.finditer(code)
-    ))
+    targets = [bronze_target]
     flags = list(dict.fromkeys(
         match.group("column") for match in _OP_TYPE_COLUMN.finditer(code)
     ))

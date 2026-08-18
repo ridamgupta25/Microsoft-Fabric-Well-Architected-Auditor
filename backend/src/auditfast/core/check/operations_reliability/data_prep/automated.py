@@ -341,77 +341,157 @@ def retry_values(ctx: CheckContext) -> Verdict:
     so an unbounded retry is not something a pipeline *can* configure. What a high
     count does mean is a long tail of failure: the threshold below is a
     house opinion, not a platform limit, and is settable per project.
+
+    **On the interval.** Fabric itself rejects a Copy-activity interval outside
+    30-86400 ("retryIntervalInSeconds cannot be '0'"), so for Copy activities the
+    positive-interval test is a floor the platform already enforces and will
+    essentially never fail. It is kept because it is not free everywhere: the
+    property can be absent entirely, other activity types are not known to share
+    the same validation, and a definition can reach the tenant through the REST
+    API, Git sync or a deployment pipeline without passing portal validation.
+    Treat a real failure here as a signal about *how the pipeline was authored*.
+    In practice the discriminating half of this check is the retry-count bound.
+
+    **What this cannot determine.** A retry count or interval supplied as a
+    pipeline expression (``@pipeline().parameters.retries``) resolves only at run
+    time, so its value is not readable from the definition. Those activities are
+    excluded from the ratio and reported, rather than guessed at or scored 0.
+    (The Fabric portal exposes retry only as a numeric spinner, so this shape
+    arrives through the API/Git rather than the UI.)
+
+    An activity with an explicit ``retry: 0`` but a parameterised interval is
+    reported separately as inert configuration: the back-off was made dynamic and
+    the retry never enabled, so the interval can never take effect. It is not
+    scored here - whether an activity should retry at all is PL-RETRY's question.
     """
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    # walk_activities, not activities: a Copy inside a ForEach/If/Switch/Until is
+    # the commonest Fabric shape, and judging only the top level both misses bad
+    # nested retries and reports N/A for a pipeline that does configure them.
+    acts = walk_activities(ctx.obj)
+
+    # Partition in one pass. An activity whose retry *or* interval is a run-time
+    # expression cannot be judged either way, so it leaves the scored population
+    # rather than failing it.
+    with_retry: list[dict] = []
+    dynamic: list[dict] = []
+    inert: list[dict] = []
+    for activity in acts:
+        count = _retry_count(activity)
+        if _retry_is_dynamic(activity):
+            if count == 0:
+                inert.append(activity)      # a dynamic back-off that can never run
+            else:
+                dynamic.append(activity)
+        elif count is not None and count >= 1:
+            with_retry.append(activity)
+
+    inert_note = (
+        f". A further {len(inert)} activity(ies) parameterise a retry interval but set "
+        f"retry to 0, so the interval can never take effect"
+    ) if inert else ""
+
+    if not with_retry:
+        if dynamic:
+            return not_applicable(
+                f"{len(dynamic)} activity(ies) set retry behaviour through a pipeline "
+                f"expression, which resolves only at run time and cannot be read from "
+                f"the definition" + inert_note
+            )
+        if inert:
+            return not_applicable(
+                f"No activity declares a retry policy. {len(inert)} activity(ies) "
+                f"parameterise a retry interval but set retry to 0, so the interval "
+                f"can never take effect"
+            )
+        return not_applicable(
+            f"Pipeline '{ctx.obj_name}' has no activity with a positive retry count; "
+            f"whether activities should retry at all is PL-RETRY's question (ref 2.4.1)"
+        )
+
     limit = ctx.setting("max_retry_count", _DEFAULT_MAX_RETRY)
     try:
         limit = int(limit)
     except (TypeError, ValueError):
         limit = _DEFAULT_MAX_RETRY
 
-    def positive_retry(activity: dict) -> bool:
-        policy = activity.get("policy") or {}
-        if "retry" not in policy:
-            return False
-        try:
-            return int(policy["retry"]) >= 1
-        except (TypeError, ValueError):
-            return True
-
-    with_retry = [a for a in walk_activities(ctx.obj) if positive_retry(a)]
-    if not with_retry:
-        return not_applicable(
-            f"Pipeline '{ctx.obj_name}' has no activity with a positive retry count; "
-            f"whether activities should retry is assessed by PL-RETRY (ref 2.4.1)"
-        )
-
-    def issues(activity: dict) -> list[str]:
-        policy = activity.get("policy") or {}
-        raw_count = policy.get("retry")
-        raw_interval = policy.get("retryIntervalInSeconds")
-        problems = []
-        try:
-            count = int(raw_count)
-        except (TypeError, ValueError):
-            problems.append(f"invalid retry count {raw_count!r}")
-        else:
-            if count < 1:
-                problems.append(f"count {count} is not positive")
-            elif count > limit:
-                problems.append(f"count {count} exceeds maximum {limit}")
-        try:
-            interval = int(raw_interval)
-        except (TypeError, ValueError):
-            interval = 0
-        if interval <= 0:
+    def faults(activity: dict) -> list[str]:
+        """Why this activity's retry settings are unsound, named so they can be fixed."""
+        problems: list[str] = []
+        count = _retry_count(activity)
+        interval = _retry_interval(activity)
+        if count is not None and count > limit:
+            problems.append(f"count {count:g} exceeds maximum {limit}")
+        if interval is None or interval <= 0:
             problems.append("missing or non-positive interval")
         return problems
 
-    assessed = [(activity, issues(activity)) for activity in with_retry]
-    good = [activity for activity, problems in assessed if not problems]
-    invalid = [
-        f"{activity.get('name', '?')}: {', '.join(problems)}"
-        for activity, problems in assessed if problems
+    assessed = [(a, faults(a)) for a in with_retry]
+    good = [a for a, problems in assessed if not problems]
+    offenders = [
+        f"{a.get('name') or '?'}: {', '.join(problems)}"
+        for a, problems in assessed if problems
     ]
-    if invalid:
-        return covered(
-            len(good), len(with_retry),
-            f"{len(good)} of {len(with_retry)} retrying activities use a bounded "
-            f"count (1-{limit}) and positive interval; invalid settings: "
-            f"{'; '.join(invalid)}",
-        )
-
-    names = ", ".join(sorted(a.get("name", "?") for a in good))
-    return covered(
-        len(good), len(with_retry),
-        f"All {len(good)} retrying activities set a bounded count (1-{limit}) and "
-        f"positive interval: {names}. Fabric allows 1-1000 and has no infinite "
-        f"option; the upper bound is the project convention",
+    evidence = (
+        f"{len(good)} of {len(with_retry)} retrying activities set a bounded count "
+        f"(1-{limit}) and a positive interval. Fabric allows 1-1000 and has no "
+        f"infinite option, so the upper bound here is a project convention"
     )
+    if offenders:
+        evidence += f". Unsound: {'; '.join(sorted(offenders)[:_MAX_NAMED_OFFENDERS])}"
+        if len(offenders) > _MAX_NAMED_OFFENDERS:
+            evidence += f" (+{len(offenders) - _MAX_NAMED_OFFENDERS} more)"
+    if dynamic:
+        evidence += (
+            f". A further {len(dynamic)} activity(ies) set retry behaviour through a "
+            f"run-time expression and are not judged here"
+        )
+    evidence += inert_note
+    return covered(len(good), len(with_retry), evidence)
+
+
+#: Offending activities named before the evidence turns into a wall of text. The
+#: count is always reported, so nothing is hidden - only the naming is capped.
+_MAX_NAMED_OFFENDERS = 5
 
 
 #: Retry attempts above which a failure takes long enough to look like a hang.
 #: Fabric permits up to 1000; this is a house convention, overridable per project.
 _DEFAULT_MAX_RETRY = 10
+
+
+def _policy_number(activity: dict, key: str) -> float | None:
+    """A numeric activity-policy value, or ``None`` when it is not statically known.
+
+    Fabric accepts either a literal or an expression object
+    (``{"value": "@pipeline().parameters.retries", "type": "Expression"}``) for
+    ``retry`` and ``retryIntervalInSeconds``. Comparing the latter with ``<=``
+    raises, so the two cases are separated here: a real number, or "not readable
+    from the definition". Booleans are rejected because ``True`` is an ``int``.
+    """
+    value = (activity.get("policy") or {}).get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+def _retry_count(activity: dict) -> float | None:
+    return _policy_number(activity, "retry")
+
+
+def _retry_interval(activity: dict) -> float | None:
+    return _policy_number(activity, "retryIntervalInSeconds")
+
+
+def _retry_is_dynamic(activity: dict) -> bool:
+    """True when retry behaviour is set, but only as a run-time expression."""
+    policy = activity.get("policy") or {}
+    return any(
+        key in policy and _policy_number(activity, key) is None
+        for key in ("retry", "retryIntervalInSeconds")
+    )
 
 
 @check(
@@ -478,6 +558,48 @@ def notebook_idempotent(ctx: CheckContext) -> Verdict:
     )
 
 
+#: Copy-activity settings that *are* a dead-letter route. Fabric writes skipped
+#: rows to the location named in ``redirectIncompatibleRowSettings`` /
+#: ``logSettings``, so their presence is the feature being configured, not a
+#: word that happens to appear in the JSON.
+_SKIP_SETTINGS = (
+    "redirectincompatiblerowsettings", "logsettings", "skiperrorfile",
+)
+
+#: Activity types that can serve as a quarantine sink on a ``[Failed]`` branch.
+_QUARANTINE_SINK_TYPES = frozenset({
+    "Copy", "SqlServerStoredProcedure", "Script", "TridentNotebook",
+    "Lookup", "AzureFunctionActivity", "WebActivity", "Web",
+})
+
+
+def _redirects_bad_rows(activity: dict) -> bool:
+    """True when a Copy activity is configured to *retain* incompatible rows.
+
+    ``enableSkipIncompatibleRow`` on its own silently drops them, which is the
+    very failure this point is about; it counts only when paired with a redirect
+    or log destination that keeps them.
+    """
+    props = activity.get("typeProperties") or {}
+    keys = {str(k).lower() for k in props}
+    if not (keys & set(_SKIP_SETTINGS)):
+        return False
+    return bool(props.get("enableSkipIncompatibleRow", True))
+
+
+def _failure_branch_targets(acts: list[dict]) -> list[str]:
+    """Names of activities that run *because* another activity failed."""
+    targets = []
+    for activity in acts:
+        for dep in activity.get("dependsOn") or []:
+            conditions = {str(c).lower() for c in (dep.get("dependencyConditions") or [])}
+            if conditions & {"failed", "skipped"}:
+                name = str(activity.get("name") or "").strip()
+                if name and (activity.get("type") or "") in _QUARANTINE_SINK_TYPES:
+                    targets.append(name)
+    return targets
+
+
 @check(
     id="PL-DEADLETTER", ref="2.4.4",
     title="Failed records captured to dead-letter / quarantine area (not silently dropped or halting good records)",
@@ -485,7 +607,26 @@ def notebook_idempotent(ctx: CheckContext) -> Verdict:
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def pl_deadletter(ctx: CheckContext) -> Verdict:
-    """Invalid records are structurally routed to a retained error output."""
+    """Invalid records are routed to a retained dead-letter or quarantine output.
+
+    **Judged structurally, never by keyword.** An earlier version searched the
+    whole pipeline JSON for words like ``error`` and ``reject``. On a real estate
+    that matched *column names* streaming from the source - ``REJECT_CODE``,
+    ``ERROR_DESC``, ``AUTHORIZATION_REJECTED`` - inside ``source.name`` /
+    ``sink.name`` column mappings, and scored a PASS on pipelines that had no
+    error handling whatsoever. Business data that happens to describe rejections
+    is not a rejection route.
+
+    What counts, all of them things Fabric actually configures:
+
+    * a Copy activity that redirects incompatible rows to a retained location
+      (``redirectIncompatibleRowSettings`` / ``logSettings`` / ``skipErrorFile``);
+    * an activity that runs on a ``[Failed]`` dependency - the quarantine branch;
+    * an activity whose own *name* marks it as the reject/quarantine step.
+
+    **What it cannot determine.** Whether the redirected rows are ever reviewed,
+    or whether a downstream notebook quarantines records the pipeline handed it.
+    """
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
     acts = walk_activities(ctx.obj)
@@ -493,58 +634,32 @@ def pl_deadletter(ctx: CheckContext) -> Verdict:
     if not data_acts:
         return not_applicable("No data-movement activity to assess for failed records")
 
-    def copy_redirect(activity: dict) -> bool:
-        if (activity.get("type") or "") != "Copy":
-            return False
-        properties = activity.get("typeProperties") or {}
-        redirected_rows = (
-            properties.get("enableSkipIncompatibleRow") is True
-            and bool(properties.get("redirectIncompatibleRowSettings"))
-        )
-        logged_or_skipped_file = any(bool(properties.get(key)) for key in COPY_LOG_KEYS)
-        logged_or_skipped_file |= bool(properties.get("skipErrorFile"))
-        return redirected_rows or logged_or_skipped_file
-
-    def explicit_error_sink(activity: dict) -> bool:
-        if _ERROR_ROUTE_NAME.search(str(activity.get("name") or "")):
-            return True
-        properties = activity.get("typeProperties") or {}
-        sink = properties.get("sink") or {}
-        outputs = activity.get("outputs") or []
-        targets = [sink, *outputs]
-        return any(_ERROR_ROUTE_NAME.search(json.dumps(target)) for target in targets)
-
-    redirected = [a for a in acts if copy_redirect(a)]
-    if redirected:
-        names = ", ".join(str(a.get("name") or "?") for a in redirected)
-        return binary(True, f"Copy activity redirects incompatible rows or logs/skips error files: {names}")
-
-    failed_routes = [
-        activity for activity in acts
-        if any(
-            "Failed" in (dependency.get("dependencyConditions") or [])
-            for dependency in (activity.get("dependsOn") or [])
-        ) and explicit_error_sink(activity)
+    redirecting = [
+        str(a.get("name") or "?") for a in data_acts if _redirects_bad_rows(a)
     ]
-    if failed_routes:
-        names = ", ".join(str(a.get("name") or "?") for a in failed_routes)
-        return binary(True, f"Failed dependency routes to an explicit logging/quarantine activity: {names}")
+    failure_targets = _failure_branch_targets(acts)
+    named_sinks = [
+        str(a.get("name") or "?") for a in acts
+        if _RECORD_ERROR.search(str(a.get("name") or ""))
+    ]
 
-    sinks = [a for a in acts if explicit_error_sink(a)]
-    if sinks:
-        names = ", ".join(str(a.get("name") or "?") for a in sinks)
-        return binary(True, f"Explicit reject/quarantine sink activity found: {names}")
-
-    if not _RECORD_ERROR.search(json.dumps(ctx.obj)):
-        return not_applicable(
-            f"Pipeline '{ctx.obj_name}' has no failed-record validation or routing signal to assess"
-        )
-
+    if redirecting:
+        return binary(True, f"Incompatible rows are redirected to a retained "
+                            f"location by: {', '.join(redirecting[:5])}")
+    if named_sinks:
+        return binary(True, f"A quarantine/reject step is present: {', '.join(named_sinks[:5])}")
+    if failure_targets:
+        return graded(2, f"{len(failure_targets)} activity(ies) run on a [Failed] "
+                         f"dependency ({', '.join(failure_targets[:5])}), so a failure path "
+                         f"exists - but nothing names a record-level quarantine sink, so "
+                         f"whether the bad *rows* are retained could not be confirmed")
     return binary(
         False,
-        f"Pipeline '{ctx.obj_name}' moves data but has no structural failed-record route "
-        "(no incompatible-row redirect/logging, Failed dependency quarantine path, or "
-        "explicit reject sink); error/reject words in column mappings do not count",
+        f"Pipeline '{ctx.obj_name}' moves data but has no structural failed-record route: "
+        f"none of the {len(data_acts)} data-movement activity(ies) redirects incompatible "
+        f"rows, no activity runs on a [Failed] dependency, and no activity names a reject "
+        f"sink - so a bad record either halts the run or is dropped. Column names "
+        f"containing 'error'/'reject' are source data, not an error route, and do not count",
     )
 
 

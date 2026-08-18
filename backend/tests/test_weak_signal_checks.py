@@ -442,7 +442,7 @@ def test_trend_fails_when_the_model_is_current_state_only():
     )})
     verdict = monitoring_models_support_trend_analysis(ctx)
     assert verdict.score == _FAIL
-    assert "current-state only" in verdict.evidence
+    assert "never a historical trend" in verdict.evidence
 
 
 def test_trend_names_a_date_axis_without_time_intelligence_rather_than_hiding_it():
@@ -450,18 +450,19 @@ def test_trend_names_a_date_axis_without_time_intelligence_rather_than_hiding_it
         ["Date", "pipeline_runs"], ("Runs", "COUNTROWS(pipeline_runs)"),
     )})
     verdict = monitoring_models_support_trend_analysis(ctx)
-    assert verdict.score == _FAIL
-    assert "no time-intelligence measure" in verdict.evidence
+    assert verdict.score == _PARTIAL_LOW
+    assert "date/calendar table" in verdict.evidence
     assert "not readable here" in verdict.evidence
 
 
-def test_trend_is_partial_when_only_some_models_carry_the_mechanics():
+def test_trend_passes_when_any_model_carries_the_mechanics():
+    """The estate can express a trend as soon as one model has both mechanics."""
     ctx = _ws_ctx(semantic_models={
         "Ops Monitoring": _model(["Date", "runs"],
                                  ("Runs LY", "CALCULATE([Runs], DATEADD('Date'[Date], -1, YEAR))")),
         "Ops Current": _model(["runs"], ("Runs", "COUNTROWS(runs)")),
     })
-    assert monitoring_models_support_trend_analysis(ctx).score == _PARTIAL_LOW
+    assert monitoring_models_support_trend_analysis(ctx).score == _PASS
 
 
 def test_trend_evidence_admits_report_visuals_are_never_read():
