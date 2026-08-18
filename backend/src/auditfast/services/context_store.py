@@ -31,6 +31,7 @@ from pathlib import Path
 
 from ..clients.base import ALL_RESOURCES, Provider
 from ..core.enums import Layer, Resource
+from ..core.errors import WorkspaceAccessError
 from ..core.models import WorkspaceContext
 
 log = logging.getLogger("auditfast.kb")
@@ -265,6 +266,108 @@ class KBArchive:
             "read_failures": ctx.read_failures,
         }
 
+    # -- replay (running the checks over saved snapshots) ----------------------
+    def _latest_by_id(self) -> dict[str, dict]:
+        """The newest snapshot folder per workspace id.
+
+        Every run appends a fresh dated folder, so a workspace has many. Only the
+        most recent matters for replay, and the leaf name ends in
+        ``_<YYYYMMDD_HHMMSS>`` — which sorts chronologically — so we read just the
+        newest leaf per workspace folder instead of every summary on disk (an
+        archive accumulates thousands of folders). Returns a map of
+        ``workspace_id -> {row, folder}`` where ``row`` is display metadata and
+        ``folder`` is the snapshot directory to load from.
+        """
+        latest: dict[str, dict] = {}
+        if not self.root.exists():
+            return latest
+        for workspace_dir in self.root.iterdir():
+            if not workspace_dir.is_dir():
+                continue
+            leaves = [leaf for leaf in workspace_dir.iterdir() if leaf.is_dir()]
+            if not leaves:
+                continue
+            newest = max(leaves, key=lambda leaf: leaf.name)
+            meta = self._read_meta(newest)
+            if meta is None:
+                continue
+            ws_id = meta["id"]
+            current = latest.get(ws_id)
+            if current is None or meta["captured_at"] > current["row"]["captured_at"]:
+                latest[ws_id] = {"row": meta, "folder": newest}
+        return latest
+
+    @staticmethod
+    def _read_meta(snapshot: Path) -> dict | None:
+        """Display metadata for one snapshot folder, from its summary.
+
+        Falls back to the full ``workspace.json`` when a summary is absent (an
+        older capture), and to the folder name for the timestamp when neither
+        carries one — a snapshot must never be dropped from the picker just
+        because its summary is missing a field.
+        """
+        summary_path = snapshot / "summary.json"
+        workspace_path = snapshot / "workspace.json"
+        if not workspace_path.exists():
+            return None
+        stamp = snapshot.name.rsplit("_", 2)[-2:]
+        fallback_stamp = "_".join(stamp) if len(stamp) == 2 else snapshot.name
+        try:
+            if summary_path.exists():
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                ws_id = summary.get("workspace_id")
+                if not ws_id:
+                    return None
+                return {
+                    "id": ws_id,
+                    "name": summary.get("workspace") or ws_id,
+                    "role": summary.get("layer", "") or "",
+                    "layer": summary.get("layer", "") or "",
+                    "items": summary.get("items"),
+                    "pipelines": summary.get("pipelines_read"),
+                    "complete": bool(summary.get("complete", False)),
+                    "captured_at": str(summary.get("captured_at") or fallback_stamp),
+                }
+            data = json.loads(workspace_path.read_text(encoding="utf-8"))
+            ws_id = data.get("id")
+            if not ws_id:
+                return None
+            return {
+                "id": ws_id,
+                "name": data.get("display_name") or ws_id,
+                "role": data.get("layer", "") or "",
+                "layer": data.get("layer", "") or "",
+                "items": len(data.get("items", [])),
+                "pipelines": len(data.get("pipelines", {})),
+                "complete": None,
+                "captured_at": fallback_stamp,
+            }
+        except Exception as exc:  # a corrupt snapshot must not hide the others
+            log.warning("KB archive snapshot %s is unreadable: %s", snapshot, exc)
+            return None
+
+    def index(self) -> list[dict]:
+        """One display row per archived workspace (its newest snapshot).
+
+        This is what the "run over saved KB" picker lists — no token, no Fabric
+        call, just what has already been crawled to disk.
+        """
+        rows = [entry["row"] for entry in self._latest_by_id().values()]
+        return sorted(rows, key=lambda r: (r["name"] or "").lower())
+
+    def load_latest(self, workspace_id: str) -> WorkspaceContext | None:
+        """Rebuild the newest archived context for ``workspace_id``, or ``None``."""
+        entry = self._latest_by_id().get(workspace_id)
+        if entry is None:
+            return None
+        workspace_path = entry["folder"] / "workspace.json"
+        try:
+            data = json.loads(workspace_path.read_text(encoding="utf-8"))
+            return WorkspaceContext.from_dict(data)
+        except Exception as exc:
+            log.warning("KB archive context %s is unreadable: %s", workspace_id, exc)
+            return None
+
 
 class ArchivingProvider:
     """Wraps any provider and archives every context it returns.
@@ -301,3 +404,56 @@ class ArchivingProvider:
     @property
     def served_from_cache(self) -> bool:
         return bool(getattr(self._inner, "served_from_cache", False))
+
+
+class SnapshotProvider:
+    """A :class:`Provider` that serves saved/uploaded snapshots — no live tenant.
+
+    This is what runs the check library over a knowledge base that already
+    exists on disk (the archive) or one the reviewer uploaded, without a sign-in
+    token and without a single Fabric call. Because the snapshot is frozen, a
+    replay is the most reproducible run possible.
+
+    Contexts passed in ``uploaded`` (already-parsed uploads) take precedence; any
+    other workspace is loaded lazily from the ``archive`` on first request. A
+    workspace neither uploaded nor archived raises :class:`WorkspaceAccessError`,
+    which the engine turns into a visible access row — never a silent pass.
+    """
+
+    def __init__(
+        self,
+        *,
+        uploaded: dict[str, WorkspaceContext] | None = None,
+        archive: KBArchive | None = None,
+        rows: list[dict] | None = None,
+    ):
+        self._uploaded = dict(uploaded or {})
+        self._archive = archive
+        self._rows = list(rows or [])
+        #: KB runs are never served from the live-crawl cache; the flag exists so
+        #: the audit service can report provenance uniformly across sources.
+        self.served_from_cache = False
+
+    def fetch(
+        self,
+        workspace_id: str,
+        layer: Layer = Layer.MIXED,
+        resources: Iterable[Resource] = ALL_RESOURCES,
+    ) -> WorkspaceContext:
+        ctx = self._uploaded.get(workspace_id)
+        if ctx is None and self._archive is not None:
+            ctx = self._archive.load_latest(workspace_id)
+        if ctx is None:
+            # 404 semantics: the snapshot is not in the KB, so it cannot be
+            # audited from disk — the reviewer must upload it or crawl it live.
+            raise WorkspaceAccessError(workspace_id, 404)
+        # Honour the layer the reviewer assigned for this run, exactly as a live
+        # crawl does — the layer is an audit-time role, not a property of the
+        # captured snapshot.
+        if layer is not None and ctx.layer != layer:
+            ctx.layer = layer
+        return ctx
+
+    def list_workspaces(self) -> list[dict]:
+        return list(self._rows)
+

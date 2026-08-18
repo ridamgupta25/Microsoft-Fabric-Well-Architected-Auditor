@@ -236,6 +236,21 @@ def test_json_validation_is_na_when_notebook_definitions_were_unreadable():
     assert notebook_validates_json_payloads(ctx).status is Status.NA
 
 
+def test_json_validation_is_na_for_stdlib_json_config_parsing():
+    """A deployment notebook that reads pipeline JSON files with stdlib
+    ``json.load``/``json.loads`` is not EAM *data* ingestion - the shared gate
+    must not open on bare stdlib parsing (both siblings agree)."""
+    ctx = _nb_ctx(
+        "import json\n"
+        "with open(path) as f:\n"
+        "    cfg = json.load(f)\n"
+        "payload = json.dumps(cfg)\n"
+        "parsed = json.loads(response.text)\n"
+    )
+    assert notebook_validates_json_payloads(ctx).status is Status.NA
+    assert nb_eam_ingest(ctx).status is Status.NA
+
+
 # =============================================================================
 # registration
 # =============================================================================

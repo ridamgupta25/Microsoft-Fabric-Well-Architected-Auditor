@@ -105,6 +105,16 @@ def test_merge_ignores_python_commented_dml():
     assert v.status is Status.NA
 
 
+def test_merge_failure_suggests_consolidating_into_merge_into():
+    v = delta_merge(_ctx(_nb(
+        "spark.sql('DELETE FROM t WHERE 1=1')\nspark.sql('INSERT INTO t SELECT * FROM s')"
+    )))
+    assert v.score == 0
+    assert "t (DELETE + INSERT)" in v.evidence
+    assert "MERGE INTO" in v.evidence
+    assert "atomically" in v.evidence
+
+
 # -- DELTA-OPTIMIZE ------------------------------------------------------------
 
 def test_optimize_after_write_passes():

@@ -474,6 +474,26 @@ def test_a_multiline_sql_anti_join_still_binds_to_its_variable():
     assert nb_orphan_detect(_nb_ctx(code)).score == 3
 
 
+def test_comma_style_sql_join_is_detected_as_a_join():
+    """``FROM a t, b i, c g WHERE ...`` is an implicit inner join that silently
+    drops unmatched rows - exactly the orphan risk - so it must not read as
+    'does not perform joins'."""
+    code = ('df = spark.sql("""\n'
+            "    SELECT t.amt, i.name, g.acct\n"
+            "    FROM in_tran_tmlc t, in_item_tbl i, gl_interface_tmlc g\n"
+            "    WHERE t.item_id = i.item_id AND t.gl_id = g.gl_id\n"
+            '""")\n')
+    verdict = nb_orphan_detect(_nb_ctx(code))
+    assert verdict.score == 0
+    assert "without orphan record detection" in verdict.evidence
+
+
+def test_a_select_column_list_is_not_a_comma_join():
+    """A comma in the SELECT list with a single-table FROM is not an implicit join."""
+    code = 'df = spark.sql("SELECT a, b, c FROM one_table WHERE a > 0")\n'
+    assert nb_orphan_detect(_nb_ctx(code)).status is Status.NA
+
+
 # --- 5.3.9: the validated table must be the merged table ---------------------
 
 def test_merge_validated_on_a_different_table_fails():
@@ -1415,6 +1435,26 @@ def test_fact_write_with_duplicate_guard_has_detailed_pass_evidence():
     assert verdict.score == 3
     assert "Notebook 'nb'" in verdict.evidence
     assert "dropDuplicates" in verdict.evidence
+
+
+def test_ctas_write_is_recognised_so_the_na_reason_is_accurate():
+    """A CTAS load writes a table; a non-fact CTAS target is N/A for a *fact*-grain
+    check, but the reason must not claim the notebook 'writes no table'."""
+    code = ('spark.sql("""\n'
+            "    CREATE TABLE lh.bronze.gl_detail AS\n"
+            "    SELECT * FROM staging.gl\n"
+            '""")\n')
+    verdict = nb_grain_unique(_nb_ctx(code))
+    assert verdict.status is Status.NA
+    assert "writes no table" not in verdict.evidence
+    assert "no provable fact write target" in verdict.evidence
+
+
+def test_ctas_into_a_fact_table_without_dedup_fails():
+    code = 'spark.sql("CREATE TABLE gold.fact_sales AS SELECT * FROM staging.sales")\n'
+    verdict = nb_grain_unique(_nb_ctx(code))
+    assert verdict.score == 0
+    assert "fact_sales" in verdict.evidence
 
 
 # =============================================================================

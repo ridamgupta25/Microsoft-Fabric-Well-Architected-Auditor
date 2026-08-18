@@ -1,9 +1,10 @@
 /**
  * Submit an audit: pick workspaces and pillars, then watch it run.
  *
- * Always audits the live tenant. Workspaces are only ever fetched once the user
- * has a real sign-in session — there is no sample/fixture data shown here, so
- * what you see on this page is always what your account can actually reach.
+ * Two data sources are offered. **Live** audits the signed-in tenant. **Saved
+ * KB** replays snapshots already crawled to disk — no sign-in — and also accepts
+ * a workspace snapshot uploaded as JSON. What you see under Live is always what
+ * your account can actually reach; there is no sample/fixture data.
  *
  * Submission is fire-and-poll, so the page shows live status while the backend
  * works rather than freezing on a long request.
@@ -16,13 +17,15 @@ import { ErrorBanner, Section, Spinner } from "@/components/ui";
 import { useAuditContext } from "@/context/AuditContext";
 import { useAsync } from "@/hooks/useAsync";
 import {
+  listKbWorkspaces,
   listLiveWorkspaces,
   pollAudit,
   submitAudit,
   submitAuditAnswers,
+  uploadKbSnapshot,
 } from "@/services/auditService";
 import { listLayers, listPillars } from "@/services/catalogService";
-import type { AuditJob, Workspace } from "@/types/api";
+import type { AuditJob, AuditSource, Workspace } from "@/types/api";
 
 const TERMINAL_STATUSES = new Set<AuditJob["status"]>(["succeeded", "failed"]);
 
@@ -43,11 +46,20 @@ export function RunAuditPage() {
   const navigate = useNavigate();
   const { session, isSignedIn, setLastAuditId, setReport } = useAuditContext();
 
-  // Only fetch once there is a real session — never fall back to sample data.
+  // Live reads the signed-in tenant; KB replays saved/uploaded snapshots offline.
+  const [source, setSource] = useState<AuditSource>("live");
+
+  // Live workspaces need a session; saved-KB workspaces come from disk with no
+  // sign-in. Either way this is the only source of the queue — never sample data.
   const workspaces = useAsync(
-    () => (session ? listLiveWorkspaces(session) : Promise.resolve([])),
-    [session],
-    isSignedIn,
+    () =>
+      source === "kb"
+        ? listKbWorkspaces()
+        : session
+          ? listLiveWorkspaces(session)
+          : Promise.resolve([]),
+    [source, session],
+    source === "kb" || isSignedIn,
   );
   const pillars = useAsync(() => listPillars(), []);
   const layers = useAsync(() => listLayers(), []);
@@ -56,6 +68,11 @@ export function RunAuditPage() {
   const [roles, setRoles] = useState<Record<string, string>>({});
   const [manual, setManual] = useState<Workspace[]>([]);
   const [removed, setRemoved] = useState<Record<string, boolean>>({});
+  // Uploaded KB snapshots, keyed by workspace id. A `kb` run carries these
+  // inline; archived workspaces are loaded from disk by id and need no entry.
+  const [snapshots, setSnapshots] = useState<Record<string, Record<string, unknown>>>({});
+  const [uploading, setUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [newWsId, setNewWsId] = useState("");
   const [newWsRole, setNewWsRole] = useState("Mixed");
   const [groups, setGroups] = useState<WorkspaceGroup[]>([]);
@@ -139,8 +156,8 @@ export function RunAuditPage() {
 
   const submitFor = useCallback(
     async (specs: { id: string; role: string }[]) => {
-      if (!isSignedIn || !session) {
-        setError("Connect to Fabric before running an audit.");
+      if (source === "live" && (!isSignedIn || !session)) {
+        setError("Connect to Fabric before running a live audit.");
         return;
       }
       const chosen = Object.entries(chosenPillars)
@@ -168,11 +185,18 @@ export function RunAuditPage() {
       abortRef.current = controller;
 
       try {
+        // A KB run carries only the snapshots that were uploaded; workspaces
+        // picked from the saved archive are loaded on the server by id.
+        const uploaded = specs
+          .map((spec) => snapshots[spec.id])
+          .filter((snap): snap is Record<string, unknown> => Boolean(snap));
         const accepted = await submitAudit({
           pillars: chosen,
           workspaces: specs,
-          auth_session: session,
           weight_by_environment: weightByEnv,
+          auth_session: source === "kb" ? undefined : session,
+          source,
+          snapshots: source === "kb" ? uploaded : undefined,
         });
         setLastAuditId(accepted.audit_id);
         setAuditId(accepted.audit_id);
@@ -192,7 +216,7 @@ export function RunAuditPage() {
         setSubmitting(false);
       }
     },
-    [chosenPillars, isSignedIn, session, setLastAuditId, weightByEnv],
+    [chosenPillars, isSignedIn, session, source, snapshots, setLastAuditId, weightByEnv],
   );
   const specsFor = useCallback(
     (list: Workspace[]) =>
@@ -302,6 +326,11 @@ export function RunAuditPage() {
       delete next[id];
       return next;
     });
+    setSnapshots((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
   };
 
   const toggleGroupMember = (id: string) => {
@@ -329,20 +358,91 @@ export function RunAuditPage() {
     setGroups((prev) => prev.filter((group) => group.id !== id));
   };
 
-  if (!isSignedIn) {
+  // Read one or more uploaded workspace snapshot files, validate each against
+  // the server (which normalizes it), and add it to the queue. Untrusted input:
+  // the server rejects anything that is not a workspace snapshot.
+  const handleUpload = useCallback(async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    setUploading(true);
+    setError(null);
+    try {
+      for (const file of Array.from(files)) {
+        const text = await file.text();
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          throw new Error(`${file.name} is not valid JSON.`);
+        }
+        const { workspace, snapshot } = await uploadKbSnapshot(parsed);
+        setSnapshots((prev) => ({ ...prev, [workspace.id]: snapshot }));
+        setManual((prev) =>
+          prev.some((w) => w.id === workspace.id)
+            ? prev.map((w) => (w.id === workspace.id ? workspace : w))
+            : [...prev, workspace],
+        );
+        setRoles((prev) => ({ ...prev, [workspace.id]: workspace.role || "Mixed" }));
+        setSelected((prev) => ({ ...prev, [workspace.id]: true }));
+        setRemoved((prev) => {
+          const next = { ...prev };
+          delete next[workspace.id];
+          return next;
+        });
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }, []);
+
+  // The source picker is shown in both the signed-out gate and the main view,
+  // so a user with no session can still switch to the offline saved-KB source.
+  const sourceToggle = (
+    <Section
+      title="Audit source"
+      description="Audit the live Fabric tenant you sign in to, or replay a workspace already saved to the knowledge base — no sign-in needed."
+    >
+      <div className="flex flex-wrap gap-2">
+        <button
+          type="button"
+          className={source === "live" ? "btn-primary" : "btn-secondary"}
+          onClick={() => setSource("live")}
+          aria-pressed={source === "live"}
+        >
+          Live tenant
+        </button>
+        <button
+          type="button"
+          className={source === "kb" ? "btn-primary" : "btn-secondary"}
+          onClick={() => setSource("kb")}
+          aria-pressed={source === "kb"}
+        >
+          Saved KB (offline)
+        </button>
+      </div>
+    </Section>
+  );
+
+  if (source === "live" && !isSignedIn) {
     return (
-      <div className="card flex flex-col items-center gap-3 py-12 text-center">
-        <div className="rounded-full bg-orange-100 p-3 dark:bg-orange-950">
-          <span className="block h-2.5 w-2.5 rounded-full bg-orange-500" aria-hidden="true" />
+      <div className="space-y-6">
+        {sourceToggle}
+        <div className="card flex flex-col items-center gap-3 py-12 text-center">
+          <div className="rounded-full bg-orange-100 p-3 dark:bg-orange-950">
+            <span className="block h-2.5 w-2.5 rounded-full bg-orange-500" aria-hidden="true" />
+          </div>
+          <h2 className="text-lg font-semibold">Connect to Microsoft Fabric</h2>
+          <p className="max-w-md text-sm text-slate-600 dark:text-slate-400">
+            Sign in to see the workspaces you have access to, then choose which ones to audit.
+            Read-only — the tool never writes to your tenant. Or switch to{" "}
+            <strong>Saved KB</strong> above to replay a workspace offline.
+          </p>
+          <Link to="/sign-in" className="btn-primary mt-2">
+            Connect to Fabric
+          </Link>
         </div>
-        <h2 className="text-lg font-semibold">Connect to Microsoft Fabric</h2>
-        <p className="max-w-md text-sm text-slate-600 dark:text-slate-400">
-          Sign in to see the workspaces you have access to, then choose which ones to audit.
-          Read-only — the tool never writes to your tenant.
-        </p>
-        <Link to="/sign-in" className="btn-primary mt-2">
-          Connect to Fabric
-        </Link>
       </div>
     );
   }
@@ -430,9 +530,15 @@ export function RunAuditPage() {
     <div className="space-y-6">
       {error && <ErrorBanner message={error} />}
 
+      {sourceToggle}
+
       <Section
         title="Workspaces"
-        description="Organize related environments as projects, or audit standalone workspaces independently."
+        description={
+          source === "kb"
+            ? "Workspaces already saved to the knowledge base. Pick any to replay offline, or upload a workspace snapshot below."
+            : "Organize related environments as projects, or audit standalone workspaces independently."
+        }
         actions={
           <div className="flex gap-2">
             <button type="button" className="btn-secondary" onClick={() => selectAll(true)}>
@@ -658,6 +764,33 @@ export function RunAuditPage() {
           )}
         </div>
 
+        {source === "kb" && (
+          <div className="card flex flex-wrap items-end gap-2">
+            <div className="flex-1">
+              <label
+                htmlFor="upload-kb"
+                className="mb-1 block text-xs font-medium text-slate-500"
+              >
+                Upload a workspace snapshot (JSON)
+              </label>
+              <input
+                id="upload-kb"
+                ref={fileInputRef}
+                type="file"
+                accept="application/json,.json"
+                multiple
+                className="input"
+                onChange={(event) => handleUpload(event.target.files)}
+                disabled={uploading}
+              />
+            </div>
+            {uploading && <Spinner label="Validating…" />}
+            <p className="w-full text-xs text-slate-500">
+              Accepts a snapshot exported by this tool (the workspace.json from the KB
+              archive, or the TTL cache shape). It is validated but never trusted.
+            </p>
+          </div>
+        )}
         {/* Add a workspace by name or id — for one that is not listed, or to
             build a specific audit queue by hand. */}
         <div className="card flex flex-wrap items-end gap-2">
@@ -706,12 +839,21 @@ export function RunAuditPage() {
 
         {allWorkspaces.length === 0 && !workspaces.loading && (
           <div className="card text-sm text-slate-600 dark:text-slate-400">
-            No workspaces are visible to the signed-in account. Add one above, confirm you
-            have at least Viewer access, or check{" "}
-            <Link to="/sign-in" className="font-medium underline">
-              access diagnostics
-            </Link>
-            .
+            {source === "kb" ? (
+              <>
+                No workspaces have been saved to the knowledge base yet. Upload a snapshot
+                above, or run a live audit once to populate the archive.
+              </>
+            ) : (
+              <>
+                No workspaces are visible to the signed-in account. Add one above, confirm you
+                have at least Viewer access, or check{" "}
+                <Link to="/sign-in" className="font-medium underline">
+                  access diagnostics
+                </Link>
+                .
+              </>
+            )}
           </div>
         )}
         {allWorkspaces.length > 0 && (

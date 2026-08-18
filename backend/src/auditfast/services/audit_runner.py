@@ -62,6 +62,8 @@ class AuditRunner:
         organization_id: str | None = None,
         auth_session: str | None = None,
         weight_by_environment: bool = False,
+        source: str = "live",
+        snapshots: list[dict] | None = None,
     ) -> AuditJob:
         """Accept an audit and start it in the background."""
         job = AuditJob(
@@ -73,6 +75,7 @@ class AuditRunner:
                 "pillars": pillars or [],
                 "workspaces": workspaces or [],
                 "weight_by_environment": weight_by_environment,
+                "source": source,
             },
             questionnaire=questionnaire_service.build_questionnaire(pillars, workspaces),
         )
@@ -88,6 +91,8 @@ class AuditRunner:
                 token=token,
                 auth_session=auth_session,
                 weight_by_environment=weight_by_environment,
+                source=source,
+                snapshots=snapshots,
                 parent_correlation_id=correlation_id.get(),
             )
         )
@@ -106,6 +111,8 @@ class AuditRunner:
         token: str | None,
         auth_session: str | None = None,
         weight_by_environment: bool = False,
+        source: str = "live",
+        snapshots: list[dict] | None = None,
         parent_correlation_id: str = "-",
     ) -> None:
         """Run one audit to completion, recording success or failure."""
@@ -113,14 +120,22 @@ class AuditRunner:
         # to keep the audit's log lines traceable to whoever asked for it.
         correlation_id.set(parent_correlation_id)
         from . import auth_service
-        token_refresher = auth_service.make_token_refresher(auth_session)
-        powerbi_token = auth_service.powerbi_token_for(auth_session)
-        sql_token = auth_service.sql_token_for(auth_session)
-        storage_token = auth_service.storage_token_for(auth_session)
 
-        def sql_token_refresher():
-            """Re-mint the SQL token when it expires mid-crawl."""
-            return auth_service.sql_token_for(auth_session)
+        # A knowledge-base replay makes no Fabric call, so it mints no tokens —
+        # that is exactly what lets it run without a sign-in.
+        if source == "kb":
+            token_refresher = None
+            powerbi_token = sql_token = storage_token = None
+            sql_token_refresher = None
+        else:
+            token_refresher = auth_service.make_token_refresher(auth_session)
+            powerbi_token = auth_service.powerbi_token_for(auth_session)
+            sql_token = auth_service.sql_token_for(auth_session)
+            storage_token = auth_service.storage_token_for(auth_session)
+
+            def sql_token_refresher():
+                """Re-mint the SQL token when it expires mid-crawl."""
+                return auth_service.sql_token_for(auth_session)
 
         async with self._semaphore:
             job.mark_running()
@@ -149,6 +164,8 @@ class AuditRunner:
                     storage_token=storage_token,
                     sql_token_refresher=sql_token_refresher,
                     weight_by_environment=weight_by_environment,
+                    source=source,
+                    snapshots=snapshots,
                 )
                 report: dict[str, Any] = audit_service.to_json(run)
                 report["audit_id"] = job.id
