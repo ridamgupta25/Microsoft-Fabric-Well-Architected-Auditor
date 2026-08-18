@@ -35,7 +35,7 @@ def test_group_check_runs_over_members_sorted_dev_to_prod(provider):
     seen: dict[str, object] = {}
 
     @group_check(id="G-CMP", ref="G.1", title="compare members",
-                 pillar=Pillar.OPERATIONS, registry=reg)
+                 pillar=Pillar.RELIABILITY, registry=reg)
     def compare(ctx: GroupContext):
         seen["count"] = len(ctx.members)
         seen["levels"] = [m.environment_level for m in ctx.members]
@@ -63,7 +63,7 @@ def test_group_check_reports_na_with_fewer_than_two_readable_members(provider):
     reg = GroupCheckRegistry()
 
     @group_check(id="G-NA", ref="G.2", title="needs two",
-                 pillar=Pillar.OPERATIONS, registry=reg)
+                 pillar=Pillar.RELIABILITY, registry=reg)
     def compare(ctx: GroupContext):
         return binary(True, "should not be reached")
 
@@ -100,7 +100,7 @@ def test_group_check_reuses_already_crawled_member_contexts(provider):
     reg = GroupCheckRegistry()
 
     @group_check(id="G-REUSE", ref="G.3", title="reuse",
-                 pillar=Pillar.OPERATIONS, registry=reg)
+                 pillar=Pillar.RELIABILITY, registry=reg)
     def compare(ctx: GroupContext):
         return binary(len(ctx.members) == 2, "two members")
 

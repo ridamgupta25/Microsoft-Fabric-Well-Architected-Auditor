@@ -54,7 +54,7 @@ def test_novel_point_yields_a_proposal_not_a_match():
 
 def test_scope_and_pillar_inference():
     proposal = authoring.draft_proposal("Enforce row-level security on the semantic model")
-    assert proposal.pillar.value == "Security"
+    assert proposal.pillar.value == "Security & Access Control"
     assert proposal.severity.value == "High"
 
 

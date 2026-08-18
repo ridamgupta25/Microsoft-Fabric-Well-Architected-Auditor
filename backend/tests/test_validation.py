@@ -52,13 +52,13 @@ def test_spec_to_dict_carries_the_flag():
 def test_result_to_dict_carries_the_flag():
     validated_ref = next(iter(VALIDATED_REFS))
     validated = CheckResult(
-        check_id="ANY", ref=validated_ref, title="t", pillar=Pillar.SECURITY,
+        check_id="ANY", ref=validated_ref, title="t", pillar=Pillar.SECURITY_ACCESS,
         status=Status.PASS, score=3, scope=Scope.WORKSPACE,
     )
     assert validated.to_dict()["validated"] is True
 
     pending = CheckResult(
-        check_id="ANY", ref="NOT-A-REAL-REF", title="t", pillar=Pillar.SECURITY,
+        check_id="ANY", ref="NOT-A-REAL-REF", title="t", pillar=Pillar.SECURITY_ACCESS,
         status=Status.PASS, score=3, scope=Scope.WORKSPACE,
     )
     assert pending.to_dict()["validated"] is False

@@ -27,7 +27,7 @@ _MAX_NAMED = 3
 @check(
     id="GOV-WH-AUDIT", ref="7.4.6",
     title="Warehouse-level auditing enabled for sensitive schemas (Finance) where supported",
-    pillar=Pillar.GOVERNANCE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_GOVERNANCE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=_LAYERS, requires=[Resource.ITEMS, Resource.WAREHOUSE_AUDIT], required=True,
 )
 def warehouse_auditing_enabled(ctx: CheckContext) -> Verdict:

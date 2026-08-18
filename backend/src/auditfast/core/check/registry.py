@@ -147,12 +147,13 @@ def check(
         # so an *empty* registry is falsy and a caller passing a fresh one would
         # silently register into the global registry instead.
         target = registry if registry is not None else REGISTRY
+        resolved_pillar = Pillar.for_checklist_ref(ref, pillar)
         target.register(
             CheckSpec(
                 id=id,
                 ref=ref,
                 title=title,
-                pillar=pillar,
+                pillar=resolved_pillar,
                 scope=scope,
                 fn=fn,
                 severity=severity,
@@ -345,7 +346,7 @@ def group_check(
                 id=id,
                 ref=ref,
                 title=title,
-                pillar=pillar,
+                pillar=Pillar.for_checklist_ref(ref, pillar),
                 fn=fn,
                 severity=severity,
                 requires=frozenset(requires),

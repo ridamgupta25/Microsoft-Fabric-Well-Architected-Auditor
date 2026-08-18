@@ -106,7 +106,7 @@ def access_error_result(workspace_id: str, layer: Layer, message: str) -> CheckR
     """
     return CheckResult(
         check_id="WS-ACCESS", ref="-", title="Workspace could not be read",
-        pillar=Pillar.FOUNDATION, status=Status.FAIL, score=None, coverage=None,
+        pillar=Pillar.ARCHITECTURE, status=Status.FAIL, score=None, coverage=None,
         evidence=message, recommendation=_ACCESS_RECOMMENDATION,
         severity=Severity.CRITICAL, workspace=workspace_id, layer=layer,
         obj="", scope=Scope.WORKSPACE, scored=False,
@@ -158,7 +158,7 @@ def read_incomplete_result(workspace: WorkspaceContext, resource_value: str, sta
     return CheckResult(
         check_id=READ_INCOMPLETE_CHECK_ID, ref="-",
         title="Incomplete crawl — data could not be read",
-        pillar=Pillar.FOUNDATION, status=Status.NA, score=None, coverage=None,
+        pillar=Pillar.ARCHITECTURE, status=Status.NA, score=None, coverage=None,
         evidence=evidence, recommendation="",
         severity=Severity.HIGH, workspace=workspace.name, layer=workspace.layer,
         obj=label, scope=Scope.WORKSPACE, scored=False,

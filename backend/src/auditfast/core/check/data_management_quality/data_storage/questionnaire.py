@@ -35,7 +35,7 @@ def _options(partial_guidance: str, no_guidance: str) -> list[CheckOption]:
 questionnaire_check(
     id="WS-LINEAGE-E2E", ref="1.2.1",
     title="Data flow lineage traceable end-to-end from source to Gold Warehouse and downstream semantic models",
-    pillar=Pillar.DATA, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.DATA_QUALITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question=(
         "Can you trace a data flow end-to-end — source system, Bronze/Silver, Gold Warehouse, and "
         f"the semantic models built on it — from documented or tooled lineage? ({_WHY})"

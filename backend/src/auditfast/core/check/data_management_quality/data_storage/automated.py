@@ -200,7 +200,7 @@ def _domain_from_path(path: str) -> tuple[str | None, str | None]:
 @check(
     id="WS-WH-LOAD", ref="3.6.1",
     title="Gold Warehouse load pattern is defined and consistent",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
     required=True,
 )
@@ -264,7 +264,7 @@ def wh_load_pattern(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-NO-CURSOR", ref="3.6.2",
     title="Silver-to-Gold transformations are set-based (no row-by-row cursors)",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_no_cursor(ctx: CheckContext) -> Verdict:
@@ -284,7 +284,7 @@ def nb_no_cursor(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-STAGING", ref="3.6.3",
     title="Staging tables/schema used for Warehouse loads before merge into final tables",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
 )
 def wh_staging_pattern(ctx: CheckContext) -> Verdict:
@@ -307,7 +307,7 @@ def wh_staging_pattern(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-WH-TRYCATCH", ref="3.6.5",
     title="Warehouse/lakehouse load SQL uses TRY...CATCH with transaction handling",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
     required=True,
 )
@@ -393,7 +393,7 @@ def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-WH-INCREMENTAL", ref="3.6.6",
     title="Warehouse loads avoid unnecessary full reloads",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
     required=True,
 )
@@ -455,7 +455,7 @@ def wh_incremental_loads(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-WH-STATS", ref="3.6.7",
     title="Statistics are updated after significant Warehouse loads",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
     required=True,
 )
@@ -539,7 +539,7 @@ def wh_stats_updated_after_loads(ctx: CheckContext) -> Verdict:
 
 @check(
     id="TB-NAMING", ref="4.2.1", title="Tables use meaningful, consistent naming conventions (agreed standard)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
 )
 def table_naming(ctx: CheckContext) -> Verdict:
@@ -553,7 +553,7 @@ def table_naming(ctx: CheckContext) -> Verdict:
 
 @check(
     id="TB-MANAGED-DELTA", ref="4.1.1", title="Lakehouse Tables (managed) used for structured data; Files section for raw/unstructured",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
 )
 def table_managed_delta(ctx: CheckContext) -> Verdict:
@@ -570,7 +570,7 @@ def table_managed_delta(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-SHORTCUT-GOVERNANCE", ref="4.1.3",
     title="Shortcuts avoid circular and ungoverned access paths",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS], required=True,
 )
 def shortcut_governance(ctx: CheckContext) -> Verdict:
@@ -629,7 +629,7 @@ def shortcut_governance(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-LH-BRONZE-SILVER-SEP", ref="4.1.4",
     title="Bronze and Silver lakehouse responsibilities are clearly separated per domain",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS, Resource.TABLE_SCHEMAS], required=True,
 )
 def bronze_silver_separation(ctx: CheckContext) -> Verdict:
@@ -676,7 +676,7 @@ def bronze_silver_separation(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-LH-TAXONOMY", ref="4.1.5",
     title="Bronze/Silver domain folders follow a consistent workspace taxonomy",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS, Resource.TABLE_SCHEMAS], required=True,
 )
 def bronze_silver_taxonomy(ctx: CheckContext) -> Verdict:
@@ -735,7 +735,7 @@ def bronze_silver_taxonomy(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-PARTITION-STRATEGY", ref="4.2.2",
     title="Partitioning or clustering strategy is defined for large tables",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.LAKEHOUSE_FILES],
     required=True,
 )
@@ -798,7 +798,7 @@ def table_partition_strategy(ctx: CheckContext) -> Verdict:
 
 @check(
     id="TB-AUDITCOLS", ref="4.2.5", title="Audit columns present (created_date, modified_date, source_system, batch_id)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -895,7 +895,7 @@ def _table_stores(ctx: CheckContext) -> str:
 
 @check(
     id="TB-STARSCHEMA", ref="4.5.1", title="Star schema design implemented (fact + dimension tables, not flat wide tables)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.ITEMS], required=True,
 )
 def table_star_schema(ctx: CheckContext) -> Verdict:
@@ -988,7 +988,7 @@ def _fact_width_note(facts: dict[str, dict]) -> str:
 @check(
     id="TB-DATATYPE-SIZING", ref="4.4.3",
     title="Data types are appropriate and sized correctly",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=True,
 )
@@ -1051,7 +1051,7 @@ def table_type_sizing(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-SURROGATE-GEN", ref="4.4.4",
     title="Surrogate keys are implemented for dimensions with a generated-key pattern",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=True,
 )
@@ -1091,7 +1091,7 @@ def table_surrogate_generated(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-REL-DECLARED", ref="4.4.5",
     title="Primary/foreign key relationships are declared where supported",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS,
     requires=[Resource.TABLE_SCHEMAS, Resource.SEMANTIC_MODEL_DEFINITIONS],
     required=True,
@@ -1161,7 +1161,7 @@ def table_relationships_declared(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-STATS-STRATEGY", ref="4.4.6",
     title="Statistics maintenance strategy is defined and automated",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def stats_strategy_defined(ctx: CheckContext) -> Verdict:
@@ -1240,7 +1240,7 @@ def stats_strategy_defined(ctx: CheckContext) -> Verdict:
 
 @check(
     id="TB-DATEDIM", ref="4.5.7", title="Date/Time dimension exists with all required attributes (fiscal periods, quarter, holidays)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.ITEMS], required=False,
 )
 def table_date_dimension(ctx: CheckContext) -> Verdict:
@@ -1311,7 +1311,7 @@ def table_date_dimension(ctx: CheckContext) -> Verdict:
 
 @check(
     id="TB-SURROGATE", ref="4.5.6", title="Surrogate keys used for dimension tables (not business keys as PKs in facts)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -1361,7 +1361,7 @@ def table_surrogate_keys(ctx: CheckContext) -> Verdict:
 
 @check(
     id="TB-COL-NAMING", ref="4.2.3", title="Column naming is consistent and self-documenting",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.LOW,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -1421,7 +1421,7 @@ def table_column_naming(ctx: CheckContext) -> Verdict:
 
 @check(
     id="TB-DATATYPES", ref="4.2.4", title="Data types are appropriate (no stringly-typed dates, no oversized varchars)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -1576,7 +1576,7 @@ def _shadow_reason(conn: dict) -> str | None:
 @check(
     id="WS-SHORTCUT-SCOPE", ref="4.1.2",
     title="OneLake used as the single data lake â€” no ungoverned shadow storage",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS, Resource.CONNECTIONS], required=False,
 )
 def shortcut_scope(ctx: CheckContext) -> Verdict:
@@ -1689,7 +1689,7 @@ def _scd2_roles(table: dict) -> dict[str, str]:
 
 @check(
     id="TB-SCD2", ref="4.5.9", title="SCD Type 2 includes valid_from, valid_to, and is_current flag correctly maintained (where used)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -1777,7 +1777,7 @@ _NO_STORE = (
 @check(
     id="TB-WH-MODELED", ref="1.2.6",
     title="Gold Warehouse is consumption-ready and modeled (star schema) for the semantic layer",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
 )
 def warehouse_is_modeled(ctx: CheckContext) -> Verdict:
@@ -1838,7 +1838,7 @@ def warehouse_is_modeled(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-AUDIT-SEPARATED", ref="1.2.8",
     title="Audit Tables role clearly defined and separated from business data",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -1914,7 +1914,7 @@ def _sample(names: list[str], limit: int = 3) -> str:
 @check(
     id="TB-CONFORMED-DIM", ref="4.4.9",
     title="Cross-domain conformed dimensions shared, not duplicated per domain",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
 )
 def conformed_dimensions(ctx: CheckContext) -> Verdict:
@@ -1983,7 +1983,7 @@ def conformed_dimensions(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-FACT-PURITY", ref="4.5.3",
     title="Fact tables contain only foreign keys and measures (no descriptive attributes)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -2035,7 +2035,7 @@ def fact_tables_have_no_descriptive_attributes(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-DIM-DENORM", ref="4.5.4",
     title="Dimension tables are denormalized appropriately (star over snowflake unless justified)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -2113,7 +2113,7 @@ _SCD_MARKERS: frozenset[str] = frozenset({
 @check(
     id="TB-SCD-STRATEGY", ref="4.5.8",
     title="SCD strategy defined and implemented per dimension (Type 1 / Type 2 / Hybrid)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -2219,7 +2219,7 @@ def _grain_components(name: str, table: dict) -> set[tuple[str, ...]]:
 @check(
     id="TB-FACT-GRAIN", ref="4.5.2",
     title="Fact table grain clearly defined and documented for each fact table",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -2295,7 +2295,7 @@ _MIN_JUNK_CANDIDATES = 3
 @check(
     id="TB-DEGENERATE-JUNK-DIM", ref="4.5.11",
     title="Degenerate and junk dimensions used where appropriate",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.LOW,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -2449,7 +2449,7 @@ def _schema_score(schemas: dict[str, int]) -> int:
 @check(
     id="TB-WH-SCHEMAS", ref="4.4.1",
     title="Warehouse schema organization is logical (by domain schema, plus staging schema)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=True,
 )
@@ -2598,7 +2598,7 @@ def _dominant(styles: list[str]) -> tuple[str, int]:
 @check(
     id="TB-WH-NAME-CONSISTENCY", ref="4.4.2",
     title="Table and column naming conventions are consistent across the Warehouse",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.LOW,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -2694,7 +2694,7 @@ _MAX_NAMED_SOURCES = 5
 @check(
     id="WS-VIEW-ABSTRACTION", ref="4.4.7",
     title="Views/stored procedures used to abstract the semantic-facing layer from physical tables",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS,
     requires=[Resource.TABLE_SCHEMAS, Resource.PIPELINE_DEFINITIONS,
               Resource.NOTEBOOK_DEFINITIONS],
@@ -2848,7 +2848,7 @@ def _serving_items(ctx: CheckContext) -> list[Item]:
 @check(
     id="WS-GOLD-FRESHNESS", ref="5.4.7",
     title="Freshness validation: Gold tables updated within defined SLA",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS,
     requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=True,
 )

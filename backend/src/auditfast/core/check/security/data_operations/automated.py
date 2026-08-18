@@ -31,7 +31,7 @@ SECRET_PATTERNS = [
 @check(
     id="WS-ROLES-GROUPS", ref="IMPL-02",
     title="No individual user accounts for role assignments — security groups used",
-    pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.SECURITY_ACCESS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     requires=[Resource.ROLE_ASSIGNMENTS], required=True,
 )
 def roles_use_groups(ctx: CheckContext) -> Verdict:
@@ -91,7 +91,7 @@ def _is_individual_principal(principal: dict) -> bool:
 
 @check(
     id="WS-LEASTPRIV", ref="IMPL-06", title="Workspace roles follow least-privilege principle (Admin/Member/Contributor/Viewer used correctly)",
-    pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.SECURITY_ACCESS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     requires=[Resource.ROLE_ASSIGNMENTS], required=True,
 )
 def least_privilege(ctx: CheckContext) -> Verdict:
@@ -108,7 +108,7 @@ def least_privilege(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-SPN", ref="1.3.5",
     title="Connections use secure, non-personal identities (SPN / Workspace Identity) rather than individual accounts",
-    pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.SECURITY_ACCESS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     requires=[Resource.ROLE_ASSIGNMENTS], required=True,
 )
 def automation_identity(ctx: CheckContext) -> Verdict:
@@ -131,7 +131,7 @@ def automation_identity(ctx: CheckContext) -> Verdict:
 
 @check(
     id="WS-GUESTS", ref="IMPL-01", title="Guest/external user access is explicitly governed",
-    pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.SECURITY_ACCESS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     requires=[Resource.ROLE_ASSIGNMENTS], required=True,
 )
 def no_guest_access(ctx: CheckContext) -> Verdict:
@@ -180,7 +180,7 @@ def _is_guest_principal(principal: dict) -> bool:
 
 @check(
     id="PL-SECRETS", ref="6.4.2", title="No secrets in notebook code, pipeline expressions, or Spark config",
-    pillar=Pillar.SECURITY, scope=Scope.PIPELINE, severity=Severity.CRITICAL,
+    pillar=Pillar.SECURITY_ACCESS, scope=Scope.PIPELINE, severity=Severity.CRITICAL,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def no_hardcoded_secrets(ctx: CheckContext) -> Verdict:
@@ -209,7 +209,7 @@ def _tls_version(value: object) -> tuple[int, int] | None:
 
 @check(
     id="WS-TLS", ref="6.3.4", title="API / source connections use TLS 1.2+",
-    pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.SECURITY_ACCESS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=(Layer.OPERATIONS,), requires=[Resource.CONNECTIONS], required=True,
 )
 def connections_use_tls12(ctx: CheckContext) -> Verdict:

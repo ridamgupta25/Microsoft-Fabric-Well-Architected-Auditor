@@ -327,7 +327,7 @@ def test_duplicate_registration_is_rejected():
 
     registry = CheckRegistry()
     kwargs = dict(
-        ref="1.1", title="t", pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, registry=registry
+        ref="1.1", title="t", pillar=Pillar.RELIABILITY, scope=Scope.WORKSPACE, registry=registry
     )
     check(id="X-DUP", **kwargs)(lambda ctx: None)
     with pytest.raises(DuplicateCheckError):
@@ -343,7 +343,7 @@ def test_explicit_registry_is_isolated_from_the_global_one():
     from auditfast.core.check.registry import CheckRegistry, check
 
     registry = CheckRegistry()
-    check(id="X-ISOLATED", ref="0.0", title="t", pillar=Pillar.OPERATIONS,
+    check(id="X-ISOLATED", ref="0.0", title="t", pillar=Pillar.RELIABILITY,
           scope=Scope.WORKSPACE, registry=registry)(lambda ctx: None)
 
     assert registry.get("X-ISOLATED") is not None
@@ -356,9 +356,9 @@ def test_explicit_registry_is_isolated_from_the_global_one():
 def test_pillar_filter_runs_less_work(provider):
     """Filtering happens before execution, so fewer checks actually run."""
     everything = _run(provider)
-    security_only = _run(provider, pillars=[Pillar.SECURITY])
+    security_only = _run(provider, pillars=[Pillar.SECURITY_ACCESS])
     assert len(security_only) < len(everything)
-    assert {r.pillar for r in security_only} == {Pillar.SECURITY}
+    assert {r.pillar for r in security_only} == {Pillar.SECURITY_ACCESS}
 
 
 def test_pipeline_checks_skip_non_pipeline_layers(provider):
@@ -383,7 +383,7 @@ def test_required_resources_narrow_with_selection():
     from auditfast.core.enums import Resource
 
     all_specs = REGISTRY.select(layer=Layer.PREP)
-    cost_specs = REGISTRY.select(layer=Layer.PREP, pillars=[Pillar.COST])
+    cost_specs = REGISTRY.select(layer=Layer.PREP, pillars=[Pillar.COST_MANAGEMENT])
     assert Resource.PIPELINE_DEFINITIONS in REGISTRY.required_resources(all_specs)
     # Cost checks read the workspace and its items — never pipeline definitions,
     # which are the expensive one-call-per-pipeline fetch.
@@ -418,8 +418,8 @@ def test_every_scoreable_check_ref_has_remediation_text():
     That failure is silent — the finding still appears, just with nothing telling
     anyone what to do about it — so it is pinned here rather than left to review.
 
-    Foundation checks are excluded: they describe the estate rather than judging
-    it, never fail, and so have nothing to remediate.
+    Informational inventory checks are excluded because they describe the estate
+    rather than judging it, never fail, and so need no remediation.
     """
     from auditfast.services.project import load_project, load_remediation
 
@@ -429,7 +429,7 @@ def test_every_scoreable_check_ref_has_remediation_text():
     missing = sorted({
         f"{spec.id} (ref {spec.ref})"
         for spec in REGISTRY
-        if spec.pillar is not Pillar.FOUNDATION
+        if spec.id != "WS-INVENTORY"
         and not spec.manual
         and spec.automation is not Automation.ROADMAP
         and not book.get(spec.ref)
@@ -477,7 +477,7 @@ def test_a_crashing_check_does_not_abort_the_run(provider):
     registry = CheckRegistry()
 
     @check(id="X-BOOM", ref="0.0", title="explodes",
-           pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, registry=registry)
+           pillar=Pillar.RELIABILITY, scope=Scope.WORKSPACE, registry=registry)
     def _boom(ctx):
         raise RuntimeError("kaboom")
 
@@ -502,5 +502,8 @@ def test_weights_are_applied(provider):
 
     results = _run(provider)
     baseline = aggregate(results)["overall"]
-    weighted = [replace(r, weight=2.0) if r.pillar is Pillar.SECURITY else r for r in results]
+    weighted = [
+        replace(r, weight=2.0) if r.pillar is Pillar.SECURITY_ACCESS else r
+        for r in results
+    ]
     assert aggregate(weighted)["overall"] != baseline
