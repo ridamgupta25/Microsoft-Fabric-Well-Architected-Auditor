@@ -15,6 +15,7 @@ import type {
   AuditRequest,
   CheckResult,
   Diagnostics,
+  KBUploadResponse,
   Page,
   RecommendationList,
   Workspace,
@@ -24,6 +25,34 @@ export async function listLiveWorkspaces(session: string): Promise<Workspace[]> 
   const { data } = await apiClient.get<Workspace[]>("/workspaces/live", {
     params: { session },
   });
+  return data;
+}
+
+/**
+ * List workspaces already crawled to the saved knowledge base.
+ *
+ * No sign-in: these are replayed from disk, so the picker works offline and
+ * without a token. Powers the "Saved KB" audit source.
+ */
+export async function listKbWorkspaces(): Promise<Workspace[]> {
+  const { data } = await apiClient.get<Workspace[]>("/workspaces/kb");
+  return data;
+}
+
+/**
+ * Validate an uploaded workspace snapshot and get it back normalized.
+ *
+ * The returned `snapshot` is what a `source: "kb"` audit must carry in
+ * `AuditRequest.snapshots`; re-normalizing server-side means the run reads
+ * exactly what was validated here.
+ */
+export async function uploadKbSnapshot(
+  snapshot: Record<string, unknown>,
+): Promise<KBUploadResponse> {
+  const { data } = await apiClient.post<KBUploadResponse>(
+    "/workspaces/kb/upload",
+    snapshot,
+  );
   return data;
 }
 
