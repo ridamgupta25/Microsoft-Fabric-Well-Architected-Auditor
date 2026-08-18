@@ -401,54 +401,77 @@ def _table_key(value: object) -> str:
     return str(value or "").strip().lower()
 
 
-def _active_edges(model: dict[str, Any]) -> list[tuple[str, str]]:
-    """``(table_a, table_b)`` for every *active* relationship, endpoints sorted.
+def _directed_filter_graph(
+    model: dict[str, Any],
+) -> tuple[dict[str, set[str]], set[tuple[str, str]], int]:
+    """The model's filter-propagation graph, as *directed* edges.
 
-    Self-relationships (both ends on one table) and relationships missing an
-    endpoint carry no filter path between two tables, so they are dropped rather
-    than guessed at.
+    A relationship propagates a filter from its "one" side to its "many" side —
+    from the ``to`` endpoint (the dimension key) to the ``from`` endpoint (the
+    fact's foreign key). A both-directions relationship propagates each way. That
+    direction is exactly what separates a genuine ambiguity from an ordinary star
+    or galaxy schema: two fact tables sharing a dimension form an *undirected*
+    cycle, but every edge still points dimension -> fact, so no table is reachable
+    by two routes and there is nothing for the engine to disambiguate.
+
+    Returns the adjacency map, the set of unordered table pairs joined by more
+    than one active relationship (ambiguous outright), and the count of usable
+    active relationships (to decide whether a second path is even possible).
     """
-    edges: list[tuple[str, str]] = []
+    adjacency: dict[str, set[str]] = {}
+    pair_counts: Counter[tuple[str, str]] = Counter()
+    usable = 0
     for rel in _relationships(model):
         if not _is_active(rel):
             continue
-        left = _table_key(rel.get("from_table") or rel.get("fromTable"))
-        right = _table_key(rel.get("to_table") or rel.get("toTable"))
-        if not left or not right or left == right:
+        many = _table_key(rel.get("from_table") or rel.get("fromTable"))
+        one = _table_key(rel.get("to_table") or rel.get("toTable"))
+        if not many or not one or many == one:
             continue
-        edges.append((left, right) if left <= right else (right, left))
-    return edges
+        usable += 1
+        adjacency.setdefault(one, set()).add(many)
+        behaviour = str(
+            rel.get("cross_filter") or rel.get("crossFilteringBehavior") or ""
+        ).strip().lower()
+        if behaviour == "bothdirections":
+            adjacency.setdefault(many, set()).add(one)
+        pair_counts[(many, one) if many <= one else (one, many)] += 1
+    duplicates = {pair for pair, seen in pair_counts.items() if seen > 1}
+    return adjacency, duplicates, usable
 
 
-def _redundant_pairs(edges: list[tuple[str, str]]) -> list[tuple[str, str]]:
-    """Table pairs that a second *active* filter path also connects.
+def _ambiguous_pairs(
+    adjacency: dict[str, set[str]], duplicates: set[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """Table pairs a second *active* filter route can reach.
 
-    Union-find over the distinct edges, walked in sorted order so the answer is
-    the same on every run: an edge whose endpoints are *already* connected by the
-    edges accepted before it closes a cycle, and a cycle in a relationship graph
-    means at least two active routes exist between some pair of tables. A pair
-    joined by more than one active relationship is ambiguous outright and is
-    reported too.
+    A pair joined by more than one active relationship is ambiguous outright. For
+    the rest, a bounded depth-first walk counts distinct *simple* directed paths
+    out of each source; a target reached by two different routes — the diamond of
+    a snowflake short-cut, or a bidirectional loop — is the second filter path the
+    engine would have to choose between. A single-direction star or galaxy schema
+    forms no such diamond, so it is not flagged.
+
+    The walk is capped so a pathological bidirectional graph cannot run away;
+    exhausting the cap can only *under*-report, never invent an ambiguity.
     """
-    duplicates = sorted({pair for pair, n in Counter(edges).items() if n > 1})
-
-    parent: dict[str, str] = {}
-
-    def find(node: str) -> str:
-        parent.setdefault(node, node)
-        while parent[node] != node:
-            parent[node] = parent[parent[node]]
-            node = parent[node]
-        return node
-
-    closes_cycle: list[tuple[str, str]] = []
-    for left, right in sorted(set(edges)):
-        root_left, root_right = find(left), find(right)
-        if root_left == root_right:
-            closes_cycle.append((left, right))
-        else:
-            parent[root_left] = root_right
-    return sorted(set(duplicates) | set(closes_cycle))
+    pairs: set[tuple[str, str]] = set(duplicates)
+    nodes = sorted(set(adjacency) | {t for outs in adjacency.values() for t in outs})
+    budget = 200_000
+    for source in nodes:
+        reached: dict[str, int] = {}
+        stack: list[tuple[str, frozenset[str]]] = [(source, frozenset((source,)))]
+        while stack and budget > 0:
+            node, visited = stack.pop()
+            for nxt in sorted(adjacency.get(node, ())):
+                if nxt in visited:
+                    continue
+                budget -= 1
+                reached[nxt] = reached.get(nxt, 0) + 1
+                if reached[nxt] == 2:
+                    pairs.add((source, nxt) if source <= nxt else (nxt, source))
+                stack.append((nxt, visited | frozenset((nxt,))))
+    return sorted(pairs)
 
 
 @check(
@@ -463,12 +486,16 @@ def relationships_have_no_ambiguous_paths(ctx: CheckContext) -> list[Verdict]:
     Two or more active routes between the same pair of tables make filter
     propagation non-deterministic: the engine picks a path, and a measure that
     looks correct returns a silently different number depending on which one it
-    took. The relationship graph is built per model from the *active*
-    relationships and two defects are named:
+    took. A *directed* filter-propagation graph is built per model from the
+    *active* relationships (dimension -> fact, both ways for a bidirectional
+    relationship) and two defects are named:
 
     * a pair of tables joined by more than one active relationship;
-    * a cycle in the graph — an edge whose endpoints another chain of active
-      relationships already connects, so a second route exists.
+    * a pair a second *directed* filter route also reaches — the diamond of a
+      snowflake short-cut or a bidirectional loop. Because direction is honoured,
+      a star or galaxy schema where several facts share a dimension is **not**
+      flagged: its relationships form an undirected cycle, yet every edge points
+      dimension -> fact, so no table is reachable two ways.
 
     Inactive relationships are counted and reported alongside, because a
     modeller who hit ambiguity usually deactivated one leg to escape it: they
@@ -500,13 +527,13 @@ def relationships_have_no_ambiguous_paths(ctx: CheckContext) -> list[Verdict]:
     inactive_total = 0
     offenders: dict[str, str] = {}
     for name, defn in models.items():
-        edges = _active_edges(defn)
+        adjacency, duplicates, usable = _directed_filter_graph(defn)
         inactive_total += sum(1 for r in _relationships(defn) if not _is_active(r))
-        if len(edges) < 2:
+        if usable < 2:
             # One (or no) active relationship cannot form a second path.
             continue
         judged += 1
-        ambiguous = _redundant_pairs(edges)
+        ambiguous = _ambiguous_pairs(adjacency, duplicates)
         if not ambiguous:
             clean += 1
             continue
@@ -514,7 +541,7 @@ def relationships_have_no_ambiguous_paths(ctx: CheckContext) -> list[Verdict]:
         more = f" (+{len(ambiguous) - 10} more)" if len(ambiguous) > 10 else ""
         offenders[name] = (
             f"{len(ambiguous)} table pair(s) reachable by more than one active "
-            f"relationship path: {named}{more}"
+            f"filter path: {named}{more}"
         )
 
     if not judged:

@@ -348,6 +348,12 @@ _BLOB_TYPES = ("binary", "varbinary", "blob", "json", "variant", "object", "stru
 #: Types that carry a point in time.
 _TEMPORAL_TYPES = ("timestamp", "datetime", "smalldatetime", "datetimeoffset", "date", "time")
 
+#: Numeric types - the measures a fact table aggregates.
+_NUMERIC_TYPES = (
+    "int", "bigint", "smallint", "tinyint", "decimal", "numeric", "money",
+    "smallmoney", "float", "real", "double", "long", "short", "byte",
+)
+
 #: Words that name a column as a point in time even when the type is unreadable.
 _TIME_WORDS: frozenset[str] = frozenset({
     "date", "datetime", "timestamp", "time", "ts", "dt", "when",
@@ -368,6 +374,11 @@ def is_blob_column(col: dict) -> bool:
     return column_type(col).startswith(_BLOB_TYPES)
 
 
+def is_numeric_column(col: dict) -> bool:
+    """True when the column's declared type is a number - a candidate measure."""
+    return column_type(col).startswith(_NUMERIC_TYPES)
+
+
 def is_timestamp_column(col: dict) -> bool:
     """True when a column records a point in time, by declared type or by name."""
     if column_type(col).startswith(_TEMPORAL_TYPES):
@@ -380,11 +391,331 @@ def has_timestamp_column(table: dict) -> bool:
 
 
 def is_dimension(name: str) -> bool:
+    """Name-only dimension test. Prefer :func:`table_role` - see its docstring."""
     return (name or "").lower().startswith("dim")
 
 
 def is_fact(name: str) -> bool:
+    """Name-only fact test. Prefer :func:`table_role` - see its docstring."""
     return (name or "").lower().startswith(("fact", "fct"))
+
+
+#: A fact must carry at least this many key columns. One key is a lookup table
+#: pointing at its parent; a fact sits at the centre of several dimensions.
+_FACT_MIN_KEYS = 3
+
+#: Above this share of key/measure columns a table reads as a fact rather than a
+#: dimension. Dimensions are mostly descriptive attributes; facts are keys and
+#: numbers. Deliberately high: a misread here is worse than an unknown.
+_FACT_KEY_SHARE = 0.6
+
+#: A fact must also carry real *measures* - the numbers it exists to aggregate.
+#: Without this, a raw landing table of identifiers and codes reads as a fact:
+#: measured on a Bronze ``_TMLC`` estate, 383 of 863 tables were classified fact,
+#: which is not a believable star schema and quietly poisoned every downstream
+#: dimensional verdict. A table of keys alone is a bridge, a log, or staging.
+_FACT_MIN_MEASURES = 2
+
+#: Above this width a table is not a modelled fact. A fact is narrow by
+#: construction - foreign keys plus the handful of measures it aggregates. A
+#: 125-column table is a source-system extract or a wide report table, and its
+#: "measures" are usually numeric *attributes* (lead time, safety stock, minimum
+#: order quantity) that this code cannot distinguish from additive facts. Two
+#: such ERP masters survived every other guard on a real estate; nothing about
+#: their schema says fact except that the source system had many numbers.
+_FACT_MAX_COLUMNS = 60
+
+#: Store-name words that mark a raw/landing layer. Shape is *not* inferred there
+#: - see :func:`table_role`. Kept in step with ``_notebook._LAYER_WORDS`` but
+#: local, because ``_tables`` must not import a notebook helper.
+_RAW_STORE_WORDS: frozenset[str] = frozenset({
+    "bronze", "raw", "landing", "land", "staging", "stage", "stg",
+    "ingest", "ingestion", "inbound", "source", "src", "l0",
+})
+
+_STORE_TOKENS = re.compile(r"[^A-Za-z0-9]+")
+
+
+def in_raw_store(table: dict) -> bool:
+    """True when the table's owning store names itself a raw/landing layer.
+
+    ``LH_Bronze``, ``staging_lh``, ``raw-landing`` all match; an unknown or
+    unnamed store does not, so this only ever *adds* caution where there is
+    positive evidence of a raw layer.
+    """
+    store = store_of(table)
+    if not store:
+        return False
+    tokens = {t.lower() for t in _STORE_TOKENS.split(store) if t}
+    return bool(tokens & _RAW_STORE_WORDS)
+
+
+def _referenced_names(tables: dict[str, dict] | None) -> frozenset[str]:
+    """Every table named as an FK target by some *other* table.
+
+    Built once per call rather than re-scanned per table: the naive form made
+    :func:`table_role` O(n) in the table count, :func:`facts_in` O(n^2), and a
+    check calling ``facts_in`` inside a per-table loop O(n^3). On a 1,845-table
+    estate that is billions of comparisons - the audit simply stopped.
+    """
+    if not tables:
+        return frozenset()
+    out: set[str] = set()
+    for other in tables.values():
+        out.update(str(r) for r in ((other or {}).get("references") or ()))
+    return frozenset(out)
+
+
+#: Table names normalised for cross-source matching. A semantic model names a
+#: table as the modeller typed it ("Sales Order"), the SQL endpoint as the store
+#: holds it ("sales_order", or "dbo.sales_order"), so the two only meet once
+#: separators and the schema prefix are normalised away.
+def normalise_table_name(name: str) -> str:
+    """A table name reduced to a form comparable across sources."""
+    text = (name or "").strip().lower()
+    text = text.split(".")[-1]                      # drop a schema/db prefix
+    return re.sub(r"[\s\-_]+", "", text)
+
+
+#: ``dataCategory`` values that name a table as descriptive reference data.
+#: From the TMSL table object: 1-TIME, 6-ACCOUNTS, 7-CUSTOMERS, 8-PRODUCTS,
+#: 15-ORGANIZATION, 17-GEOGRAPHY. Power BI sets "Time" automatically when a
+#: table is marked as the date table, which makes it the one commonly present.
+_DIMENSION_DATA_CATEGORIES: frozenset[str] = frozenset({
+    "time", "accounts", "customers", "products", "organization", "geography",
+    "scenario", "quantitative", "utility", "channel", "promotion",
+})
+
+
+def declared_roles(
+    tables: dict[str, dict] | None,
+    semantic_models: dict[str, dict] | None,
+) -> dict[str, str]:
+    """``{normalised table name: role}`` from what the estate *declares*.
+
+    **Why this outranks every inference.** Microsoft's star-schema guidance is
+    explicit that no property marks a table as a fact or a dimension - *"It's in
+    fact determined by the model relationships"* - and that in a one-to-many
+    relationship *"the 'one' side is always a dimension table while the 'many'
+    side is always a fact table"*
+    (``learn.microsoft.com/power-bi/guidance/star-schema``). A semantic-model
+    relationship is therefore not a hint about the role: it *is* the role, stated
+    by whoever built the model.
+
+    Two declarative sources are read, and a table named by both must agree:
+
+    * **Relationship cardinality.** ``from_table`` is the many side (fact),
+      ``to_table`` the one side (dimension). Power BI's auto date/time tables are
+      already dropped by the TMSL parser, so they cannot pollute this.
+    * **``dataCategory``.** "Time", "Customers", "Products", "Geography" and
+      friends are a modeller stating that a table is reference data.
+
+    **A table appearing on both sides is left out.** A dimension that is itself a
+    fact's target *and* references another dimension (a snowflake outrigger) is
+    genuinely both, and guessing between them would be worse than saying nothing:
+    it is excluded so the caller falls back to other evidence rather than
+    inheriting a coin flip.
+
+    Returns an empty mapping when no model is readable - which is the normal case
+    for a Bronze/landing workspace, and the caller must treat it as "no
+    declarative evidence", never as "no dimensional model exists".
+    """
+    if not tables or not semantic_models:
+        return {}
+
+    known = {normalise_table_name(name) for name in tables}
+    fact_side: set[str] = set()
+    dimension_side: set[str] = set()
+    categorised: dict[str, str] = {}
+
+    for model in semantic_models.values():
+        if not isinstance(model, dict):
+            continue
+        for rel in model.get("relationships") or []:
+            if not isinstance(rel, dict):
+                continue
+            # An inactive relationship is still a declared structural link; it is
+            # inactive for filter propagation, not untrue.
+            many = normalise_table_name(str(rel.get("from_table") or rel.get("fromTable") or ""))
+            one = normalise_table_name(str(rel.get("to_table") or rel.get("toTable") or ""))
+            if many and many in known:
+                fact_side.add(many)
+            if one and one in known:
+                dimension_side.add(one)
+
+        for table_name, category in (model.get("data_categories") or {}).items():
+            key = normalise_table_name(str(table_name))
+            if key in known and str(category).strip().lower() in _DIMENSION_DATA_CATEGORIES:
+                categorised[key] = "dimension"
+
+    roles: dict[str, str] = {}
+    for name in dimension_side - fact_side:
+        roles[name] = "dimension"
+    for name in fact_side - dimension_side:
+        roles[name] = "fact"
+    # dataCategory only fills gaps: a relationship is the stronger statement.
+    for name, role in categorised.items():
+        roles.setdefault(name, role)
+    return roles
+
+
+def table_roles(
+    tables: dict[str, dict],
+    semantic_models: dict[str, dict] | None = None,
+) -> dict[str, str]:
+    """``{table name: role}`` for every table, computed in one pass.
+
+    Prefer this over calling :func:`table_role` in a loop: it shares the
+    foreign-key reverse index across every table instead of rebuilding it.
+
+    ``semantic_models`` is optional and additive. When supplied, a role the model
+    *declares* (see :func:`declared_roles`) wins over anything inferred from the
+    table's own shape - so an estate that models its star schema in Power BI is
+    judged on what it stated, and one that does not is unaffected.
+    """
+    referenced = _referenced_names(tables)
+    declared = declared_roles(tables, semantic_models)
+    roles: dict[str, str] = {}
+    for name, table in tables.items():
+        stated = declared.get(normalise_table_name(name))
+        # Platform tables are never given a role, even if a model names them.
+        if stated and not is_platform_table(name):
+            roles[name] = stated
+        else:
+            roles[name] = _role(name, table, referenced)
+    return roles
+
+
+def table_role(name: str, table: dict | None = None,
+               tables: dict[str, dict] | None = None) -> str:
+    """``"fact"``, ``"dimension"`` or ``"unknown"`` for one table.
+
+    **Why this exists.** The name-only :func:`is_fact`/:func:`is_dimension` pair
+    answers only for estates that prefix ``dim_``/``fact_``. Measured against two
+    real tenants, 47 of 1,845 tables carried such a name - so checks gated on
+    them returned N/A on thousands of readable tables. That is not a false
+    failure, but it is no coverage at all.
+
+    **Evidence order**, strongest first:
+
+    1. **Declared foreign keys.** A table other tables *reference* is a
+       dimension; a table that references several others is a fact. This is
+       structural, naming-independent, and read from ``sys.foreign_keys``.
+    2. **Naming.** An explicit ``dim_``/``fact_`` prefix is the author stating
+       the role outright. It ranks above column shape because shape is an
+       inference about intent whereas the name *is* the intent - a wide fact
+       with no key-shaped column names must not be re-labelled a dimension.
+    3. **Column shape**, but only outside a raw/landing store, and only for a
+       table narrow enough to be a model table. For estates that use no
+       convention: a table with several keys *and* several numeric measures,
+       dominated by the two, is fact-shaped; one with few keys and mostly
+       descriptive attributes is dimension-shaped.
+    4. **Unknown**, so a caller can return N/A rather than guess.
+
+    **Shape is never inferred in a Bronze/raw store.** A landing zone holds
+    source tables copied as-is, and an ERP master table is full of *numeric
+    attributes* - lead time, safety stock, minimum order quantity - which this
+    code cannot tell from additive measures. Measured on a real estate, that
+    read 316 raw ERP extracts as fact tables and graded a landing zone against
+    star-schema rules. Facts and dimensions are built downstream, so in a raw
+    store only a declared constraint or an explicit ``fact_``/``dim_`` name -
+    both statements of intent, not inferences - assigns a role.
+
+    **Operational tables are never given a role.** An audit/run-log table and a
+    config/control table are infrastructure, not part of the dimensional model:
+    ``audit_table`` (run ids, timestamps, row counts) and ``control_table``
+    (source/target names, watermarks) both read as dimensions on shape alone,
+    and a "conformed dimension" finding about a watermark table is noise.
+
+    **Platform tables are never given a role.** Fabric's own telemetry views
+    (``queryinsights.exec_requests_history`` and friends) are key-and-measure
+    shaped and would otherwise read as facts, putting system telemetry into a
+    dimensional-model finding.
+
+    ``table`` and ``tables`` are optional: with neither, this degrades to the
+    naming test, which is what the old helpers did.
+    """
+    return _role(name, table, _referenced_names(tables))
+
+
+def _role(name: str, table: dict | None, referenced: frozenset[str]) -> str:
+    """:func:`table_role` with the FK reverse index passed in, not rebuilt."""
+    if is_platform_table(name):
+        return "unknown"
+    meta = table or {}
+
+    # 1. Declared constraints - the only evidence that is not an inference.
+    references = len(meta.get("references") or ())
+    if name in referenced and not references:
+        return "dimension"
+    if references >= 2:
+        return "fact"
+
+    # 2. A declared name beats an inferred shape.
+    if is_fact(name):
+        return "fact"
+    if is_dimension(name):
+        return "dimension"
+
+    # 3. Column shape - never in a raw/landing store, where a table's shape is
+    #    the source system's, not a modelling decision, and never for the
+    #    operational tables that support the pipeline rather than the model.
+    if in_raw_store(meta) or is_audit_table(name, meta) or is_config_table_name(name):
+        return "unknown"
+    cols = columns(meta)
+    if 4 <= len(cols) <= _FACT_MAX_COLUMNS:
+        keys = sum(1 for c in cols if is_key_column(c.get("name") or ""))
+        measures = sum(1 for c in cols if is_numeric_column(c))
+        descriptive = len(cols) - keys - measures
+        if (keys >= _FACT_MIN_KEYS and measures >= _FACT_MIN_MEASURES
+                and (keys + measures) / len(cols) >= _FACT_KEY_SHARE):
+            return "fact"
+        # A dimension describes one thing: it needs an identifier *and* real
+        # descriptive columns. Without both this is some other kind of table -
+        # a log, a config row, a staging buffer - and stays unknown.
+        if 1 <= keys <= 2 and descriptive >= 2 and descriptive > measures:
+            return "dimension"
+
+    return "unknown"
+
+
+def facts_in(tables: dict[str, dict],
+             semantic_models: dict[str, dict] | None = None) -> dict[str, dict]:
+    """Every fact-role table: declared by a model where possible, else inferred.
+
+    ``semantic_models`` is optional so existing callers keep working; passing it
+    lets a relationship the modeller declared outrank a shape guess.
+    """
+    roles = table_roles(tables, semantic_models)
+    return {n: t for n, t in tables.items() if roles[n] == "fact"}
+
+
+def dimensions_in(tables: dict[str, dict],
+                  semantic_models: dict[str, dict] | None = None) -> dict[str, dict]:
+    """Every dimension-role table: declared by a model where possible, else inferred."""
+    roles = table_roles(tables, semantic_models)
+    return {n: t for n, t in tables.items() if roles[n] == "dimension"}
+
+
+def role_evidence(tables: dict[str, dict],
+                  semantic_models: dict[str, dict] | None = None) -> dict[str, int]:
+    """How many roles came from a declaration versus an inference.
+
+    Lets a check say *how* it knows what it knows: a verdict over roles the
+    estate declared is a different quality of finding from one over roles this
+    code guessed, and the evidence should not pretend otherwise.
+    """
+    declared = declared_roles(tables, semantic_models)
+    roles = table_roles(tables, semantic_models)
+    modelled = sum(1 for n in tables
+                   if normalise_table_name(n) in declared and not is_platform_table(n))
+    assigned = sum(1 for r in roles.values() if r != "unknown")
+    return {
+        "declared": modelled,
+        "inferred": max(0, assigned - modelled),
+        "assigned": assigned,
+        "total": len(tables),
+    }
 
 
 #: Trailing words that mark a column as a *key*. Matched against the final word of

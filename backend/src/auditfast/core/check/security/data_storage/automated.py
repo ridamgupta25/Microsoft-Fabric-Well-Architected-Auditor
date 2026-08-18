@@ -107,6 +107,12 @@ def rls_on_semantic_models(ctx: CheckContext) -> list[Verdict]:
         else:
             failing_models.append((name, "Defines no RLS role"))
 
+    # Semantic models are read one definition at a time, so the crawl can return
+    # *some* of them. Those that could not be read are unknown, never failing -
+    # the same rule the Warehouse branch below already applied.
+    model_stat = ctx.workspace.read_failures.get(Resource.SEMANTIC_MODEL_DEFINITIONS.value, {})
+    unread_models = max(0, int(model_stat.get("attempted", 0)) - int(model_stat.get("read", 0)))
+
     # Warehouses: assessed only when the SQL analytics endpoint answered.
     security = ctx.workspace.warehouse_security or {}
     protected_warehouses: list[str] = []
@@ -148,7 +154,7 @@ def rls_on_semantic_models(ctx: CheckContext) -> list[Verdict]:
         f"RLS NOT ENABLED - Warehouses: {issues(failing_warehouses)}. "
         f"NOT ASSESSED - Warehouses: {names(unread_warehouses)}. "
         f"NOT ASSESSED - Semantic model inventory: "
-        f"{'none' if models_available else 'definitions unavailable'}. "
+        f"{'definitions unavailable' if not models_available else (f'{unread_models} definition(s) could not be read' if unread_models else 'none')}. "
         f"NOT ASSESSED - Warehouse inventory: "
         f"{'none' if items_available else 'workspace items unavailable'}. "
         "A semantic model is marked enabled when at least one defined role contains a "

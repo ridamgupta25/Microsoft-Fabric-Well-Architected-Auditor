@@ -21,7 +21,8 @@ from auditfast.core.check.data_management_quality.data_storage.automated import 
     warehouse_schema_organization,
 )
 from auditfast.core.check.data_management_quality.reporting_semantic.automated import (
-    _redundant_pairs,
+    _ambiguous_pairs,
+    _directed_filter_graph,
     key_columns_are_hidden,
     relationships_have_no_ambiguous_paths,
 )
@@ -83,11 +84,32 @@ def _wh_table(*cols: str, store: str = "WH", kind: str = "Warehouse") -> dict:
 # =============================================================================
 
 def test_redundant_pairs_finds_a_cycle_and_a_duplicate_edge():
-    """The detector names the pair a second active route reaches."""
-    assert _redundant_pairs([("a", "b"), ("b", "c")]) == []
-    assert _redundant_pairs([("a", "b"), ("b", "c"), ("a", "c")]) == [("b", "c")]
+    """The directed detector names the pair a second filter route reaches."""
+    # A plain chain dim -> fact -> (nothing) has no second route.
+    adjacency = {"date": {"sales"}, "customer": {"sales"}}
+    assert _ambiguous_pairs(adjacency, set()) == []
+    # A snowflake short-cut (date reaches sales directly and via product) is a diamond.
+    diamond = {"date": {"sales", "product"}, "product": {"sales"}}
+    assert _ambiguous_pairs(diamond, set()) == [("date", "sales")]
     # Two active relationships between one pair is ambiguous outright.
-    assert _redundant_pairs([("a", "b"), ("a", "b")]) == [("a", "b")]
+    assert _ambiguous_pairs({}, {("a", "b")}) == [("a", "b")]
+
+
+def test_a_galaxy_schema_of_shared_dimensions_is_not_ambiguous():
+    """Several facts sharing two dimensions form an undirected cycle but no diamond."""
+    models = {
+        "m": {"relationships": [
+            _rel("BudgetFact", "Date"), _rel("BudgetFact", "Site"),
+            _rel("SalesFact", "Date"), _rel("SalesFact", "Site"),
+        ]},
+    }
+    verdict = _scored(relationships_have_no_ambiguous_paths(_model_ctx(models)))
+    assert verdict.score == _PASS
+    assert "1 of 1" in verdict.evidence
+    # The directed graph puts every edge dimension -> fact, so facts are sinks.
+    adjacency, duplicates, usable = _directed_filter_graph(models["m"])
+    assert usable == 4
+    assert _ambiguous_pairs(adjacency, duplicates) == []
 
 
 def test_ambiguous_paths_pass_when_the_relationship_graph_is_a_tree():

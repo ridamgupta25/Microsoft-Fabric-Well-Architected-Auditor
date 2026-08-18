@@ -33,6 +33,7 @@ from auditfast.core.check.operations_reliability.reporting_semantic.automated im
 from auditfast.core.check.performance_capacity.data_prep.automated import schedule_stagger
 from auditfast.core.check.performance_capacity.reporting_semantic.automated import (
     sm_column_shape,
+    sm_query_transform,
 )
 from auditfast.core.check.registry import REGISTRY
 from auditfast.core.enums import Automation, Layer, Resource, Status
@@ -215,6 +216,20 @@ def test_column_shape_does_not_flag_a_plain_date_or_an_ordinary_attribute():
     assert verdict.score == 3
 
 
+def test_column_shape_does_not_flag_a_description_named_column_without_an_unbounded_type():
+    """A `Description` column is judged free text only by its source type, not its name."""
+    model = {
+        "tables": ["Product"], "relationships": [],
+        "columns": [
+            _column("Description", "Product", data_type="string"),
+            _column("Notes", "Product", data_type="string"),
+            _column("Amount", "Product", data_type="decimal"),
+        ],
+    }
+    verdict = sm_column_shape(_ctx(obj_name="Product", semantic_models={"Product": model}))
+    assert verdict.score == 3
+
+
 def test_column_shape_is_na_when_definitions_unreadable():
     verdict = sm_column_shape(_ctx(
         obj_name="Sales", unavailable={Resource.SEMANTIC_MODEL_DEFINITIONS},
@@ -229,6 +244,62 @@ def test_column_shape_is_na_when_the_snapshot_predates_column_parsing():
     verdict = sm_column_shape(_ctx(obj_name="Sales", semantic_models={"Sales": model}))
     assert verdict.status is Status.NA
     assert "re-crawl" in verdict.evidence
+
+
+# -- 14.2.6 — warehouse serves the model, no inline transformation ------------
+
+def _storage(**tables) -> dict:
+    """A `storage` facts dict; each value is (modes, native_query_expressions)."""
+    return {
+        name: {
+            "modes": modes,
+            "source_types": ["m"] if exprs else ["entity"],
+            "native_query_partitions": len(exprs),
+            "native_query_expressions": list(exprs),
+        }
+        for name, (modes, exprs) in tables.items()
+    }
+
+
+def test_query_transform_passes_a_plain_source_read():
+    """A source navigation or a plain SELECT is warehouse-served, not a transform."""
+    model = {"storage": _storage(
+        DimCustomer=(["import"], ['let Source = Sql.Database("s","db"){[Item="DimCustomer"]}[Data] in Source']),
+        FactSales=(["import"], ['Value.NativeQuery(Source, "SELECT Id, Amount FROM dbo.FactSales")']),
+    )}
+    verdict = sm_query_transform(_ctx(obj_name="M", semantic_models={"M": model}))
+    assert verdict.score == 3
+    assert "2 of 2" in verdict.evidence
+    assert "inline transformation" not in verdict.evidence
+
+
+def test_query_transform_flags_a_genuine_merge_or_group_by():
+    model = {"storage": _storage(
+        Appended=(["import"], ['let s = Table.Combine({A, B}) in s']),
+        Grouped=(["import"], ['Value.NativeQuery(Source, "SELECT k, SUM(v) FROM t GROUP BY k")']),
+        Clean=(["import"], ['let Source = Lakehouse.Contents(){[Item="dim"]}[Data] in Source']),
+    )}
+    verdict = sm_query_transform(_ctx(obj_name="M", semantic_models={"M": model}))
+    assert verdict.score == 0
+    assert "Appended" in verdict.evidence and "Grouped" in verdict.evidence
+    assert "Clean" not in verdict.evidence
+
+
+def test_query_transform_falls_back_when_the_snapshot_lacks_query_text():
+    """An old snapshot has only the count; it must still produce a verdict, not error."""
+    model = {"storage": {
+        "T": {"modes": ["import"], "source_types": ["m"], "native_query_partitions": 1},
+    }}
+    verdict = sm_query_transform(_ctx(obj_name="M", semantic_models={"M": model}))
+    assert verdict.score == 0
+    assert "inline transformation" in verdict.evidence
+
+
+def test_query_transform_is_na_when_definitions_unreadable():
+    verdict = sm_query_transform(_ctx(
+        obj_name="M", unavailable={Resource.SEMANTIC_MODEL_DEFINITIONS},
+    ))
+    assert verdict.status is Status.NA
 
 
 # -- 14.5.3 — refresh failures alert the owning team ---------------------------
