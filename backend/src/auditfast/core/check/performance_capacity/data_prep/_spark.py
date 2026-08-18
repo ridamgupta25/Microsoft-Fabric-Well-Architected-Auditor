@@ -244,11 +244,28 @@ def parse_version(value: str) -> tuple[int, int, int] | None:
 
 
 def fabric_runtime_to_spark(value: str) -> tuple[int, int, int] | None:
-    """Map Fabric Environment runtime versions to Spark major versions."""
+    """Map a Fabric Environment runtime version to its Spark version.
+
+    Fabric names its runtimes ``1.1``/``1.2``/``1.3``/``2.0`` and documents the
+    Spark version each carries
+    (``learn.microsoft.com/fabric/data-engineering/runtime``). The mapping is
+    published, not inferred, so it belongs in a table rather than a heuristic.
+
+    **Runtime 2.0 was missing**, so a workspace on the newest runtime resolved to
+    ``None`` and its check reported "runtime not recognized" - the best-configured
+    estate was the one that could not be judged. Unknown values still return
+    ``None`` (an honest N/A) rather than being guessed at, so a future runtime
+    behaves the same way until it is added here.
+    """
     runtime = parse_version(value)
     if runtime is None:
         return None
-    mapping = {"1.1": (3, 3, 0), "1.2": (3, 4, 0), "1.3": (3, 5, 0)}
+    mapping = {
+        "1.1": (3, 3, 0),      # retired
+        "1.2": (3, 4, 0),      # end of support
+        "1.3": (3, 5, 5),      # GA
+        "2.0": (4, 1, 0),      # GA - recommended for production
+    }
     return mapping.get(f"{runtime[0]}.{runtime[1]}")
 
 

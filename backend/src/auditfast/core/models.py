@@ -112,6 +112,13 @@ class WorkspaceContext:
     pipelines: dict[str, dict] = field(default_factory=dict)
     notebooks: dict[str, dict] = field(default_factory=dict)
     environments: dict[str, dict] = field(default_factory=dict)
+    #: The workspace's default Spark runtime, from
+    #: ``/workspaces/{id}/spark/settings``: ``{"runtime_version": "1.3",
+    #: "default_environment": str}``. A notebook that binds to no named
+    #: Environment inherits this, so without it the runtime check reported N/A on
+    #: the commonest configuration of all. Empty when the settings could not be
+    #: read - which the check must treat as unknown, never as out of date.
+    spark_settings: dict = field(default_factory=dict)
     tables: dict[str, dict] = field(default_factory=dict)
     shortcuts: dict[str, list] = field(default_factory=dict)
     semantic_models: dict[str, dict] = field(default_factory=dict)
@@ -261,6 +268,7 @@ class WorkspaceContext:
             "pipelines": self.pipelines,
             "notebooks": self.notebooks,
             "environments": self.environments,
+            "spark_settings": self.spark_settings,
             "tables": self.tables,
             "shortcuts": self.shortcuts,
             "semantic_models": self.semantic_models,
@@ -295,6 +303,7 @@ class WorkspaceContext:
             pipelines=dict(data.get("pipelines", {})),
             notebooks=dict(data.get("notebooks", {})),
             environments=dict(data.get("environments", {})),
+            spark_settings=dict(data.get("spark_settings", {})),
             tables=dict(data.get("tables", {})),
             shortcuts=dict(data.get("shortcuts", {})),
             semantic_models=dict(data.get("semantic_models", {})),
