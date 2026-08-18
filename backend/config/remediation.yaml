@@ -6,6 +6,7 @@
 "1.1.1": "Give each workspace a single, clear purpose for its layer and environment: keep the item types its role calls for, and move anything that belongs to another layer into that layer's workspace."
 "1.1.9": "Keep a Data Prep workspace to Pipelines and Notebooks only — no Lakehouses or Warehouses; storage belongs in the Data Store workspace. Move any item types that belong to another layer out of this workspace."
 "IMPL-24": "Name promotable workspaces with an environment tier — Dev, UAT, or Prod (only the tiers you use; a lone UAT is fine). Workspaces without a tier should read as their purpose instead: include 'Reporting' in the name of a reporting-only workspace, while a shared data / lakehouse workspace needs no tier. Keep the name internally consistent too: use one separator style (don't mix spaces with underscores) and clean per-word casing (avoid garbled casing like 'aRIGFHG')."
+"IMPL-20": "Informational only: this check enumerates every Fabric item type in the workspace and never fails, so there is nothing to remediate. Use the inventory to confirm the workspace holds only the item types appropriate to its layer role."
 "IMPL-02": "Assign workspace roles to Microsoft Entra security groups instead of named individuals; move the listed users into an appropriate group."
 "IMPL-06": "Reduce the number of Admin grants to the minimum required; prefer Contributor/Viewer and use security groups."
 "1.3.5": "Run automation (pipelines, deployments) under a service principal or managed identity granted a workspace role, rather than personal accounts."

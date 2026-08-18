@@ -32,7 +32,7 @@ from ._spark import NOTEBOOK_LAYERS, pip_targets, unpinned_targets, writes_delta
 
 @check(
     id="DELTA-MERGE", ref="3.3.1", title="Single `MERGE INTO` handles I/U/D atomically — not separate sequential DELETE/INSERT/UPDATE",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=(*NOTEBOOK_LAYERS, Layer.STORAGE),
     requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -67,7 +67,7 @@ def delta_merge(ctx: CheckContext) -> Verdict:
 
 @check(
     id="DELTA-OPTIMIZE", ref="3.3.2", title="`OPTIMIZE` (bin-compaction) scheduled appropriately (not after every micro-batch)",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def delta_optimize(ctx: CheckContext) -> Verdict:
@@ -82,7 +82,7 @@ def delta_optimize(ctx: CheckContext) -> Verdict:
 
 @check(
     id="DELTA-VACUUM", ref="3.3.3", title="`VACUUM` scheduled to clean up old Delta files",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def delta_vacuum(ctx: CheckContext) -> Verdict:
@@ -97,7 +97,7 @@ def delta_vacuum(ctx: CheckContext) -> Verdict:
 
 @check(
     id="DELTA-ZORDER", ref="3.3.4", title="Z-ORDER / liquid clustering applied on high-cardinality filter columns",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def delta_zorder(ctx: CheckContext) -> Verdict:
@@ -112,7 +112,7 @@ def delta_zorder(ctx: CheckContext) -> Verdict:
 
 @check(
     id="DELTA-VORDER", ref="3.3.5", title="V-Order enabled where Fabric recommends for read-optimized workloads",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def delta_vorder(ctx: CheckContext) -> Verdict:
@@ -143,7 +143,7 @@ def delta_vorder(ctx: CheckContext) -> Verdict:
 
 @check(
     id="DELTA-TBLPROPS", ref="3.3.6", title="Table properties set appropriately (optimizeWrite, autoCompaction)",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def delta_tblprops(ctx: CheckContext) -> Verdict:
@@ -168,7 +168,7 @@ def delta_tblprops(ctx: CheckContext) -> Verdict:
 
 @check(
     id="DELTA-RETENTION", ref="3.3.7", title="Delta table history / log retention configured and monitored",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def delta_retention(ctx: CheckContext) -> Verdict:
@@ -194,7 +194,7 @@ def delta_retention(ctx: CheckContext) -> Verdict:
 
 @check(
     id="SPARK-ENV", ref="3.4.1", title="Fabric Environments used to manage Spark dependencies",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def spark_env(ctx: CheckContext) -> Verdict:
@@ -212,7 +212,7 @@ def spark_env(ctx: CheckContext) -> Verdict:
 
 @check(
     id="SPARK-LIBPIN", ref="3.4.2", title="Custom library versions pinned (not latest/floating)",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def spark_libpin(ctx: CheckContext) -> Verdict:
@@ -240,7 +240,7 @@ def spark_libpin(ctx: CheckContext) -> Verdict:
 
 @check(
     id="SPARK-CONF", ref="3.4.4", title="Spark configuration tuned from defaults where justified (shuffle partitions, memory)",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def spark_conf(ctx: CheckContext) -> Verdict:
@@ -256,7 +256,7 @@ def spark_conf(ctx: CheckContext) -> Verdict:
 
 @check(
     id="SPARK-SHUFFLE", ref="3.5.2", title="Partition count appropriate (not 200 default for small/medium data)",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def spark_shuffle(ctx: CheckContext) -> Verdict:
@@ -271,7 +271,7 @@ def spark_shuffle(ctx: CheckContext) -> Verdict:
 
 @check(
     id="SPARK-CACHE", ref="3.5.3", title="Caching (`persist`/`cache`) used judiciously, not indiscriminately",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def spark_cache(ctx: CheckContext) -> Verdict:
@@ -286,7 +286,7 @@ def spark_cache(ctx: CheckContext) -> Verdict:
 
 @check(
     id="SPARK-REPARTITION", ref="3.5.4", title="Write operations use appropriate partition strategy (coalesce vs repartition; right-sized files)",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def spark_repartition(ctx: CheckContext) -> Verdict:
@@ -401,7 +401,7 @@ def spark_repartition(ctx: CheckContext) -> Verdict:
 
 @check(
     id="SPARK-SELECT", ref="3.5.8", title="Unnecessary columns eliminated in reads (explicit select, not `SELECT *`)",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def spark_select(ctx: CheckContext) -> Verdict:
@@ -418,7 +418,7 @@ def spark_select(ctx: CheckContext) -> Verdict:
 
 @check(
     id="SPARK-RUNTIME", ref="3.4.5", title="Python/Spark runtime version is current and supported",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS, Resource.ENVIRONMENT_DEFINITIONS], required=True,
 )
 def spark_runtime(ctx: CheckContext) -> Verdict:
@@ -456,7 +456,7 @@ def spark_runtime(ctx: CheckContext) -> Verdict:
 
 @check(
     id="SPARK-POOL", ref="3.4.3", title="Spark pool size appropriate for workload (not over- or under-provisioned)",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def spark_pool(ctx: CheckContext) -> Verdict:
@@ -493,7 +493,7 @@ def spark_pool(ctx: CheckContext) -> Verdict:
 
 @check(
     id="SPARK-UI", ref="3.5.1", title="Spark UI reviewed for skew, spill, shuffle issues on key jobs",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def spark_ui_review(ctx: CheckContext) -> Verdict:
@@ -511,7 +511,7 @@ def spark_ui_review(ctx: CheckContext) -> Verdict:
 
 @check(
     id="SPARK-PARTITION", ref="3.5.5", title="No full-table scans when partition pruning is possible",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def spark_partition_pruning(ctx: CheckContext) -> Verdict:
@@ -545,7 +545,7 @@ def spark_partition_pruning(ctx: CheckContext) -> Verdict:
 
 @check(
     id="SPARK-PROFILE", ref="3.5.6", title="Long-running notebooks profiled and optimized",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def spark_profile(ctx: CheckContext) -> Verdict:
@@ -587,7 +587,7 @@ def spark_profile(ctx: CheckContext) -> Verdict:
     id="NB-PUSHDOWN",
     ref="3.5.7",
     title="Predicate pushdown verified for shortcut/external reads",
-    pillar=Pillar.PERFORMANCE,
+    pillar=Pillar.DATA_PROCESSING,
     scope=Scope.NOTEBOOK,
     severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS,
@@ -620,7 +620,7 @@ def nb_pushdown(ctx: CheckContext) -> Verdict:
 # -- Copy activity parallelism (2.6.2) ----------------------------------------
 @check(
     id="PL-COPY-PARALLEL", ref="2.6.2", title="Copy activities use appropriate parallelism (DIU, degree of copy parallelism)",
-    pillar=Pillar.PERFORMANCE, scope=Scope.PIPELINE, severity=Severity.LOW,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def copy_parallelism(ctx: CheckContext) -> Verdict:
@@ -721,7 +721,7 @@ def _sizes_write_batch(sink: dict) -> bool:
 @check(
     id="PL-SQL-INGEST-TUNED", ref="2.6.5",
     title="Relational (Azure SQL DB) ingestion is tuned — query folding, ranged source reads, batch sizing",
-    pillar=Pillar.PERFORMANCE, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def sql_ingestion_tuned(ctx: CheckContext) -> Verdict:
@@ -809,7 +809,7 @@ def _run_moment(stamp: str) -> datetime | None:
 @check(
     id="WS-SCHEDULE-STAGGER", ref="2.6.4",
     title="Pipeline scheduling avoids capacity contention (staggered across domains, not all at once)",
-    pillar=Pillar.PERFORMANCE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.PREP, Layer.MIXED),
     requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=True,
 )
