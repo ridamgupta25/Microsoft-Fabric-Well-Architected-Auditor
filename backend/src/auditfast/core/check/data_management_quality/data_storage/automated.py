@@ -2189,15 +2189,123 @@ def dimensions_are_denormalized(ctx: CheckContext) -> Verdict:
 #: ``is_active``/``is_deleted`` are excluded for the same reason â€” they are
 #: business state flags. A row being active says nothing about whether its
 #: history is versioned.
-_SCD_MARKERS: frozenset[str] = frozenset({
-    "valid_from", "valid_to", "validfrom", "validto", "valid_until", "validuntil",
-    "effective_from", "effective_to", "effectivefrom", "effectiveto",
-    "effective_start_date", "effective_end_date",
-    "row_effective_date", "row_expiry_date", "record_start_date", "record_end_date",
-    "is_current", "iscurrent", "current_flag", "currentflag", "current_ind",
-    "row_hash", "rowhash", "hash_diff", "hashdiff", "row_version", "rowversion",
-    "record_version", "scd_type", "scdtype",
+#: Columns that mark the *start* of a row version. Vocabulary drawn from the
+#: frameworks that actually generate these columns: dbt snapshots
+#: (``dbt_valid_from``), Data Vault 2.0 (``load_date``), SQL Server temporal
+#: tables (``SysStartTime``), and Microsoft's own ADF/Synapse SCD-2 data flow,
+#: which uses ``StartDate``/``EndDate``/``IsActive``
+#: (``learn.microsoft.com/azure/data-factory/data-flow-scd-type-2``).
+_SCD_START_MARKERS: frozenset[str] = frozenset({
+    "valid_from", "validfrom", "valid_start_date", "dbt_valid_from",
+    "effective_from", "effectivefrom", "effective_start_date",
+    "row_effective_date", "record_start_date", "dw_valid_from", "dw_start_date",
+    "load_date", "load_dts", "sysstarttime", "sys_start_time",
+    "meta_valid_from", "_scd_start_date", "__start_at",
 })
+
+#: Names that *may* be row-versioning columns but are far more often ordinary
+#: business attributes: a contract term, a promotion window, an employee's
+#: tenure, a product revision. ``is_audit_column`` already refuses to read
+#: ``start_date`` as lineage metadata for exactly this reason, and the
+#: vocabularies must agree - a dimension holding a business date range is not
+#: thereby a Type 2 dimension.
+#:
+#: They count only alongside a current-row flag. That combination is Microsoft's
+#: own ADF/Synapse SCD-2 output (``StartDate``/``EndDate``/``IsActive``) and is
+#: not a shape a business date range takes: a contract term does not carry
+#: ``is_current``.
+_SCD_START_AMBIGUOUS: frozenset[str] = frozenset({
+    "start_date", "startdate", "start_dt", "begin_date", "begin_dt",
+    "effective_date", "effectivedate", "eff_date", "eff_dt",
+})
+
+#: Columns that mark the *end* of a row version - the half most often missing.
+_SCD_END_MARKERS: frozenset[str] = frozenset({
+    "valid_to", "validto", "valid_until", "validuntil", "dbt_valid_to",
+    "expiry_date", "expiration_date",
+    "row_expiry_date", "row_expiration_date", "record_end_date",
+    "effective_to", "effectiveto", "effective_end_date",
+    "thru_date", "through_date", "dw_valid_to", "dw_end_date",
+    "load_end_date", "load_end_dts", "sysendtime", "sys_end_time",
+    "meta_valid_to", "_scd_end_date", "__end_at",
+})
+
+#: The end-date counterparts to ``_SCD_START_AMBIGUOUS`` - same reasoning.
+_SCD_END_AMBIGUOUS: frozenset[str] = frozenset({
+    "end_date", "enddate", "end_dt", "finish_date", "finish_dt",
+})
+
+#: A convenience flag. On its own it proves nothing - ``is_active`` is just as
+#: likely to be a soft-delete marker - so it never establishes SCD 2 alone.
+_SCD_FLAG_MARKERS: frozenset[str] = frozenset({
+    "is_current", "iscurrent", "current_flag", "currentflag", "curr_flag",
+    "current_ind", "current_indicator", "current_record_flag", "is_current_record",
+    "active_flag", "activeflag", "is_active", "isactive", "active_ind",
+    "is_latest", "islatest", "latest_flag", "dw_is_current", "row_is_current",
+})
+
+#: A monotonic version is the documented alternative to an end date: paired with
+#: a start date it identifies which row supersedes which.
+_SCD_VERSION_MARKERS: frozenset[str] = frozenset({
+    "version", "version_number", "row_version", "rowversion",
+    "record_version", "scd_version", "revision",
+})
+
+#: Change-detection hashes. Evidence of *how* changes are spotted, never of row
+#: versioning itself - a hash column alone is as likely to be deduplication.
+_SCD_HASH_MARKERS: frozenset[str] = frozenset({
+    "row_hash", "rowhash", "record_hash", "hash_diff", "hashdiff",
+    "dbt_scd_id", "checksum", "change_hash", "delta_hash",
+})
+
+#: Type 3 keeps the prior value in a second column beside the current one.
+_SCD3_PREVIOUS = re.compile(
+    r"^(?:prev|previous|prior|old|former|original)[_-]\w+"
+    r"|\w+[_-](?:prev|previous|prior|old|former|original)$",
+    re.IGNORECASE,
+)
+
+
+def _scd_shape(table: dict) -> str:
+    """Classify one dimension's SCD implementation from its column names.
+
+    Returns ``"complete"``, ``"incomplete"``, ``"type3"`` or ``"none"``.
+
+    **The rule follows Kimball.** Design Tip #107 names three metadata columns
+    for Type 2 - row effective date, row expiry date, current row indicator -
+    and the validity *pair* is what makes row versioning work: a start date says
+    when a version began, an end date says when it was superseded. A version
+    number or a change hash is the documented alternative machinery.
+
+    A lone current flag is deliberately **not** enough. ``is_active`` is just as
+    likely to be a soft-delete marker, and a flag with no validity window cannot
+    say which row was current *when* - which is the entire point of Type 2.
+
+    Ambiguous business names (``start_date``, ``end_date``) count only when a
+    current-row flag sits beside them: that combination is Microsoft's own
+    ADF/Synapse SCD-2 output, and is not a shape a contract term ever takes.
+    """
+    names = {c.replace(" ", "").replace("-", "_").lower() for c in col_names(table)}
+    has_flag = bool(names & _SCD_FLAG_MARKERS)
+    has_start = bool(names & _SCD_START_MARKERS) or (
+        has_flag and bool(names & _SCD_START_AMBIGUOUS))
+    has_end = bool(names & _SCD_END_MARKERS) or (
+        has_flag and bool(names & _SCD_END_AMBIGUOUS))
+    has_version = bool(names & _SCD_VERSION_MARKERS)
+    has_hash = bool(names & _SCD_HASH_MARKERS)
+
+    if has_start and (has_end or has_version):
+        return "complete"
+    # A change hash is unambiguous SCD machinery - no business column is called
+    # ``hash_diff`` - so it stands on its own as a declared change-handling
+    # strategy, even though it versions nothing by itself.
+    if has_hash:
+        return "complete"
+    if has_start or has_end or has_flag or has_version:
+        return "incomplete"
+    if sum(1 for name in names if _SCD3_PREVIOUS.match(name)) >= 2:
+        return "type3"
+    return "none"
 
 
 @check(
@@ -2208,24 +2316,34 @@ _SCD_MARKERS: frozenset[str] = frozenset({
     required=False,
 )
 def scd_strategy_per_dimension(ctx: CheckContext) -> Verdict:
-    """Each dimension shows a declared change-handling strategy in its schema.
+    """Each dimension's change-handling strategy is evident, and *complete*.
 
-    **What it can determine.** Whether a dimension carries Type-2/hybrid markers
-    (validity dates, a current flag, a row hash, a version) â€” the only schema
-    evidence that a strategy was *chosen* per dimension.
+    **What counts as complete.** Kimball's Type 2 needs a validity *pair* - a
+    start date plus either an end date or a version number - because that is
+    what says which row was current at a given time. Microsoft's own ADF/Synapse
+    SCD-2 data flow generates exactly that shape (``StartDate`` / ``EndDate`` /
+    ``IsActive``), as do dbt snapshots (``dbt_valid_from`` / ``dbt_valid_to``)
+    and SQL Server temporal tables (``SysStartTime`` / ``SysEndTime``).
 
-    **What it cannot.** Whether an overwrite-in-place (Type 1) dimension was a
-    deliberate decision or an unexamined default: both look identical in the
-    schema. Type 1 is a legitimate strategy, so a dimension with no markers is
-    never a hard FAIL. The bands reflect exactly that: **3** when every dimension
-    declares its handling in the schema, **2** when some do (the estate knows the
-    pattern and applied it where needed), and **1** â€” partial, not zero â€” when
-    none do, because the tables may all be correctly Type 1 with the decision
-    recorded somewhere this check cannot read.
+    **Why a lone flag is not enough.** An earlier version accepted *any single*
+    marker, so a dimension carrying only ``is_current`` scored as a declared
+    strategy - and an estate where every dimension looked like that scored a
+    full pass. That is the broken half-implementation the point warns about:
+    ``is_active`` is as often a soft-delete marker, and without dates nothing
+    records *when* a row was current. Those now score as incomplete.
 
-    Broader than ``TB-SCD2`` (ref 4.5.9), which asks only whether dimensions
-    *already identified as Type 2* carry the full valid_from/valid_to/is_current
-    triple. This one asks whether any strategy is evident at all.
+    **Type 1 is legitimate, so it is never a hard failure.** A dimension with no
+    markers may be a deliberate overwrite-in-place with the decision recorded
+    somewhere unreadable. The floor is 1, not 0.
+
+    **What it cannot determine.** Whether the ETL actually maintains the
+    columns, whether the flag stays in sync with the dates, or whether Type 1
+    was chosen rather than defaulted into. Column names show declared *intent*,
+    never operational correctness.
+
+    Broader than ``TB-SCD2`` (ref 4.5.9), which asks whether dimensions already
+    identified as Type 2 carry the full trio. This asks which strategy - if
+    any - each dimension declares.
     """
     tables = ctx.workspace.tables
     if not tables:
@@ -2234,24 +2352,46 @@ def scd_strategy_per_dimension(ctx: CheckContext) -> Verdict:
     if not dims:
         return not_applicable(_NO_DIMS)
 
-    declared = [n for n, t in dims.items()
-                if any(c.replace(" ", "") in _SCD_MARKERS for c in col_names(t))]
-    if len(declared) == len(dims):
+    shapes = {name: _scd_shape(table) for name, table in dims.items()}
+    complete = sorted(n for n, s in shapes.items() if s == "complete")
+    incomplete = sorted(n for n, s in shapes.items() if s == "incomplete")
+    type3 = sorted(n for n, s in shapes.items() if s == "type3")
+    plain = sorted(n for n, s in shapes.items() if s == "none")
+    declared = complete + type3
+
+    detail = ""
+    if incomplete:
+        detail = (
+            f". {len(incomplete)} carry a partial marker set "
+            f"({', '.join(incomplete[:4])}) - a current flag with no validity dates, "
+            f"or a start date with no end date or version, cannot record which row "
+            f"was current when, so row versioning is not demonstrated"
+        )
+
+    if declared and not incomplete and not plain:
         return graded(
             3,
-            f"All {len(dims)} dimension(s) declare their change handling in the schema "
-            f"(validity dates, current flag, row hash or version)",
+            f"All {len(dims)} dimension(s) declare a complete change-handling strategy "
+            f"({len(complete)} with a validity pair, {len(type3)} keeping previous "
+            f"values)",
         )
     if declared:
         return graded(
             2,
-            f"{len(declared)} of {len(dims)} dimension(s) declare an SCD strategy "
-            f"({', '.join(sorted(declared)[:4])}); the rest overwrite in place (Type 1 "
-            f"by default), which may be correct but is not evident in the schema",
+            f"{len(declared)} of {len(dims)} dimension(s) declare a complete SCD "
+            f"strategy ({', '.join(declared[:4])}); {len(plain)} overwrite in place "
+            f"(Type 1 by default), which may be correct but is not evident in the "
+            f"schema{detail}",
+        )
+    if incomplete:
+        return graded(
+            1,
+            f"None of the {len(dims)} dimension(s) declares a complete SCD strategy"
+            f"{detail}. Confirm whether row history is genuinely tracked",
         )
     return graded(
         1,
-        f"None of the {len(dims)} dimension(s) carry SCD markers â€” all are Type 1 by "
+        f"None of the {len(dims)} dimension(s) carry SCD markers - all are Type 1 by "
         f"default. That is a legitimate strategy, but no schema evidence shows it was "
         f"chosen per dimension; confirm and record the decision",
     )
