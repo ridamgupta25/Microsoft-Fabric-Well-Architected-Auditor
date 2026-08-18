@@ -98,6 +98,60 @@ _ACCESS_RECOMMENDATION = (
 )
 
 
+def _one_line(text: str) -> str:
+    """Collapse report-bound text so it cannot break Markdown table rows."""
+    return " ".join(str(text or "").split())
+
+
+def _short_evidence(evidence: str, limit: int = 240) -> str:
+    """Keep the detected gap useful without duplicating a large evidence cell."""
+    text = _one_line(evidence)
+    if len(text) <= limit:
+        return text
+    cutoff = text.rfind(" ", 0, limit - 3)
+    if cutoff < limit // 2:
+        cutoff = limit - 3
+    return f"{text[:cutoff].rstrip()}..."
+
+
+def _recommendation_target(scope: Scope, workspace: str, obj: str) -> str:
+    workspace_name = _one_line(workspace) or "unknown workspace"
+    object_name = _one_line(obj)
+    if scope is Scope.GROUP:
+        return f'project group "{workspace_name}"'
+    if scope is Scope.WORKSPACE or not object_name:
+        return f'workspace "{workspace_name}"'
+    return f'{scope.value.replace("_", " ")} "{object_name}" in workspace "{workspace_name}"'
+
+
+def _finding_recommendation(
+    spec: CheckSpec | GroupCheckSpec,
+    remediation: RemediationBook,
+    *,
+    workspace: str,
+    obj: str,
+    scope: Scope,
+    evidence: str,
+) -> str:
+    """Build deterministic guidance tied to the exact target and observed gap."""
+    action = _one_line(remediation.get(spec.ref))
+    if not action:
+        action = (
+            f'Update this target to satisfy "{_one_line(spec.title)}". '
+            "Use the observed gap to identify the missing configuration or implementation."
+        )
+    if not action.endswith((".", "!", "?")):
+        action += "."
+
+    observed = _short_evidence(evidence) or "The check did not meet its required condition."
+    target = _recommendation_target(scope, workspace, obj)
+    return (
+        f"Target: {target}. Observed gap: {observed} "
+        f"Action: {action} Verification: Re-run the audit and confirm {spec.id} "
+        "is PASS for this target, or record a reviewed exception with supporting evidence."
+    )
+
+
 def access_error_result(workspace_id: str, layer: Layer, message: str) -> CheckResult:
     """A visible, non-scored result for a workspace that could not be read.
 
@@ -198,7 +252,14 @@ def build_result(
         coverage=verdict.coverage,
         evidence=verdict.evidence,
         # Guidance is only useful where there is something to fix.
-        recommendation="" if (passed or unjudged) else remediation.get(spec.ref),
+        recommendation="" if (passed or unjudged) else _finding_recommendation(
+            spec,
+            remediation,
+            workspace=workspace.name,
+            obj=verdict.obj if verdict.obj is not None else obj_name,
+            scope=spec.scope,
+            evidence=verdict.evidence,
+        ),
         # Severity describes the *finding*, so a passing check is never "High".
         severity=Severity.INFO if (passed or unjudged) else spec.severity,
         workspace=workspace.name,
@@ -236,7 +297,14 @@ def build_group_result(
         score=verdict.score,
         coverage=verdict.coverage,
         evidence=verdict.evidence,
-        recommendation="" if (passed or unjudged) else remediation.get(spec.ref),
+        recommendation="" if (passed or unjudged) else _finding_recommendation(
+            spec,
+            remediation,
+            workspace=group_name,
+            obj=verdict.obj if verdict.obj is not None else "",
+            scope=Scope.GROUP,
+            evidence=verdict.evidence,
+        ),
         severity=Severity.INFO if (passed or unjudged) else spec.severity,
         workspace=group_name,
         layer=Layer.MIXED,

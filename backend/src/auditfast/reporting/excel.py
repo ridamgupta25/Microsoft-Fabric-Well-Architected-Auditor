@@ -124,6 +124,12 @@ def build_excel(path: str, project_name: str, agg: dict, results: list) -> None:
     widths = [22, 16, 22, 14, 8, 34, 16, 22, 10, 7, 12, 46, 52]
     for i, w in enumerate(widths, start=1):
         cs.column_dimensions[cs.cell(row=1, column=i).column_letter].width = w
+    for row in range(2, cs.max_row + 1):
+        for column in (12, 13):
+            cs.cell(row=row, column=column).alignment = Alignment(
+                vertical="top", wrap_text=True,
+            )
+    cs.auto_filter.ref = cs.dimensions
     cs.freeze_panes = "A2"
 
     # -- Risk Register sheet ---------------------------------------------------
@@ -143,6 +149,12 @@ def build_excel(path: str, project_name: str, agg: dict, results: list) -> None:
     widths = [10, 12, 22, 22, 22, 40, 46, 52]
     for i, w in enumerate(widths, start=1):
         rr.column_dimensions[rr.cell(row=1, column=i).column_letter].width = w
+    for row in range(2, rr.max_row + 1):
+        for column in (7, 8):
+            rr.cell(row=row, column=column).alignment = Alignment(
+                vertical="top", wrap_text=True,
+            )
+    rr.auto_filter.ref = rr.dimensions
     rr.freeze_panes = "A2"
 
     wb.save(path)
