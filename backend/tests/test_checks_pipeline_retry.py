@@ -24,10 +24,12 @@ from auditfast.core.check.operations_reliability.data_prep.automated import (
     retry_values,
 )
 from auditfast.core.enums import Resource, Status
-from auditfast.core.models import CheckContext, WorkspaceContext
+
+from .fixtures.builders import definition_ctx, foreach, pipeline
 
 
 def _act(name: str, *, retry=None, interval=None, activity_type: str = "Copy") -> dict:
+    """A pipeline activity carrying a retry policy - the subject of this check."""
     policy: dict = {"timeout": "0.12:00:00"}
     if retry is not None:
         policy["retry"] = retry
@@ -36,26 +38,24 @@ def _act(name: str, *, retry=None, interval=None, activity_type: str = "Copy") -
     return {"name": name, "type": activity_type, "policy": policy}
 
 
-def _pipe(*activities: dict) -> dict:
-    return {"properties": {"activities": list(activities)}}
-
-
-def _foreach(name: str, *children: dict) -> dict:
-    return {"name": name, "type": "ForEach",
-            "typeProperties": {"activities": list(children)}}
-
-
 def _if(name: str, *, true_acts=(), false_acts=()) -> dict:
     return {"name": name, "type": "IfCondition",
             "typeProperties": {"ifTrueActivities": list(true_acts),
                                "ifFalseActivities": list(false_acts)}}
 
 
+def _pipe(*activities: dict) -> dict:
+    return pipeline(*activities)
+
+
+def _foreach(name: str, *children: dict) -> dict:
+    return foreach(name, *children)
+
+
 def _ctx(obj: dict, *, settings: dict | None = None,
-         unavailable: set | None = None) -> CheckContext:
-    workspace = WorkspaceContext(id="w", unavailable=unavailable or set())
-    return CheckContext(workspace=workspace, settings=settings or {},
-                        obj_name="pipeline", obj=obj)
+         unavailable: set | None = None):
+    return definition_ctx(obj, settings=settings, unavailable=unavailable,
+                          name="pipeline")
 
 
 # --------------------------------------------------------------------------
