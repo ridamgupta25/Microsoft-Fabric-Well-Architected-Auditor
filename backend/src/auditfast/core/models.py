@@ -165,6 +165,13 @@ class WorkspaceContext:
     #: top-level folder sample, depth/date counts, and truncation flags. Individual
     #: file names/paths are deliberately never persisted in the KB.
     lakehouse_files: dict[str, dict] = field(default_factory=dict)
+    #: Per-Lakehouse summary of the **Tables** section - the same bounded shape as
+    #: :attr:`lakehouse_files`, but for the Delta data files. A Lakehouse's tables
+    #: live under ``Tables/``, so a file-size check that read only ``Files/`` was
+    #: measuring loose landing-area files and ignoring every Parquet file the
+    #: point is actually about. Empty when the listing could not be read, which
+    #: the checks must treat as unknown rather than as an empty Lakehouse.
+    lakehouse_tables_files: dict[str, dict] = field(default_factory=dict)
     #: Per-Data-Activator (Reflex) rule summary, keyed by item display name:
     #: ``{"rules": int, "active_rules": int, "sources": int, "actions": int}``,
     #: parsed from the item's ``ReflexEntities.json`` definition. An Activator
@@ -279,6 +286,7 @@ class WorkspaceContext:
             "connections": self.connections,
             "reports": self.reports,
             "lakehouse_files": self.lakehouse_files,
+            "lakehouse_tables_files": self.lakehouse_tables_files,
             "activators": self.activators,
             "git_details": self.git_details,
             "sql_views": self.sql_views,
@@ -314,6 +322,7 @@ class WorkspaceContext:
             connections=list(data.get("connections", [])),
             reports=list(data.get("reports", [])),
             lakehouse_files=dict(data.get("lakehouse_files", {})),
+            lakehouse_tables_files=dict(data.get("lakehouse_tables_files", {})),
             activators=dict(data.get("activators", {})),
             git_details=dict(data.get("git_details", {})),
             sql_views=list(data.get("sql_views", [])),

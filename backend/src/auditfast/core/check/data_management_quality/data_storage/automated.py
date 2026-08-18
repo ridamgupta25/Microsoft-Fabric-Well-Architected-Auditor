@@ -2258,19 +2258,23 @@ def scd_strategy_per_dimension(ctx: CheckContext) -> Verdict:
 
 
 # =============================================================================
-# 4.5.2 â€” fact grain, and 4.5.11 â€” degenerate / junk dimension candidates
+# 4.5.2 — fact grain, and 4.5.11 — degenerate / junk dimension candidates
 #
-# Both points are only *partly* readable, and the two halves are named in each
+# Both points are only *partly* readable, and the limit is named in each
 # docstring rather than blurred:
 #
 # * 4.5.2 asks for a grain that is "clearly defined **and documented**". No
 #   Fabric REST call and no SQL analytics endpoint query returns a table
-#   description, an extended property or a column comment, so the documented
-#   half is out of reach entirely. Only the "clearly defined" half is scored.
+#   description, an extended property or a column comment (verified against the
+#   Fabric T-SQL surface area and the Lakehouse List Tables reference), so the
+#   documented half is out of reach entirely. Only the "clearly defined" half is
+#   scored.
 # * 4.5.11 asks for degenerate/junk dimensions "where appropriate". Whether a
 #   modelling choice is appropriate is a judgement, and the deciding fact
-#   (cardinality) needs row data, which this tool must not fetch. That point is
-#   therefore reported as an unscored note listing candidates for review.
+#   (cardinality) needs row data this tool must not fetch. The *detection* is
+#   still factual - a key resolving to no dimension is a readable gap - so the
+#   check scores the share of facts free of those shapes and names the rest as
+#   candidates for review.
 # =============================================================================
 
 #: A grain needs at least this many independent components to be identifiable
@@ -2390,32 +2394,32 @@ _MIN_JUNK_CANDIDATES = 3
     required=False,
 )
 def degenerate_and_junk_dimension_candidates(ctx: CheckContext) -> Verdict:
-    """Report fact columns shaped like a degenerate or junk dimension â€” unscored, for review.
-
-    **Deliberately unscored (a `note`).** The point says "where appropriate", and
-    appropriateness is a modelling judgement no API can make: a degenerate
-    dimension is *correct* when an order number genuinely has no attributes of
-    its own, and *wrong* when the attributes exist and were simply never
-    modelled. The deciding fact for a junk dimension â€” column cardinality â€” needs
-    row data, which this tool must not fetch. Scoring either way would be a
-    guess, so this reports the candidates and names them instead.
+    """Fact tables carry no unmodelled key or uncollapsed flag cluster.
 
     **What it can determine.** *Degenerate candidates*: key-shaped columns on a
     fact table whose referent matches no dimension table in this workspace and is
     not the fact's own identity (``order_number`` on ``fact_sales`` with no
-    ``dim_order``) â€” the exact shape of a degenerate dimension. *Junk
+    ``dim_order``) - the exact shape of a degenerate dimension. *Junk
     candidates*: three or more flag/indicator/status-shaped columns on one fact,
     the cluster a junk dimension exists to collapse.
+
+    **Scored on the share of fact tables that are clean.** An earlier version
+    reported the candidates as an unscored ``note``, reasoning that "where
+    appropriate" is a modelling judgement. It is - but the *detection* is not:
+    a key that resolves to no dimension is a readable, factual gap in the model,
+    and reporting it as INFO meant accurate findings never influenced anything.
+    The verdict now scores how many facts are free of these shapes; the named
+    candidates remain what a reviewer confirms.
 
     **What it cannot.** Column cardinality (no row data is read), whether the
     referenced dimension lives in another workspace, whether a degenerate column
     is intentional, or whether an existing junk dimension is already in use
-    somewhere it cannot see. Every name below is a *candidate for review*, never
-    a finding.
+    somewhere it cannot see. A named table is a *candidate for review*: the
+    check reports the shape, not the intent.
 
     **Sibling.** ``TB-FACT-PURITY`` (ref 4.5.3) scores *text* attributes on a
     fact that belong on a dimension. This looks at key- and flag-shaped columns,
-    which that check deliberately ignores, and judges neither.
+    which that check deliberately ignores.
     """
     tables = ctx.workspace.tables
     if not tables:
@@ -2452,29 +2456,34 @@ def degenerate_and_junk_dimension_candidates(ctx: CheckContext) -> Verdict:
         if len(flags) >= _MIN_JUNK_CANDIDATES:
             junk.append(f"{name}: {len(flags)} flag column(s) ({', '.join(flags[:4])})")
 
+    flagged = {entry.split(":")[0] for entry in degenerate} | {entry.split(":")[0] for entry in junk}
+    clean = len(facts) - len(flagged)
+
     if not degenerate and not junk:
-        return note(
-            f"No degenerate or junk dimension candidate found across {len(facts)} fact "
-            f"table(s): every key column resolves to a dimension in this workspace and no "
-            f"fact carries {_MIN_JUNK_CANDIDATES}+ flag/status columns. Whether the "
-            f"existing model uses the patterns *appropriately* is a modelling judgement "
-            f"this check does not make."
+        return covered(
+            len(facts), len(facts),
+            f"All {len(facts)} fact table(s) are free of degenerate/junk dimension "
+            f"candidates: every key column resolves to a dimension in this workspace "
+            f"and no fact carries {_MIN_JUNK_CANDIDATES}+ flag/status columns"
         )
     parts = []
     if degenerate:
         parts.append(
             f"{len(degenerate)} fact table(s) carry a key with no matching dimension "
-            f"(degenerate-dimension candidates) â€” {'; '.join(degenerate[:3])}"
+            f"(degenerate-dimension candidates) - {'; '.join(degenerate[:3])}"
         )
     if junk:
         parts.append(
             f"{len(junk)} fact table(s) carry {_MIN_JUNK_CANDIDATES}+ flag/status columns "
-            f"(junk-dimension candidates) â€” {'; '.join(junk[:3])}"
+            f"(junk-dimension candidates) - {'; '.join(junk[:3])}"
         )
-    return note(
-        "; ".join(parts)
-        + ". Reported for review, not scored: cardinality is not readable without querying "
-          "rows, and whether each pattern is appropriate here is a modelling judgement."
+    return covered(
+        clean, len(facts),
+        f"{clean} of {len(facts)} fact table(s) carry no degenerate or junk dimension "
+        f"candidate. " + "; ".join(parts)
+        + ". Each named table is a candidate for review: cardinality is not readable "
+          "without querying rows, and whether the pattern is appropriate here is a "
+          "modelling judgement this check does not make."
     )
 
 
