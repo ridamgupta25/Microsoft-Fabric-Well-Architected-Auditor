@@ -10,8 +10,10 @@ from __future__ import annotations
 import pytest
 
 from auditfast.core.check.registry import GROUP_REGISTRY, CheckRegistry
+from auditfast.core.check.data_management_quality.data_storage.group import aggregate_consistency
 from auditfast.core.engine import run_audit
-from auditfast.core.enums import Layer, Scope, Status
+from auditfast.core.enums import Layer, Resource, Scope, Status
+from auditfast.core.models import GroupContext, GroupMemberContext, WorkspaceContext
 
 from .conftest import FIXTURE_SETTINGS
 
@@ -51,6 +53,80 @@ def test_all_seventeen_ported_checks_are_registered():
     for check_id, ref in PORTED.items():
         assert check_id in specs, f"{check_id} not registered"
         assert specs[check_id].ref == ref
+
+
+def _aggregate_group(
+    *, measure: dict | None = None, sql: str = "",
+    unavailable: set[Resource] | None = None,
+) -> GroupContext:
+    members = []
+    for name, level in (("DEV", 1), ("PROD", 10)):
+        workspace = WorkspaceContext(
+            id=name,
+            display_name=name,
+            layer=Layer.STORAGE,
+            tables={"fact_sales": {}, "daily_sales_aggregate": {}},
+            semantic_models={
+                "Sales": {
+                    "tables": ["fact_sales", "daily_sales_aggregate"],
+                    "measures": [measure],
+                },
+            } if measure else {},
+            sql_routines=[{
+                "schema": "audit", "name": "validate_sales_rollup",
+                "type": "PROCEDURE", "definition": sql, "store": "SalesWarehouse",
+            }] if sql else [],
+            unavailable=set(unavailable or ()),
+        )
+        members.append(GroupMemberContext(workspace, level, Layer.STORAGE))
+    return GroupContext(name="Sales", members=tuple(members), settings={})
+
+
+def test_aggregate_table_names_alone_do_not_prove_reconciliation():
+    verdict = aggregate_consistency(_aggregate_group())
+    assert verdict.score != 3
+
+
+def test_semantic_model_detail_to_aggregate_variance_measure_passes():
+    measure = {
+        "name": "Detail vs Aggregate Variance",
+        "expression": "SUM(fact_sales[amount]) - SUM(daily_sales_aggregate[total_amount])",
+    }
+    verdict = aggregate_consistency(_aggregate_group(measure=measure))
+    assert verdict.score == 3
+
+
+def test_warehouse_enforced_detail_to_aggregate_reconciliation_passes():
+    sql = """
+DECLARE @detail_total decimal(18,2) = (SELECT SUM(amount) FROM fact_sales);
+DECLARE @aggregate_total decimal(18,2) = (SELECT SUM(total_amount) FROM daily_sales_aggregate);
+IF @detail_total <> @aggregate_total THROW 51000, 'Rollup mismatch', 1;
+"""
+    verdict = aggregate_consistency(_aggregate_group(sql=sql))
+    assert verdict.score == 3
+
+
+def test_warehouse_reconciliation_does_not_require_semantic_model_readability():
+    sql = """
+DECLARE @detail_total decimal(18,2) = (SELECT SUM(amount) FROM fact_sales);
+DECLARE @aggregate_total decimal(18,2) = (SELECT SUM(total_amount) FROM daily_sales_aggregate);
+IF @detail_total <> @aggregate_total THROW 51000, 'Rollup mismatch', 1;
+"""
+    verdict = aggregate_consistency(_aggregate_group(
+        sql=sql, unavailable={Resource.SEMANTIC_MODEL_DEFINITIONS},
+    ))
+    assert verdict.score == 3
+
+
+def test_semantic_reconciliation_does_not_require_warehouse_readability():
+    measure = {
+        "name": "Detail vs Aggregate Variance",
+        "expression": "SUM(fact_sales[amount]) - SUM(daily_sales_aggregate[total_amount])",
+    }
+    verdict = aggregate_consistency(_aggregate_group(
+        measure=measure, unavailable={Resource.TABLE_COLUMNS},
+    ))
+    assert verdict.score == 3
 
 
 @pytest.mark.parametrize("check_id,ref", sorted(PORTED.items()))
