@@ -265,7 +265,7 @@ def test_the_three_refs_are_registered_once_each_with_the_agreed_metadata():
         "NB-BUSINESS-RULE", "NB-NULL-PROPAGATION", "NB-JSON-VALIDATION",
     }
     for spec in by_ref.values():
-        assert spec.pillar is Pillar.DATA
+        assert spec.pillar is Pillar.DATA_QUALITY
         assert spec.scope is Scope.NOTEBOOK
         assert spec.severity is Severity.MEDIUM
         assert spec.requires == frozenset({Resource.NOTEBOOK_DEFINITIONS})

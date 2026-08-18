@@ -39,7 +39,7 @@ def _stays_within_layer(ws: WorkspaceContext) -> bool:
     id="XW-LAYER-SEP", ref="1.1.1",
     title="Separation of concerns maintained consistently across the estate "
           "(Data Prep / Data Store / Data Consumption × Dev / QA / Prod)",
-    pillar=Pillar.DATA, severity=Severity.MEDIUM, requires=[Resource.ITEMS],
+    pillar=Pillar.DATA_QUALITY, severity=Severity.MEDIUM, requires=[Resource.ITEMS],
     required=False,
 )
 def layer_separation_consistent(ctx: GroupContext) -> Verdict:

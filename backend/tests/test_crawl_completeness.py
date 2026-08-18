@@ -141,7 +141,7 @@ def test_engine_emits_a_read_incomplete_warning():
 
     reg = CheckRegistry()
 
-    @check(id="NB-X", ref="9.9", title="nb", pillar=Pillar.PERFORMANCE,
+    @check(id="NB-X", ref="9.9", title="nb", pillar=Pillar.DATA_PROCESSING,
            scope=Scope.NOTEBOOK, requires=[Resource.NOTEBOOK_DEFINITIONS], registry=reg)
     def _nb(c):  # pragma: no cover - not reached when definitions are absent
         return binary(True, "ok")

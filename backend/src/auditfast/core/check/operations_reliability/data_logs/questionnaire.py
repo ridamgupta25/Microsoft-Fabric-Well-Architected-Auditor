@@ -33,7 +33,7 @@ def _options(partial_guidance: str, no_guidance: str) -> list[CheckOption]:
 questionnaire_check(
     id="OPS-DASH-PIPELINE", ref="10.1.3",
     title="Dashboard shows pipeline status, duration trends, and failure rates",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question="Is there an operational dashboard showing pipeline status, duration trends, and failure rates?",
     options=_options(
         "Add the missing views (duration trends and/or failure rates) to the operational dashboard.",
@@ -45,7 +45,7 @@ questionnaire_check(
 questionnaire_check(
     id="OPS-AUDIT-SCHEMA", ref="10.2.1",
     title="Audit Tables schema designed for queryability (structured, not free-text)",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question="Are the Audit Tables modelled as structured, queryable columns (not free-text blobs)?",
     options=_options(
         "Refactor free-text audit columns into typed, queryable fields.",
@@ -57,7 +57,7 @@ questionnaire_check(
 questionnaire_check(
     id="OPS-DQ-LOGS", ref="10.2.3",
     title="DQ logs, row counts, null checks, and exceptions captured consistently across domains",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question="Are DQ logs, row counts, null checks, and exceptions captured consistently across every domain?",
     options=_options(
         "Standardise DQ logging so every domain captures the same metrics (row counts, null checks, exceptions).",
@@ -69,7 +69,7 @@ questionnaire_check(
 questionnaire_check(
     id="OPS-METADATA-DB", ref="10.2.4",
     title="Metadata DB captures every notebook run, data source changes, and lineage",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question="Does the Metadata DB record every notebook run, data-source change, and lineage relationship?",
     options=_options(
         "Extend the Metadata DB to capture the missing signals (runs, source changes, or lineage).",
@@ -81,7 +81,7 @@ questionnaire_check(
 questionnaire_check(
     id="OPS-AUDIT-QUERYABLE", ref="10.2.5",
     title="Audit Tables and Metadata DB are queryable by operations (not just developers)",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question="Can the operations team query the Audit Tables and Metadata DB directly (not only developers)?",
     options=_options(
         "Grant and document operations-team read access to the Audit Tables and Metadata DB.",
@@ -93,7 +93,7 @@ questionnaire_check(
 questionnaire_check(
     id="OPS-DASH-COVERAGE", ref="10.4.1",
     title="Dashboard covers all critical pipelines, notebooks, and Warehouse loads",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question="Does the monitoring dashboard cover all critical pipelines, notebooks, and Warehouse loads?",
     options=_options(
         "Add the uncovered critical pipelines, notebooks, or Warehouse loads to the dashboard.",
@@ -105,7 +105,7 @@ questionnaire_check(
 questionnaire_check(
     id="OPS-SPARK-LOGS", ref="10.1.2",
     title="Spark application logs captured for historical analysis",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question=(
         "Are Spark application logs exported and retained so a failure can still be investigated "
         "after Fabric's own monitoring window has rolled over? (self-assessed: Spark application "
@@ -123,7 +123,7 @@ questionnaire_check(
 questionnaire_check(
     id="OPS-EVENTHOUSE-RETENTION", ref="10.3.3",
     title="Eventhouse retention configured per compliance requirements",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question=(
         "Is Eventhouse/KQL database retention set deliberately to match your compliance "
         "requirement, rather than left at the default? (self-assessed: Eventhouse retention "

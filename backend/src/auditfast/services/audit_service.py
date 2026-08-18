@@ -217,21 +217,13 @@ def validate_snapshot(payload: dict) -> dict:
 
 
 def _resolve_pillars(names: Iterable[str] | None) -> list[Pillar] | None:
-    """Map pillar names from an API/CLI caller onto enum members.
-
-    Foundation is cross-cutting, informational context (item inventory, access
-    errors, crawl-completeness) — never scored, but always reported. It is kept
-    in every run even when the caller selects a subset of the scored pillars, so
-    the report's Workspace Inventory section is never silently empty.
-    """
+    """Map pillar names from an API/CLI caller onto enum members."""
     if not names:
         return None
     wanted = {str(n).strip().lower() for n in names if str(n).strip()}
     if not wanted:
         return None
     resolved = [p for p in Pillar if p.value.lower() in wanted]
-    if Pillar.FOUNDATION not in resolved:
-        resolved.append(Pillar.FOUNDATION)
     return resolved
 
 

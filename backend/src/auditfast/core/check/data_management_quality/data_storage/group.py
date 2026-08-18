@@ -21,7 +21,7 @@ _AGGREGATE_HINTS = ("daily", "agg", "aggregate", "summary", "rollup")
 @group_check(
     id="XW-CONFORMED-DIM", ref="4.4.9",
     title="Cross-domain conformed dimensions shared (not duplicated per domain) in the Warehouse",
-    pillar=Pillar.DATA, severity=Severity.MEDIUM, requires=[Resource.TABLE_COLUMNS],
+    pillar=Pillar.DATA_QUALITY, severity=Severity.MEDIUM, requires=[Resource.TABLE_COLUMNS],
     required=False,
 )
 def conformed_dimensions(ctx: GroupContext) -> Verdict:
@@ -51,7 +51,7 @@ def _has_detail_and_aggregate(ws) -> bool:
 @group_check(
     id="XW-AGG-CONSIST", ref="5.4.3",
     title="Aggregate consistency: sum of detail records equals aggregate totals (no data loss in rollup)",
-    pillar=Pillar.DATA, severity=Severity.HIGH, requires=[Resource.TABLE_COLUMNS],
+    pillar=Pillar.DATA_QUALITY, severity=Severity.HIGH, requires=[Resource.TABLE_COLUMNS],
     required=False,
 )
 def aggregate_consistency(ctx: GroupContext) -> Verdict:

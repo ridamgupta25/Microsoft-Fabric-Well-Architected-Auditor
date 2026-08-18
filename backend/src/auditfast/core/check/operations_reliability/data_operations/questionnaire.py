@@ -31,7 +31,7 @@ def _options(partial_guidance: str, no_guidance: str) -> list[CheckOption]:
 questionnaire_check(
     id="WS-DOMAIN-FOLDERS", ref="1.1.4",
     title="Domain segregation via folders (Finance, Sales, etc.) is consistent and applied uniformly across Prep and Store workspaces",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question="Are workspace folders used to segregate domains (Finance, Sales, …) consistently and uniformly across the Prep and Store workspaces?",
     options=_options(
         "Extend the same domain-folder taxonomy to every Prep and Store workspace so the structure is uniform.",
@@ -43,7 +43,7 @@ questionnaire_check(
 questionnaire_check(
     id="PL-SLA-MONITORED", ref="9.4.2",
     title="Pipeline completion SLAs set and monitored",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question="Are completion SLAs defined for critical pipelines and actively monitored against actual run durations?",
     options=_options(
         "Define SLAs for the remaining critical pipelines and wire them into monitoring.",
@@ -55,7 +55,7 @@ questionnaire_check(
 questionnaire_check(
     id="PL-SLA-ALERTS", ref="9.4.3",
     title="SLA breach triggers alerts (Data Activator, email, Teams)",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question="Does an SLA breach automatically raise an alert (Data Activator, email, or Teams) to the owning team?",
     options=_options(
         "Extend SLA-breach alerting to all critical pipelines and confirm the alerts reach the owning team.",
@@ -67,7 +67,7 @@ questionnaire_check(
 questionnaire_check(
     id="OPS-INTEGRATION-TESTS", ref="11.5.2",
     title="Integration tests validate end-to-end pipeline execution",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question="Do integration tests validate end-to-end pipeline execution (source → Gold) before release?",
     options=_options(
         "Broaden integration-test coverage to the remaining end-to-end pipeline paths.",
@@ -79,7 +79,7 @@ questionnaire_check(
 questionnaire_check(
     id="OPS-DATA-VALIDATION-TESTS", ref="11.5.3",
     title="Data validation tests run post-deployment (record counts, schema checks)",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question="Do automated data-validation tests (record counts, schema checks) run after each deployment?",
     options=_options(
         "Extend post-deployment validation to all critical tables and schemas.",
@@ -106,7 +106,7 @@ _WHY_GIT = (
 questionnaire_check(
     id="OPS-GIT-IGNORE", ref="11.1.3",
     title="`.gitignore` / exclusion rules prevent sensitive data in the repo",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question=(
         "Does the repository carry `.gitignore` / exclusion rules that keep data files, secrets, "
         f"and local config out of source control? ({_WHY_GIT})"
@@ -123,7 +123,7 @@ questionnaire_check(
 questionnaire_check(
     id="OPS-GIT-COMMIT-MSG", ref="11.1.5",
     title="Commit messages are descriptive and linked to work items",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question=(
         "Do commit messages describe the change and reference the work item or ticket that asked "
         f"for it? ({_WHY_GIT})"
@@ -140,7 +140,7 @@ questionnaire_check(
 questionnaire_check(
     id="OPS-GIT-PR-REVIEW", ref="11.1.6",
     title="Pull request reviews required before merge to main",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question=(
         "Is a reviewed pull request required before anything merges to main - enforced by branch "
         f"policy rather than by convention? ({_WHY_GIT})"
@@ -155,7 +155,7 @@ questionnaire_check(
 questionnaire_check(
     id="OPS-GIT-MIN-REVIEWERS", ref="11.1.7",
     title="Minimum reviewer count enforced via branch policies",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question=(
         "Does the branch policy set a minimum number of approvers (and exclude the author) rather "
         f"than accepting a single self-approval? ({_WHY_GIT})"
@@ -171,7 +171,7 @@ questionnaire_check(
 questionnaire_check(
     id="OPS-WH-SCHEMA-SCM", ref="11.4.1",
     title="Gold Warehouse schema changes are source-controlled (SQL project / DACPAC or equivalent)",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question=(
         "Are Gold Warehouse schema changes authored as source-controlled artefacts (SQL project, "
         f"DACPAC, or migration scripts) rather than applied ad-hoc in the portal? ({_WHY_GIT})"
@@ -194,7 +194,7 @@ questionnaire_check(
 questionnaire_check(
     id="OPS-DEPLOY-RULES", ref="11.2.2",
     title="Deployment rules configured for environment-specific parameters (connections, paths, capacity)",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question=(
         "Are deployment rules configured so environment-specific values - connections, lakehouse "
         "paths, capacity - are rebound on promotion instead of hand-edited afterwards? "
@@ -212,7 +212,7 @@ questionnaire_check(
 questionnaire_check(
     id="OPS-ENV-PARITY", ref="11.3.4",
     title='Environment parity maintained, no "works on dev" surprises',
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question=(
         "Do Dev, QA and Prod match closely enough in structure, settings and capacity that a "
         'change working in Dev behaves the same in Prod - no "works on dev" surprises? '
@@ -238,7 +238,7 @@ questionnaire_check(
 questionnaire_check(
     id="OPS-SLA-HISTORY", ref="9.4.4",
     title="Historical SLA compliance tracked and reported",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, layers=_LAYERS,
     question=(
         "Is SLA compliance retained over time and reported (e.g. a monthly attainment figure per "
         "critical pipeline), not just alerted on in the moment? (self-assessed: historical run "

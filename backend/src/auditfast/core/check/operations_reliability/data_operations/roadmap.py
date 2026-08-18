@@ -29,7 +29,7 @@ _CHECKS: list[tuple[str, str, str, tuple[str, ...], bool, str]] = [
 for _id, _ref, _title, _layers, _required, _requirement in _CHECKS:
     check(
         id=_id, ref=_ref, title=_title,
-        pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE,
+        pillar=Pillar.RELIABILITY, scope=Scope.WORKSPACE,
         layers=list(_layers), requires=[Resource.WORKSPACE], required=_required,
         automation=Automation.ROADMAP,
     )(gated(Requirement[_requirement]))
