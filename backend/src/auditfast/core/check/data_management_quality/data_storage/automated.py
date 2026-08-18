@@ -1694,18 +1694,21 @@ def _scd2_roles(table: dict) -> dict[str, str]:
     required=False,
 )
 def table_scd2(ctx: CheckContext) -> Verdict:
-    """Slowly-changing dimensions carry a start date, an end date, and a current flag.
+    """A slowly-changing dimension carries a start date, an end date, and a current flag.
 
-    **Judged by role, not by exact name.** The point names
-    ``valid_from``/``valid_to``/``is_current``, but an estate spelling them
-    ``effective_date``/``end_date``/``active_flag`` is implementing the same
+    **Judged by column-role pattern, not by name — across every table.** The
+    point names ``valid_from``/``valid_to``/``is_current``, but an estate spelling
+    them ``effective_date``/``end_date``/``active_flag`` is implementing the same
     pattern and must be scored on whether the *trio is complete*, not on whether
-    it picked the same words. Requiring the canonical spelling reported "no SCD2
-    dimensions" on an estate with dozens of them - a false N/A that hid both the
-    working implementation and its inconsistent naming.
+    it picked the same words. And SCD2 history tables are not always the ones a
+    model or a name calls a "dimension" - on a real estate they are Silver tables
+    the role classifier reads as unknown/fact - so restricting the scan to
+    dimension-role tables reported "no SCD2" on an estate full of it. This scans
+    every table that has column metadata.
 
-    A table counts as an SCD2 candidate once it carries **two** of the three
-    roles: one date alone is an ordinary business date, not row versioning.
+    A table is an SCD2 candidate once it carries a **current-flag** role plus at
+    least one validity date: a bare start/end date pair with no current indicator
+    is an ordinary validity period (a price, a rate), not row versioning.
 
     **What it cannot determine.** Whether ``valid_to`` is actually maintained on
     supersede, or whether exactly one row per key is flagged current - that needs
@@ -1713,26 +1716,19 @@ def table_scd2(ctx: CheckContext) -> Verdict:
     """
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
-    dims = {n: t for n, t in dimensions_in(ctx.workspace.tables, _models(ctx)).items()
-            if columns(t)}
-    if not dims:
-        # Distinguish "no columns to look at" from "columns read, no SCD2 here":
-        # the reason string is the whole value of an N/A.
-        readable = sum(1 for t in ctx.workspace.tables.values() if columns(t))
-        if readable:
-            return not_applicable(
-                f"Column metadata was read for {readable} table(s) but none is a "
-                f"dimension, so there is no slowly-changing dimension to assess"
-            )
-        return not_applicable(_NO_DIMS)
+    tabled = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
+    if not tabled:
+        return not_applicable(_NO_COLS)
 
-    candidates = {n: _scd2_roles(t) for n, t in dims.items()}
-    candidates = {n: roles for n, roles in candidates.items() if len(roles) >= 2}
+    candidates = {n: _scd2_roles(t) for n, t in tabled.items()}
+    candidates = {n: r for n, r in candidates.items() if r.get("flag") and len(r) >= 2}
     if not candidates:
+        # The columns *were* read (so this is not a permission gap) - there is
+        # simply no SCD2 pattern. The reason string is the whole value of an N/A.
         return not_applicable(
-            f"Column metadata was read for all {len(dims)} dimension(s), and none "
-            f"carries a start-date / end-date / current-flag trio, so no dimension "
-            f"is versioned as SCD Type 2"
+            f"Column metadata was read for {len(tabled)} table(s), but none carries an "
+            f"SCD2 start-date / end-date / current-flag pattern, so no table is "
+            f"versioned as SCD Type 2"
         )
 
     complete = {n: r for n, r in candidates.items() if len(r) == 3}
@@ -1743,7 +1739,7 @@ def table_scd2(ctx: CheckContext) -> Verdict:
     })
 
     evidence = (
-        f"{len(complete)} of {len(candidates)} SCD2 dimension(s) carry the full "
+        f"{len(complete)} of {len(candidates)} SCD2 table(s) carry the full "
         f"start-date / end-date / current-flag trio"
     )
     if incomplete:
