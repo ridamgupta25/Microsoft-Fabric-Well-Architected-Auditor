@@ -995,15 +995,13 @@ _BRONZE_BATCH = re.compile(
     r"batch[_ ]?(?:id|key)",
     re.IGNORECASE,
 )
-#: The four Silver disciplines the checklist point names, kept separate so the
-#: verdict can say *which* are present. A single pattern could only answer
-#: "something was found", which reported "applies cleansing, deduplication,
-#: conforming and type standardization" on a notebook doing none of the dedup.
+#: The three Silver disciplines this check *scores*. Deduplication is detected
+#: separately (``_SILVER_DEDUP``) and reported as context but never scored:
+#: whether a given Silver source needs dedup depends on whether its business key
+#: can repeat, which this check cannot see, so penalizing its absence would be a
+#: false finding (ref 1.2.5). Kept as (name, pattern) pairs so the verdict can
+#: name *which* aspects are present rather than only "something was found".
 _SILVER_ASPECTS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("deduplication", re.compile(
-        r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.distinct\s*\(\)|dedup|"
-        r"row_number\s*\(\s*\)\s*over|qualify\b",
-        re.IGNORECASE)),
     ("type standardization", re.compile(
         r"\.cast\s*\(|to_date\s*\(|to_timestamp\s*\(|astype\s*\(|"
         r"CAST\s*\(|CONVERT\s*\(",
@@ -1016,6 +1014,11 @@ _SILVER_ASPECTS: tuple[tuple[str, re.Pattern[str]], ...] = (
         r"standardi[sz]e|conform|\.withColumnRenamed\s*\(|\balias\s*\(|mapping",
         re.IGNORECASE)),
 )
+#: Deduplication detector — reported as unscored context (see ``_SILVER_ASPECTS``).
+_SILVER_DEDUP = re.compile(
+    r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.distinct\s*\(\)|dedup|"
+    r"row_number\s*\(\s*\)\s*over|qualify\b",
+    re.IGNORECASE)
 
 _EXPLICIT_ROW_BY_ROW = re.compile(
     r"row[_ -]?by[_ -]?row|record[_ -]?by[_ -]?record|per[_ -]?(?:row|record)|"
@@ -2018,23 +2021,25 @@ def nb_bronze_metadata(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_silver_quality(ctx: CheckContext) -> Verdict:
-    """Silver writes apply cleansing, deduplication, conforming and type standardization.
+    """Silver writes apply cleansing, conforming and type standardization.
 
     **Only Silver notebooks are judged**, decided by what the notebook writes to
     rather than by the word "silver" appearing anywhere in it - a Gold notebook
     that *reads* a silver table was previously judged as though it produced one.
 
-    **Scored per aspect.** The point names four disciplines, and a notebook doing
-    three of them is not the same as one doing all four. An earlier version
-    matched any one pattern and then claimed all four in its evidence, which
-    reported deduplication on notebooks that performed none. The verdict now
-    names which aspects were found and which were not, and scores the ratio, so
-    the evidence can be checked against the code.
+    **Scored on three disciplines.** The verdict names which of cleansing,
+    conforming and type standardization were found and which were not, and scores
+    the ratio, so the evidence can be checked against the code.
 
-    **What it cannot determine.** That a transformation is *correct*, or that an
-    absent aspect was unnecessary - a source with a guaranteed-unique key needs
-    no dedup. The named gaps are for a reviewer to confirm, and the write target
-    is named so the reader knows which lakehouse was judged.
+    **Deduplication is reported but not scored.** Whether a Silver source needs
+    dedup depends on whether its business key can repeat - which this check cannot
+    see - so its absence is surfaced as context for a reviewer, never counted as a
+    gap. Penalizing a discipline the tool cannot establish is required would be a
+    false finding.
+
+    **What it cannot determine.** That a transformation is *correct*. The named
+    gaps are for a reviewer to confirm, and the write target is named so the
+    reader knows which lakehouse was judged.
     """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
@@ -2052,11 +2057,17 @@ def nb_silver_quality(ctx: CheckContext) -> Verdict:
 
     present = [name for name, pattern in _SILVER_ASPECTS if pattern.search(code)]
     missing = [name for name, _ in _SILVER_ASPECTS if name not in present]
+    dedup_note = (
+        "deduplication also applied (not scored)"
+        if _SILVER_DEDUP.search(code) else
+        "deduplication not detected (not scored - confirm whether this source needs it)"
+    )
     return covered(
         len(present), len(_SILVER_ASPECTS),
         f"Silver write ({how}) applies {len(present)} of {len(_SILVER_ASPECTS)} "
-        f"quality aspect(s): {', '.join(present) if present else 'none'}"
-        + (f". Not found: {', '.join(missing)}" if missing else ""),
+        f"scored quality aspect(s): {', '.join(present) if present else 'none'}"
+        + (f". Not found: {', '.join(missing)}" if missing else "")
+        + f". {dedup_note}",
     )
 
 
