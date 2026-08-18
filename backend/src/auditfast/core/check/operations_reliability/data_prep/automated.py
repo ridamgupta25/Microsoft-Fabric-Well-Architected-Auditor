@@ -75,6 +75,17 @@ NOTIFY_TYPES = frozenset({"Teams", "Office365Outlook", "Outlook365", "SendEmail"
 NOTIFY_CALL_TYPES = frozenset({"Web", "WebActivity", "AzureFunctionActivity", "Function"})
 NOTIFY_NAME_RE = re.compile(r"notif|alert|email|teams", re.IGNORECASE)
 _DATA_MOVE_TYPES = frozenset({"Copy", "Script", "TridentNotebook", "SqlServerStoredProcedure", "Lookup"})
+#: Activities that DO move or transform data, but whose failed-record handling is
+#: configured *inside the referenced artifact* — a Copy Job item, a Gen2
+#: dataflow, or a child pipeline — never in this pipeline's own JSON. A pipeline
+#: whose only mover is one of these still moves data, so it is not "no movement";
+#: but its reject route cannot be seen here, so it is N/A (never FAIL), with a
+#: reason that says so rather than the misleading "no data-movement activity".
+_OPAQUE_MOVE_TYPES = frozenset({
+    "InvokeCopyJob", "CopyJob",
+    "RefreshDataflow", "ExecuteDataFlow", "ExecuteDataflow",
+    "ExecutePipeline", "InvokePipeline",
+})
 _RECORD_ERROR = re.compile(
     r"reject|invalid|quarantine|dead[_ -]?letter|error[_ -]?output|bad[_ -]?records?|"
     r"failed[_ -]?records?|_corrupt|_rejected|_quarantine",
@@ -632,6 +643,15 @@ def pl_deadletter(ctx: CheckContext) -> Verdict:
     acts = walk_activities(ctx.obj)
     data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
     if not data_acts:
+        opaque = sorted({a.get("type") for a in acts
+                         if (a.get("type") or "") in _OPAQUE_MOVE_TYPES})
+        if opaque:
+            return not_applicable(
+                f"Pipeline '{ctx.obj_name}' moves data only through {', '.join(opaque)}, "
+                f"whose failed-record handling is configured inside the referenced artifact "
+                f"(Copy Job / dataflow / child pipeline), not in this pipeline - it cannot be "
+                f"judged from the pipeline definition"
+            )
         return not_applicable("No data-movement activity to assess for failed records")
 
     redirecting = [
