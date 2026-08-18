@@ -473,6 +473,32 @@ def test_flag_domain_validation_passes():
     assert nb_flag_domain(_ctx(_nb(code))).score == _PASS
 
 
+def test_flag_domain_passes_when_a_flag_is_normalised_by_when_otherwise():
+    code = (
+        "df = spark.read.json('Files/events.json')\n"
+        "df = df.withColumn('is_active', when(col('is_active') == 'Y', True).otherwise(False))"
+    )
+    assert nb_flag_domain(_ctx(_nb(code))).score == _PASS
+
+
+def test_flag_domain_fails_on_a_boolean_type_declaration_alone():
+    """Declaring a BooleanType column sets a type; it does not restrict values."""
+    code = (
+        "df = spark.read.json('Files/events.json')\n"
+        "schema = StructType([StructField('amount', BooleanType())])"
+    )
+    assert nb_flag_domain(_ctx(_nb(code))).score == _FAIL
+
+
+def test_flag_domain_fails_on_a_generic_when_otherwise():
+    """A when/otherwise with no flag column and no flag literal is generic logic."""
+    code = (
+        "df = spark.read.csv('Files/events.csv')\n"
+        "df = df.withColumn('bucket', when(col('amount') > 100, 'big').otherwise('small'))"
+    )
+    assert nb_flag_domain(_ctx(_nb(code))).score == _FAIL
+
+
 def test_ingestion_controls_are_na_without_relevant_input_or_write():
     context = _ctx(_nb("print('no input or write')"))
     assert nb_source_metadata(context).status is Status.NA
