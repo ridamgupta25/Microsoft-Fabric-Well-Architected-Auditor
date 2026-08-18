@@ -112,7 +112,6 @@ _STATS_UPDATE_SQL = re.compile(
     r"\bUPDATE\s+STATISTICS\b|\bsp_updatestats\b|\bANALYZE\s+TABLE\b.*\bCOMPUTE\s+STATISTICS\b",
     re.IGNORECASE | re.DOTALL,
 )
-_TABLES_PATH = re.compile(r"(?:^|/)tables(?:/|$)", re.IGNORECASE)
 _SHORTCUTS_PATH = re.compile(r"(?:^|/)shortcuts(?:/|$)", re.IGNORECASE)
 _BRONZE_TOKEN = re.compile(r"(?:^|[/_\-.])bronze(?:[/_\-.]|$)", re.IGNORECASE)
 _SILVER_TOKEN = re.compile(r"(?:^|[/_\-.])silver(?:[/_\-.]|$)", re.IGNORECASE)
@@ -574,7 +573,25 @@ def table_managed_delta(ctx: CheckContext) -> Verdict:
     layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS], required=True,
 )
 def shortcut_governance(ctx: CheckContext) -> Verdict:
-    """Shortcut paths are structurally governed and avoid loop-prone patterns."""
+    """Shortcut paths are structurally governed and avoid loop-prone patterns.
+
+    A shortcut is flagged only for a genuine structural smell: a missing target
+    type (ungoverned), a ``..`` traversal segment, a nested ``Shortcuts`` path
+    (loop-prone), or a true duplicate — the *same* shortcut (parent path **and**
+    name) listed twice.
+
+    A shortcut rooted under ``Tables`` is **not** flagged. The Fabric List
+    Shortcuts API returns ``path`` as the parent folder a shortcut sits in
+    (``Tables`` / ``Files`` / a subpath), so a OneLake table shortcut naturally
+    reports ``path = Tables`` — and that is the supported, recommended way to
+    surface a Delta table across lakehouses without copying data. It is neither
+    circular nor ungoverned. Because ``path`` is the *parent* folder rather than
+    a per-shortcut path, two distinct shortcuts in one folder share it, so
+    duplicate detection keys on the folder **plus the shortcut name** — otherwise
+    every second table shortcut reads as a false duplicate. Whether an *external*
+    target is allowed is the neighbouring ``WS-SHORTCUT-SCOPE`` (4.1.2)
+    question, not this one.
+    """
     if not ctx.workspace.has(Resource.SHORTCUTS):
         return not_applicable(
             "Shortcut metadata could not be read. Request Workspace.Read.All + OneLake.Read.All "
@@ -588,7 +605,7 @@ def shortcut_governance(ctx: CheckContext) -> Verdict:
     risky: list[str] = []
 
     for lakehouse_name, shortcuts in (ctx.workspace.shortcuts or {}).items():
-        seen_paths: set[str] = set()
+        seen_identities: set[str] = set()
         for row in (shortcuts or []):
             total += 1
             name = str((row or {}).get("name") or "")
@@ -596,19 +613,22 @@ def shortcut_governance(ctx: CheckContext) -> Verdict:
             target_type = str((row or {}).get("target_type") or "")
             normalized = path.replace("\\", "/").strip().strip("/")
             normalized_low = normalized.lower()
+            # ``path`` is the parent folder (``Tables`` / ``Files`` / a subpath),
+            # not a per-shortcut path, so a shortcut's identity is that folder
+            # plus its own name. Keying duplicate detection on the folder alone
+            # made every second table shortcut a false duplicate.
+            identity = f"{normalized_low}/{name.strip().lower()}"
 
             issues: list[str] = []
             if not target_type.strip():
                 issues.append("missing target type")
             if ".." in normalized_low:
                 issues.append("path traversal segment '..'")
-            if _TABLES_PATH.search(normalized_low):
-                issues.append("shortcut rooted under Tables path")
             if _SHORTCUTS_PATH.search(normalized_low):
                 issues.append("nested Shortcut path (loop-prone)")
-            if normalized_low in seen_paths and normalized_low:
+            if identity != "/" and identity in seen_identities:
                 issues.append("duplicate shortcut path")
-            seen_paths.add(normalized_low)
+            seen_identities.add(identity)
 
             if issues:
                 risky.append(
