@@ -1094,11 +1094,26 @@ _TEXT_ENCODING = re.compile(
     r"decode\s*\(\s*[\"']utf[-_]?8|StringType\s*\(\)|utf[-_]?8",
     re.IGNORECASE,
 )
+#: A column name that denotes a boolean/flag field.
+_FLAG_NAME = r"(?:flag|boolean|is_[A-Za-z0-9_]+|active|enabled|valid)"
+#: The expected literals a flag is allowed to hold.
+_FLAG_LITERAL = r"(?:True|False|[\"'](?:Y|N|yes|no|true|false|0|1)[\"'])"
 _FLAG_DOMAIN = re.compile(
-    r"(?:flag|boolean|is_[A-Za-z0-9_]+|active|enabled|valid)[^\n]{0,120}?\.isin\s*\(|"
-    r"\.isin\s*\(\s*(?:True|False|[\"'](?:Y|N|true|false|0|1)[\"'])|"
+    # a flag-named column tested for membership: is_active.isin(...)
+    _FLAG_NAME + r"[^\n]{0,120}?\.isin\s*\(|"
+    # any .isin(...) whose literal set is boolean/flag values
+    r"\.isin\s*\(\s*\[?\s*" + _FLAG_LITERAL + r"|"
+    # a declared allow-list of flag / expected values
     r"(?:allowed|valid)[_ ]?(?:values|flags)|expected[_ ]?(?:values|flags)|"
-    r"BooleanType\s*\(\)|when\s*\([^\n]{0,120}?\)\.otherwise\s*\(",
+    # a when(...).otherwise(...) that normalises a flag column to expected
+    # literals - it must name a flag column AND an expected literal (either
+    # order). A bare when/otherwise is generic conditional logic and does not
+    # count; declaring a BooleanType column likewise only sets a type, it does
+    # not restrict the values, so neither is treated as flag-domain validation.
+    r"when\s*\([^\n]{0,160}?" + _FLAG_NAME + r"[^\n]{0,120}?" + _FLAG_LITERAL
+    + r"[^\n]{0,120}?\.otherwise\s*\(|"
+    r"when\s*\([^\n]{0,160}?" + _FLAG_LITERAL + r"[^\n]{0,120}?" + _FLAG_NAME
+    + r"[^\n]{0,120}?\.otherwise\s*\(",
     re.IGNORECASE,
 )
 #: A *categorical* domain restriction - 5.5.5. Deliberately distinct from
