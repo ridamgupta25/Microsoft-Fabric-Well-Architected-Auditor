@@ -716,6 +716,16 @@ _JOIN_PATTERN = re.compile(
     r"\bjoin\b\s+\w+\s+\bon\b",
     re.IGNORECASE,
 )
+#: An implicit (comma-style) SQL join: two or more tables listed in one FROM
+#: clause, joined by the WHERE predicate — ``FROM a t, b i, c g WHERE ...``. It is
+#: an inner join that silently drops unmatched rows, exactly the orphan risk this
+#: check exists to catch, so it must count as a join. Anchored on a table
+#: identifier (with an optional alias) before the comma, so a ``SELECT a, b``
+#: column list or a ``WHERE x IN (1, 2)`` value list is never read as a table list.
+_IMPLICIT_JOIN = re.compile(
+    r"\bFROM\s+[\w.`\[\]]+(?:\s+(?:AS\s+)?[A-Za-z_]\w*)?\s*,\s*[\w.`\[\]]+",
+    re.IGNORECASE,
+)
 _FK_INTEGRITY = re.compile(
     # An anti-join - the standard way to isolate FK values with no parent row.
     # ``"anti"`` is quoted so the join-type argument matches but the English word
@@ -1007,11 +1017,6 @@ _SILVER_ASPECTS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.IGNORECASE)),
 )
 
-_BULK_ACTIVITY = re.compile(
-    r"parallelCopies|batchCount|batch[_ -]?size|bulk|copy activity|"
-    r"COPY\s+INTO|write\.mode|saveAsTable|repartition|coalesce",
-    re.IGNORECASE,
-)
 _EXPLICIT_ROW_BY_ROW = re.compile(
     r"row[_ -]?by[_ -]?row|record[_ -]?by[_ -]?record|per[_ -]?(?:row|record)|"
     r"\bCURSOR\b|\bFETCH\s+NEXT\b|\.iterrows\s*\(|\.itertuples\s*\(",
@@ -1023,7 +1028,12 @@ _SET_BASED_SCRIPT = re.compile(
     re.IGNORECASE,
 )
 _EAM_JSON = re.compile(
-    r"json\.loads\s*\(|from_json\s*\(|schema_of_json\s*\(|"
+    # A real Spark/pandas JSON *data* read. A bare ``json.loads(...)`` /
+    # ``json.load(...)`` is deliberately excluded: it is generic stdlib parsing of
+    # config, an API response, or a pipeline-definition file — not EAM data
+    # ingestion. Treating any ``json.loads`` as EAM ingestion misclassified a
+    # deployment-framework notebook (which reads pipeline JSON files) as "EAM JSON".
+    r"from_json\s*\(|schema_of_json\s*\(|"
     r"spark\.read(?:Stream)?(?:\s*\.\w+\s*\([^()\n]*\))*\s*\.json\s*\(|"
     r"(?:spark\.read(?:Stream)?|\.read)\.format\s*\(\s*[\"']json[\"']\s*\)|"
     r"\b(?:pd\.)?read_json\s*\(",
@@ -1390,8 +1400,8 @@ def nb_orphan_detect(ctx: CheckContext) -> Verdict:
     computed and then dropped satisfies half the point, so it scores in the middle
     rather than passing outright.
     """
-    code = executable_code(ctx.obj)
-    if not _JOIN_PATTERN.search(code):
+    code = strip_sql_comments(executable_code(ctx.obj))
+    if not (_JOIN_PATTERN.search(code) or _IMPLICIT_JOIN.search(code)):
         return not_applicable(f"Notebook '{ctx.obj_name}' does not perform joins")
     if not _ORPHAN_DETECT.search(code):
         return binary(
@@ -1746,6 +1756,14 @@ _GRAIN_GUARD = re.compile(
     r"having\s+count\s*\(\s*\*?\s*\)\s*>\s*1|duplicate[_\s]?(?:check|count|test)",
     re.IGNORECASE,
 )
+#: A ``CREATE TABLE ... AS SELECT`` (CTAS) populates a table, so it is a write
+#: even though it uses no ``.saveAsTable``/``.write``/``INSERT``. Without this a
+#: pure-CTAS load (``CREATE TABLE lh.bronze.gl_detail AS SELECT ...``) was
+#: reported as "writes no table" — a false reason for the N/A.
+_CTAS = re.compile(
+    r"\bCREATE\s+(?:OR\s+REPLACE\s+)?TABLE\b[\s\S]{0,400}?\bAS\s+SELECT\b",
+    re.IGNORECASE,
+)
 @check(
     id="NB-GRAIN-UNIQUE", ref="5.4.9",
     title="No duplicate grain: fact tables contain unique records per defined grain",
@@ -1761,7 +1779,7 @@ def nb_grain_unique(ctx: CheckContext) -> Verdict:
     needs a GROUP BY against the warehouse.
     """
     code = strip_sql_comments(executable_code(ctx.obj))
-    if not _WRITE_PATTERN.search(code):
+    if not (_WRITE_PATTERN.search(code) or _CTAS.search(code)):
         return not_applicable(f"Notebook '{ctx.obj_name}' writes no table")
     fact_write = _fact_write_evidence(code)
     if not fact_write:

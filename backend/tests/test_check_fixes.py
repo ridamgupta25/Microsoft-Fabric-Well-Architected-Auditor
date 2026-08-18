@@ -1219,6 +1219,34 @@ def test_scd2_no_pattern_reason_acknowledges_readable_column_metadata():
     assert "Column metadata was read" in verdict.evidence
 
 
+def test_scd2_detects_the_trio_on_a_non_dimension_table():
+    """SCD2 history tables are often Silver tables the role classifier reads as
+    unknown/fact, so the scan must cover every table, not only dimensions."""
+    table = {
+        "columns": [
+            {"name": "product_code", "type": "varchar"},
+            {"name": "price", "type": "decimal"},
+            {"name": "valid_from"}, {"name": "valid_until"}, {"name": "active_flag"},
+        ],
+    }
+    verdict = table_scd2(_tables_ctx(price_versions=table))
+    assert verdict.score == _PASS
+    assert "Non-standard column names in use" in verdict.evidence
+
+
+def test_scd2_bare_start_end_pair_without_a_flag_is_not_scd2():
+    """A start/end date pair with no current-flag is a validity period, not SCD2."""
+    table = {
+        "columns": [
+            {"name": "product_code", "type": "varchar"},
+            {"name": "effective_date"}, {"name": "expiration_date"},
+        ],
+    }
+    verdict = table_scd2(_tables_ctx(prod_price=table))
+    assert verdict.status is Status.NA
+    assert "no table is versioned as SCD Type 2" in verdict.evidence
+
+
 # -- PL-COPY-PARALLEL (lone copy → N/A) ----------------------------------------
 
 def test_copy_parallel_single_untuned_copy_is_na():

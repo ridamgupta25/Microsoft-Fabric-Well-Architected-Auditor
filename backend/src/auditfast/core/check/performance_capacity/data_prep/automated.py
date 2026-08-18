@@ -52,7 +52,14 @@ def delta_merge(ctx: CheckContext) -> Verdict:
             f"{target} ({' + '.join(target_operations).upper()})"
             for target, target_operations in sorted(violations.items())
         )
-        return graded(0, f"Separate DML targets the same table instead of a single MERGE: {evidence}")
+        return graded(
+            0,
+            f"Separate DML targets the same table instead of a single MERGE: {evidence}. "
+            f"Consolidate them into one `MERGE INTO <target> USING <source> ON <key>` with "
+            f"WHEN MATCHED / WHEN NOT MATCHED clauses so the insert, update, and delete "
+            f"apply atomically in a single pass instead of separate sequential "
+            f"DELETE/INSERT/UPDATE statements.",
+        )
     if _spark.MERGE.search(code):
         return binary(True, "Uses MERGE INTO for atomic upserts")
     return not_applicable("Notebook performs no upsert/merge logic")
