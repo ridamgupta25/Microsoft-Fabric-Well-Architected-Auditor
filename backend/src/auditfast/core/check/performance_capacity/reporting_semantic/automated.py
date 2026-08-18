@@ -63,6 +63,20 @@ def _is_transforming_query(expression: str) -> bool:
 _WIDE_MODEL_COLUMNS = 100
 _LARGE_MODEL_TABLES = 5
 
+#: DAX aggregation functions. A measure whose expression calls one of these
+#: summarizes detail rows into a total — the "summarizations" the checklist point
+#: asks for, distinct from a formal ``alternateOf`` aggregation *table*. Matched
+#: on a function-call boundary so ``SUM(`` counts but a column merely named
+#: "sum_amount" does not.
+_AGG_DAX = re.compile(
+    r"\b(?:SUM|SUMX|AVERAGE|AVERAGEX|AVERAGEA|MIN|MINX|MINA|MAX|MAXX|MAXA|"
+    r"COUNT|COUNTX|COUNTA|COUNTAX|COUNTROWS|DISTINCTCOUNT|DISTINCTCOUNTNOBLANK|"
+    r"PRODUCT|PRODUCTX|GEOMEAN|GEOMEANX|MEDIAN|MEDIANX|"
+    r"PERCENTILEX?\.(?:INC|EXC)|VARX?\.(?:S|P)|STDEVX?\.(?:S|P)|"
+    r"SUMMARIZE|SUMMARIZECOLUMNS|GROUPBY)\s*\(",
+    re.IGNORECASE,
+)
+
 
 def _model(ctx: CheckContext) -> dict | None:
     """The parsed TMSL for the model under inspection, if it was read."""
@@ -154,37 +168,57 @@ def sm_directlake_fallback(ctx: CheckContext) -> Verdict:
 
 @check(
     id="SM-AGGREGATIONS", ref="14.2.4",
-    title="Aggregations used for performance-critical models",
+    title="Aggregations / summarizations used for performance-critical models",
     pillar=Pillar.PERFORMANCE, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
     layers=MODEL_LAYERS, requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
 )
 def sm_aggregations(ctx: CheckContext) -> Verdict:
-    """A large Import/DirectQuery model summarizes its detail with aggregations.
+    """A model summarizes its detail with aggregation tables or aggregate measures.
 
-    Gated to the models where aggregations actually pay: Direct Lake reads
-    columnar Delta directly, so an aggregation table is usually redundant there
-    and its absence must not be reported as a finding.
+    The checklist point credits *"aggregations / summarizations"*, so both count:
 
-    Presence is credited (PASS); absence is **N/A, never a FAIL**. Whether a
-    model genuinely needs aggregations depends on fact-table row counts and
-    VertiPaq footprint, and rows are never read into the knowledge base — so the
-    tool cannot assert a model *should* have them.
+    * a formal aggregation table (``alternateOf`` — the Manage-Aggregations /
+      automatic-aggregations feature), the strongest signal; or
+    * aggregate DAX **measures** (``SUM`` / ``AVERAGE`` / ``COUNT`` / …) that
+      summarize detail into totals — what most models actually use.
+
+    Presence of either is credited (PASS) in any storage mode. Only when neither
+    exists does the verdict fall through: a Direct Lake model is N/A (columnar
+    Delta makes aggregation tables usually redundant), and any other model is
+    also **N/A, never a FAIL** — whether a model genuinely *needs* aggregations
+    depends on fact-table row counts and VertiPaq footprint, and rows are never
+    read into the knowledge base, so the tool cannot assert it *should* have them.
     """
     model = _model(ctx)
     if model is None:
         return not_applicable("Semantic model definitions could not be read from Fabric")
 
+    # A formal aggregation table is the strongest signal, and it counts in any mode.
+    aggregations = model.get("aggregations") or []
+    if aggregations:
+        tables = sorted({a.get("table", "") for a in aggregations if a.get("table")})
+        return binary(True, f"{len(aggregations)} aggregation column(s) declared on: "
+                            f"{', '.join(tables)}")
+
+    # Aggregate measures satisfy the "summarizations" half of the point.
+    summarizing = sorted({
+        str(m.get("name") or "") for m in (model.get("measures") or [])
+        if m.get("name") and _AGG_DAX.search(str(m.get("expression") or ""))
+    })
+    if summarizing:
+        shown = ", ".join(summarizing[:5])
+        more = f" (+{len(summarizing) - 5} more)" if len(summarizing) > 5 else ""
+        return binary(True, f"No formal aggregation table, but {len(summarizing)} measure(s) "
+                            f"summarize detail with DAX aggregations: {shown}{more}")
+
+    # Neither aggregation tables nor summarizing measures. Direct Lake first —
+    # there an aggregation table is usually redundant, so absence is not a finding.
     storage = model.get("storage") or {}
     modes = {m.lower() for f in storage.values() for m in f.get("modes") or []}
     if not modes & {"import", "directquery", "dual"}:
         return not_applicable("Model is Direct Lake only — aggregation tables are not "
                               "the relevant optimization")
 
-    aggregations = model.get("aggregations") or []
-    if aggregations:
-        tables = sorted({a.get("table", "") for a in aggregations if a.get("table")})
-        return binary(True, f"{len(aggregations)} aggregation column(s) declared on: "
-                            f"{', '.join(tables)}")
     # Absence is not a defect this tool can assert. Whether a model *needs*
     # aggregations depends on fact-table row counts and VertiPaq footprint, and
     # rows are never read into the knowledge base — so a missing aggregation
@@ -202,10 +236,10 @@ def sm_aggregations(ctx: CheckContext) -> Verdict:
         signals.append(f"{table_count} tables")
     context = f" (metadata size: {'; '.join(signals)})" if signals else ""
     return not_applicable(
-        f"Model '{ctx.obj_name}' declares no aggregation tables{context}. Aggregations "
-        f"are an optional optimization that only pays on very large fact tables; whether "
-        f"this model needs them depends on row counts, which are never read into the "
-        f"knowledge base, so their absence is not scored"
+        f"Model '{ctx.obj_name}' declares no aggregation tables and no summarizing "
+        f"measures{context}. Aggregations are an optional optimization that only pays on "
+        f"very large fact tables; whether this model needs them depends on row counts, "
+        f"which are never read into the knowledge base, so their absence is not scored"
     )
 
 
