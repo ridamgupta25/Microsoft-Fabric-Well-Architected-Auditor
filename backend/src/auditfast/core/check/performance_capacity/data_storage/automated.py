@@ -57,11 +57,26 @@ def _suffix(summary: dict) -> str:
     layers=[Layer.STORAGE], requires=[Resource.LAKEHOUSE_FILES], required=True,
 )
 def lakehouse_file_sizes_avoid_small_files(ctx: CheckContext) -> Verdict:
-    """Lakehouse data files are mostly in the healthy 128MB-1GB size band."""
+    """Lakehouse data files are mostly in the healthy 128MB-1GB size band.
+
+    **Judged on the Tables section, where the data is.** A Lakehouse's Delta
+    tables live under ``Tables/``; ``Files/`` is the landing area for loose
+    files. Reading only ``Files/`` - which this check used to do - measured
+    whatever happened to sit in that landing area and reported, on a real
+    estate, "0 of 3 data files in band" for a Bronze Lakehouse whose entire
+    Delta footprint was never looked at. Both sections are now summed, so a
+    small-file problem is visible wherever the files are.
+
+    **What it cannot determine.** Whether small files are transient - a table
+    written minutes ago and not yet OPTIMIZE-compacted is temporarily small by
+    design. A truncated listing is stated in the evidence rather than being
+    silently treated as a complete count.
+    """
     if not ctx.workspace.has(Resource.LAKEHOUSE_FILES):
         return not_applicable("OneLake Files listings could not be read for Lakehouses")
-    summaries = _summaries(ctx)
-    if not summaries:
+    files_summaries = _summaries(ctx)
+    tables_summaries = ctx.workspace.lakehouse_tables_files or {}
+    if not files_summaries and not tables_summaries:
         return not_applicable("No Lakehouse Files summaries were read for this workspace")
 
     floor = _int_setting(ctx, "lakehouse_file_size_floor_bytes", _DEFAULT_FILE_SIZE_FLOOR_BYTES)
@@ -70,28 +85,46 @@ def lakehouse_file_sizes_avoid_small_files(ctx: CheckContext) -> Verdict:
         floor, ceiling = _DEFAULT_FILE_SIZE_FLOOR_BYTES, _DEFAULT_FILE_SIZE_CEILING_BYTES
 
     total_data = healthy = excluded = total_files = 0
+    truncated = 0
     details: list[str] = []
-    for name, summary in sorted(summaries.items()):
-        data = int(summary.get("data_file_count") or 0)
-        files = int(summary.get("file_count") or 0)
-        ok = _healthy_bucket_count(summary, floor, ceiling)
-        total_data += data
-        total_files += files
-        healthy += ok
-        excluded += int(summary.get("excluded_file_count") or 0)
-        details.append(f"{name}: {ok}/{data} data file(s) in band{_suffix(summary)}")
+    for name in sorted(set(files_summaries) | set(tables_summaries)):
+        lake_total = lake_ok = 0
+        parts: list[str] = []
+        for section, summary in (("Tables", tables_summaries.get(name)),
+                                 ("Files", files_summaries.get(name))):
+            if not summary:
+                continue
+            data = int(summary.get("data_file_count") or 0)
+            ok = _healthy_bucket_count(summary, floor, ceiling)
+            lake_total += data
+            lake_ok += ok
+            total_files += int(summary.get("file_count") or 0)
+            excluded += int(summary.get("excluded_file_count") or 0)
+            if summary.get("truncated"):
+                truncated += 1
+            if data:
+                parts.append(f"{section} {ok}/{data}")
+        total_data += lake_total
+        healthy += lake_ok
+        details.append(
+            f"{name}: {lake_ok}/{lake_total} data file(s) in band"
+            + (f" [{', '.join(parts)}]" if parts else "")
+        )
 
     if total_data == 0:
         return not_applicable(
-            f"No Lakehouse holds assessable data files in the Files section "
+            f"No Lakehouse holds assessable data files in its Tables or Files section "
             f"({total_files} file(s) listed; {excluded} Delta log/CRC/marker/metadata file(s) excluded)"
         )
+    caveat = (f". {truncated} listing(s) were truncated at the enumeration cap, so the "
+              f"counts below are a lower bound" if truncated else "")
     return covered(
         healthy, total_data,
         f"{healthy} of {total_data} assessable Lakehouse data file(s) are in the "
-        f"{floor // (1024 * 1024)}MB-{ceiling // (1024 * 1024)}MB target band; "
+        f"{floor // (1024 * 1024)}MB-{ceiling // (1024 * 1024)}MB target band, counting "
+        f"both the Tables (Delta) and Files sections; "
         f"{excluded} obvious non-data file(s) (_delta_log, .crc, metadata JSON, zero-byte "
-        f"markers) were excluded. {'; '.join(details)}",
+        f"markers) were excluded. {'; '.join(details)}{caveat}",
     )
 
 

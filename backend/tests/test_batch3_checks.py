@@ -168,7 +168,9 @@ def test_hidden_keys_pass_when_every_key_column_is_hidden():
     verdict = _scored(key_columns_are_hidden(_model_ctx(models)))
     assert verdict.score == _PASS
     assert "1 of 1 key-shaped column(s)" in verdict.evidence
-    assert "Display folders are not part of the parsed model definition" in verdict.evidence
+    # Display folders are readable now; a snapshot without them says so rather
+    # than implying the folder half was assessed and passed.
+    assert "Display folders are not in this snapshot" in verdict.evidence
 
 
 def test_hidden_keys_fail_when_a_key_is_visible_to_report_authors():
