@@ -52,6 +52,26 @@ class OneLakeClient:
         A 404 means the Files directory is absent/empty and returns an empty
         summary rather than a read failure.
         """
+        return self._listing_summary(workspace_id, item_id, "Files")
+
+    def lakehouse_tables_summary(self, workspace_id: str, item_id: str) -> tuple[dict, str]:
+        """Return ``(summary, failure)`` for ``<item_id>/Tables``.
+
+        **Why this exists.** A Lakehouse's Delta tables live under ``Tables/``,
+        not ``Files/`` - the Parquet files a "small file problem" check is about
+        are all there. Summarising only ``Files/`` measured whatever loose files
+        happened to sit in the landing area: on a real estate that reported
+        "0 of 3 data files in band" for a Bronze Lakehouse whose actual Delta
+        data was never looked at.
+
+        Same shape and same bounded aggregate as the Files summary, so nothing
+        downstream has to special-case it, and the same enumeration cap applies.
+        """
+        return self._listing_summary(workspace_id, item_id, "Tables")
+
+    def _listing_summary(self, workspace_id: str, item_id: str,
+                         section: str) -> tuple[dict, str]:
+        """Aggregate one Lakehouse section (``Files`` or ``Tables``) into a summary."""
         summary = empty_lakehouse_files_summary()
         continuation = ""
         seen = 0
@@ -59,7 +79,7 @@ class OneLakeClient:
             params = {
                 "recursive": "true",
                 "resource": "filesystem",
-                "directory": f"{item_id}/Files",
+                "directory": f"{item_id}/{section}",
             }
             if continuation:
                 params["continuation"] = continuation
@@ -91,7 +111,7 @@ class OneLakeClient:
                 paths = paths[:remaining]
             for entry in paths:
                 if isinstance(entry, dict):
-                    _add_entry(summary, item_id, entry)
+                    _add_entry(summary, item_id, entry, section)
             seen += len(paths)
             if seen >= self._max_entries:
                 summary["truncated"] = True
@@ -231,13 +251,13 @@ def _finalize_summary(summary: dict) -> dict:
     return summary
 
 
-def _add_entry(summary: dict, item_id: str, entry: dict) -> None:
+def _add_entry(summary: dict, item_id: str, entry: dict, section: str = "Files") -> None:
     if _is_directory(entry):
         return
     name = str(entry.get("name") or "")
     if not name:
         return
-    relative = _relative_to_files(item_id, name)
+    relative = _relative_to_section(item_id, name, section)
     if not relative:
         return
     parts = [p for p in relative.split("/") if p]
@@ -280,11 +300,12 @@ def _content_length(entry: dict) -> int:
         return 0
 
 
-def _relative_to_files(item_id: str, name: str) -> str:
-    prefix = f"{item_id}/Files/"
+def _relative_to_section(item_id: str, name: str, section: str = "Files") -> str:
+    """The path below ``<item>/<section>/``, for either Files or Tables."""
+    prefix = f"{item_id}/{section}/"
     if name.startswith(prefix):
         return name[len(prefix):]
-    marker = "/Files/"
+    marker = f"/{section}/"
     if marker in name:
         return name.split(marker, 1)[1]
     return name

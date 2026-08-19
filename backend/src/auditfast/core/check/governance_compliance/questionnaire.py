@@ -20,7 +20,7 @@ questionnaire_check(
     id="Q-CAT3-REPORT-KPI",
     ref="14.3.3",
     title="Report KPI integrity and validation",
-    pillar=Pillar.DATA_QUALITY,
+    pillar=Pillar.ARCHITECTURE,
     severity=Severity.HIGH,
     layers=_LAYERS,
     question=(
@@ -37,7 +37,7 @@ questionnaire_check(
     id="Q-CAT3-DATA-CHANGE",
     ref="2.3.5",
     title="Data change and merge strategy",
-    pillar=Pillar.DATA_QUALITY,
+    pillar=Pillar.DATA_INTEGRATION,
     severity=Severity.HIGH,
     layers=_LAYERS,
     question=(
@@ -54,7 +54,7 @@ questionnaire_check(
     id="Q-CAT3-TRANSFORMATION",
     ref="3.2.19",
     title="Transformation logic governance",
-    pillar=Pillar.DATA_QUALITY,
+    pillar=Pillar.DATA_PROCESSING,
     severity=Severity.HIGH,
     layers=_LAYERS,
     question=(
@@ -102,7 +102,7 @@ questionnaire_check(
     id="Q-CAT3-REGULATORY-SCOPE",
     ref="7.1.1",
     title="Regulatory scope and regional processing",
-    pillar=Pillar.DATA_GOVERNANCE,
+    pillar=Pillar.COMPLIANCE,
     severity=Severity.CRITICAL,
     layers=_LAYERS,
     question=(
@@ -119,7 +119,7 @@ questionnaire_check(
     id="Q-CAT3-AGREEMENTS-INCIDENTS",
     ref="7.1.5",
     title="Compliance agreements and incident notification",
-    pillar=Pillar.DATA_GOVERNANCE,
+    pillar=Pillar.COMPLIANCE,
     severity=Severity.CRITICAL,
     layers=_LAYERS,
     question=(
@@ -136,7 +136,7 @@ questionnaire_check(
     id="Q-CAT3-RELEASE-GOVERNANCE",
     ref="7.2.2",
     title="Change and release governance",
-    pillar=Pillar.RELIABILITY,
+    pillar=Pillar.DEVOPS,
     severity=Severity.HIGH,
     layers=_LAYERS,
     question=(
@@ -153,7 +153,7 @@ questionnaire_check(
     id="Q-CAT3-RETENTION",
     ref="7.2.7",
     title="Financial and audit data retention",
-    pillar=Pillar.DATA_GOVERNANCE,
+    pillar=Pillar.COMPLIANCE,
     severity=Severity.HIGH,
     layers=_LAYERS,
     question=(
@@ -170,7 +170,7 @@ questionnaire_check(
     id="Q-CAT3-PRIVACY-LIFECYCLE",
     ref="7.3.1",
     title="Privacy governance and data lifecycle",
-    pillar=Pillar.DATA_GOVERNANCE,
+    pillar=Pillar.COMPLIANCE,
     severity=Severity.CRITICAL,
     layers=_LAYERS,
     question=(
@@ -187,7 +187,7 @@ questionnaire_check(
     id="Q-CAT3-PRIVACY-RIGHTS",
     ref="7.3.3",
     title="Privacy rights implementation",
-    pillar=Pillar.DATA_GOVERNANCE,
+    pillar=Pillar.COMPLIANCE,
     severity=Severity.CRITICAL,
     layers=_LAYERS,
     question=(
@@ -204,7 +204,7 @@ questionnaire_check(
     id="Q-CAT3-DATA-OWNERSHIP",
     ref="8.2.1",
     title="Data ownership and accountability",
-    pillar=Pillar.DATA_QUALITY,
+    pillar=Pillar.DATA_GOVERNANCE,
     severity=Severity.HIGH,
     layers=_LAYERS,
     question="Does every dataset and table have a named accountable business or data owner?",
@@ -235,7 +235,7 @@ questionnaire_check(
     id="Q-CAT3-DATA-FRESHNESS",
     ref="9.4.1",
     title="Data freshness SLA",
-    pillar=Pillar.RELIABILITY,
+    pillar=Pillar.DATA_QUALITY,
     severity=Severity.HIGH,
     layers=_LAYERS,
     question="Are data-freshness SLAs defined, owned, monitored, and escalated for each data product or Gold table?",

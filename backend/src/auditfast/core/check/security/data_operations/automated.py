@@ -29,7 +29,7 @@ SECRET_PATTERNS = [
 
 
 @check(
-    id="WS-ROLES-GROUPS", ref="IMPL-02",
+    id="WS-ROLES-GROUPS", ref="13.2.2",
     title="No individual user accounts for role assignments — security groups used",
     pillar=Pillar.SECURITY_ACCESS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     requires=[Resource.ROLE_ASSIGNMENTS], required=True,
@@ -90,7 +90,7 @@ def _is_individual_principal(principal: dict) -> bool:
 
 
 @check(
-    id="WS-LEASTPRIV", ref="IMPL-06", title="Workspace roles follow least-privilege principle (Admin/Member/Contributor/Viewer used correctly)",
+    id="WS-LEASTPRIV", ref="13.2.4", title="Workspace roles follow least-privilege principle (Admin/Member/Contributor/Viewer used correctly)",
     pillar=Pillar.SECURITY_ACCESS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     requires=[Resource.ROLE_ASSIGNMENTS], required=True,
 )
@@ -108,7 +108,7 @@ def least_privilege(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-SPN", ref="1.3.5",
     title="Connections use secure, non-personal identities (SPN / Workspace Identity) rather than individual accounts",
-    pillar=Pillar.SECURITY_ACCESS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     requires=[Resource.ROLE_ASSIGNMENTS], required=True,
 )
 def automation_identity(ctx: CheckContext) -> Verdict:
@@ -130,7 +130,7 @@ def automation_identity(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="WS-GUESTS", ref="IMPL-01", title="Guest/external user access is explicitly governed",
+    id="WS-GUESTS", ref="13.2.1", title="Guest/external user access is explicitly governed",
     pillar=Pillar.SECURITY_ACCESS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     requires=[Resource.ROLE_ASSIGNMENTS], required=True,
 )

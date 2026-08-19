@@ -12,7 +12,7 @@ from auditfast.core.models import CheckContext
 
 
 @check(
-    id="WS-LABELS", ref="IMPL-04", title="Sensitivity labels applied across Fabric items",
+    id="WS-LABELS", ref="13.2.3", title="Sensitivity labels applied across Fabric items",
     pillar=Pillar.SECURITY_ACCESS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     requires=[Resource.ITEMS], required=True,
 )
