@@ -79,11 +79,11 @@ def _parse_status(status_str: str) -> Status:
 def _parse_score(score_str: str, status: Status) -> int | None:
     """Parse score from CSV.
     
-    Valid: 0-3 or blank (which becomes None for N/A checks).
-    Validates that score matches status (e.g., FAIL should be 0).
+    Valid: 0-3 or blank. A blank score means the row is unscored (N/A or INFO).
     """
     if not score_str or score_str.strip() == "":
-        if status == Status.NA:
+        # Unscored statuses (N/A, INFO) legitimately have no score.
+        if status in (Status.NA, Status.INFO):
             return None
         raise ExternalCheckError(
             f"Score cannot be blank for status {status.value}"
@@ -145,13 +145,15 @@ def load_external_checks(
     required_columns = {"Workspace", "Ref", "Check ID", "Status", "Score", "Title", "Pillar"}
     
     try:
-        with open(csv_path, encoding="utf-8") as f:
+        # utf-8-sig strips the BOM that Excel writes at the start of the file;
+        # without it the first header becomes "\ufeffWorkspace" and never matches.
+        with open(csv_path, encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             
             if reader.fieldnames is None:
                 raise ExternalCheckError("CSV file is empty")
             
-            fieldnames = set(reader.fieldnames)
+            fieldnames = {(name or "").strip() for name in reader.fieldnames}
             missing = required_columns - fieldnames
             if missing:
                 raise ExternalCheckError(
@@ -159,8 +161,13 @@ def load_external_checks(
                     f"Your CSV has: {', '.join(sorted(fieldnames))}"
                 )
             
-            for row_num, row in enumerate(reader, start=2):  # Start at 2 (after header)
+            for row_num, raw_row in enumerate(reader, start=2):  # Start at 2 (after header)
                 try:
+                    # Normalise header keys (strip whitespace/BOM remnants)
+                    row = {
+                        (k or "").strip(): (v or "")
+                        for k, v in raw_row.items()
+                    }
                     workspace = row.get("Workspace", "").strip()
                     ref = row.get("Ref", "").strip()
                     check_id = row.get("Check ID", "").strip()
@@ -205,14 +212,13 @@ def load_external_checks(
                             f"Row {row_num}: Unknown severity '{severity_str}' — using MEDIUM"
                         )
                     
-                    # Warn if workspace not in project targets
-                    if target_workspaces and workspace not in target_workspaces:
-                        warnings.append(
-                            f"Row {row_num}: Workspace '{workspace}' not in project targets"
-                        )
+                    # Note: no workspace-membership warning. External checks are
+                    # applied workspace-agnostically, and the CSV carries workspace
+                    # *names* while project targets are GUIDs, so a comparison here
+                    # would always report a mismatch.
                     
-                    # Determine scored flag (NOT SCORED / N/A means not scored)
-                    scored = status != Status.NA
+                    # Determine scored flag (N/A and INFO rows are unscored)
+                    scored = status not in (Status.NA, Status.INFO) and score is not None
                     
                     # Build CheckResult
                     result = CheckResult(
@@ -227,7 +233,7 @@ def load_external_checks(
                         recommendation="",  # External checks don't have remediation in CSV
                         severity=severity,
                         workspace=workspace,
-                        layer=Layer.ANY,  # External checks apply to all layers
+                        layer=Layer.parse(layer_str) if layer_str else Layer.ANY,
                         obj=obj,
                         scope=Scope.WORKSPACE,  # External checks are workspace-scoped by default
                         weight=1.0,

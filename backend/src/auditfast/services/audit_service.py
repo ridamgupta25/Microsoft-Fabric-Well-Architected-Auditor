@@ -365,8 +365,12 @@ def run_audit(
         from .external_checks_service import load_external_checks, ExternalCheckError
         
         try:
+            # Strip surrounding whitespace and stray quotes (Windows "Copy as path"
+            # wraps the path in double quotes, which would otherwise be taken literally).
+            raw_csv = str(external_checks_csv).strip().strip('"').strip("'").strip()
+
             # Resolve CSV path: if relative, resolve it relative to project root (parent of config dir)
-            csv_path = Path(external_checks_csv)
+            csv_path = Path(raw_csv)
             if not csv_path.is_absolute():
                 # Try relative to project root first (parent of config.yaml directory)
                 project_root = Path(config.path).parent
