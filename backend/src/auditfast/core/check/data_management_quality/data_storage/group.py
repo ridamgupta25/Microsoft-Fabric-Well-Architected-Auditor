@@ -10,11 +10,24 @@ from __future__ import annotations
 import re
 
 from auditfast.core.check import _xw
-from auditfast.core.check._notebook import strip_sql_comments
-from auditfast.core.check.helpers import Verdict
+from auditfast.core.check._notebook import executable_code, layer_words_in, strip_sql_comments
+from auditfast.core.check.data_management_quality.data_prep.automated import _WRITE_PATTERN
+from auditfast.core.check.helpers import Verdict, covered, not_applicable
 from auditfast.core.check.registry import group_check
 from auditfast.core.enums import Pillar, Resource, Severity
 from auditfast.core.models import GroupContext
+
+#: An actual reconciliation *control*, not the mere word "reconcile": a count
+#: comparison, a named count check, or a reconcile routine that is really called.
+#: A bare mention in a variable name, string, or leftover token never qualifies.
+_RECON_CONTROL = re.compile(
+    r"assert(?![^\n]*\.is(?:Not)?Null\s*\()[^\n]*?\.count\s*\([^\n]*?(?:==|!=|<=|>=|<|>)(?!\s*0\b)|"
+    r"\.count\s*\(\s*\)\s*(?:==|!=|<=|>=|<|>)(?!\s*0\b)|"
+    r"(?:row|record|source|target|actual|expected|recon)_count\b\s*(?:==|!=|<=|>=|<|>)(?!\s*0\b)|"
+    r"(?:==|!=|<=|>=|<|>)\s*(?:row|record|source|target|actual|expected|recon)_count\b|"
+    r"\breconcile\w*\s*\(|\bcount_check\b|validate[^\n]*count|expect_table_row_count",
+    re.IGNORECASE,
+)
 
 #: Table-name substrings that mark a detail (fact-grain) or an aggregate table.
 _DETAIL_HINTS = ("detail", "fact", "transaction")
@@ -144,4 +157,68 @@ def aggregate_consistency(ctx: GroupContext) -> Verdict:
         implements=_has_aggregate_reconciliation,
         practice="implements detail-to-aggregate total reconciliation in the Warehouse or semantic model",
         data_name="applicable Warehouse and semantic-model definitions",
+    )
+
+
+def _silver_to_gold_flows(ws) -> tuple[list[str], list[str]]:
+    """Return applicable and reconciled Silver-to-Gold notebook names."""
+    applicable: list[str] = []
+    reconciled: list[str] = []
+    for name, definition in ws.notebooks.items():
+        code = strip_sql_comments(executable_code(definition))
+        if not ({"silver", "gold"} <= layer_words_in(code)):
+            continue
+        if not _WRITE_PATTERN.search(code):
+            continue
+        applicable.append(name)
+        if _RECON_CONTROL.search(code):
+            reconciled.append(name)
+    return applicable, reconciled
+
+
+@group_check(
+    id="XW-LAYER-RECON", ref="5.4.6",
+    title="Cross-layer reconciliation: Gold record counts reconcile with Silver (accounting for aggregation)",
+    pillar=Pillar.DATA_QUALITY, severity=Severity.HIGH,
+    requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
+)
+def cross_layer_reconciliation(ctx: GroupContext) -> Verdict:
+    """Detect reconciliation controls across a group's Silver-to-Gold flows.
+
+    This is metadata-only: it inspects notebook definitions already present in
+    each workspace snapshot and never queries table rows or business values.
+    """
+    readable = [member for member in ctx.members
+                if member.workspace.has(Resource.NOTEBOOK_DEFINITIONS)]
+    if len(readable) < 2:
+        return not_applicable(
+            "fewer than two workspaces had readable notebook definitions to compare"
+        )
+
+    applicable: list[str] = []
+    reconciled: list[str] = []
+    for member in readable:
+        flows, controlled = _silver_to_gold_flows(member.workspace)
+        label = _xw.env_label(member)
+        applicable.extend(f"{label}/{name}" for name in flows)
+        reconciled.extend(f"{label}/{name}" for name in controlled)
+
+    if not applicable:
+        return not_applicable(
+            "no executable Silver-to-Gold notebook writes were found across the group"
+        )
+
+    missing = sorted(set(applicable) - set(reconciled))
+    if not missing:
+        return covered(
+            len(applicable), len(applicable),
+            f"all {len(applicable)} Silver-to-Gold notebook flow(s) contain a "
+            "count or aggregation reconciliation control; notebook definitions "
+            "were inspected without reading client data",
+        )
+    return covered(
+        len(reconciled), len(applicable),
+        f"reconciliation control detected in {len(reconciled)} of "
+        f"{len(applicable)} Silver-to-Gold notebook flow(s); missing in "
+        f"{', '.join(missing)}; no client data was read",
     )
