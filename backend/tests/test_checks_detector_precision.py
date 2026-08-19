@@ -632,6 +632,27 @@ def test_bulk_move_passes_with_staging_and_copy_command():
     assert "allowCopyCommand=true" in verdict.evidence
 
 
+def test_bulk_move_credits_truncate_reload_and_table_lock():
+    # A TRUNCATE-then-INSERT full reload with a bulk table lock is a genuine bulk
+    # pattern (one set-based clear plus a bulk insert), the opposite of row-by-row.
+    # It must not be mislabelled "default Copy settings".
+    pipeline = _pipe({
+        "name": "Reload dim", "type": "Copy",
+        "typeProperties": {
+            "sink": {
+                "type": "FabricSqlDatabaseSink",
+                "writeBehavior": "insert",
+                "sqlWriterUseTableLock": True,
+                "preCopyScript": "TRUNCATE TABLE [raw].[dim_site]",
+            },
+        },
+    })
+    verdict = pl_bulk_move(_ctx(pipeline))
+    assert verdict.score == _PASS
+    assert "sqlWriterUseTableLock=true" in verdict.evidence
+    assert "preCopyScript truncate/reload" in verdict.evidence
+
+
 def test_bulk_move_fails_only_explicit_row_by_row_logic():
     pipeline = _pipe({
         "name": "Insert row by row", "type": "Script",
