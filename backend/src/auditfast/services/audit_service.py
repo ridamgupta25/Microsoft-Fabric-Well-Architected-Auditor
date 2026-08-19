@@ -326,7 +326,13 @@ def write_reports(run: AuditRun, out_dir: str | Path) -> dict[str, str]:
         build_markdown(run.project_name, run.aggregate, run.results, run.errors),
         encoding="utf-8",
     )
-    build_excel(str(excel_path), run.project_name, run.aggregate, run.results)
+    build_excel(
+        str(excel_path),
+        run.project_name,
+        run.aggregate,
+        run.results,
+        run.errors,
+    )
     return {"markdown": str(markdown_path), "excel": str(excel_path)}
 
 
