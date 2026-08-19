@@ -41,31 +41,31 @@ _SCOPE_KEYWORDS: dict[Scope, frozenset[str]] = {
 }
 
 _PILLAR_KEYWORDS: dict[Pillar, frozenset[str]] = {
-    Pillar.SECURITY: frozenset(
+    Pillar.SECURITY_ACCESS: frozenset(
         {"security", "rls", "cls", "permission", "permissions", "access", "encryption",
          "secret", "secrets", "sensitivity", "private", "endpoint", "firewall",
          "identity", "guest", "admin", "mfa", "token", "credential", "keyvault"}
     ),
-    Pillar.GOVERNANCE: frozenset(
+    Pillar.DATA_GOVERNANCE: frozenset(
         {"governance", "compliance", "catalog", "lineage", "label", "labels",
          "retention", "policy", "audit", "classification", "ownership", "endorsement",
          "certified", "purview", "gdpr", "regulatory"}
     ),
-    Pillar.OPERATIONS: frozenset(
+    Pillar.RELIABILITY: frozenset(
         {"operations", "reliability", "git", "ci", "cd", "deployment", "retry",
          "monitor", "monitoring", "alert", "alerts", "backup", "recovery", "schedule",
          "orchestration", "failure", "dr", "resilience", "availability", "sla"}
     ),
-    Pillar.PERFORMANCE: frozenset(
+    Pillar.DATA_PROCESSING: frozenset(
         {"performance", "capacity", "optimize", "partition", "partitioning", "cache",
          "delta", "vorder", "compaction", "throughput", "latency", "spark",
          "concurrency", "skew", "shuffle", "index", "indexing", "directlake"}
     ),
-    Pillar.COST: frozenset(
+    Pillar.COST_MANAGEMENT: frozenset(
         {"cost", "sku", "autoscale", "pause", "budget", "billing", "consumption",
          "spend", "finops", "idle", "orphan", "orphaned", "utilization", "rightsizing"}
     ),
-    Pillar.DATA: frozenset(
+    Pillar.DATA_QUALITY: frozenset(
         {"data", "quality", "schema", "null", "nulls", "duplicate", "duplicates",
          "validation", "freshness", "completeness", "accuracy", "table", "column",
          "constraint", "dedup", "medallion", "bronze", "silver", "gold", "lakehouse"}
@@ -128,7 +128,7 @@ def infer_scope(tokens: set[str]) -> Scope:
 
 
 def infer_pillar(tokens: set[str]) -> Pillar:
-    best, best_score = Pillar.DATA, 0
+    best, best_score = Pillar.DATA_QUALITY, 0
     for pillar, words in _PILLAR_KEYWORDS.items():
         score = len(tokens & words)
         if score > best_score:
@@ -178,7 +178,7 @@ def draft_proposal(point: str) -> CheckProposal:
     token_set = set(tokens)
     scope = infer_scope(token_set)
     pillar = infer_pillar(token_set)
-    severity = Severity.HIGH if pillar is Pillar.SECURITY else Severity.MEDIUM
+    severity = Severity.HIGH if pillar is Pillar.SECURITY_ACCESS else Severity.MEDIUM
     requires = _SCOPE_REQUIRES[scope]
     proposal_id = _slug_id(_SCOPE_PREFIX[scope], tokens)
     title = _title(point)

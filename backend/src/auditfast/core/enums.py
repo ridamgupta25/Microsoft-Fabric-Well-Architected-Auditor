@@ -33,29 +33,47 @@ class StrEnum(str, Enum):
 
 
 class Pillar(StrEnum):
-    """The audit pillars — quality attributes aligned to team ownership.
+    """The audit pillars — aligned to the source checklist taxonomy.
 
-    Six scored pillars, each with a clear owner (Security team, Governance/
-    Compliance, DevOps/SRE, Performance engineers, FinOps, Data engineers).
-
-    ``FOUNDATION`` is cross-cutting and internal: it holds informational results
-    (inventory, access errors) that describe the estate rather than judging it,
-    and is never scored — so it is deliberately excluded from :meth:`scored`.
+    Thirteen scored pillars, each owning a slice of the checklist. ``FOUNDATION``
+    is cross-cutting and internal: it holds informational results (inventory,
+    access errors) that describe the estate rather than judging it, and is never
+    scored — so it is deliberately excluded from :meth:`scored`.
     """
 
-    SECURITY = "Security"
-    GOVERNANCE = "Governance & Compliance"
-    OPERATIONS = "Operations & Reliability"
-    PERFORMANCE = "Performance & Capacity"
-    COST = "Cost & Resource Optimization"
-    DATA = "Data Management & Quality"
+    ARCHITECTURE = "Architecture & Design"
+    DATA_INTEGRATION = "Data Integration & Ingestion"
+    DATA_PROCESSING = "Data Processing & Transformation"
+    DATA_MODELING = "Data Modeling & Storage"
+    DATA_QUALITY = "Data Quality Framework"
+    SECURITY_ACCESS = "Security & Access Control"
+    COMPLIANCE = "Compliance & Regulatory"
+    DATA_GOVERNANCE = "Data Governance"
+    RELIABILITY = "Reliability & Resilience"
+    MONITORING = "Monitoring & Observability"
+    DEVOPS = "DevOps & Deployment"
+    COST_MANAGEMENT = "Cost Management & Capacity"
+    DOCUMENTATION = "Documentation & Knowledge Mgmt"
     FOUNDATION = "Foundation"
 
     @classmethod
     def scored(cls) -> list[Pillar]:
         """The pillars that appear on the scorecard, in report order."""
-        return [cls.SECURITY, cls.GOVERNANCE, cls.OPERATIONS,
-                cls.PERFORMANCE, cls.COST, cls.DATA]
+        return [
+            cls.ARCHITECTURE,
+            cls.DATA_INTEGRATION,
+            cls.DATA_PROCESSING,
+            cls.DATA_MODELING,
+            cls.DATA_QUALITY,
+            cls.SECURITY_ACCESS,
+            cls.COMPLIANCE,
+            cls.DATA_GOVERNANCE,
+            cls.RELIABILITY,
+            cls.MONITORING,
+            cls.DEVOPS,
+            cls.COST_MANAGEMENT,
+            cls.DOCUMENTATION,
+        ]
 
 
 class Layer(StrEnum):

@@ -53,7 +53,7 @@ def _suffix(summary: dict) -> str:
 @check(
     id="WS-FILE-SIZE-BANDS", ref="4.3.3",
     title="File sizes avoid the small-file problem (target 128MB-1GB per file)",
-    pillar=Pillar.PERFORMANCE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=[Layer.STORAGE], requires=[Resource.LAKEHOUSE_FILES], required=True,
 )
 def lakehouse_file_sizes_avoid_small_files(ctx: CheckContext) -> Verdict:
@@ -131,7 +131,7 @@ def lakehouse_file_sizes_avoid_small_files(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-FILES-SOURCE-DATE-HIERARCHY", ref="4.3.2",
     title="Raw files in Files section organized by source/date hierarchy",
-    pillar=Pillar.PERFORMANCE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=[Layer.STORAGE], requires=[Resource.LAKEHOUSE_FILES], required=True,
 )
 def lakehouse_files_are_source_date_partitioned(ctx: CheckContext) -> Verdict:

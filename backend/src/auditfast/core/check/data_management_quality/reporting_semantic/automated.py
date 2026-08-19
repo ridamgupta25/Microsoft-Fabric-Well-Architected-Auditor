@@ -127,7 +127,7 @@ def _offender_breakdown(offenders: dict[str, list[str]], limit: int = _MAX_NAMED
     id="SM-FK-SURROGATE",
     ref="5.4.1",
     title="Fact-dimension referential integrity: all FKs in fact tables match dimension surrogate keys",
-    pillar=Pillar.DATA,
+    pillar=Pillar.DATA_QUALITY,
     scope=Scope.SEMANTIC_MODEL,
     severity=Severity.HIGH,
     layers=SEMANTIC_LAYERS,
@@ -170,7 +170,7 @@ def sm_fk_surrogate(ctx: CheckContext) -> Verdict:
     id="SM-FK-RI-DATA",
     ref="5.4.1",
     title="Fact FK values resolve to dimension surrogate keys (no orphans)",
-    pillar=Pillar.DATA,
+    pillar=Pillar.DATA_QUALITY,
     scope=Scope.WORKSPACE,
     severity=Severity.HIGH,
     layers=SEMANTIC_LAYERS,
@@ -210,7 +210,7 @@ def sm_fk_ri_data(ctx: CheckContext) -> Verdict:
 
 @check(
     id="R-BIDI-REL", ref="14.1.1", title="Star schema followed in the semantic model (single-direction relationships, no unnecessary bidirectional filters)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
 def single_direction_relationships(ctx: CheckContext) -> list[Verdict]:
@@ -261,7 +261,7 @@ def single_direction_relationships(ctx: CheckContext) -> list[Verdict]:
 
 @check(
     id="R-MEASURE-DUP", ref="14.1.3", title="Measures centralized (no duplicated calculation logic across reports)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
 def measures_not_duplicated(ctx: CheckContext) -> list[Verdict]:
@@ -312,7 +312,7 @@ def measures_not_duplicated(ctx: CheckContext) -> list[Verdict]:
 
 @check(
     id="R-DAX-VAR", ref="14.1.4", title="DAX follows good practices (variables, no repeated sub-expressions, avoids expensive iterators where avoidable)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
 def complex_measures_use_variables(ctx: CheckContext) -> list[Verdict]:
@@ -477,7 +477,7 @@ def _ambiguous_pairs(
 @check(
     id="R-REL-AMBIGUOUS", ref="14.1.2",
     title="Relationships correctly defined (cardinality, active/inactive) with no ambiguous filter paths",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
 def relationships_have_no_ambiguous_paths(ctx: CheckContext) -> list[Verdict]:
@@ -569,7 +569,7 @@ def relationships_have_no_ambiguous_paths(ctx: CheckContext) -> list[Verdict]:
 @check(
     id="R-MODEL-HIDDEN-KEYS", ref="14.1.8",
     title="Model naming and organization are consumer-friendly (display folders, hidden keys)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.LOW,
     layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
 )
 def key_columns_are_hidden(ctx: CheckContext) -> list[Verdict]:
@@ -701,7 +701,7 @@ def _reports_by_model(reports: list[dict]) -> dict[str, list[dict]]:
 @check(
     id="R-REPORT-SHARED-MODEL", ref="14.3.4",
     title="Reports use the shared certified model rather than private ad-hoc extracts",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=[Layer.REPORTING],
     requires=[Resource.REPORTS], required=False,
 )
