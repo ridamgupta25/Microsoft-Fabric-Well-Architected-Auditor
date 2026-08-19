@@ -37,16 +37,17 @@ from ._spark import NOTEBOOK_LAYERS, pip_targets, unpinned_targets, writes_delta
     requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def delta_merge(ctx: CheckContext) -> Verdict:
-    """A single ``MERGE INTO`` handles insert/update/delete, not sequential DML."""
-    # Ignore commented-out DML: strip Python "#" and SQL "--" / "/* */" comments so
-    # a disabled DELETE/INSERT does not count as a real sequential-DML upsert.
-    code = strip_sql_comments(executable_code(ctx.obj))
-    operations = _spark.sequential_dml_by_target(code)
-    violations = {
-        target: sorted(target_operations)
-        for target, target_operations in operations.items()
-        if len(target_operations) > 1
-    }
+    """A single ``MERGE INTO`` handles insert/update/delete, not sequential DML.
+
+    Sequential DML counts as the "should be one MERGE" anti-pattern only when the
+    statements form one logical upsert of one table — so they are grouped **per
+    code cell**, not across the whole notebook. That stops an ad-hoc / scratch
+    notebook, whose independent one-off statements (register a metadata row here,
+    fix a watermark there) are scattered across separate cells, from being read as
+    a single delete-insert upsert. Commented-out DML (Python ``#`` and SQL ``--``
+    / ``/* */``) is ignored.
+    """
+    violations = _spark.sequential_dml_violations(ctx.obj)
     if violations:
         evidence = "; ".join(
             f"{target} ({' + '.join(target_operations).upper()})"
@@ -54,13 +55,14 @@ def delta_merge(ctx: CheckContext) -> Verdict:
         )
         return graded(
             0,
-            f"Separate DML targets the same table instead of a single MERGE: {evidence}. "
+            f"Separate DML statements in one cell target the same table instead of "
+            f"a single MERGE: {evidence}. "
             f"Consolidate them into one `MERGE INTO <target> USING <source> ON <key>` with "
             f"WHEN MATCHED / WHEN NOT MATCHED clauses so the insert, update, and delete "
             f"apply atomically in a single pass instead of separate sequential "
             f"DELETE/INSERT/UPDATE statements.",
         )
-    if _spark.MERGE.search(code):
+    if _spark.MERGE.search(strip_sql_comments(executable_code(ctx.obj))):
         return binary(True, "Uses MERGE INTO for atomic upserts")
     return not_applicable("Notebook performs no upsert/merge logic")
 
