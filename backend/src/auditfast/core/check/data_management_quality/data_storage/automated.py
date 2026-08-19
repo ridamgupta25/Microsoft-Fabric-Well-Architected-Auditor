@@ -16,6 +16,7 @@ from auditfast.core.check._recency import parse_stamp
 from auditfast.core.check._tables import (
     TABLE_LAYERS,
     col_names,
+    column_type,
     columns,
     dimensions_in,
     facts_in,
@@ -25,13 +26,17 @@ from auditfast.core.check._tables import (
     is_audit_column,
     is_audit_table,
     is_key_column,
+    is_low_cardinality_shape,
     is_platform_table,
     is_snake_case,
     is_text_column,
     is_timestamp_column,
     key_referent,
     name_words,
+    normalise_column,
+    normalise_table_name,
     purpose_tokens,
+    related_columns,
     store_of,
     table_roles,
     tables_by_store,
@@ -2304,13 +2309,27 @@ def _scd_shape(table: dict) -> str:
     Ambiguous business names (``start_date``, ``end_date``) count only when a
     current-row flag sits beside them: that combination is Microsoft's own
     ADF/Synapse SCD-2 output, and is not a shape a contract term ever takes.
+
+    Validity columns must also carry a temporal *type*. ``valid_from int`` is
+    not a date whatever it is called. Columns with no readable type stay
+    eligible - an absent type is not evidence against.
     """
     names = {c.replace(" ", "").replace("-", "_").lower() for c in col_names(table)}
+    # A validity column must be able to hold a point in time. `valid_from int`
+    # or `start_date varchar` is not a date, whatever it is called - a free
+    # filter against a false positive, using type data already in the snapshot.
+    # Columns whose type is unreadable stay eligible: an absent type is not
+    # evidence against, and this check must not degrade on a partial crawl.
+    dated = {
+        (c.get("name") or "").replace(" ", "").replace("-", "_").lower()
+        for c in columns(table)
+        if not column_type(c) or is_timestamp_column(c)
+    }
     has_flag = bool(names & _SCD_FLAG_MARKERS)
-    has_start = bool(names & _SCD_START_MARKERS) or (
-        has_flag and bool(names & _SCD_START_AMBIGUOUS))
-    has_end = bool(names & _SCD_END_MARKERS) or (
-        has_flag and bool(names & _SCD_END_AMBIGUOUS))
+    has_start = bool(dated & _SCD_START_MARKERS) or (
+        has_flag and bool(dated & _SCD_START_AMBIGUOUS))
+    has_end = bool(dated & _SCD_END_MARKERS) or (
+        has_flag and bool(dated & _SCD_END_AMBIGUOUS))
     has_version = bool(names & _SCD_VERSION_MARKERS)
     has_hash = bool(names & _SCD_HASH_MARKERS)
 
@@ -2529,10 +2548,13 @@ def fact_grain_is_identifiable(ctx: CheckContext) -> Verdict:
     )
 
 
-#: Column names that read as a low-cardinality flag or indicator â€” the kind of
+#: Column names that read as a low-cardinality flag or indicator - the kind of
 #: attribute a junk dimension is built to collapse. Matched on the whole
 #: (lower-cased) name so ``is_active``, ``paid_flag`` and ``order_status`` count
 #: while ``flag_description`` does not.
+#:
+#: Split into two confidences, because they behave differently against real
+#: schemas. See ``_UNAMBIGUOUS_FLAG`` below.
 _FLAG_COLUMN = re.compile(
     r"^(?:is|has|can|was|are)_\w+$|"
     r"^\w+_(?:flag|flg|ind|indicator|status|type|code|category|reason)$|"
@@ -2540,8 +2562,47 @@ _FLAG_COLUMN = re.compile(
     re.IGNORECASE,
 )
 
+#: The half of the pattern that is unambiguous on its own. Nobody names a
+#: comment field ``is_active`` or a description ``paid_flag`` - the ``is_``/
+#: ``has_`` prefix and the ``_flag``/``_ind`` suffix state the column's shape
+#: in the name itself.
+#:
+#: **Why the distinction earns its place.** The junk half also requires the
+#: declared type to look narrow, so a ``rejection_reason varchar(500)`` cannot
+#: pass on its name alone. But Lakehouse Delta tables usually declare a bare
+#: ``string`` with no width, and requiring a width there silenced the check
+#: completely: on a real estate every one of 51 findings disappeared, including
+#: genuine ones like ``store_and_fwd_flag``. Trading 51 false positives for zero
+#: findings is not an improvement.
+#:
+#: So these names are trusted without a width, and the vaguer suffixes -
+#: ``_type``, ``_status``, ``_code``, ``_category``, ``_reason``, which are the
+#: ones that actually caused the false positives - still need the type to agree.
+_UNAMBIGUOUS_FLAG = re.compile(
+    r"^(?:is|has|can|was|are)_\w+$|"
+    r"^\w+_(?:flag|flg|ind|indicator)$|"
+    r"^(?:flag|indicator)$",
+    re.IGNORECASE,
+)
+
+
+def _is_junk_candidate(column: dict) -> bool:
+    """True when a column is plausibly a junk-dimension input.
+
+    An unambiguous flag name stands alone. A vaguer suffix needs the declared
+    type to be narrow as well - or to be absent, since an unreadable type is
+    not evidence against a column.
+    """
+    name = (column.get("name") or "").strip()
+    if not _FLAG_COLUMN.match(name):
+        return False
+    if _UNAMBIGUOUS_FLAG.match(name):
+        return True
+    return not column_type(column) or is_low_cardinality_shape(column)
+
+
 #: Below this many flag columns on one fact, collapsing them into a junk
-#: dimension buys nothing â€” the pattern exists to remove *several* low-value
+#: dimension buys nothing - the pattern exists to remove *several* low-value
 #: columns, not one.
 _MIN_JUNK_CANDIDATES = 3
 
@@ -2563,6 +2624,25 @@ def degenerate_and_junk_dimension_candidates(ctx: CheckContext) -> Verdict:
     candidates*: three or more flag/indicator/status-shaped columns on one fact,
     the cluster a junk dimension exists to collapse.
 
+    **Declared relationships outrank the name test.** A column that participates
+    in a semantic-model relationship is *stated* by the modeller to resolve to
+    another table, so it is never reported as unmodelled - whatever it is called.
+    Only columns with no declared relationship fall through to the name-based
+    test. That turns the strongest half of this check from an inference into a
+    fact the estate itself asserts, and removes the false positives from
+    dimensions whose names do not resemble their foreign keys.
+
+    **Declared types constrain the vaguer half of the junk test.** A junk
+    dimension collapses *low-cardinality* columns. An unambiguous flag name -
+    ``is_returned``, ``store_and_fwd_flag`` - is trusted on its own, because
+    nobody names a comment field that way. A vaguer suffix (``_type``,
+    ``_status``, ``_code``, ``_category``, ``_reason``) also needs its declared
+    type to look narrow, so ``rejection_reason varchar(500)`` no longer counts.
+    Columns whose type is unreadable are kept: an unreadable type is not
+    evidence against. The split matters because Lakehouse Delta tables usually
+    declare a bare ``string`` with no width; requiring a width everywhere
+    silenced this half of the check entirely on a real estate.
+
     **Scored on the share of fact tables that are clean.** An earlier version
     reported the candidates as an unscored ``note``, reasoning that "where
     appropriate" is a modelling judgement. It is - but the *detection* is not:
@@ -2571,11 +2651,14 @@ def degenerate_and_junk_dimension_candidates(ctx: CheckContext) -> Verdict:
     The verdict now scores how many facts are free of these shapes; the named
     candidates remain what a reviewer confirms.
 
-    **What it cannot.** Column cardinality (no row data is read), whether the
-    referenced dimension lives in another workspace, whether a degenerate column
-    is intentional, or whether an existing junk dimension is already in use
-    somewhere it cannot see. A named table is a *candidate for review*: the
-    check reports the shape, not the intent.
+    **What it cannot.** Column cardinality (no row data is read - the type is a
+    shape proxy), whether the referenced dimension lives in another workspace,
+    whether a degenerate column is intentional, or whether an existing junk
+    dimension is already in use somewhere it cannot see. Where no semantic model
+    is readable there are no declared relationships, and the check falls back
+    entirely to names - a Bronze/landing workspace gets the weaker test, and the
+    evidence says so. A named table is a *candidate for review*: the check
+    reports the shape, not the intent.
 
     **Sibling.** ``TB-FACT-PURITY`` (ref 4.5.3) scores *text* attributes on a
     fact that belong on a dimension. This looks at key- and flag-shaped columns,
@@ -2597,21 +2680,31 @@ def degenerate_and_junk_dimension_candidates(ctx: CheckContext) -> Verdict:
 
     degenerate: list[str] = []
     junk: list[str] = []
+    # A relationship is the modeller declaring that this column resolves to a
+    # dimension. Where one exists the name test is not consulted at all - the
+    # estate has already answered the question the name was being used to guess.
+    modelled = related_columns(_models(ctx))
     for name, table in sorted(facts.items()):
         own = purpose_tokens(name)
+        table_key = normalise_table_name(name)
         orphan_keys = sorted({
             column.get("name") or ""
             for column in columns(table)
             if (referent := key_referent(column.get("name") or ""))
             and referent != own
             and referent not in dimension_purposes
+            and (table_key, normalise_column(column.get("name") or "")) not in modelled
         })
         if orphan_keys:
             degenerate.append(f"{name}: {', '.join(orphan_keys[:4])}")
+        # A junk dimension collapses *low-cardinality* columns. An unambiguous
+        # flag name (`is_*`, `*_flag`) is trusted on its own; a vaguer suffix
+        # (`*_type`, `*_reason`) needs the declared type to agree, because that
+        # is where the false positives came from.
         flags = sorted({
             (column.get("name") or "")
             for column in columns(table)
-            if _FLAG_COLUMN.match((column.get("name") or "").strip())
+            if _is_junk_candidate(column)
         })
         if len(flags) >= _MIN_JUNK_CANDIDATES:
             junk.append(f"{name}: {len(flags)} flag column(s) ({', '.join(flags[:4])})")
