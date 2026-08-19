@@ -805,6 +805,19 @@ _ORPHAN_DETECT = re.compile(
     r"anti.*join.*parent|parent.*anti.*join",
     re.IGNORECASE,
 )
+#: A change-data-capture / slowly-changing-dimension incremental-merge context.
+#: In such a notebook a ``left_anti`` join or a null-on-left-join is upsert
+#: machinery — it isolates NEW and CHANGED rows to insert/expire, keyed on the
+#: target's own primary key — not child rows missing a parent. Matching any of
+#: these strong, specific tokens means the anti-join is a merge step, so the
+#: fact-to-dimension FK-orphan question does not apply here (it is judged where
+#: dimensional loads run). These tokens are deliberately narrow (a bare
+#: ``active_flag`` or ``end_date`` in ordinary business data must not trip it).
+_CDC_MERGE_CONTEXT = re.compile(
+    r"\bcdc\b|change[_ ]?hash|\bis_new\b|\bis_updated\b|\bis_deleted\b|"
+    r"add_cdc_columns|cdc_columns|\bscd\b|scd[_ ]?2",
+    re.IGNORECASE,
+)
 
 # -- 5.3.6: reconciliation *across* sources, not just a row-count assertion ----
 #: Comparing one source against another. ``_COUNT_RECONCILE`` alone is not
@@ -1421,6 +1434,14 @@ def nb_orphan_detect(ctx: CheckContext) -> Verdict:
     code = strip_sql_comments(executable_code(ctx.obj))
     if not (_JOIN_PATTERN.search(code) or _IMPLICIT_JOIN.search(code)):
         return not_applicable(f"Notebook '{ctx.obj_name}' does not perform joins")
+    if _CDC_MERGE_CONTEXT.search(code):
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' performs a CDC / SCD2 incremental merge — its "
+            "anti-join and null-on-join logic identify new and changed records to "
+            "insert or expire, keyed on the target's own primary key, not child rows "
+            "missing a parent. Referential-orphan detection does not apply here; it is "
+            "judged where fact-to-dimension loads run"
+        )
     if not _ORPHAN_DETECT.search(code):
         return binary(
             False,
@@ -2118,11 +2139,16 @@ def nb_silver_quality(ctx: CheckContext) -> Verdict:
 #: built only from those is N/A for this check rather than a failure.
 _BULK_MOVE_TYPES = {"Copy", "Script", "SqlServerStoredProcedure"}
 
+#: A Copy sink ``preCopyScript`` that clears the target before a set-based load —
+#: the TRUNCATE-then-bulk-INSERT full-reload idiom. It is a genuine bulk pattern
+#: (a single set-based clear plus a bulk insert), the opposite of row-by-row.
+_BULK_PRECOPY = re.compile(r"\bTRUNCATE\b|\bDROP\s+TABLE\b|\bDELETE\s+FROM\b", re.IGNORECASE)
+
 
 @check(
     id="PL-BULK-MOVE", ref="2.6.3",
     title="Large data movements use bulk/batch patterns, not row-by-row",
-    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def pl_bulk_move(ctx: CheckContext) -> Verdict:
@@ -2167,6 +2193,11 @@ def pl_bulk_move(ctx: CheckContext) -> Verdict:
         for key in ("writeBatchSize", "batchSize"):
             if configured(sink.get(key)):
                 signals.append(f"{key}={sink[key]}")
+        if sink.get("sqlWriterUseTableLock") is True:
+            signals.append("sqlWriterUseTableLock=true")
+        pre_copy = sink.get("preCopyScript")
+        if isinstance(pre_copy, str) and _BULK_PRECOPY.search(pre_copy):
+            signals.append("preCopyScript truncate/reload")
         return signals
 
     row_by_row = [
