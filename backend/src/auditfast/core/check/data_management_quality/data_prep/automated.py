@@ -1008,15 +1008,13 @@ _BRONZE_BATCH = re.compile(
     r"batch[_ ]?(?:id|key)",
     re.IGNORECASE,
 )
-#: The four Silver disciplines the checklist point names, kept separate so the
-#: verdict can say *which* are present. A single pattern could only answer
-#: "something was found", which reported "applies cleansing, deduplication,
-#: conforming and type standardization" on a notebook doing none of the dedup.
+#: The three Silver disciplines this check *scores*. Deduplication is detected
+#: separately (``_SILVER_DEDUP``) and reported as context but never scored:
+#: whether a given Silver source needs dedup depends on whether its business key
+#: can repeat, which this check cannot see, so penalizing its absence would be a
+#: false finding (ref 1.2.5). Kept as (name, pattern) pairs so the verdict can
+#: name *which* aspects are present rather than only "something was found".
 _SILVER_ASPECTS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("deduplication", re.compile(
-        r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.distinct\s*\(\)|dedup|"
-        r"row_number\s*\(\s*\)\s*over|qualify\b",
-        re.IGNORECASE)),
     ("type standardization", re.compile(
         r"\.cast\s*\(|to_date\s*\(|to_timestamp\s*\(|astype\s*\(|"
         r"CAST\s*\(|CONVERT\s*\(",
@@ -1029,6 +1027,11 @@ _SILVER_ASPECTS: tuple[tuple[str, re.Pattern[str]], ...] = (
         r"standardi[sz]e|conform|\.withColumnRenamed\s*\(|\balias\s*\(|mapping",
         re.IGNORECASE)),
 )
+#: Deduplication detector — reported as unscored context (see ``_SILVER_ASPECTS``).
+_SILVER_DEDUP = re.compile(
+    r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.distinct\s*\(\)|dedup|"
+    r"row_number\s*\(\s*\)\s*over|qualify\b",
+    re.IGNORECASE)
 
 _EXPLICIT_ROW_BY_ROW = re.compile(
     r"row[_ -]?by[_ -]?row|record[_ -]?by[_ -]?record|per[_ -]?(?:row|record)|"
@@ -1104,11 +1107,26 @@ _TEXT_ENCODING = re.compile(
     r"decode\s*\(\s*[\"']utf[-_]?8|StringType\s*\(\)|utf[-_]?8",
     re.IGNORECASE,
 )
+#: A column name that denotes a boolean/flag field.
+_FLAG_NAME = r"(?:flag|boolean|is_[A-Za-z0-9_]+|active|enabled|valid)"
+#: The expected literals a flag is allowed to hold.
+_FLAG_LITERAL = r"(?:True|False|[\"'](?:Y|N|yes|no|true|false|0|1)[\"'])"
 _FLAG_DOMAIN = re.compile(
-    r"(?:flag|boolean|is_[A-Za-z0-9_]+|active|enabled|valid)[^\n]{0,120}?\.isin\s*\(|"
-    r"\.isin\s*\(\s*(?:True|False|[\"'](?:Y|N|true|false|0|1)[\"'])|"
+    # a flag-named column tested for membership: is_active.isin(...)
+    _FLAG_NAME + r"[^\n]{0,120}?\.isin\s*\(|"
+    # any .isin(...) whose literal set is boolean/flag values
+    r"\.isin\s*\(\s*\[?\s*" + _FLAG_LITERAL + r"|"
+    # a declared allow-list of flag / expected values
     r"(?:allowed|valid)[_ ]?(?:values|flags)|expected[_ ]?(?:values|flags)|"
-    r"BooleanType\s*\(\)|when\s*\([^\n]{0,120}?\)\.otherwise\s*\(",
+    # a when(...).otherwise(...) that normalises a flag column to expected
+    # literals - it must name a flag column AND an expected literal (either
+    # order). A bare when/otherwise is generic conditional logic and does not
+    # count; declaring a BooleanType column likewise only sets a type, it does
+    # not restrict the values, so neither is treated as flag-domain validation.
+    r"when\s*\([^\n]{0,160}?" + _FLAG_NAME + r"[^\n]{0,120}?" + _FLAG_LITERAL
+    + r"[^\n]{0,120}?\.otherwise\s*\(|"
+    r"when\s*\([^\n]{0,160}?" + _FLAG_LITERAL + r"[^\n]{0,120}?" + _FLAG_NAME
+    + r"[^\n]{0,120}?\.otherwise\s*\(",
     re.IGNORECASE,
 )
 #: A *categorical* domain restriction - 5.5.5. Deliberately distinct from
@@ -1578,11 +1596,18 @@ _UNKNOWN_MONITORED = re.compile(
 )
 #: A real dimensional unknown-member fallback. A generic string value such as
 #: ``city = "Unknown"`` is ordinary null cleansing, not a surrogate member.
+#:
+#: The ``-1`` forms require a *numeric* -1 (a surrogate key), so each is guarded
+#: with ``(?<![\"'])`` to reject a quoted ``"-1"`` string. Legacy IFS/COM feeds
+#: store a boolean true as -1, so ``bool_value.isin("-1","1","true","yes","y")``
+#: is a flag tidy-up (scored by 5.5.7), not a surrogate-key orphan fallback -
+#: without the guard the quoted ``"-1"`` false-matched ``when(...-1`` and this
+#: completeness monitor fired on notebooks with no dimension lookup at all.
 _UNKNOWN_MEMBER_USE = re.compile(
     r"unknown[_\s]?member|inferred[_\s]?member|is_inferred|"
-    r"coalesce\s*\([^\n]{0,80}?-1|fillna\s*\([^\n]{0,60}?-1|"
-    r"\.na\.fill\s*\([^\n]{0,60}?-1|otherwise\s*\([^\n]{0,40}?-1|"
-    r"when\s*\([^\n]{0,80}?-1",
+    r"coalesce\s*\([^\n]{0,80}?(?<![\"'])-1|fillna\s*\([^\n]{0,60}?(?<![\"'])-1|"
+    r"\.na\.fill\s*\([^\n]{0,60}?(?<![\"'])-1|otherwise\s*\([^\n]{0,40}?(?<![\"'])-1|"
+    r"when\s*\([^\n]{0,80}?(?<![\"'])-1",
     re.IGNORECASE,
 )
 
@@ -1693,6 +1718,25 @@ def nb_late_arriving(ctx: CheckContext) -> Verdict:
     )
 
 
+def _describe_unknown_fallback(match_text: str) -> str:
+    """A clean, human label for a matched unknown-member fallback.
+
+    The raw regex match is a fragment cut off at the ``-1`` (e.g.
+    ``when(bool_value.isin("-1``), which reads as broken code in a report. This
+    names the *mechanism* instead — keeping the operator keyword so the evidence
+    still points at the code — rather than pasting a truncated expression.
+    """
+    text = match_text.lower()
+    if "unknown" in text and "member" in text:
+        return "a named 'unknown member'"
+    if "inferred" in text or "is_inferred" in text:
+        return "an 'inferred member'"
+    for operator in ("coalesce", "fillna", "na.fill", "otherwise", "when"):
+        if operator in text:
+            return f"a -1 surrogate-key fallback (via {operator}(...))"
+    return "an unknown/inferred member"
+
+
 @check(
     id="NB-UNKNOWN-MONITOR", ref="5.4.4",
     title="Completeness: all expected dimension members present; unknown/orphan member usage monitored",
@@ -1720,15 +1764,21 @@ def nb_unknown_monitored(ctx: CheckContext) -> Verdict:
             f"deterministic unknown/inferred-member fallback (-1 or an explicitly "
             f"named unknown/inferred member)"
         )
+    fallback = _describe_unknown_fallback(member.group(0))
     monitored = _UNKNOWN_MONITORED.search(code)
-    fallback = " ".join(member.group(0).split())
     if monitored:
         signal = " ".join(monitored.group(0).split())
-        return binary(True, f"Notebook '{ctx.obj_name}' uses unknown-member fallback "
-                      f"'{fallback}' and monitors it with '{signal}'")
-    return binary(False, f"Notebook '{ctx.obj_name}' uses unknown-member fallback "
-                  f"'{fallback}' in a fact-to-dimension lookup but never counts, "
-                  f"logs, or audits how many rows use it")
+        return binary(
+            True,
+            f"Notebook '{ctx.obj_name}' routes unmatched keys to {fallback} and "
+            f"monitors its usage (found: {signal}).",
+        )
+    return binary(
+        False,
+        f"Notebook '{ctx.obj_name}' routes unmatched keys to {fallback} in a "
+        f"fact-to-dimension lookup, but never counts, logs, or audits how many rows "
+        f"land on it — a feed that starts producing unmatched keys would look healthy.",
+    )
 
 
 @check(
@@ -2039,23 +2089,25 @@ def nb_bronze_metadata(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_silver_quality(ctx: CheckContext) -> Verdict:
-    """Silver writes apply cleansing, deduplication, conforming and type standardization.
+    """Silver writes apply cleansing, conforming and type standardization.
 
     **Only Silver notebooks are judged**, decided by what the notebook writes to
     rather than by the word "silver" appearing anywhere in it - a Gold notebook
     that *reads* a silver table was previously judged as though it produced one.
 
-    **Scored per aspect.** The point names four disciplines, and a notebook doing
-    three of them is not the same as one doing all four. An earlier version
-    matched any one pattern and then claimed all four in its evidence, which
-    reported deduplication on notebooks that performed none. The verdict now
-    names which aspects were found and which were not, and scores the ratio, so
-    the evidence can be checked against the code.
+    **Scored on three disciplines.** The verdict names which of cleansing,
+    conforming and type standardization were found and which were not, and scores
+    the ratio, so the evidence can be checked against the code.
 
-    **What it cannot determine.** That a transformation is *correct*, or that an
-    absent aspect was unnecessary - a source with a guaranteed-unique key needs
-    no dedup. The named gaps are for a reviewer to confirm, and the write target
-    is named so the reader knows which lakehouse was judged.
+    **Deduplication is reported but not scored.** Whether a Silver source needs
+    dedup depends on whether its business key can repeat - which this check cannot
+    see - so its absence is surfaced as context for a reviewer, never counted as a
+    gap. Penalizing a discipline the tool cannot establish is required would be a
+    false finding.
+
+    **What it cannot determine.** That a transformation is *correct*. The named
+    gaps are for a reviewer to confirm, and the write target is named so the
+    reader knows which lakehouse was judged.
     """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
@@ -2073,11 +2125,17 @@ def nb_silver_quality(ctx: CheckContext) -> Verdict:
 
     present = [name for name, pattern in _SILVER_ASPECTS if pattern.search(code)]
     missing = [name for name, _ in _SILVER_ASPECTS if name not in present]
+    dedup_note = (
+        "deduplication also applied (not scored)"
+        if _SILVER_DEDUP.search(code) else
+        "deduplication not detected (not scored - confirm whether this source needs it)"
+    )
     return covered(
         len(present), len(_SILVER_ASPECTS),
         f"Silver write ({how}) applies {len(present)} of {len(_SILVER_ASPECTS)} "
-        f"quality aspect(s): {', '.join(present) if present else 'none'}"
-        + (f". Not found: {', '.join(missing)}" if missing else ""),
+        f"scored quality aspect(s): {', '.join(present) if present else 'none'}"
+        + (f". Not found: {', '.join(missing)}" if missing else "")
+        + f". {dedup_note}",
     )
 
 

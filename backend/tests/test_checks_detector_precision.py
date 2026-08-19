@@ -473,6 +473,32 @@ def test_flag_domain_validation_passes():
     assert nb_flag_domain(_ctx(_nb(code))).score == _PASS
 
 
+def test_flag_domain_passes_when_a_flag_is_normalised_by_when_otherwise():
+    code = (
+        "df = spark.read.json('Files/events.json')\n"
+        "df = df.withColumn('is_active', when(col('is_active') == 'Y', True).otherwise(False))"
+    )
+    assert nb_flag_domain(_ctx(_nb(code))).score == _PASS
+
+
+def test_flag_domain_fails_on_a_boolean_type_declaration_alone():
+    """Declaring a BooleanType column sets a type; it does not restrict values."""
+    code = (
+        "df = spark.read.json('Files/events.json')\n"
+        "schema = StructType([StructField('amount', BooleanType())])"
+    )
+    assert nb_flag_domain(_ctx(_nb(code))).score == _FAIL
+
+
+def test_flag_domain_fails_on_a_generic_when_otherwise():
+    """A when/otherwise with no flag column and no flag literal is generic logic."""
+    code = (
+        "df = spark.read.csv('Files/events.csv')\n"
+        "df = df.withColumn('bucket', when(col('amount') > 100, 'big').otherwise('small'))"
+    )
+    assert nb_flag_domain(_ctx(_nb(code))).score == _FAIL
+
+
 def test_ingestion_controls_are_na_without_relevant_input_or_write():
     context = _ctx(_nb("print('no input or write')"))
     assert nb_source_metadata(context).status is Status.NA
@@ -494,27 +520,31 @@ raw.write.saveAsTable('bronze_events')
 
 
 def test_silver_quality_scores_each_aspect_separately():
-    """Two of four aspects is a partial, not a pass.
+    """Two of the three scored aspects is a partial, not a pass.
 
-    The point names cleansing, deduplication, conforming *and* type
-    standardization. An earlier version passed on any one of them and then
-    claimed all four in its evidence, which reported deduplication on notebooks
-    performing none. Scoring the ratio is what makes the evidence checkable.
+    The point scores cleansing, conforming and type standardization. Dedup is
+    detected but reported as unscored context, so it never lifts or lowers the
+    band; scoring the ratio of the three is what makes the evidence checkable.
     """
     code = """
 silver = spark.read.table('bronze_events')
-silver = silver.dropDuplicates(['event_id']).withColumn('event_date', to_date('event_date'))
+silver = (silver.dropDuplicates(['event_id'])
+          .withColumn('event_date', to_date('event_date'))
+          .withColumn('name', trim(col('name'))))
 silver.write.saveAsTable('silver_events')
 """
     verdict = nb_silver_quality(_ctx(_nb(code)))
     assert verdict.score is not None and verdict.score < _PASS
-    assert "2 of 4" in verdict.evidence
-    assert "deduplication" in verdict.evidence
-    assert "Not found: cleansing, conforming" in verdict.evidence
+    assert "2 of 3" in verdict.evidence
+    assert "Not found: conforming" in verdict.evidence
+    assert "deduplication also applied" in verdict.evidence
 
 
 def test_silver_quality_passes_when_every_aspect_is_present():
-    """All four aspects present - dedup, cast, trim (cleansing), rename (conforming)."""
+    """All three scored aspects present - cast, trim (cleansing), rename (conforming).
+
+    Dedup is also applied here, but it is reported as context, not scored.
+    """
     code = """
 silver = spark.read.table('bronze_events')
 silver = (silver.dropDuplicates(['event_id'])
@@ -525,7 +555,7 @@ silver.write.saveAsTable('silver_events')
 """
     verdict = nb_silver_quality(_ctx(_nb(code)))
     assert verdict.score == _PASS
-    assert "4 of 4" in verdict.evidence
+    assert "3 of 3" in verdict.evidence
 
 
 def test_bulk_pipeline_passes_with_parallel_copy():
