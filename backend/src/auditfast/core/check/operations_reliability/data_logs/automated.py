@@ -71,7 +71,7 @@ _NOTIFY_NAME = re.compile(r"notif|alert|email|teams|activator", re.IGNORECASE)
 @check(
     id="NB-AUDIT-LOG", ref="4.6.4",
     title="Audit Tables capture data quality logs, row counts, null checks, and exceptions",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=(Layer.LOGS,), requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def audit_tables_capture_quality_logs(ctx: CheckContext) -> Verdict:
@@ -94,7 +94,7 @@ def audit_tables_capture_quality_logs(ctx: CheckContext) -> Verdict:
 @check(
     id="PL-FAILURE-ALERT", ref="10.1.4",
     title="Alerting on pipeline failure (Data Activator or equivalent)",
-    pillar=Pillar.RELIABILITY, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    pillar=Pillar.MONITORING, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=(Layer.LOGS,), requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def pipeline_failure_alert(ctx: CheckContext) -> Verdict:
@@ -159,7 +159,7 @@ def _named(items, types: frozenset[str]) -> list[str]:
 @check(
     id="WS-EVENTHOUSE-TELEMETRY", ref="10.3.1",
     title="Eventhouse/KQL DB used for high-volume or real-time telemetry where appropriate",
-    pillar=Pillar.RELIABILITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.MONITORING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.LOGS,), requires=[Resource.ITEMS], required=True,
 )
 def eventhouse_for_telemetry(ctx: CheckContext) -> Verdict:
@@ -213,7 +213,7 @@ def eventhouse_for_telemetry(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-KQL-QUERIES", ref="10.3.2",
     title="KQL queries exist for common operational investigations and are version-controlled",
-    pillar=Pillar.RELIABILITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.MONITORING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.LOGS,), requires=[Resource.ITEMS, Resource.GIT], required=True,
 )
 def kql_queries_version_controlled(ctx: CheckContext) -> Verdict:
@@ -305,7 +305,7 @@ def _has_row_count_column(table: dict) -> bool:
 @check(
     id="WS-INGEST-VOLUME", ref="10.3.4",
     title="Ingestion volume monitored (no silent drop or over-ingestion)",
-    pillar=Pillar.RELIABILITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.MONITORING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.LOGS,), requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=True,
 )
@@ -405,7 +405,7 @@ _RUN_HISTORY_WRITE = re.compile(
 @check(
     id="WS-RUN-HISTORY-EXPORT", ref="10.1.1",
     title="Pipeline run history monitored beyond Fabric's default retention",
-    pillar=Pillar.RELIABILITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.MONITORING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.LOGS,),
     requires=[Resource.PIPELINE_DEFINITIONS, Resource.NOTEBOOK_DEFINITIONS],
     required=True,
@@ -531,7 +531,7 @@ def _has_date_table(model: dict) -> bool:
 @check(
     id="WS-MONITOR-TREND", ref="10.4.4",
     title="Historical trend analysis enabled (not just current-state)",
-    pillar=Pillar.RELIABILITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.MONITORING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.LOGS,), requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
 def monitoring_models_support_trend_analysis(ctx: CheckContext) -> Verdict:
@@ -683,7 +683,7 @@ def _warehouse_loaders(ctx: CheckContext) -> dict[str, str]:
 @check(
     id="OPS-WH-LOAD-MONITORED", ref="10.1.5",
     title="Warehouse load jobs monitored (duration, failures, row counts)",
-    pillar=Pillar.RELIABILITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.MONITORING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.LOGS,),
     requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY, Resource.PIPELINE_DEFINITIONS,
               Resource.NOTEBOOK_DEFINITIONS, Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
@@ -821,7 +821,7 @@ def _median_interval_hours(stamps: list[str]) -> float | None:
 @check(
     id="OPS-MONITOR-REFRESH", ref="10.4.2",
     title="Refresh frequency of monitoring data is adequate (near-real-time or hourly)",
-    pillar=Pillar.RELIABILITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.MONITORING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.LOGS,), requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY],
     required=True,
 )
@@ -922,7 +922,7 @@ def _retention_policy(eventhouse: Any) -> Any:
     id="EVENTHOUSE-RETENTION",
     ref="10.3.3",
     title="Eventhouse retention configured",
-    pillar=Pillar.RELIABILITY,
+    pillar=Pillar.MONITORING,
     scope=Scope.EVENTHOUSE,
     layers=[Layer.LOGS],
     severity=Severity.MEDIUM,

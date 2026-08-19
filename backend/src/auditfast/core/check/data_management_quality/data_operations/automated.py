@@ -91,7 +91,7 @@ _CODE_STANDARDIZATION = re.compile(
 
 @check(
     id="WS-LAYER-CONTENT", ref="1.1.1", title="Clear separation of concerns across the 67 workspaces (Data Prep / Data Store / Data Consumption × Dev / QA / Prod)",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     requires=[Resource.ITEMS], required=True,
 )
 def layer_content(ctx: CheckContext) -> Verdict:
@@ -111,7 +111,7 @@ def layer_content(ctx: CheckContext) -> Verdict:
 
 @check(
     id="WS-LAYER-SEP", ref="1.1.9", title="Layer separation: each workspace holds only the item types appropriate to its layer role — e.g. Data Prep workspaces contain only Pipelines/Notebooks, with all storage (Lakehouses/Warehouses) kept in the Data Store layer",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     requires=[Resource.ITEMS], required=True,
 )
 def layer_separation(ctx: CheckContext) -> Verdict:

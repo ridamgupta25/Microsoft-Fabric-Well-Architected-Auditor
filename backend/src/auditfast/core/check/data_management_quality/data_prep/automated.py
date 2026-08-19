@@ -59,7 +59,7 @@ _DYNAMIC_CONTENT = re.compile(
 
 @check(
     id="PL-NAME", ref="2.1.1", title="Pipelines follow consistent naming conventions (including domain prefix/folder alignment)",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.PIPELINE, severity=Severity.LOW,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def naming_convention(ctx: CheckContext) -> Verdict:
@@ -90,7 +90,7 @@ def naming_convention(ctx: CheckContext) -> Verdict:
 
 @check(
     id="PL-DESC", ref="2.1.6", title="Pipeline annotations/descriptions populated for pipelines and key activities",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.PIPELINE, severity=Severity.LOW,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def descriptions(ctx: CheckContext) -> Verdict:
@@ -108,7 +108,7 @@ def descriptions(ctx: CheckContext) -> Verdict:
 
 @check(
     id="PL-PARAM", ref="2.1.2", title="Pipelines are parameterized (no hardcoded sources, targets, dates, or environment values)",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def parameterized(ctx: CheckContext) -> Verdict:
@@ -160,7 +160,7 @@ _WIDE_CALL = re.compile(r"\.(?:collect|toPandas)\s*\(|\.count\s*\(\s*\)")
 
 @check(
     id="NB-SECRETS", ref="3.1.3", title="No hardcoded paths, connection strings, secrets, or environment-specific values",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.CRITICAL,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.CRITICAL,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_no_secrets(ctx: CheckContext) -> Verdict:
@@ -172,7 +172,7 @@ def nb_no_secrets(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-PARAMS", ref="3.1.2", title="Notebooks are parameterized using Fabric notebook parameters or widgets",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_parameterized(ctx: CheckContext) -> Verdict:
@@ -185,7 +185,7 @@ def nb_parameterized(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-IMPORTS", ref="3.2.7", title="Explicit imports only (no `import *`)",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_explicit_imports(ctx: CheckContext) -> Verdict:
@@ -197,7 +197,7 @@ def nb_explicit_imports(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-DISPLAY", ref="3.1.6", title="Notebooks avoid `display()` / `show()` in production execution paths",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_no_display(ctx: CheckContext) -> Verdict:
@@ -209,7 +209,7 @@ def nb_no_display(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-COLLECT", ref="3.2.3", title="No unnecessary `collect()`, `toPandas()`, or `count()` on large datasets",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_no_wide_calls(ctx: CheckContext) -> Verdict:
@@ -304,7 +304,7 @@ def _has_default_timeout(node: object, defaults: frozenset[str]) -> bool:
 
 @check(
     id="NB-STRUCTURE", ref="3.1.1", title="Notebooks follow a consistent structure (parameters → imports → config → logic → output)",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_structure(ctx: CheckContext) -> Verdict:
@@ -344,7 +344,7 @@ def nb_structure(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-MARKDOWN", ref="3.1.4", title="Cell-level documentation (markdown cells) explains business logic, not just code",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_markdown(ctx: CheckContext) -> Verdict:
@@ -356,7 +356,7 @@ def nb_markdown(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-MODULAR", ref="3.1.5", title="Functions are modular and reusable — not monolithic single-cell scripts",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_modular(ctx: CheckContext) -> Verdict:
@@ -368,7 +368,7 @@ def nb_modular(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-NAME", ref="3.1.7", title="All notebooks have meaningful, consistent names aligned to domain/layer",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_name(ctx: CheckContext) -> Verdict:
@@ -386,7 +386,7 @@ def nb_name(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-TIMEOUT", ref="3.1.8", title="Notebook execution timeout / max runtime configured to prevent runaway Spark sessions",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_timeout(ctx: CheckContext) -> Verdict:
@@ -417,7 +417,7 @@ def nb_timeout(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-LANG", ref="3.2.1", title="Consistent language approach (PySpark vs Spark SQL — one primary, not mixed ad-hoc)",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_language(ctx: CheckContext) -> Verdict:
@@ -443,7 +443,7 @@ def nb_language(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-DATAFRAME", ref="3.2.2", title="DataFrame API used over RDD API",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_dataframe_api(ctx: CheckContext) -> Verdict:
@@ -455,7 +455,7 @@ def nb_dataframe_api(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-BROADCAST", ref="3.2.4", title="Broadcast joins used for small-large table joins where appropriate",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_broadcast(ctx: CheckContext) -> Verdict:
@@ -477,7 +477,7 @@ def nb_broadcast(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-NO-UDF", ref="3.2.5", title="UDFs avoided where native Spark functions exist",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_no_udf(ctx: CheckContext) -> Verdict:
@@ -489,7 +489,7 @@ def nb_no_udf(ctx: CheckContext) -> Verdict:
 
 @check(
     id="NB-SCHEMA", ref="3.2.6", title="Schema explicitly defined at read time for external sources (not inferred on CSV/JSON)",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_schema(ctx: CheckContext) -> Verdict:
@@ -505,7 +505,7 @@ def nb_schema(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-LATE-ARRIVAL", ref="2.3.8",
     title="Out-of-order / late-arriving change records handled without data corruption",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_late_arrival(ctx: CheckContext) -> Verdict:
@@ -583,7 +583,7 @@ def _data_move_summary(acts: list[dict]) -> str:
 
 @check(
     id="PL-ORCHESTRATION", ref="2.1.3", title="Master/orchestrator pipeline pattern used for coordinating dependent domain pipelines",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.WORKSPACE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def pl_orchestration(ctx: CheckContext) -> Verdict:
@@ -602,7 +602,7 @@ def pl_orchestration(ctx: CheckContext) -> Verdict:
 
 @check(
     id="PL-INCREMENTAL", ref="2.2.1", title="Incremental load implemented where applicable (watermark, CDC, delta detection) for IFS/EAM/LIMS",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def pl_incremental(ctx: CheckContext) -> Verdict:
@@ -634,7 +634,7 @@ def pl_incremental(ctx: CheckContext) -> Verdict:
 
 @check(
     id="PL-LOADMODE", ref="2.2.5", title="Initial load vs. incremental load clearly separated or parameterized",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.PIPELINE, severity=Severity.LOW,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def pl_load_mode(ctx: CheckContext) -> Verdict:
@@ -803,6 +803,19 @@ _ORPHAN_DETECT = re.compile(
     r"left_anti|leftanti|\bleft\s+anti\s+join\b|"
     r"orphan|unmatched|no_parent|missing_parent|"
     r"anti.*join.*parent|parent.*anti.*join",
+    re.IGNORECASE,
+)
+#: A change-data-capture / slowly-changing-dimension incremental-merge context.
+#: In such a notebook a ``left_anti`` join or a null-on-left-join is upsert
+#: machinery — it isolates NEW and CHANGED rows to insert/expire, keyed on the
+#: target's own primary key — not child rows missing a parent. Matching any of
+#: these strong, specific tokens means the anti-join is a merge step, so the
+#: fact-to-dimension FK-orphan question does not apply here (it is judged where
+#: dimensional loads run). These tokens are deliberately narrow (a bare
+#: ``active_flag`` or ``end_date`` in ordinary business data must not trip it).
+_CDC_MERGE_CONTEXT = re.compile(
+    r"\bcdc\b|change[_ ]?hash|\bis_new\b|\bis_updated\b|\bis_deleted\b|"
+    r"add_cdc_columns|cdc_columns|\bscd\b|scd[_ ]?2",
     re.IGNORECASE,
 )
 
@@ -1403,6 +1416,14 @@ def nb_orphan_detect(ctx: CheckContext) -> Verdict:
     code = strip_sql_comments(executable_code(ctx.obj))
     if not (_JOIN_PATTERN.search(code) or _IMPLICIT_JOIN.search(code)):
         return not_applicable(f"Notebook '{ctx.obj_name}' does not perform joins")
+    if _CDC_MERGE_CONTEXT.search(code):
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' performs a CDC / SCD2 incremental merge — its "
+            "anti-join and null-on-join logic identify new and changed records to "
+            "insert or expire, keyed on the target's own primary key, not child rows "
+            "missing a parent. Referential-orphan detection does not apply here; it is "
+            "judged where fact-to-dimension loads run"
+        )
     if not _ORPHAN_DETECT.search(code):
         return binary(
             False,
@@ -1481,7 +1502,7 @@ _PLAIN_INSERT = re.compile(r"\bINSERT\s+INTO\b", re.IGNORECASE)
 @check(
     id="PL-IDEMPOTENT-LOAD", ref="3.6.4",
     title="Warehouse load procedures are idempotent and re-runnable",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def pl_idempotent_load(ctx: CheckContext) -> Verdict:
@@ -1614,7 +1635,7 @@ def _fact_write_evidence(code: str) -> str:
 @check(
     id="NB-LATE-ARRIVING", ref="4.5.10",
     title="Late-arriving dimensions and facts handled (unknown/inferred member pattern)",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    pillar=Pillar.DATA_MODELING, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=(*NOTEBOOK_LAYERS, Layer.STORAGE),
     requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
@@ -1802,7 +1823,7 @@ def nb_grain_unique(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-FACT-DIM-RI", ref="4.5.12",
     title="Referential integrity validated (every FK in fact tables has a matching dimension record)",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    pillar=Pillar.DATA_MODELING, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_fact_dim_ri(ctx: CheckContext) -> Verdict:
@@ -1844,7 +1865,7 @@ _FILE_PURGE = re.compile(
 @check(
     id="WS-FILE-PURGE", ref="4.3.4",
     title="Orphaned files cleaned up periodically (archiving/purging policy)",
-    pillar=Pillar.DATA_PROCESSING, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=(Layer.STORAGE, Layer.PREP, Layer.MIXED),
     requires=[Resource.ITEMS, Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
@@ -1877,7 +1898,7 @@ def ws_file_purge(ctx: CheckContext) -> Verdict:
 @check(
     id="PL-LATE-ARRIVAL", ref="2.3.8",
     title="Out-of-order / late-arriving change records handled without data corruption",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def pl_late_arrival(ctx: CheckContext) -> Verdict:
@@ -1967,7 +1988,7 @@ def nb_key_quality(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-BRONZE-METADATA", ref="1.2.3",
     title="Bronze Lakehouse captures raw data with audit metadata (ingestion timestamp, source system, batch ID)",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_bronze_metadata(ctx: CheckContext) -> Verdict:
@@ -2014,7 +2035,7 @@ def nb_bronze_metadata(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-SILVER-QUALITY", ref="1.2.5",
     title="Silver Lakehouse applies cleansing, deduplication, conforming, and type standardization",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_silver_quality(ctx: CheckContext) -> Verdict:
@@ -2067,11 +2088,16 @@ def nb_silver_quality(ctx: CheckContext) -> Verdict:
 #: built only from those is N/A for this check rather than a failure.
 _BULK_MOVE_TYPES = {"Copy", "Script", "SqlServerStoredProcedure"}
 
+#: A Copy sink ``preCopyScript`` that clears the target before a set-based load —
+#: the TRUNCATE-then-bulk-INSERT full-reload idiom. It is a genuine bulk pattern
+#: (a single set-based clear plus a bulk insert), the opposite of row-by-row.
+_BULK_PRECOPY = re.compile(r"\bTRUNCATE\b|\bDROP\s+TABLE\b|\bDELETE\s+FROM\b", re.IGNORECASE)
+
 
 @check(
     id="PL-BULK-MOVE", ref="2.6.3",
     title="Large data movements use bulk/batch patterns, not row-by-row",
-    pillar=Pillar.DATA_PROCESSING, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def pl_bulk_move(ctx: CheckContext) -> Verdict:
@@ -2116,6 +2142,11 @@ def pl_bulk_move(ctx: CheckContext) -> Verdict:
         for key in ("writeBatchSize", "batchSize"):
             if configured(sink.get(key)):
                 signals.append(f"{key}={sink[key]}")
+        if sink.get("sqlWriterUseTableLock") is True:
+            signals.append("sqlWriterUseTableLock=true")
+        pre_copy = sink.get("preCopyScript")
+        if isinstance(pre_copy, str) and _BULK_PRECOPY.search(pre_copy):
+            signals.append("preCopyScript truncate/reload")
         return signals
 
     row_by_row = [
@@ -2166,7 +2197,7 @@ def pl_bulk_move(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-EAM-INGEST", ref="2.6.6",
     title="JSON ingestion (EAM) is efficient (streaming/partitioned parse, no oversized single-file bottlenecks)",
-    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_eam_ingest(ctx: CheckContext) -> Verdict:
@@ -2416,7 +2447,7 @@ _FOREACH = "ForEach"
 @check(
     id="PL-PARALLEL", ref="2.1.5",
     title="Parallel execution used where possible (no unnecessary sequential execution)",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def pl_parallel(ctx: CheckContext) -> Verdict:
@@ -2465,6 +2496,55 @@ _OVERWRITE_BEHAVIOUR = re.compile(
     re.IGNORECASE,
 )
 
+#: ``tableActionOption`` values that replace a Lakehouse table's contents.
+#: ``Append`` and ``Upsert`` add to it; ``Overwrite``/``OverwriteSchema`` do not.
+_OVERWRITE_TABLE_ACTIONS = frozenset({"overwrite", "overwriteschema"})
+
+
+def _copy_sinks(definition: dict) -> list[dict]:
+    """Every Copy activity's ``sink`` block, including those inside containers."""
+    sinks: list[dict] = []
+    for activity in walk_activities(definition):
+        if (activity.get("type") or "") != "Copy":
+            continue
+        sink = (activity.get("typeProperties") or {}).get("sink")
+        if isinstance(sink, dict):
+            sinks.append(sink)
+    return sinks
+
+
+def _sink_table(sink: dict) -> str:
+    """The table a Copy sink writes to, or "" when it is not statically known.
+
+    Fabric embeds the target inline rather than in a separate dataset artifact,
+    but one level deeper than the activity's own ``typeProperties``:
+    ``sink.datasetSettings.typeProperties.table``. Reading only the activity
+    level - which this check used to do - found nothing and reported every
+    Copy-driven reload as an unnamed target.
+
+    Returns "" when the name is a pipeline *expression*
+    (``{"value": "@{item().TABLE_NAME}", "type": "Expression"}``), because a
+    ForEach-driven copy genuinely has no single target until run time.
+    """
+    props = (sink.get("datasetSettings") or {}).get("typeProperties") or {}
+    table = props.get("table")
+    if isinstance(table, str):
+        return table
+    return ""      # expression object, or absent
+
+
+def _sink_overwrites(sink: dict) -> bool:
+    """True when this sink replaces the table's contents rather than adding to it."""
+    action = str(sink.get("tableActionOption") or "").strip().lower()
+    if action in _OVERWRITE_TABLE_ACTIONS:
+        return True
+    if str(sink.get("writeBehavior") or "").strip().lower() == "overwrite":
+        return True
+    # A pre-copy TRUNCATE/DELETE is a full reload however the write is spelled.
+    pre_copy = sink.get("preCopyScript")
+    return bool(isinstance(pre_copy, str)
+                and re.search(r"\b(?:TRUNCATE|DELETE)\b", pre_copy, re.IGNORECASE))
+
 
 def _bare_table(name: str) -> str:
     """The table name without schema qualifier, brackets, or quotes."""
@@ -2501,35 +2581,78 @@ def _is_initial_load_context(ctx: CheckContext) -> bool:
 @check(
     id="PL-FULLLOAD", ref="2.2.2",
     title="Full load reserved only for small reference/dimension tables or initial loads",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def pl_full_load(ctx: CheckContext) -> Verdict:
-    """Wholesale reloads target lookup/dimension tables, or are a one-time initial load."""
+    """Wholesale reloads target lookup/dimension tables, or are a one-time initial load.
+
+    **Three sources of a reload target**, all read from the definition itself:
+    inline T-SQL (``TRUNCATE`` / ``INSERT OVERWRITE`` / ``DROP TABLE``) in a
+    Script activity, and - for a Copy activity - the sink's own declared
+    behaviour and target. Fabric embeds the sink inline rather than in a separate
+    dataset artifact, so ``tableActionOption`` (``Overwrite`` / ``OverwriteSchema``
+    vs ``Append``), ``writeBehavior``, ``preCopyScript`` and the target
+    ``schema``/``table`` are all in the pipeline JSON. Reading only the SQL - which
+    this check used to do - reported every Copy-driven reload as an unnamed target.
+
+    **What it cannot determine.** The target of a Copy whose table name is a
+    pipeline expression (``@{item().TABLE_NAME}`` in a ForEach), because it has no
+    single target until run time. That is N/A: an unresolvable name is a gap in
+    what the definition exposes, not evidence that a fact table is reloaded.
+    """
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
     sql = script_sql(ctx.obj)
-    blob = json.dumps(ctx.obj)
 
     targets: list[str] = []
     for pattern in _FULL_LOAD_TARGETS:
         targets.extend(_bare_table(m) for m in pattern.findall(sql))
-    overwrite_copy = bool(_OVERWRITE_BEHAVIOUR.search(blob))
+
+    # Copy activities: the sink states whether it overwrites, and what it writes to.
+    overwriting_sinks = [s for s in _copy_sinks(ctx.obj) if _sink_overwrites(s)]
+    dynamic_targets = 0
+    for sink in overwriting_sinks:
+        table = _sink_table(sink)
+        if table:
+            targets.append(_bare_table(table))
+        else:
+            dynamic_targets += 1
+
+    # The old catch-all: an overwrite signal somewhere in the JSON that the sink
+    # parse did not attribute to a table. Kept so a sink shape we do not model
+    # still counts as a reload rather than vanishing.
+    overwrite_copy = bool(overwriting_sinks) or bool(_OVERWRITE_BEHAVIOUR.search(json.dumps(ctx.obj)))
 
     if not targets and not overwrite_copy:
         return not_applicable("Pipeline runs no full-reload statement "
                               "(TRUNCATE / INSERT OVERWRITE / overwrite sink)")
 
-    # An initial / one-time load may reload anything, fact tables included — the
+    # An initial / one-time load may reload anything, fact tables included - the
     # checklist reserves full loads for small tables *or* initial loads.
     initial_load = _is_initial_load_context(ctx)
     if not targets:
         if initial_load:
             return binary(True, "A Copy activity overwrites its sink, but this is a dedicated "
                                 "initial/one-time load, which the standard permits")
-        return graded(1, "A Copy activity overwrites its sink, but the target table "
-                         "is not named in the definition — cannot confirm it is a "
-                         "small reference/dimension table")
+        # Undetermined is N/A, never a partial failure: scoring here marked a
+        # pipeline down for this tool's blind spot rather than for anything the
+        # team did.
+        if dynamic_targets:
+            return not_applicable(
+                f"{dynamic_targets} Copy activity/activities overwrite a table whose name "
+                f"is a pipeline expression resolved at run time (a metadata-driven "
+                f"ForEach), so which table is reloaded cannot be determined from the "
+                f"definition"
+            )
+        return not_applicable(
+            "A Copy activity overwrites its sink, but the target table is not named "
+            "in the definition, so whether the reload targets a small "
+            "reference/dimension table cannot be determined"
+        )
+
+    unresolved = (f". A further {dynamic_targets} overwrite target(s) are named by a "
+                  f"run-time expression and are not judged") if dynamic_targets else ""
 
     facts = sorted({t for t in targets if is_fact(t)})
     safe = sorted({t for t in targets if not is_fact(t)})
@@ -2537,17 +2660,18 @@ def pl_full_load(ctx: CheckContext) -> Verdict:
         if initial_load:
             return binary(True, f"Full reload targets fact table(s): {', '.join(facts)}, but "
                                 f"this is a dedicated initial/one-time load, which the standard "
-                                f"permits for fact tables")
+                                f"permits for fact tables" + unresolved)
         return binary(False, f"Full reload targets fact table(s): {', '.join(facts)} — "
-                             f"facts should load incrementally, not be replaced wholesale")
+                             f"facts should load incrementally, not be replaced wholesale"
+                             + unresolved)
     kind = "dimension/reference" if any(is_dimension(t) for t in safe) else "reference"
-    return binary(True, f"Full reload targets only {kind} table(s): {', '.join(safe)}")
+    return binary(True, f"Full reload targets only {kind} table(s): {', '.join(safe)}" + unresolved)
 
 
 # -- 2.2.3 historical (Adage) load separated from ongoing incremental ----------
 _HISTORICAL = re.compile(
     r"historical|back[_ -]?fill|backfill|full[_ -]?history|one[_ -]?time[_ -]?load|"
-    r"initial[_ -]?load|adage|reload[_ -]?history",
+    r"initial[_ -]?load|reload[_ -]?history",
     re.IGNORECASE,
 )
 _ONGOING = re.compile(
@@ -2556,10 +2680,53 @@ _ONGOING = re.compile(
 )
 
 
+def _load_intent_text(pipeline_name: str, activities: list[dict]) -> str:
+    """Identifiers that carry *load intent* - the pipeline name and each
+    activity's name - joined for keyword matching.
+
+    Deliberately excludes activity ``typeProperties`` (schema / table / column
+    names, expressions, connection ids). Those are incidental data values:
+    matching a load-mode keyword against them flagged a routine full-load
+    pipeline as a "historical/backfill" load merely because it wrote to the
+    project's own ``ADAGE`` schema, and flipped the verdict between two
+    structurally identical pipelines on such a token. Intent is what the author
+    *named* the pipeline and its steps, not the data they happen to touch.
+    """
+    parts = [pipeline_name or ""]
+    parts.extend(str((a or {}).get("name") or "") for a in activities)
+    return "\n".join(parts)
+
+
+def _gate_condition_text(activity: dict) -> str:
+    """A Switch / IfCondition's *branch condition* - its name, boolean / selector
+    expression and any Switch case labels - without the nested branch bodies.
+
+    A load-mode gate is identified by what it branches *on*, not by what sits
+    inside its branches, so a container is not read as a load-mode gate just
+    because a nested activity name or value contains a load-mode word.
+    """
+    props = activity.get("typeProperties") or {}
+
+    def _expr(value: object) -> str:
+        return str(value.get("value") if isinstance(value, dict) else (value or ""))
+
+    parts = [
+        str(activity.get("name") or ""),
+        _expr(props.get("expression")),   # IfCondition predicate
+        _expr(props.get("on")),           # Switch selector
+    ]
+    parts.extend(
+        str((c or {}).get("value") or "")
+        for c in (props.get("cases") or [])
+        if isinstance(c, dict)
+    )
+    return "\n".join(parts)
+
+
 @check(
     id="PL-HIST-SEPARATION", ref="2.2.3",
     title="Adage historical load clearly separated from ongoing incremental patterns",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def pl_historical_separation(ctx: CheckContext) -> Verdict:
@@ -2568,14 +2735,23 @@ def pl_historical_separation(ctx: CheckContext) -> Verdict:
     Narrower than ``PL-LOADMODE`` (2.2.5), which asks whether *any* initial /
     incremental separation exists. This fires only when a historical or backfill
     load is actually present, and asks whether it is kept off the routine path.
+
+    **What counts as the signal.** Historical/backfill and ongoing/incremental
+    intent are read from load-bearing *identifiers* - the pipeline name and its
+    activity names (see :func:`_load_intent_text`) - never from the serialized
+    definition. Searching the whole JSON matched incidental data values (a
+    ``schema`` / ``table`` name in a Copy sink), so a plain full-load pipeline
+    read as "historical" merely because it wrote to the project's ``ADAGE``
+    schema, and the verdict flipped between structurally identical pipelines on
+    such a token. Intent is what the author named, not the data touched.
     """
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
-    blob = json.dumps(ctx.obj)
     acts = walk_activities(ctx.obj)
+    intent = _load_intent_text(ctx.obj_name, acts)
     historical_in_name = bool(_HISTORICAL.search(ctx.obj_name))
-    historical_in_definition = bool(_HISTORICAL.search(blob))
-    if not historical_in_definition and not historical_in_name:
+    historical_signal = bool(_HISTORICAL.search(intent))
+    if not historical_signal:
         return not_applicable(
             f"Pipeline '{ctx.obj_name}' contains no historical/backfill load signal"
         )
@@ -2588,7 +2764,8 @@ def pl_historical_separation(ctx: CheckContext) -> Verdict:
     gating_branches = [
         a for a in acts
         if (a.get("type") or "") in {"Switch", "IfCondition"}
-        and (_HISTORICAL.search(json.dumps(a)) or _LOAD_MODE.search(json.dumps(a)))
+        and (_HISTORICAL.search(_gate_condition_text(a))
+             or _LOAD_MODE.search(_gate_condition_text(a)))
     ]
     if gating_branches:
         gate = gating_branches[0]
@@ -2599,7 +2776,7 @@ def pl_historical_separation(ctx: CheckContext) -> Verdict:
             "incremental path cannot enter it without the branch condition",
         )
 
-    if _ONGOING.search(blob):
+    if _ONGOING.search(intent):
         return binary(
             False,
             f"Pipeline '{ctx.obj_name}' contains both historical/backfill and ongoing "
@@ -2699,7 +2876,7 @@ def _succeeds_after(activity: dict, predecessor: str) -> bool:
 @check(
     id="PL-WATERMARK-STORE", ref="2.2.4",
     title="Watermark / control values persisted reliably in the Metadata DB (not volatile locations)",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def pl_watermark_store(ctx: CheckContext) -> Verdict:
@@ -2812,7 +2989,7 @@ _CDC_SOURCE_SIGNAL = re.compile(
 @check(
     id="NB-OPTYPE", ref="2.3.2",
     title="Operation type column/flag preserved in Bronze for auditability where the source provides it",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_operation_type(ctx: CheckContext) -> Verdict:
@@ -2880,7 +3057,7 @@ _MERGE_DELETE = re.compile(
 @check(
     id="NB-IUD-MERGE", ref="2.3.3",
     title="All applicable operation types (I/U/D) handled correctly in the merge strategy",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_iud_merge(ctx: CheckContext) -> Verdict:
@@ -2925,7 +3102,7 @@ _DEDUP_BEFORE_MERGE = re.compile(
 @check(
     id="NB-INSERT-UNIQUE", ref="2.3.4",
     title="Insert records validated for uniqueness / business key before merge into target",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_insert_unique(ctx: CheckContext) -> Verdict:
@@ -2989,7 +3166,7 @@ def _lookup_reference(activity: dict) -> str | None:
 @check(
     id="PL-METADATA-DRIVEN", ref="2.5.1",
     title="Metadata DB drives ingestion (source list, load type, schedule, target mapping) rather than hardcoded pipelines",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def pl_metadata_driven(ctx: CheckContext) -> Verdict:
@@ -3130,7 +3307,7 @@ def _run_control_fields(text: str) -> tuple[dict[str, str], list[str]]:
 @check(
     id="WS-RUNCONTROL", ref="2.5.3",
     title="Run control tables capture batch ID, status, row counts, start/end timestamps",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS,
     requires=[Resource.PIPELINE_DEFINITIONS, Resource.NOTEBOOK_DEFINITIONS],
     required=False,
@@ -3223,7 +3400,7 @@ _DURATION_BASELINE = re.compile(
 @check(
     id="WS-RUNTIME-BASELINE", ref="2.6.1",
     title="Pipeline execution times monitored and baselined",
-    pillar=Pillar.DATA_PROCESSING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS,
     requires=[Resource.PIPELINE_DEFINITIONS, Resource.NOTEBOOK_DEFINITIONS],
     required=False,
@@ -4724,7 +4901,7 @@ def _is_self_documenting(name: str) -> bool:
 @check(
     id="PL-ACTIVITY-SELFDOC", ref="2.1.4",
     title="Pipeline activities are logically grouped, annotated, and self-documenting",
-    pillar=Pillar.DATA_QUALITY, scope=Scope.PIPELINE, severity=Severity.LOW,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def pipeline_activities_are_self_documenting(ctx: CheckContext) -> Verdict:

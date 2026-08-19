@@ -446,6 +446,22 @@ def test_orphan_check_is_na_without_a_join():
     assert nb_orphan_detect(_nb_ctx("print(1)\n")).status is Status.NA
 
 
+def test_cdc_incremental_merge_is_not_orphan_detection():
+    # A CDC / SCD2 incremental merge uses left_anti and null-on-join to isolate
+    # new and changed rows to upsert (keyed on the target's own PK), not child
+    # rows missing a parent. The FK orphan-detection check must not read that as
+    # "orphans detected but dropped" - it does not apply, so it is N/A.
+    code = (
+        'df_join = bronze.join(silver_pk_hash, keys, "left")\n'
+        'is_new = F.col("_silver_change_hash").isNull()\n'
+        'df_to_insert = df_join.filter(is_new)\n'
+        'silver_rest = silver.join(expire_pks, keys, "left_anti")\n'
+        'final = silver_rest.unionByName(df_to_insert)\n'
+        'final.write.format("delta").mode("overwrite").saveAsTable("silver.dim")\n'
+    )
+    assert nb_orphan_detect(_nb_ctx(code)).status is Status.NA
+
+
 @pytest.mark.parametrize("source", [
     'columns = ", ".join(df.columns)',
     'message = "\\n".join(lines)',

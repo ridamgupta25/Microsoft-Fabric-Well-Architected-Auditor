@@ -49,6 +49,7 @@ class Pillar(StrEnum):
     DEVOPS = "DevOps & Deployment"
     COST_MANAGEMENT = "Cost Management & Capacity"
     DOCUMENTATION = "Documentation & Knowledge Mgmt"
+    FOUNDATION = "Foundation"
 
     @classmethod
     def scored(cls) -> list[Pillar]:

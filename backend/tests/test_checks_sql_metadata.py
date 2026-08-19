@@ -7,7 +7,7 @@ principals alongside the column schemas. Three validated checks can use that:
   key", which beats inferring one from the column name;
 * **4.5.1 TB-STARSCHEMA** - row counts make "is this fact big enough for its
   shape to matter" measurable rather than assumed;
-* **IMPL-01 / IMPL-02** - workspace role assignments need *Member or higher*, so
+* **13.2.1 / 13.2.2** - workspace role assignments need *Member or higher*, so
   on a Viewer sign-in they are unavailable and both checks went N/A. Database
   principals answer the same question with no elevated role.
 
@@ -91,7 +91,7 @@ def test_star_schema_omits_size_when_no_row_count_was_read():
     assert "rows" not in verdict.evidence.split("Widest fact")[-1].split(";")[0]
 
 
-# -- IMPL-01 / IMPL-02 fall back to database principals ------------------------
+# -- 13.2.1 / 13.2.2 fall back to database principals --------------------------
 
 
 def _principals(*entries: tuple[str, str]) -> list[dict]:

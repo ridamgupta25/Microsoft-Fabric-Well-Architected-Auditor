@@ -114,7 +114,7 @@ _RESTART_BOUNDARY = re.compile(
 
 @check(
     id="PL-RETRY", ref="2.4.1", title="All pipeline activities have appropriate retry policies configured (copy, notebook, lookup, web, ForEach)",
-    pillar=Pillar.RELIABILITY, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def retry_policy(ctx: CheckContext) -> Verdict:
@@ -127,7 +127,7 @@ def retry_policy(ctx: CheckContext) -> Verdict:
 
 @check(
     id="PL-FAILPATH", ref="2.4.3", title="On-failure paths defined for critical activities",
-    pillar=Pillar.RELIABILITY, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def failure_path(ctx: CheckContext) -> Verdict:
@@ -143,7 +143,7 @@ def failure_path(ctx: CheckContext) -> Verdict:
 
 @check(
     id="PL-NOTIFY", ref="2.4.5", title="Pipeline failure triggers notification (Data Activator, email, Teams)",
-    pillar=Pillar.RELIABILITY, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def failure_notification(ctx: CheckContext) -> Verdict:
@@ -209,8 +209,8 @@ def restart_from_failure(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-TIMEOUT", ref="IMPL-23", title="Pipeline activities set an explicit timeout (not Fabric's multi-day default) [PL-TIMEOUT]",
-    pillar=Pillar.RELIABILITY, scope=Scope.PIPELINE, severity=Severity.LOW,
+    id="PL-TIMEOUT", ref="13.4.1", title="Pipeline activities set an explicit timeout (not Fabric's multi-day default) [PL-TIMEOUT]",
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def explicit_timeouts(ctx: CheckContext) -> Verdict:
@@ -327,7 +327,7 @@ def notebook_bad_records(ctx: CheckContext) -> Verdict:
 
 @check(
     id="PL-RETRY-VALUES", ref="2.4.2", title="Retry count and interval follow reasonable patterns (not infinite retries)",
-    pillar=Pillar.RELIABILITY, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def retry_values(ctx: CheckContext) -> Verdict:
@@ -603,7 +603,7 @@ def _failure_branch_targets(acts: list[dict]) -> list[str]:
 @check(
     id="PL-DEADLETTER", ref="2.4.4",
     title="Failed records captured to dead-letter / quarantine area (not silently dropped or halting good records)",
-    pillar=Pillar.RELIABILITY, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def pl_deadletter(ctx: CheckContext) -> Verdict:
@@ -703,7 +703,7 @@ _ANY_WRITE = re.compile(
 @check(
     id="NB-DEADLETTER", ref="5.1.10",
     title="DQ quarantine pattern: failed records routed to error tables with failure reason",
-    pillar=Pillar.RELIABILITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_deadletter(ctx: CheckContext) -> Verdict:

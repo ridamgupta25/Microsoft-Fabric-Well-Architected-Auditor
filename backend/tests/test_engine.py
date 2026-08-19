@@ -83,11 +83,11 @@ def test_result_and_scored_counts_are_unchanged(provider):
 
 def test_status_counts_are_unchanged(provider):
     agg = aggregate(_run(provider))
-    assert agg["counts"][Status.PASS] == 66
+    assert agg["counts"][Status.PASS] == 68
     assert agg["counts"][Status.PARTIAL] == 24
     assert agg["counts"][Status.FAIL] == 67
     assert agg["counts"][Status.NA] == 207
-    assert agg["counts"][Status.INFO] == 10
+    assert agg["counts"][Status.INFO] == 9
 
 
 def test_mixed_layer_runs_every_layers_checks():
@@ -418,8 +418,8 @@ def test_every_scoreable_check_ref_has_remediation_text():
     That failure is silent — the finding still appears, just with nothing telling
     anyone what to do about it — so it is pinned here rather than left to review.
 
-    Informational inventory checks are excluded because they describe the estate
-    rather than judging it, never fail, and so need no remediation.
+    Foundation checks are excluded: they describe the estate rather than judging
+    it, never fail, and so have nothing to remediate.
     """
     from auditfast.services.project import load_project, load_remediation
 
@@ -429,7 +429,7 @@ def test_every_scoreable_check_ref_has_remediation_text():
     missing = sorted({
         f"{spec.id} (ref {spec.ref})"
         for spec in REGISTRY
-        if spec.id != "WS-INVENTORY"
+        if spec.pillar is not Pillar.FOUNDATION
         and not spec.manual
         and spec.automation is not Automation.ROADMAP
         and not book.get(spec.ref)
@@ -502,8 +502,5 @@ def test_weights_are_applied(provider):
 
     results = _run(provider)
     baseline = aggregate(results)["overall"]
-    weighted = [
-        replace(r, weight=2.0) if r.pillar is Pillar.SECURITY_ACCESS else r
-        for r in results
-    ]
+    weighted = [replace(r, weight=2.0) if r.pillar is Pillar.SECURITY_ACCESS else r for r in results]
     assert aggregate(weighted)["overall"] != baseline

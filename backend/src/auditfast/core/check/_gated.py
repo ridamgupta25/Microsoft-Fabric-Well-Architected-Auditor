@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from ..enums import StrEnum
+from ..enums import Pillar, StrEnum
 from ..models import CheckContext
 from .helpers import Verdict, not_applicable
 
@@ -83,3 +83,33 @@ def gated(requirement: Requirement) -> Callable[[CheckContext], Verdict]:
         return not_applicable(reason)
 
     return _gated
+
+
+# -- ref -> pillar (checklist taxonomy) ---------------------------------------
+# Section rule plus the handful of explicit overrides reproduces the source
+# checklist's pillar for every ref. Used by the generated roadmap modules so a
+# gated check lands on the same pillar its ref would as a real evaluator.
+_SECTION_PILLARS: dict[str, Pillar] = {
+    "1": Pillar.ARCHITECTURE, "2": Pillar.DATA_INTEGRATION, "3": Pillar.DATA_PROCESSING,
+    "4": Pillar.DATA_MODELING, "5": Pillar.DATA_QUALITY, "6": Pillar.SECURITY_ACCESS,
+    "7": Pillar.COMPLIANCE, "8": Pillar.DATA_GOVERNANCE, "9": Pillar.RELIABILITY,
+    "10": Pillar.MONITORING, "11": Pillar.DEVOPS, "12": Pillar.COST_MANAGEMENT,
+    "14.1": Pillar.ARCHITECTURE, "14.2": Pillar.DATA_PROCESSING, "14.3": Pillar.ARCHITECTURE,
+    "14.4": Pillar.SECURITY_ACCESS, "14.5": Pillar.DATA_INTEGRATION,
+}
+_REF_PILLARS: dict[str, Pillar] = {
+    "13.2.1": Pillar.SECURITY_ACCESS, "13.2.2": Pillar.SECURITY_ACCESS,
+    "13.2.3": Pillar.SECURITY_ACCESS, "13.2.4": Pillar.SECURITY_ACCESS,
+    "13.3.1": Pillar.COST_MANAGEMENT, "13.1.2": Pillar.ARCHITECTURE,
+    "13.4.1": Pillar.DATA_INTEGRATION, "13.1.3": Pillar.ARCHITECTURE,
+    "14.5.3": Pillar.MONITORING, "14.5.4": Pillar.DEVOPS,
+}
+
+
+def pillar_for_ref(ref: str, fallback: Pillar = Pillar.ARCHITECTURE) -> Pillar:
+    """Return the checklist pillar for ``ref`` (explicit override, else section rule)."""
+    if ref in _REF_PILLARS:
+        return _REF_PILLARS[ref]
+    parts = ref.split(".")
+    section = ".".join(parts[:2]) if parts and parts[0] == "14" else parts[0]
+    return _SECTION_PILLARS.get(section, fallback)

@@ -248,7 +248,7 @@ def cross_domain_dependencies_identifiable(ctx: CheckContext) -> Verdict:
 @check(
     id="GOV-FIN-CHANGE-AUDIT", ref="7.2.3",
     title="Audit trail for all data modifications in financial-relevant data",
-    pillar=Pillar.DATA_GOVERNANCE, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.COMPLIANCE, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=_LAYERS, requires=[Resource.ITEMS, Resource.WAREHOUSE_AUDIT], required=True,
 )
 def financial_data_modifications_audited(ctx: CheckContext) -> Verdict:

@@ -112,6 +112,13 @@ class WorkspaceContext:
     pipelines: dict[str, dict] = field(default_factory=dict)
     notebooks: dict[str, dict] = field(default_factory=dict)
     environments: dict[str, dict] = field(default_factory=dict)
+    #: The workspace's default Spark runtime, from
+    #: ``/workspaces/{id}/spark/settings``: ``{"runtime_version": "1.3",
+    #: "default_environment": str}``. A notebook that binds to no named
+    #: Environment inherits this, so without it the runtime check reported N/A on
+    #: the commonest configuration of all. Empty when the settings could not be
+    #: read - which the check must treat as unknown, never as out of date.
+    spark_settings: dict = field(default_factory=dict)
     tables: dict[str, dict] = field(default_factory=dict)
     shortcuts: dict[str, list] = field(default_factory=dict)
     semantic_models: dict[str, dict] = field(default_factory=dict)
@@ -158,6 +165,13 @@ class WorkspaceContext:
     #: top-level folder sample, depth/date counts, and truncation flags. Individual
     #: file names/paths are deliberately never persisted in the KB.
     lakehouse_files: dict[str, dict] = field(default_factory=dict)
+    #: Per-Lakehouse summary of the **Tables** section - the same bounded shape as
+    #: :attr:`lakehouse_files`, but for the Delta data files. A Lakehouse's tables
+    #: live under ``Tables/``, so a file-size check that read only ``Files/`` was
+    #: measuring loose landing-area files and ignoring every Parquet file the
+    #: point is actually about. Empty when the listing could not be read, which
+    #: the checks must treat as unknown rather than as an empty Lakehouse.
+    lakehouse_tables_files: dict[str, dict] = field(default_factory=dict)
     #: Per-Data-Activator (Reflex) rule summary, keyed by item display name:
     #: ``{"rules": int, "active_rules": int, "sources": int, "actions": int}``,
     #: parsed from the item's ``ReflexEntities.json`` definition. An Activator
@@ -261,6 +275,7 @@ class WorkspaceContext:
             "pipelines": self.pipelines,
             "notebooks": self.notebooks,
             "environments": self.environments,
+            "spark_settings": self.spark_settings,
             "tables": self.tables,
             "shortcuts": self.shortcuts,
             "semantic_models": self.semantic_models,
@@ -271,6 +286,7 @@ class WorkspaceContext:
             "connections": self.connections,
             "reports": self.reports,
             "lakehouse_files": self.lakehouse_files,
+            "lakehouse_tables_files": self.lakehouse_tables_files,
             "activators": self.activators,
             "git_details": self.git_details,
             "sql_views": self.sql_views,
@@ -295,6 +311,7 @@ class WorkspaceContext:
             pipelines=dict(data.get("pipelines", {})),
             notebooks=dict(data.get("notebooks", {})),
             environments=dict(data.get("environments", {})),
+            spark_settings=dict(data.get("spark_settings", {})),
             tables=dict(data.get("tables", {})),
             shortcuts=dict(data.get("shortcuts", {})),
             semantic_models=dict(data.get("semantic_models", {})),
@@ -305,6 +322,7 @@ class WorkspaceContext:
             connections=list(data.get("connections", [])),
             reports=list(data.get("reports", [])),
             lakehouse_files=dict(data.get("lakehouse_files", {})),
+            lakehouse_tables_files=dict(data.get("lakehouse_tables_files", {})),
             activators=dict(data.get("activators", {})),
             git_details=dict(data.get("git_details", {})),
             sql_views=list(data.get("sql_views", [])),
