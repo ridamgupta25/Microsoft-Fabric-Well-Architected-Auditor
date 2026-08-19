@@ -390,3 +390,29 @@ def test_monitor_refresh_uses_every_item_in_a_data_logs_workspace():
         run_history={"p1": _hourly()},
     ))
     assert verdict.score == 3
+
+
+def test_monitor_refresh_uses_every_item_in_a_mixed_workspace():
+    """A Mixed workspace plays the Data Logs role, so it falls back the same way.
+
+    Previously a Mixed workspace with no monitoring-named item returned N/A even
+    though run history was read - the Logs-only fallback excluded Mixed.
+    """
+    verdict = monitoring_refresh_cadence(_ctx(
+        layer=Layer.MIXED,
+        items=[Item(id="p1", type="DataPipeline", display_name="PL_Nightly")],
+        run_history={"p1": _hourly()},
+    ))
+    assert verdict.score == 3
+    assert "near-real-time or hourly" in verdict.evidence
+
+
+def test_monitor_refresh_is_na_on_a_non_logs_non_mixed_workspace_without_named_items():
+    """A Reporting workspace with no monitoring-named item has no cadence to judge."""
+    verdict = monitoring_refresh_cadence(_ctx(
+        layer=Layer.REPORTING,
+        items=[Item(id="p1", type="DataPipeline", display_name="PL_Nightly")],
+        run_history={"p1": _hourly()},
+    ))
+    assert verdict.status is Status.NA
+    assert "not tagged Data Logs or Mixed" in verdict.evidence

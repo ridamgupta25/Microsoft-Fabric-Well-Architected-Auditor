@@ -834,8 +834,9 @@ def monitoring_refresh_cadence(ctx: CheckContext) -> Verdict:
     a day is partial; daily is weak; weekly or less scores nothing. Items are
     selected by name (monitor / telemetry / audit / log / metric / SLA /
     heartbeat …); an alert or notification item is not itself monitoring data, so
-    it is not selected. In a Data Logs workspace, where every runnable item is
-    part of the monitoring estate, all of them are used when no name matches.
+    it is not selected. In a Data Logs workspace — or a Mixed workspace, which
+    plays the Data Logs role too — every runnable item is part of the monitoring
+    estate, so all of them are used when no name matches.
 
     **What it cannot.** It does not read the *configured* schedule — the job
     scheduler's schedule API is not called — so a job configured hourly but
@@ -869,12 +870,16 @@ def monitoring_refresh_cadence(ctx: CheckContext) -> Verdict:
         item_id: stamps for item_id, stamps in history.items()
         if _MONITORING_NAME.search(_name(item_id))
     }
-    candidates = named or (history if ctx.workspace.layer is Layer.LOGS else {})
+    # A Data Logs workspace is entirely a monitoring estate; a Mixed workspace
+    # plays that role too (it is why this Logs-layer check runs on it at all), so
+    # both fall back to judging every item's cadence when nothing is named.
+    monitoring_estate = ctx.workspace.layer in (Layer.LOGS, Layer.MIXED)
+    candidates = named or (history if monitoring_estate else {})
     if not candidates:
         return not_applicable(
             f"None of the {len(history)} item(s) with a run history is identifiable as "
-            f"monitoring-oriented by name, and this workspace is not tagged Data Logs, "
-            f"so there is no monitoring cadence to judge"
+            f"monitoring-oriented by name, and this workspace is not tagged Data Logs "
+            f"or Mixed, so there is no monitoring cadence to judge"
         )
 
     intervals: dict[str, float] = {}
