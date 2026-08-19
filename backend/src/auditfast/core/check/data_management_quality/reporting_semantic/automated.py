@@ -474,6 +474,30 @@ def _ambiguous_pairs(
     return sorted(pairs)
 
 
+def _many_to_many_pairs(model: dict[str, Any]) -> list[tuple[str, str]]:
+    """Active relationships declared many-to-many on both ends — i.e. no bridge.
+
+    A conformed bridge uses two many-to-one relationships through an intermediate
+    table; a relationship whose *own* endpoints are both ``many`` is a direct
+    many-to-many, the "many-to-many without a bridge" the checklist names. TMSL
+    omits the cardinality fields for a standard many-to-one relationship, so only
+    an *explicit* ``many``/``many`` is flagged — a defaulted relationship is not.
+    Inactive relationships propagate no filter, so only active ones are judged.
+    """
+    pairs: set[tuple[str, str]] = set()
+    for rel in _relationships(model):
+        if not _is_active(rel):
+            continue
+        frm = str(rel.get("from_cardinality") or rel.get("fromCardinality") or "").strip().lower()
+        to = str(rel.get("to_cardinality") or rel.get("toCardinality") or "").strip().lower()
+        if frm == "many" and to == "many":
+            many = _table_key(rel.get("from_table") or rel.get("fromTable"))
+            one = _table_key(rel.get("to_table") or rel.get("toTable"))
+            if many and one and many != one:
+                pairs.add((many, one) if many <= one else (one, many))
+    return sorted(pairs)
+
+
 @check(
     id="R-REL-AMBIGUOUS", ref="14.1.2",
     title="Relationships correctly defined (cardinality, active/inactive) with no ambiguous filter paths",
@@ -502,12 +526,18 @@ def relationships_have_no_ambiguous_paths(ctx: CheckContext) -> list[Verdict]:
     are the fingerprint of the problem, not a defect in themselves (a
     ``USERELATIONSHIP`` role-playing dimension is a legitimate use).
 
-    **What it cannot determine.** Cardinality (``fromCardinality`` /
-    ``toCardinality``) is not carried by the parsed TMSL projection, so the
-    "many-to-many without a bridge" half of the point is *not* judged here and
-    the evidence says so; nothing is inferred about it. Whether a particular
-    inactive relationship is deliberate is a modelling judgement and is
-    reported, never scored.
+    **Cardinality is assessed structurally.** The parsed TMSL now carries each
+    relationship's declared ``fromCardinality`` / ``toCardinality`` (definition
+    metadata, never row data). A relationship declared ``many`` on both ends is a
+    direct many-to-many with no bridge table — the "cardinality" half of this
+    point — and is flagged as a defect alongside ambiguous paths. TMSL omits the
+    fields for an ordinary many-to-one relationship, so only an *explicit*
+    many/many is flagged; a defaulted relationship is left alone.
+
+    **What it cannot determine.** Whether a particular inactive relationship is
+    deliberate is a modelling judgement and is reported, never scored. Row-level
+    cardinality (actual distinct-value counts) still needs the rows and is never
+    read.
 
     Distinct from ``R-BIDI-REL`` (ref 14.1.1), which judges only the *direction*
     of cross-filtering on each relationship in isolation. A model can filter in
@@ -529,32 +559,46 @@ def relationships_have_no_ambiguous_paths(ctx: CheckContext) -> list[Verdict]:
     for name, defn in models.items():
         adjacency, duplicates, usable = _directed_filter_graph(defn)
         inactive_total += sum(1 for r in _relationships(defn) if not _is_active(r))
-        if usable < 2:
-            # One (or no) active relationship cannot form a second path.
+        m2m = _many_to_many_pairs(defn)
+        # A model is judged when there is something to assess: a second filter
+        # path is only *possible* with two active relationships, but a direct
+        # many-to-many relationship is a defect on its own, so a model carrying
+        # one is judged even with a single relationship.
+        if usable < 2 and not m2m:
             continue
         judged += 1
-        ambiguous = _ambiguous_pairs(adjacency, duplicates)
-        if not ambiguous:
+        ambiguous = _ambiguous_pairs(adjacency, duplicates) if usable >= 2 else []
+        reasons: list[str] = []
+        if ambiguous:
+            named = ", ".join(f"{left} <-> {right}" for left, right in ambiguous[:10])
+            more = f" (+{len(ambiguous) - 10} more)" if len(ambiguous) > 10 else ""
+            reasons.append(
+                f"{len(ambiguous)} table pair(s) reachable by more than one active "
+                f"filter path: {named}{more}"
+            )
+        if m2m:
+            named = ", ".join(f"{left} <-> {right}" for left, right in m2m[:10])
+            more = f" (+{len(m2m) - 10} more)" if len(m2m) > 10 else ""
+            reasons.append(
+                f"{len(m2m)} direct many-to-many relationship(s) with no bridge "
+                f"table: {named}{more}"
+            )
+        if not reasons:
             clean += 1
             continue
-        named = ", ".join(f"{left} <-> {right}" for left, right in ambiguous[:10])
-        more = f" (+{len(ambiguous) - 10} more)" if len(ambiguous) > 10 else ""
-        offenders[name] = (
-            f"{len(ambiguous)} table pair(s) reachable by more than one active "
-            f"filter path: {named}{more}"
-        )
+        offenders[name] = "; ".join(reasons)
 
     if not judged:
         return [not_applicable(
-            "No semantic model defines two or more active relationships, so no "
-            "second filter path can exist"
+            "No semantic model defines two or more active relationships or a "
+            "many-to-many relationship, so there is no filter path or cardinality "
+            "defect to assess"
         )]
 
     detail = (
         f"{clean} of {judged} semantic model(s) have exactly one active filter path "
-        f"between any two tables; {inactive_total} inactive relationship(s) across the "
-        f"workspace. Relationship cardinality is not part of the parsed model "
-        f"definition, so many-to-many without a bridge is not assessed here."
+        f"between any two tables and no direct many-to-many relationship; "
+        f"{inactive_total} inactive relationship(s) across the workspace"
     )
     verdicts: list[Verdict] = [covered(clean, judged, detail)]
     verdicts += [note(reason, obj=model_name) for model_name, reason in sorted(offenders.items())]

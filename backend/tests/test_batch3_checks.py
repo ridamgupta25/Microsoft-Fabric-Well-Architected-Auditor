@@ -117,8 +117,44 @@ def test_ambiguous_paths_pass_when_the_relationship_graph_is_a_tree():
     verdict = _scored(relationships_have_no_ambiguous_paths(_model_ctx(models)))
     assert verdict.score == _PASS
     assert "1 of 1" in verdict.evidence
-    # The limit is stated, never implied away.
-    assert "cardinality is not part of the parsed model definition" in verdict.evidence
+    assert "no direct many-to-many relationship" in verdict.evidence
+
+
+def _m2m_rel(from_table: str, to_table: str, *, active: bool = True) -> dict:
+    """A relationship declared many-to-many on both ends (no bridge)."""
+    return {
+        "name": f"{from_table}-{to_table}",
+        "from_table": from_table, "from_column": "k",
+        "to_table": to_table, "to_column": "k",
+        "cross_filter": "bothDirections", "is_active": active,
+        "from_cardinality": "many", "to_cardinality": "many",
+    }
+
+
+def test_direct_many_to_many_relationship_is_flagged():
+    """A relationship declared many/many on both ends has no bridge - a defect."""
+    models = {"m": {"relationships": [_m2m_rel("Sales", "Account")]}}
+    outcome = relationships_have_no_ambiguous_paths(_model_ctx(models))
+    assert _scored(outcome).score == _FAIL
+    detail = _details(outcome)[0]
+    assert detail.obj == "m"
+    assert "direct many-to-many" in detail.evidence
+    assert "account <-> sales" in detail.evidence
+
+
+def test_standard_many_to_one_relationship_is_not_flagged_as_many_to_many():
+    """A defaulted (cardinality-omitted) relationship must not read as many-to-many."""
+    models = {"m": {"relationships": [_rel("Sales", "Date"), _rel("Sales", "Customer")]}}
+    verdict = _scored(relationships_have_no_ambiguous_paths(_model_ctx(models)))
+    assert verdict.score == _PASS
+
+
+def test_a_single_many_to_many_relationship_is_judged_not_skipped():
+    """A lone many-to-many relationship is a defect even without a second path."""
+    models = {"m": {"relationships": [_m2m_rel("A", "B")]}}
+    verdict = _scored(relationships_have_no_ambiguous_paths(_model_ctx(models)))
+    assert verdict.score == _FAIL
+    assert "0 of 1" in verdict.evidence
 
 
 def test_ambiguous_paths_fail_when_a_second_active_route_exists():
