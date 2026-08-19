@@ -1418,6 +1418,24 @@ def test_unknown_dimension_member_with_monitoring_passes():
     assert "unknown_count" in verdict.evidence
 
 
+def test_boolean_isin_minus_one_is_not_a_surrogate_key():
+    """A quoted "-1" in a boolean tidy-up (isin) is not a -1 surrogate key.
+
+    Legacy IFS/COM systems store a boolean true as -1, so
+    ``bool_value.isin("-1","1","true","yes","y")`` maps those strings to True.
+    The ``-1`` is a *string* literal inside a membership test, not a numeric
+    surrogate-key fallback, so the completeness monitor does not apply - even
+    when incidental dim/fact table *names* and a CDC ``.join(`` appear elsewhere
+    in the notebook and satisfy the fact-to-dimension gate.
+    """
+    code = ('name_map = {"r5events": "fct_events", "r5meters": "dim_meters"}\n'
+            'delta = old.join(new, keys, "left_anti").count()\n'
+            'df = df.withColumn("flag", '
+            'F.when(bool_value.isin("-1","1","true","yes","y"), F.lit(True))'
+            '.when(bool_value.isin("0","false","no","n"), F.lit(False)))\n')
+    assert nb_unknown_monitored(_nb_ctx(code)).status is Status.NA
+
+
 def test_layer_names_in_comments_do_not_create_reconciliation_scope():
     code = ('# Read from Silver before writing Gold\n'
             'df.write.mode("overwrite").saveAsTable("gold.fact_sales")\n')
