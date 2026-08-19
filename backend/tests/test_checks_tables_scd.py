@@ -26,11 +26,23 @@ from .fixtures.builders import tables_ctx
 
 
 def _dim(*columns: str) -> dict:
-    """A dimension-shaped table: a key, two descriptive attributes, plus extras."""
-    base = ("customer_key", "customer_name", "city")
+    """A dimension-shaped table: a key, two descriptive attributes, plus extras.
+
+    Extra columns are typed from their name, because the check now requires a
+    validity column to carry a temporal type - typing everything ``varchar``
+    made every SCD test look like a non-date column.
+    """
+    base = (("customer_key", "bigint"), ("customer_name", "varchar(100)"),
+            ("city", "varchar(50)"))
+    extra = tuple(
+        (name, "varchar(20)" if any(w in name.lower() for w in
+                                    ("current", "active", "latest", "hash", "version"))
+         else "timestamp")
+        for name in columns
+    )
     return {
         "type": "Managed", "format": "Delta", "store": "WH_Gold",
-        "columns": [{"name": name, "type": "varchar"} for name in base + columns],
+        "columns": [{"name": name, "type": type_} for name, type_ in base + extra],
     }
 
 
@@ -169,6 +181,41 @@ def test_a_complete_dimension_beside_a_half_implemented_one_is_partial():
     ))
     assert verdict.score == 2
     assert "partial marker set" in verdict.evidence
+
+
+def test_a_non_temporal_validity_column_does_not_count():
+    """``valid_from int`` is not a date, whatever it is called.
+
+    A free filter against a false positive: the declared type is already in the
+    snapshot, so a column that cannot hold a point in time never establishes a
+    validity window.
+    """
+    verdict = scd_strategy_per_dimension(tables_ctx(
+        dim_customer={
+            "type": "Managed", "format": "Delta", "store": "WH_Gold",
+            "columns": [
+                {"name": "customer_key", "type": "bigint"},
+                {"name": "customer_name", "type": "varchar(100)"},
+                {"name": "valid_from", "type": "int"},
+                {"name": "valid_to", "type": "int"},
+            ],
+        }))
+    assert verdict.score == 1
+
+
+def test_a_column_with_no_readable_type_still_counts():
+    """An absent type is not evidence against - a partial crawl must not downgrade."""
+    verdict = scd_strategy_per_dimension(tables_ctx(
+        dim_customer={
+            "type": "Managed", "format": "Delta", "store": "WH_Gold",
+            "columns": [
+                {"name": "customer_key", "type": "bigint"},
+                {"name": "customer_name", "type": "varchar(100)"},
+                {"name": "valid_from", "type": ""},
+                {"name": "valid_to", "type": ""},
+            ],
+        }))
+    assert verdict.score == 3
 
 
 def test_no_dimension_is_na():
