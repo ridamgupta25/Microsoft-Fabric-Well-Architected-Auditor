@@ -168,13 +168,8 @@ def sm_directlake_fallback(ctx: CheckContext) -> Verdict:
 
 @check(
     id="SM-AGGREGATIONS", ref="14.2.4",
-<<<<<<< HEAD
-    title="Aggregations / summarizations used for performance-critical models",
-    pillar=Pillar.PERFORMANCE, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
-=======
     title="Aggregations used for performance-critical models",
     pillar=Pillar.DATA_PROCESSING, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
->>>>>>> 250b8d60d0475f1d0b7d07e9c706c72c15f96a08
     layers=MODEL_LAYERS, requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
 )
 def sm_aggregations(ctx: CheckContext) -> Verdict:
