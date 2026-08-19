@@ -74,7 +74,7 @@ def _style_issues(name: str) -> str:
 
 @check(
     id="WS-NAME", ref="IMPL-24", title="Workspace name follows the organization naming convention (e.g., <Domain>-<Env>-<Project>) [WS-NAME]",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.LOW,
     requires=[Resource.WORKSPACE, Resource.ITEMS], required=False,
 )
 def naming_convention(ctx: CheckContext) -> Verdict:
@@ -116,7 +116,7 @@ def naming_convention(ctx: CheckContext) -> Verdict:
 
 @check(
     id="WS-GIT", ref="11.1.1", title="Git integration enabled for Fabric workspaces",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DEVOPS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     requires=[Resource.GIT], required=True,
 )
 def git_connected(ctx: CheckContext) -> Verdict:
@@ -130,7 +130,7 @@ def git_connected(ctx: CheckContext) -> Verdict:
 
 @check(
     id="WS-DEPLOY", ref="11.2.1", title="Fabric Deployment Pipelines configured (Dev → QA → Prod) for all three layer workspaces",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DEVOPS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     requires=[Resource.WORKSPACE], required=True,
 )
 def deployment_pipeline(ctx: CheckContext) -> Verdict:
@@ -162,7 +162,7 @@ GIT_DERIVED_TYPES: frozenset[str] = frozenset({"SQLEndpoint"})
 @check(
     id="WS-GIT-COVERAGE", ref="11.1.2",
     title="All pipelines, notebooks, semantic models, and Warehouse artifacts source-controlled",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DEVOPS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.GIT, Resource.ITEMS], required=True,
 )
 def git_covers_every_artifact(ctx: CheckContext) -> Verdict:
@@ -254,7 +254,7 @@ def _store_purpose(name: str) -> tuple[str, ...]:
 @check(
     id="WS-SINGLE-SOURCE", ref="1.1.8",
     title="Single source of truth — no duplicate data stores serving the same purpose across domains or layers",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.ITEMS], required=True,
 )
 def single_source_of_truth(ctx: CheckContext) -> Verdict:
@@ -352,7 +352,7 @@ def _foreign_tiers_in(text: str) -> set[str]:
 @check(
     id="WS-ENV-ISOLATION", ref="1.1.3",
     title="Environment isolation enforced (Dev / QA / Prod workspaces have no shared mutable artifacts or cross-env dependencies)",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=(Layer.OPERATIONS,),
     requires=[Resource.WORKSPACE, Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -431,7 +431,7 @@ EVENT_SOURCE_TYPES: frozenset[str] = frozenset({
 @check(
     id="WS-ACTIVATOR", ref="10.5.1",
     title="Data Activator (or equivalent) triggers configured for critical events",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.MONITORING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.ITEMS, Resource.ACTIVATOR_DEFINITIONS],
     required=True,
 )
@@ -569,7 +569,7 @@ _PROMOTED_TIERS: frozenset[str] = frozenset({"QA", "UAT", "Staging", "Pre-Prod",
 @check(
     id="WS-BRANCH", ref="11.1.4",
     title="Branching strategy defined (feature branches, main, release)",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DEVOPS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.GIT], required=True,
 )
 def branching_strategy(ctx: CheckContext) -> Verdict:
@@ -658,7 +658,7 @@ _PIPELINE_EXPRESSION = re.compile(
 @check(
     id="WS-WH-DEPLOY", ref="11.4.2",
     title="Warehouse deployments are automated and environment-parameterized (not manual T-SQL in Prod)",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.DEVOPS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=(Layer.OPERATIONS,),
     requires=[Resource.WORKSPACE, Resource.ITEMS, Resource.GIT,
               Resource.PIPELINE_DEFINITIONS], required=True,
@@ -752,7 +752,7 @@ SEMANTIC_REFRESH_TYPES: frozenset[str] = frozenset({
 @check(
     id="WS-SM-DEPLOY", ref="11.4.5",
     title="Semantic model deployment is versioned and part of the Data Consumption pipeline",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DEVOPS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,),
     requires=[Resource.WORKSPACE, Resource.ITEMS, Resource.GIT,
               Resource.PIPELINE_DEFINITIONS], required=True,
@@ -851,7 +851,7 @@ _TRANSFORM_WRITE_RE = re.compile(
 @check(
     id="WS-UNIT-TESTS", ref="11.5.1",
     title="Unit tests exist for critical transformation logic",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DEVOPS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,),
     requires=[Resource.NOTEBOOK_DEFINITIONS, Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -973,7 +973,7 @@ def _copy_sink_types(definition: dict) -> set[str]:
 @check(
     id="WS-GOLD-SECONDARY-COPY", ref="9.2.4",
     title="Critical Gold-layer data has a secondary copy or export mechanism",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.RELIABILITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=(Layer.OPERATIONS,),
     requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS, Resource.SHORTCUTS],
     required=True,
@@ -1090,7 +1090,7 @@ def gold_data_has_a_secondary_copy(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-TIER-DECLARED", ref="11.3.1",
     title="Separate workspaces for Dev, QA, and Production per layer",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DEVOPS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.WORKSPACE],
     required=False,
 )
@@ -1173,7 +1173,7 @@ def _medallion_tiers(name: str) -> set[str]:
 @check(
     id="WS-MEDALLION", ref="1.1.5",
     title="Medallion architecture properly implemented (Bronze Lakehouse -> Silver Lakehouse -> Gold Warehouse) with clear layer boundaries",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.WORKSPACE, Resource.ITEMS], required=True,
 )
 def medallion_architecture(ctx: CheckContext) -> Verdict:

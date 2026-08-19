@@ -8,7 +8,7 @@ it. When that data is available a check can be promoted to a real evaluator.
 
 Do not edit by hand — regenerate with build-manual-checks.py.
 """
-from auditfast.core.check._gated import Requirement, gated
+from auditfast.core.check._gated import Requirement, gated, pillar_for_ref
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Automation, Pillar, Resource, Scope
 
@@ -19,7 +19,7 @@ _CHECKS: list[tuple[str, str, str, tuple[str, ...], bool, str]] = [
 for _id, _ref, _title, _layers, _required, _requirement in _CHECKS:
     check(
         id=_id, ref=_ref, title=_title,
-        pillar=Pillar.SECURITY, scope=Scope.WORKSPACE,
+        pillar=pillar_for_ref(_ref), scope=Scope.WORKSPACE,
         layers=list(_layers), requires=[Resource.WORKSPACE], required=_required,
         automation=Automation.ROADMAP,
     )(gated(Requirement[_requirement]))

@@ -77,7 +77,7 @@ def _notebook_registry() -> CheckRegistry:
     reg = CheckRegistry()
 
     @check(id="NB-GAPTEST", ref="9.99", title="Notebook gap test",
-           pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK,
+           pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK,
            requires=[Resource.NOTEBOOK_DEFINITIONS], registry=reg)
     def _nb(ctx):  # pragma: no cover - never reached when definitions are absent
         return binary(True, "ran")

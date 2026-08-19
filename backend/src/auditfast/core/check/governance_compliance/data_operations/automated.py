@@ -83,7 +83,7 @@ def _wiring(text: str, *, is_pipeline: bool, attached: bool) -> str:
 @check(
     id="GOV-LINEAGE-VIEW", ref="8.1.1",
     title="Fabric lineage view used and accurate for all key data flows",
-    pillar=Pillar.GOVERNANCE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_GOVERNANCE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=_LAYERS,
     requires=[Resource.PIPELINE_DEFINITIONS, Resource.NOTEBOOK_DEFINITIONS],
     required=True,
@@ -155,7 +155,7 @@ def lineage_view_is_accurate(ctx: CheckContext) -> Verdict:
 @check(
     id="GOV-LINEAGE-CROSSDOMAIN", ref="8.1.5",
     title="Cross-domain data dependencies documented in lineage",
-    pillar=Pillar.GOVERNANCE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_GOVERNANCE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=_LAYERS,
     requires=[Resource.PIPELINE_DEFINITIONS, Resource.NOTEBOOK_DEFINITIONS,
               Resource.SHORTCUTS],
@@ -248,7 +248,7 @@ def cross_domain_dependencies_identifiable(ctx: CheckContext) -> Verdict:
 @check(
     id="GOV-FIN-CHANGE-AUDIT", ref="7.2.3",
     title="Audit trail for all data modifications in financial-relevant data",
-    pillar=Pillar.GOVERNANCE, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.COMPLIANCE, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=_LAYERS, requires=[Resource.ITEMS, Resource.WAREHOUSE_AUDIT], required=True,
 )
 def financial_data_modifications_audited(ctx: CheckContext) -> Verdict:
