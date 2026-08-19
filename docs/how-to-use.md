@@ -420,10 +420,21 @@ score; each id links back to its report.](images/11-history.png)
 From any report, use the **Markdown** and **Excel** buttons at the top.
 
 - **Markdown** — a clean, shareable text version of the whole report.
-- **Excel** — a workbook with three tabs:
-  - **Scorecard** — the pillar and overall scores;
-  - **Checks** — every check and its result;
-  - **Risk Register** — the findings laid out as a ready-to-use risk register.
+- **Excel** — a stakeholder workbook aligned to the SQL Auditor framework:
+  - **Summary** — executive narrative, scores, strengths, key risks, validation,
+    and the remediation roadmap;
+  - **Area Detail** — pillar/category scores followed by consolidated strengths
+    and findings;
+  - **Checklist** — one row per consolidated control and one score/result column
+    per workspace, headed by the matching Inventory ID (`WS1`, `WS2`, ...).
+    Scored cells show the engine's weighted raw 0-3 score, not a percentage;
+  - **Findings** — consolidated impacted, non-impacted, and not-assessed assets;
+  - **Risk Register** — ownership, treatment, SLA, closure, and verification fields;
+  - **Invent** — the assessed workspace inventory and its sequential Workspace IDs.
+
+All tabular sheets use filters, frozen identifier columns, wrapped text, bounded
+auto-fit widths, banded rows, appropriate percentage formats in summary views,
+and red-yellow-green conditional formatting for rapid stakeholder review.
 
 When you run from the [command line](#using-the-command-line-no-browser),
 the same files are written to `backend/output/` as `audit-report.md` and
