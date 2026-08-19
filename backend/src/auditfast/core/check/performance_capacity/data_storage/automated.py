@@ -1,7 +1,7 @@
 """Performance & Capacity · Data Storage — OneLake Files layout checks."""
 from __future__ import annotations
 
-from auditfast.core.check.helpers import Verdict, covered, not_applicable
+from auditfast.core.check.helpers import Verdict, covered, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
@@ -50,13 +50,50 @@ def _suffix(summary: dict) -> str:
     return f" ({', '.join(flags)})" if flags else ""
 
 
+#: How many offending files one Lakehouse row names. The crawl already caps its
+#: retained sample; this caps what reaches the report cell.
+_MAX_REPORTED_FILES = 6
+
+
+def _mb(size: int) -> str:
+    """A size in the unit a reviewer thinks in."""
+    if size < 1024 * 1024:
+        return f"{size / 1024:.0f}KB"
+    return f"{size / (1024 * 1024):.0f}MB"
+
+
+def _offender_names(summary: dict, section: str) -> list[str]:
+    """Name a few of the worst-sized files, smallest and largest.
+
+    The two are opposite problems with opposite fixes - compact the tiny ones,
+    split the huge ones - so they are reported separately rather than as one
+    "bad files" list. Paths arrive from the crawl already truncated to their last
+    two segments, so a finding locates the table or folder without persisting the
+    customer's directory structure.
+    """
+    out: list[str] = []
+    smallest = summary.get("smallest_files") or []
+    largest = summary.get("largest_files") or []
+    if smallest:
+        shown = ", ".join(f"{f['path']} ({_mb(int(f['bytes']))})"
+                          for f in smallest[:_MAX_REPORTED_FILES])
+        out.append(f"{section} smallest: {shown}"
+                   + (f" (+{len(smallest) - _MAX_REPORTED_FILES} more sampled)"
+                      if len(smallest) > _MAX_REPORTED_FILES else ""))
+    if largest:
+        shown = ", ".join(f"{f['path']} ({_mb(int(f['bytes']))})"
+                          for f in largest[:_MAX_REPORTED_FILES])
+        out.append(f"{section} largest: {shown}")
+    return out
+
+
 @check(
     id="WS-FILE-SIZE-BANDS", ref="4.3.3",
     title="File sizes avoid the small-file problem (target 128MB-1GB per file)",
     pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=[Layer.STORAGE], requires=[Resource.LAKEHOUSE_FILES], required=True,
 )
-def lakehouse_file_sizes_avoid_small_files(ctx: CheckContext) -> Verdict:
+def lakehouse_file_sizes_avoid_small_files(ctx: CheckContext) -> list[Verdict]:
     """Lakehouse data files are mostly in the healthy 128MB-1GB size band.
 
     **Judged on the Tables section, where the data is.** A Lakehouse's Delta
@@ -73,11 +110,11 @@ def lakehouse_file_sizes_avoid_small_files(ctx: CheckContext) -> Verdict:
     silently treated as a complete count.
     """
     if not ctx.workspace.has(Resource.LAKEHOUSE_FILES):
-        return not_applicable("OneLake Files listings could not be read for Lakehouses")
+        return [not_applicable("OneLake Files listings could not be read for Lakehouses")]
     files_summaries = _summaries(ctx)
     tables_summaries = ctx.workspace.lakehouse_tables_files or {}
     if not files_summaries and not tables_summaries:
-        return not_applicable("No Lakehouse Files summaries were read for this workspace")
+        return [not_applicable("No Lakehouse Files summaries were read for this workspace")]
 
     floor = _int_setting(ctx, "lakehouse_file_size_floor_bytes", _DEFAULT_FILE_SIZE_FLOOR_BYTES)
     ceiling = _int_setting(ctx, "lakehouse_file_size_ceiling_bytes", _DEFAULT_FILE_SIZE_CEILING_BYTES)
@@ -87,9 +124,11 @@ def lakehouse_file_sizes_avoid_small_files(ctx: CheckContext) -> Verdict:
     total_data = healthy = excluded = total_files = 0
     truncated = 0
     details: list[str] = []
+    offenders: dict[str, list[str]] = {}
     for name in sorted(set(files_summaries) | set(tables_summaries)):
         lake_total = lake_ok = 0
         parts: list[str] = []
+        named: list[str] = []
         for section, summary in (("Tables", tables_summaries.get(name)),
                                  ("Files", files_summaries.get(name))):
             if not summary:
@@ -104,28 +143,42 @@ def lakehouse_file_sizes_avoid_small_files(ctx: CheckContext) -> Verdict:
                 truncated += 1
             if data:
                 parts.append(f"{section} {ok}/{data}")
+            # The crawl retains a bounded sample of the worst files, so the
+            # finding can say *which* to look at. Without it the evidence gave a
+            # ratio per Lakehouse and nothing to act on: "0 of 2286 in band" says
+            # the estate has a problem, not where to start.
+            named.extend(_offender_names(summary, section))
         total_data += lake_total
         healthy += lake_ok
         details.append(
             f"{name}: {lake_ok}/{lake_total} data file(s) in band"
             + (f" [{', '.join(parts)}]" if parts else "")
         )
+        if named:
+            offenders[name] = named
 
     if total_data == 0:
-        return not_applicable(
+        return [not_applicable(
             f"No Lakehouse holds assessable data files in its Tables or Files section "
             f"({total_files} file(s) listed; {excluded} Delta log/CRC/marker/metadata file(s) excluded)"
-        )
+        )]
     caveat = (f". {truncated} listing(s) were truncated at the enumeration cap, so the "
               f"counts below are a lower bound" if truncated else "")
-    return covered(
+    verdicts: list[Verdict] = [covered(
         healthy, total_data,
         f"{healthy} of {total_data} assessable Lakehouse data file(s) are in the "
         f"{floor // (1024 * 1024)}MB-{ceiling // (1024 * 1024)}MB target band, counting "
         f"both the Tables (Delta) and Files sections; "
         f"{excluded} obvious non-data file(s) (_delta_log, .crc, metadata JSON, zero-byte "
         f"markers) were excluded. {'; '.join(details)}{caveat}",
-    )
+    )]
+    # One unscored row per Lakehouse, naming a sample of its worst files. Unscored
+    # so that a 90-Lakehouse estate does not let this single point outvote every
+    # other check; named so the finding is somewhere to start rather than a
+    # statistic.
+    for name, named in offenders.items():
+        verdicts.append(note("; ".join(named), obj=name))
+    return verdicts
 
 
 @check(
