@@ -1690,6 +1690,25 @@ def nb_late_arriving(ctx: CheckContext) -> Verdict:
     )
 
 
+def _describe_unknown_fallback(match_text: str) -> str:
+    """A clean, human label for a matched unknown-member fallback.
+
+    The raw regex match is a fragment cut off at the ``-1`` (e.g.
+    ``when(bool_value.isin("-1``), which reads as broken code in a report. This
+    names the *mechanism* instead — keeping the operator keyword so the evidence
+    still points at the code — rather than pasting a truncated expression.
+    """
+    text = match_text.lower()
+    if "unknown" in text and "member" in text:
+        return "a named 'unknown member'"
+    if "inferred" in text or "is_inferred" in text:
+        return "an 'inferred member'"
+    for operator in ("coalesce", "fillna", "na.fill", "otherwise", "when"):
+        if operator in text:
+            return f"a -1 surrogate-key fallback (via {operator}(...))"
+    return "an unknown/inferred member"
+
+
 @check(
     id="NB-UNKNOWN-MONITOR", ref="5.4.4",
     title="Completeness: all expected dimension members present; unknown/orphan member usage monitored",
@@ -1717,15 +1736,21 @@ def nb_unknown_monitored(ctx: CheckContext) -> Verdict:
             f"deterministic unknown/inferred-member fallback (-1 or an explicitly "
             f"named unknown/inferred member)"
         )
+    fallback = _describe_unknown_fallback(member.group(0))
     monitored = _UNKNOWN_MONITORED.search(code)
-    fallback = " ".join(member.group(0).split())
     if monitored:
         signal = " ".join(monitored.group(0).split())
-        return binary(True, f"Notebook '{ctx.obj_name}' uses unknown-member fallback "
-                      f"'{fallback}' and monitors it with '{signal}'")
-    return binary(False, f"Notebook '{ctx.obj_name}' uses unknown-member fallback "
-                  f"'{fallback}' in a fact-to-dimension lookup but never counts, "
-                  f"logs, or audits how many rows use it")
+        return binary(
+            True,
+            f"Notebook '{ctx.obj_name}' routes unmatched keys to {fallback} and "
+            f"monitors its usage (found: {signal}).",
+        )
+    return binary(
+        False,
+        f"Notebook '{ctx.obj_name}' routes unmatched keys to {fallback} in a "
+        f"fact-to-dimension lookup, but never counts, logs, or audits how many rows "
+        f"land on it — a feed that starts producing unmatched keys would look healthy.",
+    )
 
 
 @check(
