@@ -88,7 +88,7 @@ def _model(ctx: CheckContext) -> dict | None:
 @check(
     id="SM-STORAGE-MODE", ref="14.2.1",
     title="Storage mode chosen deliberately (Direct Lake / Import / DirectQuery)",
-    pillar=Pillar.PERFORMANCE, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
     layers=MODEL_LAYERS, requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
 )
 def sm_storage_mode(ctx: CheckContext) -> Verdict:
@@ -134,7 +134,7 @@ def sm_storage_mode(ctx: CheckContext) -> Verdict:
 @check(
     id="SM-DIRECTLAKE-FALLBACK", ref="14.2.2",
     title="Direct Lake fallback behaviour is set deliberately",
-    pillar=Pillar.PERFORMANCE, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
     layers=MODEL_LAYERS, requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
 )
 def sm_directlake_fallback(ctx: CheckContext) -> Verdict:
@@ -168,8 +168,13 @@ def sm_directlake_fallback(ctx: CheckContext) -> Verdict:
 
 @check(
     id="SM-AGGREGATIONS", ref="14.2.4",
+<<<<<<< HEAD
     title="Aggregations / summarizations used for performance-critical models",
     pillar=Pillar.PERFORMANCE, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
+=======
+    title="Aggregations used for performance-critical models",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
+>>>>>>> 250b8d60d0475f1d0b7d07e9c706c72c15f96a08
     layers=MODEL_LAYERS, requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
 )
 def sm_aggregations(ctx: CheckContext) -> Verdict:
@@ -246,7 +251,7 @@ def sm_aggregations(ctx: CheckContext) -> Verdict:
 @check(
     id="SM-COLUMN-SHAPE", ref="14.2.3",
     title="Model size and column cardinality optimized (reduce high-cardinality columns where possible)",
-    pillar=Pillar.PERFORMANCE, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
     layers=MODEL_LAYERS, requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
 )
 def sm_column_shape(ctx: CheckContext) -> Verdict:
@@ -351,7 +356,7 @@ def sm_column_shape(ctx: CheckContext) -> Verdict:
 @check(
     id="SM-QUERY-TRANSFORM", ref="14.2.6",
     title="Warehouse serves the model directly (no per-refresh transformation)",
-    pillar=Pillar.PERFORMANCE, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
     layers=MODEL_LAYERS, requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
 )
 def sm_query_transform(ctx: CheckContext) -> Verdict:

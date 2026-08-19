@@ -18,6 +18,7 @@ import base64
 import contextlib
 import json
 import logging
+import re
 import time
 from collections import Counter
 from collections.abc import Iterable
@@ -323,6 +324,32 @@ class LiveFabricProvider:
             # A .py export: wrap the raw source as a single code cell.
             return {"cells": [{"cell_type": "code", "source": payload}]}, ""
         return None, failure
+
+    def _spark_settings(self, workspace_id: str) -> dict:
+        """The workspace's default Spark runtime, from the Spark settings API.
+
+        ``GET /workspaces/{id}/spark/settings`` returns
+        ``environment.runtimeVersion`` - the runtime a notebook inherits when it
+        binds to no named Environment, which is the commonest setup. Documented
+        as an ordinary delegated read (Viewer is enough), not tenant-admin.
+
+        Only the runtime and the default-environment name are kept: pool sizes
+        and session timeouts are settings no check reads, and the KB must not
+        grow with data nobody uses. A failure yields ``{}`` so the runtime check
+        falls back to its other evidence rather than raising.
+        """
+        status, body = self._get(f"/workspaces/{workspace_id}/spark/settings")
+        if status != 200 or not isinstance(body, dict):
+            log.info("workspace spark settings unavailable for %s (status %s) - "
+                     "notebooks with no bound Environment will have no runtime",
+                     workspace_id, status)
+            return {}
+        environment = body.get("environment") or {}
+        settings = {
+            "runtime_version": str(environment.get("runtimeVersion") or ""),
+            "default_environment": str(environment.get("name") or ""),
+        }
+        return settings if settings["runtime_version"] else {}
 
     def _environment_definition(self, workspace_id: str, item_id: str) -> tuple[dict | None, str]:
         """Read an Environment's Sparkcompute settings from its definition."""
@@ -1110,6 +1137,67 @@ class LiveFabricProvider:
         ]
         return reports, known
 
+    def _report_bindings_from_definitions(self, ctx: WorkspaceContext,
+                                          workspace_id: str) -> list[dict]:
+        """Report → semantic-model bindings from the *Fabric* item definitions.
+
+        The Power BI *Get Reports In Group* API needs a Power BI-audience token,
+        which a Fabric-only sign-in does not have - so the reuse checks reported
+        N/A on a workspace whose bindings were perfectly readable another way.
+        A Report item's ``definition.pbir`` carries ``datasetReference`` as
+        either ``byPath`` (``"../Sales.SemanticModel"``, same workspace) or
+        ``byConnection`` (``"semanticmodelid=<guid>"``), and ``getDefinition``
+        serves it on the Fabric token the crawl already holds.
+
+        Used only as a fallback: the Power BI listing is preferred because it
+        also carries the *owning workspace* of the model, which is what tells a
+        cross-workspace (central-hub) binding apart from a local one.
+        """
+        bindings: list[dict] = []
+        for item in ctx.items:
+            if item.type not in ("Report", "PaginatedReport"):
+                continue
+            parts, _failure = self._definition_parts(workspace_id, item.id)
+            dataset_id = ""
+            for part in parts:
+                if not str(part.get("path") or "").lower().endswith("definition.pbir"):
+                    continue
+                try:
+                    payload = base64.b64decode(part["payload"]).decode("utf-8")
+                    document = json.loads(payload)
+                except (KeyError, ValueError, UnicodeDecodeError):
+                    continue
+                reference = (document.get("datasetReference") or {})
+                by_connection = reference.get("byConnection") or {}
+                connection = str(by_connection.get("connectionString") or "")
+                match = re.search(r"semanticmodelid\s*=\s*([0-9a-fA-F-]{36})", connection)
+                if match:
+                    dataset_id = match.group(1)
+                    break
+                by_path = reference.get("byPath") or {}
+                path = str(by_path.get("path") or "")
+                if path:
+                    # A relative path names the model by *name*, not id; resolve it
+                    # against the item list so the checks still see a stable key.
+                    wanted = path.rsplit("/", 1)[-1].removesuffix(".SemanticModel")
+                    for candidate in ctx.items:
+                        if (candidate.type == "SemanticModel"
+                                and candidate.display_name == wanted):
+                            dataset_id = candidate.id
+                            break
+                    break
+            if dataset_id:
+                bindings.append({
+                    "id": item.id,
+                    "name": item.display_name or item.id,
+                    "dataset_id": dataset_id,
+                    # getDefinition names the model, never its owning workspace.
+                    # Left blank rather than guessed: the reuse check treats an
+                    # unknown owner as local, which is the conservative reading.
+                    "dataset_workspace_id": "",
+                })
+        return bindings
+
     def _enrich_run_history(self, ctx: WorkspaceContext, workspace_id: str) -> None:
         """Fill ``Item.last_run_utc`` from each runnable item's run/refresh history.
 
@@ -1228,6 +1316,8 @@ class LiveFabricProvider:
 
         # Report → semantic-model bindings (Power BI Get Reports In Group). One
         # list call, no per-report fetch: only id/name/datasetId are retained.
+        # A Fabric-native fallback runs after the item list below, for a sign-in
+        # that yielded no Power BI token.
         if Resource.REPORTS in wanted:
             ctx.reports, readable = self._workspace_reports(workspace_id)
             if not readable:
@@ -1257,6 +1347,19 @@ class LiveFabricProvider:
                 ctx.unavailable.add(Resource.ITEMS)
             log.info("fetch %s: %d items by type %s", workspace_id,
                      len(ctx.items), dict(Counter(i.type for i in ctx.items)))
+
+            # Fabric-native fallback for report bindings. definition.pbir carries
+            # the semantic-model reference on the Fabric token the crawl already
+            # holds, so a sign-in with no Power BI token no longer forces the
+            # model-reuse checks to N/A. Runs here because it needs the item list.
+            if Resource.REPORTS in wanted and not ctx.reports:
+                bindings = self._report_bindings_from_definitions(ctx, workspace_id)
+                if bindings:
+                    ctx.reports = bindings
+                    ctx.unavailable.discard(Resource.REPORTS)
+                    log.info("fetch %s: %d report binding(s) recovered from Fabric "
+                             "item definitions (no Power BI token needed)",
+                             workspace_id, len(bindings))
 
         # Per-item run/refresh recency (last_run_utc) plus the per-workspace
         # semantic-model created date. Fetched whenever a recency-needing resource
@@ -1302,6 +1405,15 @@ class LiveFabricProvider:
                         ctx.environments[item.display_name] = record
             self._record_failures(ctx, Resource.ENVIRONMENT_DEFINITIONS,
                                   attempted, read, forbidden, transient)
+
+        # The workspace's *default* Spark runtime, for notebooks that bind to no
+        # named Environment. Deliberately outside the ENVIRONMENT_DEFINITIONS
+        # block above: a workspace with no Environment items still has a default
+        # runtime, and that is exactly the case this exists to answer. Keyed on
+        # the notebook resource because it is the notebook checks that read it.
+        # One call per workspace, not per item.
+        if Resource.NOTEBOOK_DEFINITIONS in wanted or Resource.ENVIRONMENT_DEFINITIONS in wanted:
+            ctx.spark_settings = self._spark_settings(workspace_id)
 
         # The expensive one — one call per pipeline. Only paid for when a
         # selected check actually reads a pipeline definition.
@@ -1422,6 +1534,14 @@ class LiveFabricProvider:
                             ctx.lakehouse_files, item.display_name or item.id, item.id
                         )
                         ctx.lakehouse_files[key] = summary
+                        # Delta table data lives under Tables/, not Files/. Summarising
+                        # only Files/ measured whatever loose files sat in the landing
+                        # area and reported "0 of 3 data files in band" for a Lakehouse
+                        # whose actual Delta data was never looked at.
+                        tables_summary, tables_failure = onelake.lakehouse_tables_summary(
+                            workspace_id, item.id)
+                        if not tables_failure:
+                            ctx.lakehouse_tables_files[key] = tables_summary
                         self._annotate_partitions(ctx, onelake, workspace_id, item)
             self._record_failures(ctx, Resource.LAKEHOUSE_FILES,
                                   attempted, read, forbidden, transient)

@@ -42,7 +42,7 @@ def _options(partial_guidance: str, no_guidance: str) -> list[CheckOption]:
 questionnaire_check(
     id="GOV-LINEAGE-E2E", ref="8.1.2",
     title="End-to-end lineage visible from source system to Gold Warehouse and Power BI",
-    pillar=Pillar.GOVERNANCE, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.DATA_GOVERNANCE, severity=Severity.MEDIUM, layers=_LAYERS,
     question=(
         "Can lineage be followed unbroken from the source system through the Gold Warehouse to the "
         f"Power BI reports that consume it? ({_WHY_LINEAGE})"
@@ -59,7 +59,7 @@ questionnaire_check(
 questionnaire_check(
     id="GOV-TECH-METADATA", ref="8.3.2",
     title="Technical metadata (schema, lineage) automatically captured",
-    pillar=Pillar.GOVERNANCE, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.DATA_GOVERNANCE, severity=Severity.MEDIUM, layers=_LAYERS,
     question=(
         "Is technical metadata — table/warehouse schemas and lineage relationships — captured "
         f"automatically by a scan or scheduled job rather than hand-maintained? ({_WHY_LINEAGE})"
