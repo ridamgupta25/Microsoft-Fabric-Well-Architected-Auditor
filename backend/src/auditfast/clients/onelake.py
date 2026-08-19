@@ -14,6 +14,20 @@ _ONELAKE_BASE = "https://onelake.dfs.fabric.microsoft.com"
 _DEFAULT_MAX_ENTRIES = 5_000
 _MAX_TOP_LEVEL_FOLDERS = 25
 
+#: How many offending file paths one Lakehouse summary retains. A *sample*, not
+#: a list: the point of naming them is to give a reviewer somewhere to start,
+#: and 20 does that. Keeping every path would defeat the reason this summary is
+#: bounded at all - one real crawl carried 4,456 files in a single Lakehouse, so
+#: an unbounded list would grow the KB by the size of the estate and persist the
+#: customer's whole directory structure.
+_MAX_NAMED_FILES = 20
+
+#: Only the two extremes are worth a reviewer's time. A 16-128MB file is
+#: slightly small; a sub-1MB file in a Delta table is the small-file problem
+#: itself, and a >1GB file is the opposite failure. Sampling the extremes keeps
+#: the retained set both small and actionable.
+_TINY_FILE = 1024 * 1024
+
 _UNDER_16MB = 16 * 1024 * 1024
 _UNDER_128MB = 128 * 1024 * 1024
 _UNDER_1GB = 1024 * 1024 * 1024
@@ -235,6 +249,14 @@ def empty_lakehouse_files_summary() -> dict:
             "128mb_1gb": 0,
             "over_1gb": 0,
         },
+        #: A bounded sample of the worst offenders, so a finding can say *which*
+        #: files to look at instead of only how many. Two lists, because they are
+        #: opposite problems with opposite fixes: compact the tiny ones, split
+        #: the huge ones. Paths are relative to the section and truncated to the
+        #: last two segments - enough to locate the table or folder, without
+        #: persisting the customer's full directory structure.
+        "smallest_files": [],
+        "largest_files": [],
         "top_level_folders": [],
         "_top_level": set(),
         "max_depth": 0,
@@ -248,6 +270,11 @@ def _finalize_summary(summary: dict) -> dict:
     summary["top_level_folders"] = sorted(summary["_top_level"])[:_MAX_TOP_LEVEL_FOLDERS]
     summary.pop("_top_level", None)
     summary["sampled"] = bool(summary["truncated"])
+    # Sort and trim once, here, rather than on every file added.
+    summary["smallest_files"].sort(key=lambda entry: entry["bytes"])
+    del summary["smallest_files"][_MAX_NAMED_FILES:]
+    summary["largest_files"].sort(key=lambda entry: entry["bytes"], reverse=True)
+    del summary["largest_files"][_MAX_NAMED_FILES:]
     return summary
 
 
@@ -284,6 +311,36 @@ def _add_entry(summary: dict, item_id: str, entry: dict, section: str = "Files")
     summary["total_bytes"] += size
     bucket = _size_bucket(size)
     summary["size_buckets"][bucket] += 1
+    _sample_offender(summary, parts, size)
+
+
+def _short_path(parts: list[str]) -> str:
+    """The last two path segments - enough to locate a file, not a directory map."""
+    return "/".join(parts[-2:]) if len(parts) > 1 else (parts[-1] if parts else "")
+
+
+def _sample_offender(summary: dict, parts: list[str], size: int) -> None:
+    """Keep a bounded sample of the smallest and largest data files.
+
+    Insertion is O(1) per file with a single comparison against the current worst
+    kept, so a 4,000-file Lakehouse costs no more than counting them. The lists
+    are sorted and trimmed once, in :func:`_finalize_summary`, rather than on
+    every file.
+    """
+    if size < _UNDER_16MB:
+        smallest = summary["smallest_files"]
+        # Only sort/trim when the buffer grows past twice the cap, so the common
+        # path stays an append.
+        smallest.append({"path": _short_path(parts), "bytes": size})
+        if len(smallest) > _MAX_NAMED_FILES * 2:
+            smallest.sort(key=lambda entry: entry["bytes"])
+            del smallest[_MAX_NAMED_FILES:]
+    elif size > _UNDER_1GB:
+        largest = summary["largest_files"]
+        largest.append({"path": _short_path(parts), "bytes": size})
+        if len(largest) > _MAX_NAMED_FILES * 2:
+            largest.sort(key=lambda entry: entry["bytes"], reverse=True)
+            del largest[_MAX_NAMED_FILES:]
 
 
 def _is_directory(entry: dict) -> bool:

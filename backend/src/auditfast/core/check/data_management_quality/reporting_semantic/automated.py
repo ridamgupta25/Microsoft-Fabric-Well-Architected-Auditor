@@ -381,8 +381,14 @@ def complex_measures_use_variables(ctx: CheckContext) -> list[Verdict]:
         f"{repeated} repeat a substantial sub-expression, "
         f"{iterators} use an iterator pattern with a cheaper equivalent"
     )
+    # The offending measures are NOT repeated here. They were, and the combined
+    # string ran to hundreds of names with each one's model buried in a
+    # semicolon-separated run, so a reviewer could not tell which measure belonged
+    # to which model. Each model already gets its own row below, carrying its own
+    # measures and nothing else - which is where that detail belongs.
     if offenders:
-        headline += ". Measures needing attention — " + _offender_breakdown(offenders)
+        headline += (f". {len(offenders)} model(s) carry at least one measure needing "
+                     f"attention; each is listed on its own row below")
     verdicts = [covered(compliant, total, headline)]
     verdicts += [
         binary(False, _measure_detail(names, "break a DAX practice"), obj=model_name)

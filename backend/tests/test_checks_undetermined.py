@@ -207,7 +207,7 @@ def test_try_catch_is_na_when_only_copy_activities_load():
     """
     pipelines = {"P": _pipe(*[_copy(f"Copy {i}") for i in range(10)])}
     workspace = _ws(pipelines=pipelines)
-    verdict = wh_try_catch_transactions(_ctx(None, workspace))
+    verdict = wh_try_catch_transactions(_ctx(None, workspace))[0]
     assert verdict.status is Status.NA
     assert verdict.score is None
     assert "10 Copy activity" in verdict.evidence
@@ -221,7 +221,7 @@ def test_try_catch_judges_readable_sql_regardless_of_copy_count():
         *[_copy(f"Copy {i}") for i in range(10)],
     )}
     workspace = _ws(pipelines=pipelines)
-    verdict = wh_try_catch_transactions(_ctx(None, workspace))
+    verdict = wh_try_catch_transactions(_ctx(None, workspace))[0]
     assert verdict.score == 0
     assert "0 of 1 readable SQL load" in verdict.evidence
     assert "10 Copy activity/activities load without SQL and are out of scope" in verdict.evidence
@@ -233,7 +233,7 @@ def test_try_catch_scores_mixed_readable_loads():
         _script("Bad", _BARE_LOAD),
     )}
     workspace = _ws(pipelines=pipelines)
-    verdict = wh_try_catch_transactions(_ctx(None, workspace))
+    verdict = wh_try_catch_transactions(_ctx(None, workspace))[0]
     assert verdict.score is not None
     assert "1 of 2 readable SQL load" in verdict.evidence
     assert "out of scope" not in verdict.evidence
@@ -241,7 +241,7 @@ def test_try_catch_scores_mixed_readable_loads():
 
 def test_try_catch_unreadable_definitions_are_na():
     workspace = _ws(unavailable={Resource.PIPELINE_DEFINITIONS})
-    verdict = wh_try_catch_transactions(_ctx(None, workspace))
+    verdict = wh_try_catch_transactions(_ctx(None, workspace))[0]
     assert verdict.status is Status.NA
 
 
@@ -252,7 +252,7 @@ def test_try_catch_reads_stored_procedure_bodies():
         sql_routines=[{"store": "WH_Gold", "name": "usp_load",
                        "definition": _TRANSACTIONAL_LOAD}],
     )
-    verdict = wh_try_catch_transactions(_ctx(None, workspace))
+    verdict = wh_try_catch_transactions(_ctx(None, workspace))[0]
     assert verdict.score == 3
     assert "1 of 1 readable SQL load" in verdict.evidence
 
@@ -267,6 +267,6 @@ def test_try_catch_reports_a_called_procedure_whose_body_is_missing():
         "name": "Run load", "type": "SqlServerStoredProcedure",
         "typeProperties": {"storedProcedureName": "dbo.usp_missing"},
     })})
-    verdict = wh_try_catch_transactions(_ctx(None, workspace))
+    verdict = wh_try_catch_transactions(_ctx(None, workspace))[0]
     assert verdict.status is Status.NA
     assert "body is not in this snapshot" in verdict.evidence

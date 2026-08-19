@@ -858,10 +858,45 @@ class LiveFabricProvider:
             if entry is not None:
                 entry["has_declared_key"] = True
 
+        # IDENTITY columns: the table *declares* which column the engine
+        # generates. A check reading this no longer has to infer "generated"
+        # from a column name. Stored per table as a list of column names, since
+        # a check needs to know which column, not merely that one exists.
+        for row in sets.get("identity_columns", ()):
+            entry = table_entry(row[0])
+            if entry is None or not row[1]:
+                continue
+            identity = entry.setdefault("identity_columns", [])
+            if row[1] not in identity:
+                identity.append(str(row[1]))
+
+        # Database-level automatic-statistics switches, per store. Off is a real
+        # misconfiguration a user can reach and we can read - unlike NORECOMPUTE,
+        # which Fabric refuses to set at all.
+        for row in sets.get("database_options", ()):
+            ctx.warehouse_options[endpoint.name] = {
+                "auto_create_stats": bool(row[0]) if row[0] is not None else None,
+                "auto_update_stats": bool(row[1]) if row[1] is not None else None,
+                "auto_update_stats_async": bool(row[2]) if len(row) > 2 and row[2] is not None else None,
+            }
+
         for row in sets.get("stats", ()):
             entry = table_entry(row[0])
-            if entry is not None:
-                entry["statistics"] = int(entry.get("statistics", 0)) + 1
+            if entry is None:
+                continue
+            entry["statistics"] = int(entry.get("statistics", 0)) + 1
+            # `no_recompute = 1` means someone switched automatic refresh off for
+            # this statistic - the only way stale statistics survive on Fabric,
+            # and the one thing worth reporting now the engine maintains the rest.
+            if len(row) > 4 and row[4]:
+                entry["statistics_norecompute"] = int(
+                    entry.get("statistics_norecompute", 0)) + 1
+            # Newest refresh across the table's statistics, so a check can see
+            # whether automatic maintenance is actually running here.
+            if len(row) > 5 and row[5]:
+                stamp = str(row[5])
+                if stamp > str(entry.get("statistics_last_updated") or ""):
+                    entry["statistics_last_updated"] = stamp
 
         # Views and routines are workspace-level, not per table: they describe the
         # load logic, which several Warehouse checks need and none can read today.

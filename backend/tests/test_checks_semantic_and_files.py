@@ -67,7 +67,7 @@ def test_file_sizes_count_the_tables_section():
         lakehouse_files={"Bronze": _summary(data_files=3, in_band=0)},
         lakehouse_tables_files={"Bronze": _summary(data_files=900, in_band=850)},
     )
-    verdict = lakehouse_file_sizes_avoid_small_files(_ctx(workspace))
+    verdict = lakehouse_file_sizes_avoid_small_files(_ctx(workspace))[0]
     assert "850 of 903" in verdict.evidence
     assert "Tables 850/900" in verdict.evidence
     assert "Files 0/3" in verdict.evidence
@@ -78,14 +78,14 @@ def test_file_sizes_work_with_only_a_tables_section():
         id="w",
         lakehouse_tables_files={"Gold": _summary(data_files=10, in_band=10)},
     )
-    verdict = lakehouse_file_sizes_avoid_small_files(_ctx(workspace))
+    verdict = lakehouse_file_sizes_avoid_small_files(_ctx(workspace))[0]
     assert verdict.score == 3
     assert "10 of 10" in verdict.evidence
 
 
 def test_file_sizes_are_na_when_nothing_was_listed():
     workspace = WorkspaceContext(id="w")
-    verdict = lakehouse_file_sizes_avoid_small_files(_ctx(workspace))
+    verdict = lakehouse_file_sizes_avoid_small_files(_ctx(workspace))[0]
     assert verdict.status is Status.NA
 
 
@@ -94,14 +94,14 @@ def test_file_sizes_report_a_truncated_listing():
     truncated = _summary(data_files=5000, in_band=10)
     truncated["truncated"] = True
     workspace = WorkspaceContext(id="w", lakehouse_tables_files={"Big": truncated})
-    verdict = lakehouse_file_sizes_avoid_small_files(_ctx(workspace))
+    verdict = lakehouse_file_sizes_avoid_small_files(_ctx(workspace))[0]
     assert "truncated" in verdict.evidence
     assert "lower bound" in verdict.evidence
 
 
 def test_file_sizes_unreadable_listing_is_na():
     workspace = WorkspaceContext(id="w", unavailable={Resource.LAKEHOUSE_FILES})
-    assert lakehouse_file_sizes_avoid_small_files(_ctx(workspace)).status is Status.NA
+    assert lakehouse_file_sizes_avoid_small_files(_ctx(workspace))[0].status is Status.NA
 
 
 # ---------------------------------------------------------------------------

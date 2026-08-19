@@ -135,6 +135,17 @@ class WorkspaceContext:
     #: ("defines no policy"); the warehouse being absent from the map means it could
     #: not be read, which is N/A.
     warehouse_security: dict[str, list] = field(default_factory=dict)
+    #: Per-Warehouse database options that govern automatic statistics, keyed by
+    #: store name: ``auto_create_stats`` / ``auto_update_stats`` /
+    #: ``auto_update_stats_async``. Read from ``sys.databases``.
+    #:
+    #: These are the *auditable* statistics setting. Fabric maintains statistics
+    #: itself, so no manual UPDATE STATISTICS is required - but a user can switch
+    #: the automatic behaviour off with ALTER DATABASE, and Microsoft says OFF
+    #: "can cause suboptimal query plans and degraded query performance".
+    #: ``None`` means the value could not be read, which is never the same as
+    #: "off".
+    warehouse_options: dict[str, dict] = field(default_factory=dict)
     #: Per-Warehouse SQL audit *configuration*, keyed by warehouse display name.
     #: Each value is the normalised ``settings/sqlAudit`` payload:
     #: ``{"state": str, "enabled": bool, "action_groups": [str], "retention_days": int|None}``.
@@ -281,6 +292,7 @@ class WorkspaceContext:
             "semantic_models": self.semantic_models,
             "refresh_schedules": self.refresh_schedules,
             "warehouse_security": self.warehouse_security,
+            "warehouse_options": self.warehouse_options,
             "warehouse_audit": self.warehouse_audit,
             "run_history": self.run_history,
             "connections": self.connections,
@@ -317,6 +329,7 @@ class WorkspaceContext:
             semantic_models=dict(data.get("semantic_models", {})),
             refresh_schedules=dict(data.get("refresh_schedules", {})),
             warehouse_security=dict(data.get("warehouse_security", {})),
+            warehouse_options=dict(data.get("warehouse_options", {})),
             warehouse_audit=dict(data.get("warehouse_audit", {})),
             run_history=dict(data.get("run_history", {})),
             connections=list(data.get("connections", [])),

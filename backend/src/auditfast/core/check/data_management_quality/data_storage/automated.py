@@ -6,6 +6,7 @@ model. Each check is workspace-scoped and aggregates across every table found.
 """
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
 
@@ -375,7 +376,7 @@ def wh_staging_pattern(ctx: CheckContext) -> Verdict:
     layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
     required=True,
 )
-def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
+def wh_try_catch_transactions(ctx: CheckContext) -> list[Verdict]:
     """Load SQL wraps transactional changes in TRY...CATCH.
 
     **Only readable SQL is judged.** Two sources carry it: stored procedures and
@@ -392,19 +393,24 @@ def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
     were hidden. They are now excluded from the population entirely and reported
     separately as context.
 
+    **The failing loads are named.** An earlier version listed only the
+    *compliant* ones, so a reviewer saw "5 of 12" and the names of the 5 already
+    fine - nothing to act on. Each load missing the handling now gets its own
+    named row, unscored so that one checklist point does not vote once per load.
+
     **When nothing readable exists the answer is N/A, never FAIL.** A workspace
     that loads exclusively through Copy activities has no SQL error-handling
     practice to assess - that is not the same finding as having a bad one.
     """
     if not ctx.workspace.has(Resource.ITEMS):
-        return not_applicable("Workspace items could not be read from Fabric")
+        return [not_applicable("Workspace items could not be read from Fabric")]
 
     storage_items = [
         item for item in ctx.workspace.items
         if item.type in {"Warehouse", "Lakehouse"}
     ]
     if not storage_items:
-        return not_applicable("No Warehouse/Lakehouse items found in this workspace")
+        return [not_applicable("No Warehouse/Lakehouse items found in this workspace")]
 
     inspected: list[tuple[str, bool]] = []
     copy_loads: list[str] = []
@@ -456,33 +462,54 @@ def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
 
     if not inspected:
         if unread_routines:
-            return not_applicable(
+            return [not_applicable(
                 f"{len(unread_routines)} pipeline activity/activities call a stored "
                 f"procedure whose body is not in this snapshot, so TRY...CATCH "
-                f"handling cannot be verified. " + _SQL_PERMISSION_HINT
-            )
+                f"handling cannot be verified: {_named(unread_routines)}. "
+                + _SQL_PERMISSION_HINT
+            )]
         if copy_loads:
-            return not_applicable(
+            return [not_applicable(
                 f"This workspace loads through {len(copy_loads)} Copy activity/activities "
                 f"and declares no SQL load routine. A Copy activity runs no SQL of its "
                 f"own - Fabric generates the load internally - so there is no error "
                 f"handling to assess, which is not the same as having none"
-            )
-        return not_applicable("No SQL load routine or Script activity was found to assess")
+            )]
+        return [not_applicable("No SQL load routine or Script activity was found to assess")]
 
     compliant = [name for name, ok in inspected if ok]
+    offenders = [name for name, ok in inspected if not ok]
     evidence = (
         f"{len(compliant)} of {len(inspected)} readable SQL load(s) use TRY...CATCH "
         "and BEGIN/COMMIT/ROLLBACK transaction handling"
-        + (f"; compliant: {', '.join(compliant[:5])}" if compliant else "")
     )
+    # Name the loads that are *missing* the handling. The previous version listed
+    # only the compliant ones, so a reviewer could see the size of the gap but not
+    # which store or pipeline it was in - the finding said "5 of 12" and named the
+    # 5 that were already fine.
+    if offenders:
+        evidence += (f". No TRY...CATCH with transaction handling in: "
+                     f"{_named(offenders)} - a failure part-way through leaves the "
+                     f"target in a partially loaded state")
+    if compliant:
+        evidence += f". Compliant: {_named(compliant)}"
     if copy_loads:
         evidence += (f". A further {len(copy_loads)} Copy activity/activities load without "
                      f"SQL and are out of scope for this check")
     if unread_routines:
         evidence += (f". {len(unread_routines)} activity/activities call a stored procedure "
-                     f"whose body could not be read")
-    return covered(len(compliant), len(inspected), evidence)
+                     f"whose body could not be read: {_named(unread_routines)}")
+
+    verdicts: list[Verdict] = [covered(len(compliant), len(inspected), evidence)]
+    # Unscored per-object rows so the report's Object column names each load,
+    # without one checklist point voting once per load on a large estate.
+    for name in offenders:
+        verdicts.append(note(
+            "SQL load with no TRY...CATCH and transaction handling - a failure part-way "
+            "through leaves the target partially loaded, with no rollback",
+            obj=name,
+        ))
+    return verdicts
 
 @check(
     id="WS-WH-INCREMENTAL", ref="3.6.6",
@@ -550,11 +577,38 @@ def wh_incremental_loads(ctx: CheckContext) -> Verdict:
     id="WS-WH-STATS", ref="3.6.7",
     title="Statistics are updated after significant Warehouse loads",
     pillar=Pillar.DATA_PROCESSING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
+    layers=TABLE_LAYERS,
+    requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS, Resource.TABLE_SCHEMAS],
     required=True,
 )
 def wh_stats_updated_after_loads(ctx: CheckContext) -> Verdict:
-    """Significant inspectable SQL loads are paired with statistics maintenance."""
+    """Statistics keep pace with Warehouse loads - which Fabric now handles itself.
+
+    **The engine refreshes statistics automatically, so a load with no explicit
+    ``UPDATE STATISTICS`` is not a finding.** Microsoft documents that *"if the
+    query engine determines that existing statistics relevant to query no longer
+    accurately reflect the data, those statistics are automatically refreshed"*,
+    using the same recompilation threshold as SQL Server 2016, and that proactive
+    refresh - which front-loads updates after data changes - is *"enabled by
+    default"* (``learn.microsoft.com/fabric/data-warehouse/statistics``). It
+    applies to the SQL analytics endpoint as well as the Warehouse.
+
+    An earlier version scored every readable load that did not run statistics
+    maintenance as non-compliant. On Fabric that is the normal configuration, so
+    the check was penalising estates for not doing work the platform performs -
+    and asking them to add maintenance that buys nothing.
+
+    **What is still worth reporting.** Microsoft documents one residual use:
+    pre-warming statistics *"if there's a large enough window between your table
+    transformations and your query workload"*, so the first production query
+    does not pay for the refresh. A load that does this is doing something
+    genuinely useful, and gets credit; a load that does not is fine.
+
+    **What it cannot determine.** Whether statistics are accurate or fresh - the
+    engine owns that - or whether any particular table would benefit from
+    pre-warming. Sibling ``WS-STATS-STRATEGY`` (4.4.6) asks the same question
+    from the store's side rather than the load's.
+    """
     if not ctx.workspace.has(Resource.ITEMS):
         return not_applicable("Workspace items could not be read from Fabric")
 
@@ -568,67 +622,66 @@ def wh_stats_updated_after_loads(ctx: CheckContext) -> Verdict:
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
 
-    pipeline_loads: dict[str, list[str]] = {}
-    pipeline_stats: dict[str, list[str]] = {}
-    opaque_loads: list[str] = []
+    loads: set[str] = set()
+    prewarming: set[str] = set()
 
     for pipeline_name, pipeline_def in ctx.workspace.pipelines.items():
         for activity in pipeline_activities(pipeline_def):
-            activity_type = str(activity.get("type", "") or "")
-            activity_name = activity.get("name", activity_type) or activity_type
-            marker = f"{pipeline_name}/{activity_name}"
-
-            if activity_type == "Script":
-                text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
-                if _WAREHOUSE_SQL_LOAD.search(text):
-                    pipeline_loads.setdefault(pipeline_name, []).append(marker)
-                if _STATS_UPDATE_SQL.search(text):
-                    pipeline_stats.setdefault(pipeline_name, []).append(marker)
+            if str(activity.get("type", "") or "") != "Script":
                 continue
+            text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
+            if _WAREHOUSE_SQL_LOAD.search(text):
+                loads.add(pipeline_name)
+            if _STATS_UPDATE_SQL.search(text):
+                prewarming.add(pipeline_name)
 
-            if activity_type in ("Copy", "SqlServerStoredProcedure", "StoredProcedure"):
-                opaque_loads.append(marker)
+    for routine in ctx.workspace.sql_routines:
+        body = str(routine.get("definition") or "")
+        name = str(routine.get("name") or "stored procedure")
+        if _WAREHOUSE_SQL_LOAD.search(body):
+            loads.add(name)
+        if _STATS_UPDATE_SQL.search(body):
+            prewarming.add(name)
 
-    inspectable_pipelines = sorted(pipeline_loads)
+    engine = ("Fabric refreshes statistics automatically when the optimizer finds them "
+              "stale, and proactive refresh front-loads updates after data changes "
+              "(on by default), so a load that runs no UPDATE STATISTICS is correctly "
+              "configured")
 
-    # Statistics maintenance also lives in stored procedures, and the Warehouse's
-    # own ``sys.stats`` says whether user-created statistics exist at all - a
-    # second, structural answer to the same question.
-    routine_loads = [
-        r for r in ctx.workspace.sql_routines
-        if _WAREHOUSE_SQL_LOAD.search(str(r.get("definition") or ""))
-    ]
-    routine_stats = [
-        r for r in routine_loads
-        if _STATS_UPDATE_SQL.search(str(r.get("definition") or ""))
-    ]
-
-    if not inspectable_pipelines and not routine_loads:
-        if opaque_loads:
-            return not_applicable(
-                f"{len(opaque_loads)} load activity/activities run through a Copy or "
-                "stored procedure whose SQL is not in this snapshot, and the "
-                "Warehouse declared no routine body to read, so post-load "
-                "statistics maintenance cannot be verified. " + _SQL_PERMISSION_HINT
-            )
-        return not_applicable("No significant readable SQL warehouse/lakehouse load was found")
-
-    total = len(inspectable_pipelines) + len(routine_loads)
-    compliant_pipelines = [name for name in inspectable_pipelines if pipeline_stats.get(name)]
-    compliant = len(compliant_pipelines) + len(routine_stats)
-    evidence = (
-        f"{compliant} of {total} readable load(s) also run statistics maintenance "
-        "(UPDATE STATISTICS / sp_updatestats / ANALYZE TABLE)"
+    # Verified, not assumed: a store with AUTO_CREATE/UPDATE_STATISTICS switched
+    # off does not get the automatic maintenance these loads otherwise rely on.
+    auto_off = sorted(
+        store for store, opts in (ctx.workspace.warehouse_options or {}).items()
+        if opts.get("auto_create_stats") is False or opts.get("auto_update_stats") is False
     )
-    if routine_loads:
-        evidence += (f"; {len(routine_stats)} of {len(routine_loads)} Warehouse stored "
-                     f"procedure(s) that load data maintain statistics")
-    if opaque_loads:
-        evidence += f"; {len(opaque_loads)} Copy activity/activities run no readable SQL"
-    if compliant_pipelines:
-        evidence += f"; compliant pipelines: {', '.join(compliant_pipelines[:5])}"
+    if auto_off and loads:
+        return graded(
+            1,
+            f"{len(loads)} readable load path(s) feed store(s) where automatic statistics "
+            f"are switched OFF ({_named(auto_off)}). Those loads run no UPDATE STATISTICS "
+            f"and the engine will not refresh for them either, so plans are built from "
+            f"stale or missing histograms",
+        )
 
-    return covered(compliant, total, evidence)
+    if prewarming:
+        return graded(
+            3,
+            f"{engine}. {len(prewarming)} load path(s) additionally pre-warm statistics "
+            f"({_named(sorted(prewarming))}) - the one case Microsoft still documents for "
+            f"manual maintenance, removing first-query latency after a batch load",
+        )
+    if loads:
+        return graded(
+            3,
+            f"{engine}, and automatic statistics are confirmed ON for every readable "
+            f"store. {len(loads)} readable load path(s) rely on that automatic "
+            f"maintenance. Pre-warming statistics in a maintenance window would remove "
+            f"first-query latency, but is an optimisation rather than a requirement",
+        )
+    return not_applicable(
+        "No readable SQL warehouse/lakehouse load was found, so there is no load path "
+        "to assess for statistics handling"
+    )
 
 
 @check(
@@ -1163,6 +1216,24 @@ def table_type_sizing(ctx: CheckContext) -> Verdict:
     )
 
 
+#: How many offending object names one evidence string carries. Enough to act
+#: on, few enough to stay readable in a report cell - the same limit the other
+#: naming checks in this module use.
+_MAX_NAMED_TABLES = 5
+
+
+def _named(names: list[str]) -> str:
+    """``"a, b, c (+4 more)"`` - a bounded, sorted list of offenders.
+
+    A finding that reports only a ratio ("43 of 80 dimensions") tells a reviewer
+    the size of the problem and nothing about where it is. Naming the objects is
+    what makes the row actionable.
+    """
+    shown = ", ".join(names[:_MAX_NAMED_TABLES])
+    extra = len(names) - _MAX_NAMED_TABLES
+    return f"{shown} (+{extra} more)" if extra > 0 else shown
+
+
 @check(
     id="TB-SURROGATE-GEN", ref="4.4.4",
     title="Surrogate keys are implemented for dimensions with a generated-key pattern",
@@ -1170,37 +1241,103 @@ def table_type_sizing(ctx: CheckContext) -> Verdict:
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=True,
 )
-def table_surrogate_generated(ctx: CheckContext) -> Verdict:
+def table_surrogate_generated(ctx: CheckContext) -> list[Verdict]:
     """Dimension schemas include surrogate keys with generation-oriented naming hints.
 
-    This is a schema-level proxy for generated-key patterns. It cannot inspect ETL
-    code paths (hash/window/key-table logic), so it looks for surrogate-key columns
-    plus a generation hint in the declared column names.
+    **Declared evidence first.** Fabric Warehouse supports ``IDENTITY`` columns,
+    and Microsoft names them the way to build a surrogate key: *"IDENTITY columns
+    enable automatic generation of these surrogate keys when inserting new rows
+    into a table"* (``learn.microsoft.com/fabric/data-warehouse/identity``). The
+    crawl reads ``sys.identity_columns``, so where a table declares one this
+    check reports a fact rather than an inference.
+
+    **Names are the fallback, not the primary signal.** Nothing in Fabric flags
+    a column as "a surrogate key" - it is a design convention - and a Lakehouse
+    Delta table has no ``IDENTITY`` concept at all, so on Lakehouse tables the
+    naming proxy is all there is. It cannot inspect ETL code paths
+    (hash/window/key-table logic) either. The evidence says which basis was used.
+
+    **Each offending dimension is its own scored row.** A single workspace-level
+    ratio ("43 of 80") named no object, so a reviewer could not act on it: the
+    report's Object column was empty and the affected tables were invisible.
+    Following ``R-MODEL-HIDDEN-KEYS`` (14.1.8), the summary verdict is followed
+    by one row per offending table carrying its name.
+
+    **The two ways a dimension fails are different problems**, so they read
+    differently. A dimension with *no surrogate key at all* is keyed on its
+    business key - and Microsoft is explicit that "a surrogate key is required
+    because there will be duplicate natural keys when multiple versions are
+    stored", so this blocks SCD Type 2 outright. A dimension that *has* a
+    surrogate key but keeps no natural/business key beside it breaks the ETL
+    lookup Kimball describes, where an incoming row is matched by natural key to
+    find its surrogate.
     """
     if not ctx.workspace.tables:
-        return not_applicable(_NO_TABLES)
+        return [not_applicable(_NO_TABLES)]
     dims = {n: t for n, t in dimensions_in(ctx.workspace.tables, _models(ctx)).items()
             if columns(t)}
     if not dims:
-        return not_applicable(_NO_DIMS)
+        return [not_applicable(_NO_DIMS)]
 
-    compliant = 0
-    for table in dims.values():
+    compliant: list[str] = []
+    declared: list[str] = []
+    no_surrogate: list[str] = []
+    no_hint: list[str] = []
+    for name, table in sorted(dims.items()):
         names = col_names(table)
-        has_surrogate = any(
+        identity = [str(c).lower() for c in (table.get("identity_columns") or [])]
+        has_surrogate = bool(identity) or any(
             n.endswith(("_sk", "_key")) or n in {"surrogate_key", "surrogate_id"}
             for n in names
         )
-        has_generated_hint = any(_GENERATED_KEY_HINT.search(n) for n in names)
+        has_generated_hint = bool(identity) or any(
+            _GENERATED_KEY_HINT.search(n) for n in names)
         has_business_hint = any(_BUSINESS_KEY_HINT.search(n) for n in names)
         if has_surrogate and (has_generated_hint or has_business_hint):
-            compliant += 1
+            compliant.append(name)
+            if identity:
+                declared.append(f"{name}.{identity[0]}")
+        elif not has_surrogate:
+            no_surrogate.append(name)
+        else:
+            no_hint.append(name)
 
-    return covered(
-        compliant, len(dims),
-        f"{compliant} of {len(dims)} dimension table(s) include surrogate keys with "
-        "generation-oriented naming evidence",
-    )
+    basis = (f". {len(declared)} confirmed by a declared IDENTITY column "
+             f"({_named(declared)}) rather than inferred from naming"
+             if declared else
+             ". No dimension declares an IDENTITY column, so this rests on column "
+             "naming - Lakehouse Delta tables have no IDENTITY concept, and Fabric "
+             "exposes no flag marking a column as a surrogate key")
+
+    verdicts: list[Verdict] = [covered(
+        len(compliant), len(dims),
+        f"{len(compliant)} of {len(dims)} dimension table(s) implement a surrogate key "
+        f"with a generated-key pattern{basis}",
+    )]
+    # The per-object rows are UNSCORED. They exist so the report names the
+    # affected tables - the reviewer's "object name not captured" - not to vote
+    # again on a verdict the summary already cast.
+    #
+    # Scoring them would let one checklist point dominate the roll-up on a large
+    # estate: a workspace with 120 dimensions emitted 121 scored rows out of ~375
+    # in total, so this single point carried a third of the score, while an
+    # unrelated critical finding still carried one row. It would also punish size
+    # rather than quality - two estates equally bad at surrogate keys would score
+    # very differently purely because one has more tables. The summary's ratio
+    # already reflects the proportion, which is the fair measure.
+    for name in no_surrogate:
+        verdicts.append(note(
+            "No surrogate key column - the dimension is keyed on its business key, so "
+            "no second version of a member can be stored (SCD Type 2 is not possible)",
+            obj=name,
+        ))
+    for name in no_hint:
+        verdicts.append(note(
+            "Surrogate key present but no natural/business key beside it - an "
+            "incremental load cannot match an incoming row back to its dimension row",
+            obj=name,
+        ))
+    return verdicts
 
 
 @check(
@@ -1211,7 +1348,7 @@ def table_surrogate_generated(ctx: CheckContext) -> Verdict:
     requires=[Resource.TABLE_SCHEMAS, Resource.SEMANTIC_MODEL_DEFINITIONS],
     required=True,
 )
-def table_relationships_declared(ctx: CheckContext) -> Verdict:
+def table_relationships_declared(ctx: CheckContext) -> list[Verdict]:
     """Fact tables declare their key relationships somewhere machine-readable.
 
     **Two sources, strongest first.** A Warehouse can declare ``NOT ENFORCED``
@@ -1221,17 +1358,23 @@ def table_relationships_declared(ctx: CheckContext) -> Verdict:
     that never declared any), semantic-model relationships are the fallback:
     they are the same structure expressed in the model rather than the database.
 
+    **Each undeclared fact is its own scored row.** A single ratio named no
+    object, leaving the report's Object column empty and the affected tables
+    invisible. Following ``R-MODEL-HIDDEN-KEYS`` (14.1.8), a summary verdict is
+    followed by one row per fact table that declares nothing.
+
     **What it cannot determine.** Whether a declared relationship is *correct* -
     Fabric does not enforce these constraints, so a declaration is a statement of
     intent, not a guarantee that the data honours it. ``NB-FK-INTEGRITY`` (5.3.2)
     is what looks for code that actually validates the values.
     """
     if not ctx.workspace.tables:
-        return not_applicable(_NO_TABLES)
+        return [not_applicable(_NO_TABLES)]
 
     facts = list(facts_in(ctx.workspace.tables, _models(ctx)))
     if not facts:
-        return not_applicable("No fact-like tables found to assess for declared FK relationships")
+        return [not_applicable(
+            "No fact-like tables found to assess for declared FK relationships")]
 
     # Declared database constraints - the direct answer where they exist.
     with_constraint = {
@@ -1257,10 +1400,10 @@ def table_relationships_declared(ctx: CheckContext) -> Verdict:
         name for name in facts if _norm_name(name) in linked_tables
     }
     if not declared and not models and not with_constraint:
-        return not_applicable(
+        return [not_applicable(
             "Neither declared database constraints nor semantic-model "
             "relationships could be read, so key relationships cannot be assessed"
-        )
+        )]
 
     evidence = (f"{len(declared)} of {len(facts)} fact-like table(s) declare their key "
                 f"relationships")
@@ -1270,89 +1413,153 @@ def table_relationships_declared(ctx: CheckContext) -> Verdict:
     else:
         evidence += (" through semantic-model relationships; no Warehouse FK constraint "
                      "is declared, which Fabric supports as NOT ENFORCED metadata")
-    return covered(len(declared), len(facts), evidence)
+
+    verdicts: list[Verdict] = [covered(len(declared), len(facts), evidence)]
+    # Unscored, for the reason given on TB-SURROGATE-GEN above: these rows name
+    # the affected tables, they do not re-cast the summary's verdict. On a
+    # 133-fact estate, scoring them would give this one point 126 votes out of
+    # ~375 rows and would penalise a large estate over a small one with the same
+    # proportion of gaps.
+    for name in sorted(set(facts) - declared):
+        verdicts.append(note(
+            "No declared relationship - neither a Warehouse FK constraint nor a "
+            "semantic-model relationship, so nothing machine-readable states how this "
+            "table joins to its dimensions",
+            obj=name,
+        ))
+    return verdicts
 
 
 @check(
     id="WS-STATS-STRATEGY", ref="4.4.6",
     title="Statistics maintenance strategy is defined and automated",
     pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS], required=True,
+    layers=TABLE_LAYERS,
+    requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS, Resource.TABLE_SCHEMAS],
+    required=True,
 )
-def stats_strategy_defined(ctx: CheckContext) -> Verdict:
-    """A statistics-maintenance strategy is defined and automated.
+def stats_strategy_defined(ctx: CheckContext) -> list[Verdict]:
+    """Statistics exist, and nothing has disabled their automatic maintenance.
 
-    Three sources of evidence, strongest first: statistics objects the Warehouse
-    actually holds (``sys.stats``, counted per table during the crawl), stored
-    procedures that maintain them, and pipeline Script activities that run
-    ``UPDATE STATISTICS``. The first is structural - it says statistics exist,
-    not merely that some code mentions them.
+    **Fabric maintains statistics itself, so "no manual strategy" is not a
+    finding.** The engine *"automatically creates those statistics if they don't
+    already exist"* whenever the optimizer needs them, and *"if the query engine
+    determines that existing statistics relevant to query no longer accurately
+    reflect the data, those statistics are automatically refreshed"*
+    (``learn.microsoft.com/fabric/data-warehouse/statistics``). Proactive refresh
+    is *"enabled by default"*. This applies to the SQL analytics endpoint as well
+    as the Warehouse.
+
+    An earlier version scored a workspace down for having no pipeline or stored
+    procedure running ``UPDATE STATISTICS``. On Fabric that is the normal,
+    correct configuration, so the check reported a gap that no longer exists.
+
+    **But passing on the strength of that alone would be an assumption, not an
+    audit.** ``sys.stats.no_recompute`` is the one readable setting that turns the
+    automatic refresh *off* for a statistics object - a deliberate act, and the
+    only way an estate genuinely ends up with stale statistics on Fabric. The
+    crawl now reads it, so this check verifies that nothing has been disabled
+    rather than trusting that the platform is doing its job.
+
+    **Pre-warming earns credit, never a requirement.** Microsoft documents one
+    residual use for manual statistics: running them *"if there's a large enough
+    window between your table transformations and your query workload"*, which
+    removes first-query latency after a batch load.
+
+    **What it cannot determine.** Whether a given statistic is *accurate*, or
+    whether a heavily-queried table would benefit from pre-warming. A table with
+    no statistics is expected rather than a gap - they are created on first
+    query.
     """
     if not ctx.workspace.has(Resource.ITEMS):
-        return not_applicable("Workspace items could not be read from Fabric")
+        return [not_applicable("Workspace items could not be read from Fabric")]
 
-    storage_items = [item for item in ctx.workspace.items if item.type in {"Warehouse", "Lakehouse"}]
+    storage_items = [item for item in ctx.workspace.items
+                     if item.type in {"Warehouse", "Lakehouse"}]
     if not storage_items:
-        return not_applicable("No Warehouse/Lakehouse items found in this workspace")
+        return [not_applicable("No Warehouse/Lakehouse items found in this workspace")]
 
-    inspectable = 0
-    automated = 0
-    opaque = 0
+    tables = ctx.workspace.tables or {}
+    options = ctx.workspace.warehouse_options or {}
+    if not tables and not options:
+        return [not_applicable(
+            "Neither the tables a store holds nor its database options could be read, "
+            "so statistics handling is not assessable. " + _SQL_PERMISSION_HINT
+        )]
 
-    if ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
-        for _, pipeline_def in (ctx.workspace.pipelines or {}).items():
-            for activity in pipeline_activities(pipeline_def):
-                activity_type = str(activity.get("type", "") or "")
-                if activity_type == "Script":
-                    text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
-                    if _STATS_UPDATE_SQL.search(text):
-                        inspectable += 1
-                        automated += 1
-                    elif _WAREHOUSE_SQL_LOAD.search(text):
-                        inspectable += 1
-                    continue
+    with_stats = sum(1 for table in tables.values() if table.get("statistics"))
 
-                if activity_type in ("Copy", "SqlServerStoredProcedure", "StoredProcedure"):
-                    opaque += 1
-
-    # Stored procedures that load data: do they maintain statistics too?
-    for routine in ctx.workspace.sql_routines:
-        text = str(routine.get("definition") or "")
-        if _STATS_UPDATE_SQL.search(text):
-            inspectable += 1
-            automated += 1
-        elif _WAREHOUSE_SQL_LOAD.search(text):
-            inspectable += 1
-
-    # Statistics the Warehouse actually holds - the structural signal.
-    tables_with_stats = sum(
-        1 for table in (ctx.workspace.tables or {}).values()
-        if table.get("statistics")
+    # The genuinely auditable setting. Fabric maintains statistics itself, so no
+    # manual schedule is required - but a user can switch that automatic
+    # behaviour off, and Microsoft says OFF "can cause suboptimal query plans and
+    # degraded query performance". `None` means unreadable, never "off".
+    auto_off = sorted(
+        store for store, opts in options.items()
+        if opts.get("auto_create_stats") is False or opts.get("auto_update_stats") is False
+    )
+    checked = sorted(
+        store for store, opts in options.items()
+        if opts.get("auto_create_stats") is not None or opts.get("auto_update_stats") is not None
     )
 
-    if inspectable == 0:
-        if tables_with_stats:
-            return note(
-                f"No load automation could be inspected for a statistics strategy, but "
-                f"{tables_with_stats} table(s) carry statistics objects, so statistics "
-                f"exist even though nothing readable maintains them on a schedule"
-            )
-        if opaque:
-            return not_applicable(
-                f"{opaque} load activity/activities run through a Copy or stored "
-                "procedure whose SQL is not in this snapshot, and no Warehouse "
-                "routine was readable, so a statistics strategy cannot be verified. "
-                + _SQL_PERMISSION_HINT
-            )
-        return not_applicable("No readable storage-load automation was found to evaluate statistics strategy")
+    prewarming: list[str] = []
+    if ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        for name, pipeline_def in (ctx.workspace.pipelines or {}).items():
+            for activity in pipeline_activities(pipeline_def):
+                if str(activity.get("type", "") or "") != "Script":
+                    continue
+                text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
+                if _STATS_UPDATE_SQL.search(text):
+                    prewarming.append(name)
+                    break
+    for routine in ctx.workspace.sql_routines:
+        if _STATS_UPDATE_SQL.search(str(routine.get("definition") or "")):
+            prewarming.append(str(routine.get("name") or "stored procedure"))
 
-    evidence = (f"{automated} of {inspectable} readable load automation step(s) include "
-                f"statistics maintenance")
-    if tables_with_stats:
-        evidence += f"; {tables_with_stats} table(s) carry statistics objects"
-    return covered(automated, inspectable, evidence,
-                   obj="readable load automation steps")
+    engine = ("Fabric creates and refreshes statistics automatically at query time "
+              "(incremental and proactive refresh are on by default), so no manual "
+              "maintenance schedule is required")
 
+    if auto_off:
+        verdicts: list[Verdict] = [covered(
+            len(checked) - len(auto_off), max(len(checked), 1),
+            f"{len(auto_off)} store(s) have AUTO_CREATE_STATISTICS or "
+            f"AUTO_UPDATE_STATISTICS switched OFF ({_named(auto_off)}). That disables the "
+            f"automatic maintenance Fabric otherwise performs, and Microsoft documents the "
+            f"OFF state as causing suboptimal query plans and degraded query performance",
+        )]
+        for store in auto_off:
+            verdicts.append(note(
+                "Automatic statistics creation or update is switched off for this store "
+                "(ALTER DATABASE ... SET AUTO_CREATE_STATISTICS / AUTO_UPDATE_STATISTICS "
+                "OFF), so query plans will be built from missing or stale histograms",
+                obj=store,
+            ))
+        return verdicts
+
+    verified = (f", and automatic statistics are confirmed ON for all {len(checked)} "
+                f"readable store(s)" if checked else
+                ". The database options that would disable it could not be read for any "
+                "store, so that half is unverified")
+
+    if prewarming:
+        return [graded(
+            3,
+            f"{engine}{verified}. {len(prewarming)} load step(s) additionally pre-warm "
+            f"statistics ({_named(sorted(set(prewarming)))}), removing first-query latency "
+            f"after a batch load - the one case Microsoft still documents for manual "
+            f"CREATE/UPDATE STATISTICS"
+            + (f". {with_stats} table(s) already carry statistics objects"
+               if with_stats else ""),
+        )]
+
+    return [graded(
+        3,
+        f"{engine}{verified}. {with_stats} of {len(tables)} readable table(s) already "
+        f"carry statistics objects; the rest acquire them on first query. No load step "
+        f"pre-warms statistics, which is optional - it only removes first-query latency "
+        f"after a batch load",
+    )]
 @check(
     id="TB-DATEDIM", ref="4.5.7", title="Date/Time dimension exists with all required attributes (fiscal periods, quarter, holidays)",
     pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
@@ -3177,13 +3384,60 @@ _DEFAULT_SLA_HOURS = 48
 #: How many stale item names to name in the evidence before summarising.
 _MAX_NAMED_STALE = 5
 
+#: Item types whose run/refresh history Fabric actually records. A Warehouse or
+#: Lakehouse is a *store*, not a job: nothing "runs" it, so ``last_run_utc`` is
+#: never populated for one. A freshness check that reads that field on a
+#: Warehouse is asking for a value the platform does not keep - which is why
+#: this check reported "0 of 6 carry a readable timestamp" on every
+#: Warehouse-based estate, and always would have.
+_RUNNABLE_ITEM_TYPES = frozenset({
+    "DataPipeline", "Notebook", "Dataflow", "SparkJobDefinition", "SemanticModel",
+})
+
+
+def _writes_to(definition: dict, item_ids: set[str]) -> set[str]:
+    """Which of ``item_ids`` a pipeline definition references.
+
+    Read from the **id references the definition already carries** - a Fabric
+    activity names its target store by ``artifactId``/``workspaceId``, not by
+    display name - so this is a fact the pipeline states, not two objects paired
+    because their names look alike.
+    """
+    blob = json.dumps(definition)
+    return {item_id for item_id in item_ids if item_id and item_id in blob}
+
+
+def _store_freshness(ctx: CheckContext, store: Item) -> tuple[str | None, str]:
+    """``(timestamp, source)`` for a store that has no run history of its own.
+
+    A Warehouse is refreshed by whatever loads it, so the newest run of a
+    pipeline or notebook that *references this store by id* is the readable
+    proxy for "when was this data last written". Returns ``(None, "")`` when
+    nothing references it, which the caller must treat as unknown rather than
+    stale.
+    """
+    newest: str | None = None
+    source = ""
+    for item in ctx.workspace.items:
+        if item.type not in {"DataPipeline", "Notebook"} or not item.last_run_utc:
+            continue
+        definition = (ctx.workspace.pipelines or {}).get(item.display_name) \
+            or (ctx.workspace.notebooks or {}).get(item.display_name)
+        if not definition or not _writes_to(definition, {store.id}):
+            continue
+        if newest is None or item.last_run_utc > newest:
+            newest = item.last_run_utc
+            source = item.display_name or item.id
+    return newest, source
+
+
 def _serving_items(ctx: CheckContext) -> list[Item]:
     """The workspace's Gold/serving items.
 
     Every **Warehouse** qualifies by type: a Fabric Warehouse exists to be
     queried by reports, so it *is* the serving surface regardless of what it is
     called. A **Lakehouse** or **SemanticModel** qualifies only when its name
-    carries a serving token â€” a Bronze/Silver lakehouse is not Gold, and nothing
+    carries a serving token - a Bronze/Silver lakehouse is not Gold, and nothing
     else in the item list distinguishes them.
     """
     serving: list[Item] = []
@@ -3221,11 +3475,21 @@ def gold_items_refreshed_within_sla(ctx: CheckContext) -> Verdict:
     :func:`name_words` splitter.
 
     **What it cannot determine.** This is the item's **last run/refresh**, which
-    is the closest readable proxy for "the Gold *table* was updated" â€” Delta
+    is the closest readable proxy for "the Gold *table* was updated" - Delta
     table commit times are not fetched, so a run that succeeded while writing
     nothing still reads as fresh, and a table updated by a pipeline in another
     workspace reads as stale here. It also cannot read the *agreed* SLA: the
     window is a project setting, not something the tenant publishes.
+
+    **A store carries no run history of its own.** Fabric records
+    ``last_run_utc`` only for runnable items - pipelines, notebooks, dataflows,
+    Spark jobs, semantic models. A Warehouse or Lakehouse is a store, so nothing
+    "runs" it. Reading that field on a Warehouse asked for a value the platform
+    does not keep, and the check reported "0 of 6 carry a readable timestamp" on
+    every Warehouse-based estate - a structural mismatch, not a permission gap.
+    Those stores now take their freshness from the newest run of a pipeline or
+    notebook that **references them by id** in its definition, which is the load
+    that writes them.
 
     **Missing timestamps are excluded, never counted stale.** An item with no
     readable last-run stamp leaves the denominator entirely â€” "we could not read
@@ -3256,13 +3520,28 @@ def gold_items_refreshed_within_sla(ctx: CheckContext) -> Verdict:
             "serving / curated / mart / presentation"
         )
 
-    dated = [(i, parse_stamp(i.last_run_utc)) for i in serving]
-    readable = [(i, stamp) for i, stamp in dated if stamp is not None]
+    dated: list[tuple[Item, object, str]] = []
+    for item in serving:
+        stamp = parse_stamp(item.last_run_utc)
+        source = "its own run/refresh history"
+        if stamp is None and item.type in {"Warehouse", "Lakehouse"}:
+            # A store has no run history of its own - Fabric records that only
+            # for runnable items. The load that writes it does, so use the
+            # newest run of a pipeline/notebook that references this store by id.
+            loader_stamp, loader = _store_freshness(ctx, item)
+            stamp = parse_stamp(loader_stamp)
+            if stamp is not None:
+                source = f"the load that writes it ({loader})"
+        dated.append((item, stamp, source))
+
+    readable = [(i, stamp, source) for i, stamp, source in dated if stamp is not None]
     if not readable:
         return not_applicable(
-            f"None of the {len(serving)} Gold/serving item(s) carries a readable last "
-            "run/refresh timestamp, so how recently they were updated cannot be measured "
-            "â€” unknown recency is never reported as stale"
+            f"None of the {len(serving)} Gold/serving item(s) has a readable last-update "
+            f"time. A Warehouse or Lakehouse carries no run history of its own - Fabric "
+            f"records that only for runnable items - and no pipeline or notebook that "
+            f"writes to them has a readable run either, so how recently they were updated "
+            f"cannot be measured. Unknown recency is never reported as stale"
         )
 
     try:
@@ -3274,16 +3553,21 @@ def gold_items_refreshed_within_sla(ctx: CheckContext) -> Verdict:
     now = datetime.now(timezone.utc)
     stale = sorted(
         item.display_name or item.id
-        for item, stamp in readable
+        for item, stamp, _ in readable
         if (now - stamp).total_seconds() > sla_hours * 3600
     )
+    via_loader = sum(1 for _, _, source in readable if source.startswith("the load"))
     excluded = len(serving) - len(readable)
 
     detail = (
         f"{len(readable) - len(stale)} of {len(readable)} Gold/serving item(s) with a "
-        f"readable last run/refresh were updated within the {sla_hours}h SLA "
+        f"readable last update were refreshed within the {sla_hours}h SLA "
         f"(gold_freshness_sla_hours)"
     )
+    if via_loader:
+        detail += (f"; {via_loader} of those are stores whose freshness was read from the "
+                   f"pipeline/notebook that writes them, since a store has no run history "
+                   f"of its own")
     if stale:
         detail += (f"; stale: {', '.join(stale[:_MAX_NAMED_STALE])}"
                    + (f", â€¦(+{len(stale) - _MAX_NAMED_STALE} more)"
