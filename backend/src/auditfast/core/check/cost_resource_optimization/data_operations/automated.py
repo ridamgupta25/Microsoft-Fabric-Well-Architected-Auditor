@@ -18,7 +18,7 @@ from auditfast.core.models import CheckContext, Item
 
 
 @check(
-    id="WS-CAPACITY", ref="IMPL-15", title="Workspace is assigned to a Fabric capacity [WS-CAPACITY]",
+    id="WS-CAPACITY", ref="13.3.1", title="Workspace is assigned to a Fabric capacity [WS-CAPACITY]",
     pillar=Pillar.COST_MANAGEMENT, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     requires=[Resource.WORKSPACE], required=True,
 )

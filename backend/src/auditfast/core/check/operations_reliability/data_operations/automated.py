@@ -73,7 +73,7 @@ def _style_issues(name: str) -> str:
 
 
 @check(
-    id="WS-NAME", ref="IMPL-24", title="Workspace name follows the organization naming convention (e.g., <Domain>-<Env>-<Project>) [WS-NAME]",
+    id="WS-NAME", ref="13.1.3", title="Workspace name follows the organization naming convention (e.g., <Domain>-<Env>-<Project>) [WS-NAME]",
     pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.LOW,
     requires=[Resource.WORKSPACE, Resource.ITEMS], required=False,
 )
@@ -1113,7 +1113,7 @@ def environment_tier_is_declared(ctx: CheckContext) -> Verdict:
     facts a reviewer needs to assemble the estate-wide picture across the
     workspaces in the report.
 
-    **Related, and genuinely different.** ``WS-NAME`` (IMPL-24) scores naming
+    **Related, and genuinely different.** ``WS-NAME`` (13.1.3) scores naming
     style; ``WS-ENV-ISOLATION`` (1.1.3) scores whether this workspace's pipelines
     reach into another tier; ``WS-DEPLOY`` (11.2.1) scores deployment-pipeline
     assignment. None of them reports the tier itself, which is what the estate

@@ -451,7 +451,7 @@ def test_4_5_1_still_fails_when_no_dimension_exists():
     assert "no dimension tables" in verdict.evidence
 
 
-# -- IMPL-04 sensitivity labels -----------------------------------------------
+# -- 13.2.3 sensitivity labels -----------------------------------------------
 
 
 def test_label_is_read_from_either_documented_spelling():
