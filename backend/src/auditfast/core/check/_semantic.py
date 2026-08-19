@@ -83,17 +83,6 @@ _LARGE_TEXT_SOURCE_TYPE = re.compile(
     re.IGNORECASE,
 )
 
-#: Words that name a column as free text rather than a category a user slices by.
-#: Deliberately narrow: ``name``, ``city`` and ``status`` are *not* here — they
-#: are legitimate low-cardinality attributes and flagging them would turn this
-#: into a check every model fails.
-_FREE_TEXT_WORDS: frozenset[str] = frozenset({
-    "description", "descriptions", "desc", "comment", "comments", "note", "notes",
-    "remark", "remarks", "message", "text", "body", "detail", "details",
-    "address", "address1", "address2", "street", "email", "url", "uri", "link",
-    "json", "payload", "xml", "reason", "feedback", "summary",
-})
-
 #: Words that mean a temporal column carries a *time of day*, not just a date.
 #: A column at second precision has roughly one distinct value per row, where the
 #: same column split into a date key plus a time key has 365-ish and 86400-ish.
@@ -161,9 +150,11 @@ def high_cardinality_shape(column: dict) -> str:
         if timed:
             return "full-precision datetime"
 
-    if (data_type == "string" or source_type) and (
-        _LARGE_TEXT_SOURCE_TYPE.search(source_type) or (words & _FREE_TEXT_WORDS)
-    ):
+    if _LARGE_TEXT_SOURCE_TYPE.search(source_type):
+        # Only an *unbounded* source type (varchar(max), text, json, xml) is
+        # flagged. A column is not judged free text on its name alone: a
+        # ``Description`` mapped 1:1 to a low-cardinality key has that key's
+        # cardinality, which the name cannot reveal and the rows are never read.
         return "free text"
 
     return ""

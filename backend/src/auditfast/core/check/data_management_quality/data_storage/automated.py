@@ -1,4 +1,4 @@
-"""Data Management & Quality · Data Storage — table design & dimensional model.
+﻿"""Data Management & Quality Â· Data Storage â€” table design & dimensional model.
 
 Reads lakehouse/warehouse table metadata (names, storage type/format, and column
 schemas) to judge naming, managed-Delta usage, audit columns, and the star-schema
@@ -9,30 +9,36 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
-from auditfast.core.check._notebook import executable_code, notebook_code
+from auditfast.core.check._notebook import NOTEBOOK_LAYERS, executable_code
 from auditfast.core.check._pipeline import activities as pipeline_activities
 from auditfast.core.check._pipeline import script_sql
 from auditfast.core.check._recency import parse_stamp
 from auditfast.core.check._tables import (
     TABLE_LAYERS,
     col_names,
+    column_type,
     columns,
+    dimensions_in,
+    facts_in,
     has_audit_column,
     has_surrogate_key,
     in_warehouse,
     is_audit_column,
     is_audit_table,
-    is_dimension,
-    is_fact,
     is_key_column,
+    is_low_cardinality_shape,
     is_platform_table,
     is_snake_case,
     is_text_column,
     is_timestamp_column,
     key_referent,
     name_words,
+    normalise_column,
+    normalise_table_name,
     purpose_tokens,
+    related_columns,
     store_of,
+    table_roles,
     tables_by_store,
 )
 from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable, note
@@ -43,32 +49,56 @@ from auditfast.core.models import CheckContext, Item
 _NO_TABLES = "No lakehouse/warehouse tables were read for this workspace"
 
 #: N/A reason when lakehouse/warehouse tables exist but none are dimensions with
-#: readable columns. Named to make the scope explicit — semantic-model tables
+#: readable columns. Named to make the scope explicit â€” semantic-model tables
 #: (e.g. a Power BI ``DateDimension``) are not lakehouse tables and are judged
 #: separately by the 5.4.x semantic-model checks.
 _NO_DIMS = "No lakehouse/warehouse dimension tables with column metadata"
 
 #: N/A reason when lakehouse/warehouse tables exist but none carry readable column
 #: schemas. Scope is made explicit so it is not mistaken for "no columns anywhere"
-#: — semantic-model column metadata is not read by these table checks.
+#: â€” semantic-model column metadata is not read by these table checks.
 _NO_COLS = "No lakehouse/warehouse table column metadata available"
 
 #: Column names implying a date/time value, for the data-type check.
 _DATE_NAME = re.compile(r"(date|timestamp|_dt$|_time$)", re.IGNORECASE)
 
 
-# T-SQL cursor and pandas row-by-row iteration anti-patterns (3.6.7).
-# Note: .collect()/.toPandas() are separately caught by NB-COLLECT; this
-# targets explicit SQL cursor syntax and pandas row iterators that are
-# semantically cursor-equivalent.
-_CURSOR = re.compile(
-    r"\bDECLARE\s+\w+\s+CURSOR\b"    # T-SQL cursor declaration
-    r"|\bFETCH\s+NEXT\b"               # T-SQL cursor fetch
-    r"|\bWHILE\s+@@FETCH_STATUS\b"     # T-SQL cursor loop
-    r"|\.iterrows\s*\(\s*\)"           # pandas row-by-row iteration
-    r"|\.itertuples\s*\(\s*\)",        # pandas tuple-by-tuple iteration
-    re.IGNORECASE,
+#: Row-by-row processing, in the two languages a Fabric notebook actually uses.
+#:
+#: **T-SQL cursors** belong to Warehouse routines, not notebooks - a Fabric
+#: notebook is Spark - so those patterns are applied to ``sql_routines`` by the
+#: Warehouse checks and are deliberately absent here.
+#:
+#: **The Spark anti-patterns** are what a notebook can genuinely do wrong:
+#: pulling a distributed DataFrame onto the driver and then looping over it.
+#: ``collect()`` and ``toPandas()`` alone are not enough - both are legitimate
+#: for a small result - so each is paired with the iteration that follows it,
+#: which is what turns a materialisation into row-by-row processing.
+_ROW_BY_ROW = (
+    ("pandas .iterrows()", re.compile(r"\.iterrows\s*\(\s*\)")),
+    ("pandas .itertuples()", re.compile(r"\.itertuples\s*\(\s*\)")),
+    # ``for row in df.collect():`` - the classic driver-side loop. The receiver
+    # is matched loosely because a real call is chained
+    # (``spark.table('x').collect()``), not a bare name.
+    ("loop over collect()", re.compile(
+        r"for\s+\w+\s+in\s+[^\n:]*?\.collect\s*\(\s*\)", re.IGNORECASE)),
+    ("loop over toPandas()", re.compile(
+        r"for\s+\w+\s+in\s+[^\n:]*?\.toPandas\s*\(\s*\)", re.IGNORECASE)),
+    # ``for i in range(df.count()):`` then indexing - iteration by row number.
+    ("loop over row count", re.compile(
+        r"for\s+\w+\s+in\s+range\s*\(\s*[^\n:]*?\.count\s*\(\s*\)", re.IGNORECASE)),
+    # ``.rdd.map(...)`` with a Python lambda is per-row Python, not set-based.
+    ("rdd row map", re.compile(r"\.rdd\s*\.\s*(?:map|foreach)\s*\(", re.IGNORECASE)),
 )
+
+#: A ``collect()``/``toPandas()`` whose result is *assigned* and then iterated a
+#: few lines later - the same anti-pattern spread over two statements, which a
+#: single-line pattern misses. The right-hand side is matched loosely because a
+#: real call is chained (``spark.table('silver.sales').collect()``), not a bare
+#: name: an earlier ``[\w.]*`` version matched only the simplest possible form
+#: and silently missed every realistic one.
+_COLLECT_ASSIGNED = re.compile(
+    r"(\w+)\s*=\s*[^\n=]*?\.(?:collect|toPandas)\s*\(\s*\)", re.IGNORECASE)
 
 #: Table/schema name patterns that indicate a staging area.
 #: Keys in ctx.workspace.tables are either plain lakehouse names ("StagingTemp")
@@ -111,7 +141,6 @@ _STATS_UPDATE_SQL = re.compile(
     r"\bUPDATE\s+STATISTICS\b|\bsp_updatestats\b|\bANALYZE\s+TABLE\b.*\bCOMPUTE\s+STATISTICS\b",
     re.IGNORECASE | re.DOTALL,
 )
-_TABLES_PATH = re.compile(r"(?:^|/)tables(?:/|$)", re.IGNORECASE)
 _SHORTCUTS_PATH = re.compile(r"(?:^|/)shortcuts(?:/|$)", re.IGNORECASE)
 _BRONZE_TOKEN = re.compile(r"(?:^|[/_\-.])bronze(?:[/_\-.]|$)", re.IGNORECASE)
 _SILVER_TOKEN = re.compile(r"(?:^|[/_\-.])silver(?:[/_\-.]|$)", re.IGNORECASE)
@@ -129,7 +158,7 @@ _LOGIC_HINT = re.compile(r"(?:merge|join|window|row_number|dedup|rule|calc|busin
 
 _DECLARED_WIDTH = re.compile(r"^n?(?:varchar|char)\s*\(\s*(max|\d+)\s*\)", re.IGNORECASE)
 
-#: Widths above this are treated as oversized — they defeat statistics and inflate row size.
+#: Widths above this are treated as oversized â€” they defeat statistics and inflate row size.
 _MAX_TEXT_WIDTH = 4000
 _DECIMAL_PRECISION = re.compile(r"^(?:decimal|numeric)\((\d+)\s*,\s*(\d+)\)$", re.IGNORECASE)
 
@@ -199,7 +228,7 @@ def _domain_from_path(path: str) -> tuple[str | None, str | None]:
 @check(
     id="WS-WH-LOAD", ref="3.6.1",
     title="Gold Warehouse load pattern is defined and consistent",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
     required=True,
 )
@@ -219,7 +248,7 @@ def wh_load_pattern(ctx: CheckContext) -> Verdict:
     if not pipelines:
         return graded(
             1,
-            f"{len(warehouses)} Warehouse item(s) found but no pipelines defined — "
+            f"{len(warehouses)} Warehouse item(s) found but no pipelines defined â€” "
             "a load pattern (COPY INTO / CTAS / Copy activity / stored procedure) should be established",
         )
 
@@ -263,27 +292,63 @@ def wh_load_pattern(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-NO-CURSOR", ref="3.6.2",
     title="Silver-to-Gold transformations are set-based (no row-by-row cursors)",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_no_cursor(ctx: CheckContext) -> Verdict:
-    """Set-based SQL and DataFrame operations rather than T-SQL cursors or pandas row iteration."""
+    """Transformations run set-based rather than looping over rows on the driver.
+
+    **Scoped to what a notebook can actually do.** An earlier version searched
+    notebook code for T-SQL cursor syntax (``DECLARE ... CURSOR``,
+    ``FETCH NEXT``, ``WHILE @@FETCH_STATUS``). A Fabric notebook is Spark, so
+    that syntax cannot appear in one and those patterns could never fire; the
+    cursor question belongs to Warehouse routines and is asked there. What is
+    checked here is the Spark equivalent: materialising a distributed DataFrame
+    on the driver and then iterating it.
+
+    ``collect()`` and ``toPandas()`` on their own are **not** flagged - both are
+    legitimate for a small result, and ``NB-COLLECT`` already judges unbounded
+    materialisation. The signal is the *iteration*: a loop over the collected
+    result, whether written inline or one statement later.
+
+    **What it cannot determine.** Whether a small driver-side loop is
+    justified - iterating 12 month names is not the anti-pattern this describes.
+    The evidence names the construct found so a reviewer can judge the scale.
+    """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
-    code = notebook_code(ctx.obj)
-    hits = _CURSOR.findall(code)
+    code = executable_code(ctx.obj)
+    if not code.strip():
+        return not_applicable("Notebook has no executable code to assess")
+
+    found: list[str] = []
+    for label, pattern in _ROW_BY_ROW:
+        hits = pattern.findall(code)
+        if hits:
+            found.append(f"{label} x{len(hits)}")
+
+    # A collect()/toPandas() assigned to a name, then looped over separately.
+    for match in _COLLECT_ASSIGNED.finditer(code):
+        variable = re.escape(match.group(1))
+        if re.search(rf"for\s+\w+\s+in\s+{variable}\b", code):
+            found.append("loop over a collected DataFrame")
+            break
+
+    if not found:
+        return binary(True, "No row-by-row iteration found - transformations run "
+                            "set-based on the Spark engine")
     return binary(
-        not hits,
-        f"{len(hits)} cursor/row-iteration pattern(s) detected "
-        "(T-SQL CURSOR / .iterrows() / .itertuples())" if hits
-        else "No T-SQL cursors or row-by-row iteration patterns — set-based transformations",
+        False,
+        f"Row-by-row processing found ({', '.join(sorted(set(found)))}). Each pulls "
+        f"rows onto the driver and loops over them, so the work runs single-threaded "
+        f"instead of across the cluster; confirm the volume justifies it",
     )
 
 
 @check(
     id="WS-STAGING", ref="3.6.3",
     title="Staging tables/schema used for Warehouse loads before merge into final tables",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
 )
 def wh_staging_pattern(ctx: CheckContext) -> Verdict:
@@ -300,30 +365,36 @@ def wh_staging_pattern(ctx: CheckContext) -> Verdict:
     return graded(
         1,
         f"{len(tables)} table(s) found but none follow a staging naming pattern "
-        "(stg_* / staging_* / stage_*) — a staging schema buffers loads before the final merge",
+        "(stg_* / staging_* / stage_*) â€” a staging schema buffers loads before the final merge",
     )
 
 @check(
     id="WS-WH-TRYCATCH", ref="3.6.5",
     title="Warehouse/lakehouse load SQL uses TRY...CATCH with transaction handling",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
     required=True,
 )
 def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
     """Load SQL wraps transactional changes in TRY...CATCH.
 
-    **Two sources of SQL.** Stored procedures and functions declared in the
-    Warehouse, now read from ``INFORMATION_SCHEMA.ROUTINES`` - which is where a
-    ``SqlServerStoredProcedure`` activity's logic actually lives - plus the
-    inline T-SQL a pipeline runs through a Script activity. Before the routine
-    bodies were fetched, a pipeline that called a stored procedure was recorded
-    as an *opaque* load and the whole check reported N/A: the logic existed, it
-    simply had not been read.
+    **Only readable SQL is judged.** Two sources carry it: stored procedures and
+    functions declared in the Warehouse (read from ``INFORMATION_SCHEMA.ROUTINES``,
+    which is where a ``SqlServerStoredProcedure`` activity's logic actually lives)
+    and the inline T-SQL a pipeline runs through a Script activity.
 
-    **What it cannot determine.** Whether a ``Copy`` activity's implicit load is
-    transactional - it runs no SQL of its own - so those are still counted as
-    opaque and named in the evidence rather than judged.
+    **A Copy activity is out of scope, not un-judged.** It runs no SQL of its own -
+    Fabric generates the load internally and the pipeline definition contains
+    nothing to read - so there is no error handling for this check to find, ever.
+    Counting Copy activities as unreadable loads made the check look blind on
+    estates that simply do not use SQL for loading: on one workspace 109 of 114
+    "loads" were Copy activities, and the verdict read as though 96% of the estate
+    were hidden. They are now excluded from the population entirely and reported
+    separately as context.
+
+    **When nothing readable exists the answer is N/A, never FAIL.** A workspace
+    that loads exclusively through Copy activities has no SQL error-handling
+    practice to assess - that is not the same finding as having a bad one.
     """
     if not ctx.workspace.has(Resource.ITEMS):
         return not_applicable("Workspace items could not be read from Fabric")
@@ -336,7 +407,8 @@ def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
         return not_applicable("No Warehouse/Lakehouse items found in this workspace")
 
     inspected: list[tuple[str, bool]] = []
-    opaque_loads: list[str] = []
+    copy_loads: list[str] = []
+    unread_routines: list[str] = []
 
     # Stored procedures and functions declared in the Warehouse itself.
     for routine in ctx.workspace.sql_routines:
@@ -348,6 +420,10 @@ def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
             marker,
             bool(_TRY_CATCH_SQL.search(text)) and bool(_TXN_SQL.search(text)),
         ))
+
+    declared_routines = {
+        str(r.get("name") or "").lower() for r in ctx.workspace.sql_routines
+    }
 
     if ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         for pipeline_name, pipeline_def in ctx.workspace.pipelines.items():
@@ -365,34 +441,53 @@ def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
                     inspected.append((marker, has_try_catch and has_transaction))
                     continue
 
-                if activity_type in ("SqlServerStoredProcedure", "StoredProcedure", "Copy"):
-                    opaque_loads.append(marker)
+                if activity_type == "Copy":
+                    # No SQL exists to read, by design - not a gap in the crawl.
+                    copy_loads.append(marker)
+                    continue
+
+                if activity_type in ("SqlServerStoredProcedure", "StoredProcedure"):
+                    # The body lives in the Warehouse. If the routine list did not
+                    # carry it, that *is* a gap worth reporting - unlike a Copy.
+                    called = str((activity.get("typeProperties") or {}).get(
+                        "storedProcedureName") or "").split(".")[-1].strip("[]").lower()
+                    if not called or called not in declared_routines:
+                        unread_routines.append(marker)
 
     if not inspected:
-        if opaque_loads:
+        if unread_routines:
             return not_applicable(
-                f"{len(opaque_loads)} load activity/activities run through a stored "
-                "procedure or Copy whose SQL is not in this snapshot, and the "
-                "Warehouse declared no routine body to read, so TRY...CATCH "
-                "handling cannot be verified. " + _SQL_PERMISSION_HINT
+                f"{len(unread_routines)} pipeline activity/activities call a stored "
+                f"procedure whose body is not in this snapshot, so TRY...CATCH "
+                f"handling cannot be verified. " + _SQL_PERMISSION_HINT
             )
-        return not_applicable("No inspectable scripted SQL load activity was found")
+        if copy_loads:
+            return not_applicable(
+                f"This workspace loads through {len(copy_loads)} Copy activity/activities "
+                f"and declares no SQL load routine. A Copy activity runs no SQL of its "
+                f"own - Fabric generates the load internally - so there is no error "
+                f"handling to assess, which is not the same as having none"
+            )
+        return not_applicable("No SQL load routine or Script activity was found to assess")
 
     compliant = [name for name, ok in inspected if ok]
     evidence = (
-        f"{len(compliant)} of {len(inspected)} inspectable SQL load(s) use "
-        "TRY...CATCH and BEGIN/COMMIT/ROLLBACK transaction handling"
+        f"{len(compliant)} of {len(inspected)} readable SQL load(s) use TRY...CATCH "
+        "and BEGIN/COMMIT/ROLLBACK transaction handling"
         + (f"; compliant: {', '.join(compliant[:5])}" if compliant else "")
     )
-    if opaque_loads:
-        evidence += (f". {len(opaque_loads)} Copy/stored-procedure activity/activities "
-                     f"run no readable SQL and are not judged")
+    if copy_loads:
+        evidence += (f". A further {len(copy_loads)} Copy activity/activities load without "
+                     f"SQL and are out of scope for this check")
+    if unread_routines:
+        evidence += (f". {len(unread_routines)} activity/activities call a stored procedure "
+                     f"whose body could not be read")
     return covered(len(compliant), len(inspected), evidence)
 
 @check(
     id="WS-WH-INCREMENTAL", ref="3.6.6",
     title="Warehouse loads avoid unnecessary full reloads",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
     required=True,
 )
@@ -454,7 +549,7 @@ def wh_incremental_loads(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-WH-STATS", ref="3.6.7",
     title="Statistics are updated after significant Warehouse loads",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
     required=True,
 )
@@ -538,7 +633,7 @@ def wh_stats_updated_after_loads(ctx: CheckContext) -> Verdict:
 
 @check(
     id="TB-NAMING", ref="4.2.1", title="Tables use meaningful, consistent naming conventions (agreed standard)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
 )
 def table_naming(ctx: CheckContext) -> Verdict:
@@ -552,7 +647,7 @@ def table_naming(ctx: CheckContext) -> Verdict:
 
 @check(
     id="TB-MANAGED-DELTA", ref="4.1.1", title="Lakehouse Tables (managed) used for structured data; Files section for raw/unstructured",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
 )
 def table_managed_delta(ctx: CheckContext) -> Verdict:
@@ -569,11 +664,29 @@ def table_managed_delta(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-SHORTCUT-GOVERNANCE", ref="4.1.3",
     title="Shortcuts avoid circular and ungoverned access paths",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS], required=True,
 )
 def shortcut_governance(ctx: CheckContext) -> Verdict:
-    """Shortcut paths are structurally governed and avoid loop-prone patterns."""
+    """Shortcut paths are structurally governed and avoid loop-prone patterns.
+
+    A shortcut is flagged only for a genuine structural smell: a missing target
+    type (ungoverned), a ``..`` traversal segment, a nested ``Shortcuts`` path
+    (loop-prone), or a true duplicate — the *same* shortcut (parent path **and**
+    name) listed twice.
+
+    A shortcut rooted under ``Tables`` is **not** flagged. The Fabric List
+    Shortcuts API returns ``path`` as the parent folder a shortcut sits in
+    (``Tables`` / ``Files`` / a subpath), so a OneLake table shortcut naturally
+    reports ``path = Tables`` — and that is the supported, recommended way to
+    surface a Delta table across lakehouses without copying data. It is neither
+    circular nor ungoverned. Because ``path`` is the *parent* folder rather than
+    a per-shortcut path, two distinct shortcuts in one folder share it, so
+    duplicate detection keys on the folder **plus the shortcut name** — otherwise
+    every second table shortcut reads as a false duplicate. Whether an *external*
+    target is allowed is the neighbouring ``WS-SHORTCUT-SCOPE`` (4.1.2)
+    question, not this one.
+    """
     if not ctx.workspace.has(Resource.SHORTCUTS):
         return not_applicable(
             "Shortcut metadata could not be read. Request Workspace.Read.All + OneLake.Read.All "
@@ -587,7 +700,7 @@ def shortcut_governance(ctx: CheckContext) -> Verdict:
     risky: list[str] = []
 
     for lakehouse_name, shortcuts in (ctx.workspace.shortcuts or {}).items():
-        seen_paths: set[str] = set()
+        seen_identities: set[str] = set()
         for row in (shortcuts or []):
             total += 1
             name = str((row or {}).get("name") or "")
@@ -595,19 +708,22 @@ def shortcut_governance(ctx: CheckContext) -> Verdict:
             target_type = str((row or {}).get("target_type") or "")
             normalized = path.replace("\\", "/").strip().strip("/")
             normalized_low = normalized.lower()
+            # ``path`` is the parent folder (``Tables`` / ``Files`` / a subpath),
+            # not a per-shortcut path, so a shortcut's identity is that folder
+            # plus its own name. Keying duplicate detection on the folder alone
+            # made every second table shortcut a false duplicate.
+            identity = f"{normalized_low}/{name.strip().lower()}"
 
             issues: list[str] = []
             if not target_type.strip():
                 issues.append("missing target type")
             if ".." in normalized_low:
                 issues.append("path traversal segment '..'")
-            if _TABLES_PATH.search(normalized_low):
-                issues.append("shortcut rooted under Tables path")
             if _SHORTCUTS_PATH.search(normalized_low):
                 issues.append("nested Shortcut path (loop-prone)")
-            if normalized_low in seen_paths and normalized_low:
+            if identity != "/" and identity in seen_identities:
                 issues.append("duplicate shortcut path")
-            seen_paths.add(normalized_low)
+            seen_identities.add(identity)
 
             if issues:
                 risky.append(
@@ -628,7 +744,7 @@ def shortcut_governance(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-LH-BRONZE-SILVER-SEP", ref="4.1.4",
     title="Bronze and Silver lakehouse responsibilities are clearly separated per domain",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS, Resource.TABLE_SCHEMAS], required=True,
 )
 def bronze_silver_separation(ctx: CheckContext) -> Verdict:
@@ -675,7 +791,7 @@ def bronze_silver_separation(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-LH-TAXONOMY", ref="4.1.5",
     title="Bronze/Silver domain folders follow a consistent workspace taxonomy",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS, Resource.TABLE_SCHEMAS], required=True,
 )
 def bronze_silver_taxonomy(ctx: CheckContext) -> Verdict:
@@ -734,7 +850,7 @@ def bronze_silver_taxonomy(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-PARTITION-STRATEGY", ref="4.2.2",
     title="Partitioning or clustering strategy is defined for large tables",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.LAKEHOUSE_FILES],
     required=True,
 )
@@ -797,7 +913,7 @@ def table_partition_strategy(ctx: CheckContext) -> Verdict:
 
 @check(
     id="TB-AUDITCOLS", ref="4.2.5", title="Audit columns present (created_date, modified_date, source_system, batch_id)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -858,12 +974,25 @@ def _is_scratch_table(name: str, table: dict) -> bool:
     cols = [str(c.get("name") or "") for c in columns(table)]
     return bool(cols) and all(_UNNAMED_COLUMN.match(c) for c in cols)
 
+def _models(ctx: CheckContext) -> dict[str, dict]:
+    """Semantic models to resolve declared table roles from, when readable.
+
+    Passed to :func:`facts_in` / :func:`dimensions_in` so a role the modeller
+    *declared* through a relationship outranks one inferred from column shape.
+    Empty when the definitions were not read - the classifier then falls back to
+    its own evidence exactly as before.
+    """
+    if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
+        return {}
+    return ctx.workspace.semantic_models or {}
+
+
 def _table_stores(ctx: CheckContext) -> str:
     """Name the lakehouse/warehouse(s) whose tables a workspace check inspected.
 
     Workspace-scoped table checks aggregate over every store's tables, so the
     engine leaves their object blank. Naming the store(s) here points the finding
-    at what was judged — the analogue of a pipeline check naming its pipeline.
+    at what was judged â€” the analogue of a pipeline check naming its pipeline.
     Falls back to a generic label when the item list was not read.
     """
     names = sorted({
@@ -881,14 +1010,14 @@ def _table_stores(ctx: CheckContext) -> str:
 
 @check(
     id="TB-STARSCHEMA", ref="4.5.1", title="Star schema design implemented (fact + dimension tables, not flat wide tables)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.ITEMS], required=True,
 )
 def table_star_schema(ctx: CheckContext) -> Verdict:
     """The model separates fact tables from dimension tables (not flat wide tables).
 
     **What it can determine.** Whether the workspace holds both fact-named
-    (``fact*``/``fct*``) and dimension-named (``dim*``) tables — the readable
+    (``fact*``/``fct*``) and dimension-named (``dim*``) tables â€” the readable
     signature of a dimensional model. The evidence also reports how wide the fact
     tables are, because the point contrasts a star schema with "flat wide
     tables": a fact carrying dozens of columns is the shape that warrants a look.
@@ -896,8 +1025,8 @@ def table_star_schema(ctx: CheckContext) -> Verdict:
     **What it cannot determine, and deliberately does not score.** Whether the
     model is *correctly* star-shaped. Column width is reported but **not scored**
     here, for two reasons: how wide is "too wide" is a modelling judgement rather
-    than a fact, and the underlying defect — descriptive attributes sitting on a
-    fact instead of a dimension — is already scored by ``TB-FACT-PURITY``
+    than a fact, and the underlying defect â€” descriptive attributes sitting on a
+    fact instead of a dimension â€” is already scored by ``TB-FACT-PURITY``
     (ref 4.5.3). Scoring it twice would penalise one mistake under two refs.
     Grain is judged by ``TB-FACT-GRAIN`` (4.5.2), relationships by
     ``TB-REL-DECLARED`` (4.4.5), and the Warehouse-scoped version of this same
@@ -911,8 +1040,8 @@ def table_star_schema(ctx: CheckContext) -> Verdict:
     if not tables:
         return not_applicable(_NO_TABLES)
     stores = _table_stores(ctx)
-    facts = {n: t for n, t in tables.items() if is_fact(n)}
-    dims = {n: t for n, t in tables.items() if is_dimension(n)}
+    facts = facts_in(tables, _models(ctx))
+    dims = dimensions_in(tables, _models(ctx))
 
     if facts and dims:
         return binary(
@@ -974,7 +1103,7 @@ def _fact_width_note(facts: dict[str, dict]) -> str:
 @check(
     id="TB-DATATYPE-SIZING", ref="4.4.3",
     title="Data types are appropriate and sized correctly",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=True,
 )
@@ -1026,7 +1155,7 @@ def table_type_sizing(ctx: CheckContext) -> Verdict:
 
     return covered(
         compliant, assessed,
-        f"{compliant} of {assessed} assessable columns have appropriate sizing — "
+        f"{compliant} of {assessed} assessable columns have appropriate sizing â€” "
         f"{oversized_text} oversized text column(s), {imprecise_numeric} "
         "decimal/numeric column(s) with invalid precision/scale"
         + (f"; {lakehouse_defaults} Lakehouse default varchar({_LAKEHOUSE_TEXT_WIDTH}) "
@@ -1037,7 +1166,7 @@ def table_type_sizing(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-SURROGATE-GEN", ref="4.4.4",
     title="Surrogate keys are implemented for dimensions with a generated-key pattern",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=True,
 )
@@ -1050,7 +1179,8 @@ def table_surrogate_generated(ctx: CheckContext) -> Verdict:
     """
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
-    dims = {n: t for n, t in ctx.workspace.tables.items() if is_dimension(n) and columns(t)}
+    dims = {n: t for n, t in dimensions_in(ctx.workspace.tables, _models(ctx)).items()
+            if columns(t)}
     if not dims:
         return not_applicable(_NO_DIMS)
 
@@ -1076,7 +1206,7 @@ def table_surrogate_generated(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-REL-DECLARED", ref="4.4.5",
     title="Primary/foreign key relationships are declared where supported",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS,
     requires=[Resource.TABLE_SCHEMAS, Resource.SEMANTIC_MODEL_DEFINITIONS],
     required=True,
@@ -1099,7 +1229,7 @@ def table_relationships_declared(ctx: CheckContext) -> Verdict:
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
 
-    facts = [name for name in ctx.workspace.tables if is_fact(name)]
+    facts = list(facts_in(ctx.workspace.tables, _models(ctx)))
     if not facts:
         return not_applicable("No fact-like tables found to assess for declared FK relationships")
 
@@ -1146,7 +1276,7 @@ def table_relationships_declared(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-STATS-STRATEGY", ref="4.4.6",
     title="Statistics maintenance strategy is defined and automated",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def stats_strategy_defined(ctx: CheckContext) -> Verdict:
@@ -1225,7 +1355,7 @@ def stats_strategy_defined(ctx: CheckContext) -> Verdict:
 
 @check(
     id="TB-DATEDIM", ref="4.5.7", title="Date/Time dimension exists with all required attributes (fiscal periods, quarter, holidays)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.ITEMS], required=False,
 )
 def table_date_dimension(ctx: CheckContext) -> Verdict:
@@ -1296,7 +1426,7 @@ def table_date_dimension(ctx: CheckContext) -> Verdict:
 
 @check(
     id="TB-SURROGATE", ref="4.5.6", title="Surrogate keys used for dimension tables (not business keys as PKs in facts)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -1313,7 +1443,7 @@ def table_surrogate_keys(ctx: CheckContext) -> Verdict:
     column). Matching only the underscored form reported ``0 of 19`` on an estate
     where most dimensions were correctly modelled.
 
-    An ``…AlternateKey`` never counts: AdventureWorks uses that for the natural
+    An ``â€¦AlternateKey`` never counts: AdventureWorks uses that for the natural
     key, which is the distinction this point is about.
 
     **What it cannot determine.** Whether the column is genuinely system
@@ -1321,7 +1451,8 @@ def table_surrogate_keys(ctx: CheckContext) -> Verdict:
     """
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
-    dims = {n: t for n, t in ctx.workspace.tables.items() if is_dimension(n) and columns(t)}
+    dims = {n: t for n, t in dimensions_in(ctx.workspace.tables, _models(ctx)).items()
+            if columns(t)}
     if not dims:
         return not_applicable(_NO_DIMS)
 
@@ -1345,26 +1476,26 @@ def table_surrogate_keys(ctx: CheckContext) -> Verdict:
 
 @check(
     id="TB-COL-NAMING", ref="4.2.3", title="Column naming is consistent and self-documenting",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.LOW,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
 def table_column_naming(ctx: CheckContext) -> Verdict:
-    """Column names follow *one* convention across the workspace — whichever one.
+    """Column names follow *one* convention across the workspace â€” whichever one.
 
     **Consistency is what is scored, not a particular house style.** Each name is
     classified as ``snake_case``, ``UPPER_CASE``, ``PascalCase``, ``camelCase`` or
     ``mixed``; the dominant convention is found, and the score is the share of
     columns that follow it. Requiring ``snake_case`` specifically marked down any
-    estate that had standardised on something else — Microsoft's own AdventureWorks
-    sample is PascalCase throughout — which measured style preference rather than
+    estate that had standardised on something else â€” Microsoft's own AdventureWorks
+    sample is PascalCase throughout â€” which measured style preference rather than
     quality. A ``mixed`` name (a space, ``Customer_ID`` blending Pascal with
     underscores) can never be dominant: it follows no convention at all.
 
     **Deliberately different from ``TB-WH-NAME-CONSISTENCY`` (ref 4.4.2)**, which
     asks the same question but only of tables known to live in a **Warehouse**,
     and judges table names as well as column names. This one covers **every**
-    table in the workspace, Lakehouse included, and only its columns — so a
+    table in the workspace, Lakehouse included, and only its columns â€” so a
     Lakehouse-only estate (where 4.4.2 is N/A) is still assessed here.
 
     **What it cannot determine.** Whether a consistently-named column is
@@ -1389,7 +1520,7 @@ def table_column_naming(ctx: CheckContext) -> Verdict:
         return covered(
             0, len(styles),
             f"None of {len(styles)} column name(s) across {len(tables)} table(s) follows "
-            f"a single naming convention — every name mixes styles (a space, or "
+            f"a single naming convention â€” every name mixes styles (a space, or "
             f"capitals joined by underscores)",
         )
     mixed = sum(1 for style in styles if style == "mixed")
@@ -1398,14 +1529,14 @@ def table_column_naming(ctx: CheckContext) -> Verdict:
         f"{following} of {len(styles)} column name(s) across {len(tables)} table(s) "
         f"follow the dominant convention ({convention})"
         + (f"; {mixed} name(s) follow no convention at all" if mixed else "")
-        + ". Consistency is what is scored — any one convention counts, provided "
+        + ". Consistency is what is scored â€” any one convention counts, provided "
           "the estate sticks to it.",
     )
 
 
 @check(
     id="TB-DATATYPES", ref="4.2.4", title="Data types are appropriate (no stringly-typed dates, no oversized varchars)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -1460,10 +1591,10 @@ def table_data_types(ctx: CheckContext) -> Verdict:
         )
     return covered(
         compliant, assessed,
-        f"{compliant} of {assessed} assessable columns are appropriately typed — "
+        f"{compliant} of {assessed} assessable columns are appropriately typed â€” "
         f"{stringly_dates} date column(s) typed as text, "
         f"{oversized} text column(s) wider than {_MAX_TEXT_WIDTH}"
-        + (f"; {lakehouse_defaults} Lakehouse column(s) excluded — a Lakehouse SQL "
+        + (f"; {lakehouse_defaults} Lakehouse column(s) excluded â€” a Lakehouse SQL "
            f"endpoint forces every Delta string to varchar({_LAKEHOUSE_TEXT_WIDTH}), "
            f"so that width is the platform's choice, not the model's"
            if lakehouse_defaults else ""),
@@ -1523,7 +1654,7 @@ _ONELAKE_NATIVE = {
     "kqldatabase", "eventhouse", "powerbisemanticmodel", "fabricsql",
 }
 
-#: A local or UNC filesystem path — ``C:\Users\...`` or ``\\server\share``.
+#: A local or UNC filesystem path â€” ``C:\Users\...`` or ``\\server\share``.
 _LOCAL_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
 
 #: A personal cloud drive rather than a governed team site.
@@ -1538,7 +1669,7 @@ def _shadow_reason(conn: dict) -> str | None:
 
     Deliberately conservative: an enterprise object store reached through a
     shareable cloud connection (ADLS, S3, GCS, a SQL source) is *not* shadow
-    storage — it is a governed external source, which the point allows. What it
+    storage â€” it is a governed external source, which the point allows. What it
     flags is data living outside any shared, managed store: a file on a person's
     machine, a personal cloud drive, or an ad-hoc file pulled over HTTP.
     """
@@ -1559,8 +1690,8 @@ def _shadow_reason(conn: dict) -> str | None:
 
 @check(
     id="WS-SHORTCUT-SCOPE", ref="4.1.2",
-    title="OneLake used as the single data lake — no ungoverned shadow storage",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    title="OneLake used as the single data lake â€” no ungoverned shadow storage",
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS, Resource.CONNECTIONS], required=False,
 )
 def shortcut_scope(ctx: CheckContext) -> Verdict:
@@ -1569,7 +1700,7 @@ def shortcut_scope(ctx: CheckContext) -> Verdict:
     Two populations answer this. **Shortcuts** show where OneLake itself points;
     a shortcut to Dataverse or ADLS is a legitimate governed pattern, so it is
     reported for review rather than failed. **Connections** are where shadow
-    storage actually shows up — a spreadsheet on someone's laptop reached through
+    storage actually shows up â€” a spreadsheet on someone's laptop reached through
     a personal gateway is exactly the "ungoverned shadow storage" the point
     forbids, and that is what this check scores.
     """
@@ -1600,11 +1731,11 @@ def shortcut_scope(ctx: CheckContext) -> Verdict:
     if not has_connections:
         return not_applicable(
             f"Connections could not be read from Fabric, so shadow storage cannot be "
-            f"judged — {shortcut_note}"
+            f"judged â€” {shortcut_note}"
         )
     connections = ctx.workspace.connections or []
     if not connections:
-        return not_applicable(f"No Fabric source connections were returned — {shortcut_note}")
+        return not_applicable(f"No Fabric source connections were returned â€” {shortcut_note}")
 
     reasons: dict[str, int] = {}
     native = governed = 0
@@ -1624,65 +1755,121 @@ def shortcut_scope(ctx: CheckContext) -> Verdict:
         f"{len(connections) - shadow} of {len(connections)} source connection(s) are "
         f"governed ({native} OneLake-native, {governed} governed external); "
         f"{shadow} are ungoverned shadow storage"
-        f"{' — ' + breakdown if breakdown else ''}. {shortcut_note}. "
-        f"External shortcuts and external sources are legitimate when governed — "
+        f"{' â€” ' + breakdown if breakdown else ''}. {shortcut_note}. "
+        f"External shortcuts and external sources are legitimate when governed â€” "
         f"confirm each is intended.",
     )
 
 
 
+#: The three roles an SCD Type 2 row needs, each with the spellings seen in the
+#: wild. Matching by *role* rather than by one canonical name is the point: an
+#: estate using ``effective_date``/``end_date``/``active_flag`` is doing SCD2 and
+#: must be judged as such, then told its names deviate from the standard.
+_SCD2_START = frozenset({
+    "valid_from", "validfrom", "effective_date", "effectivedate", "effective_from",
+    "effectivefrom", "start_date", "startdate", "row_effective_date",
+    "record_start_date", "effective_start_date", "valid_start_date", "dw_valid_from",
+})
+_SCD2_END = frozenset({
+    "valid_to", "validto", "valid_until", "validuntil", "end_date", "enddate",
+    "expiration_date", "expirationdate", "expiry_date", "expirydate",
+    "effective_to", "effectiveto", "row_expiry_date", "record_end_date",
+    "effective_end_date", "valid_end_date", "dw_valid_to",
+})
+_SCD2_FLAG = frozenset({
+    "is_current", "iscurrent", "current_flag", "currentflag", "current_ind",
+    "active_flag", "activeflag", "is_active", "isactive", "current_record",
+    "is_latest", "islatest", "latest_flag", "dw_is_current",
+})
+
+#: The spelling the checklist point names. Anything else is a deviation worth
+#: reporting - it still works, but it costs every consumer a lookup.
+_SCD2_STANDARD = ("valid_from", "valid_to", "is_current")
+
+
+def _scd2_roles(table: dict) -> dict[str, str]:
+    """Which SCD2 role each column fills: ``{"start": "effective_date", ...}``."""
+    found: dict[str, str] = {}
+    for name in col_names(table):
+        key = str(name or "").strip().lower()
+        if "start" not in found and key in _SCD2_START:
+            found["start"] = key
+        elif "end" not in found and key in _SCD2_END:
+            found["end"] = key
+        elif "flag" not in found and key in _SCD2_FLAG:
+            found["flag"] = key
+    return found
+
+
 @check(
     id="TB-SCD2", ref="4.5.9", title="SCD Type 2 includes valid_from, valid_to, and is_current flag correctly maintained (where used)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
 def table_scd2(ctx: CheckContext) -> Verdict:
-    """Detect semantic SCD2 trios, then enforce the canonical column names."""
+    """A slowly-changing dimension carries a start date, an end date, and a current flag.
+
+    **Judged by column-role pattern, not by name — across every table.** The
+    point names ``valid_from``/``valid_to``/``is_current``, but an estate spelling
+    them ``effective_date``/``end_date``/``active_flag`` is implementing the same
+    pattern and must be scored on whether the *trio is complete*, not on whether
+    it picked the same words. And SCD2 history tables are not always the ones a
+    model or a name calls a "dimension" - on a real estate they are Silver tables
+    the role classifier reads as unknown/fact - so restricting the scan to
+    dimension-role tables reported "no SCD2" on an estate full of it. This scans
+    every table that has column metadata.
+
+    A table is an SCD2 candidate once it carries a **current-flag** role plus at
+    least one validity date: a bare start/end date pair with no current indicator
+    is an ordinary validity period (a price, a rate), not row versioning.
+
+    **What it cannot determine.** Whether ``valid_to`` is actually maintained on
+    supersede, or whether exactly one row per key is flagged current - that needs
+    the data, not the schema. Naming deviations are reported alongside the score.
+    """
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
-    readable = {name: table for name, table in ctx.workspace.tables.items() if columns(table)}
-    if not readable:
-        return not_applicable("Table metadata is present, but no table columns were readable")
+    tabled = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
+    if not tabled:
+        return not_applicable(_NO_COLS)
 
-    aliases = {
-        "start": ("valid_from", "effective_date", "start_date"),
-        "end": ("valid_to", "end_date", "expiration_date"),
-        "current": ("is_current", "active_flag", "current_flag", "is_active"),
-    }
-
-    candidates: dict[str, tuple[str, str, str]] = {}
-    for name, table in readable.items():
-        names = set(col_names(table))
-        matched = tuple(
-            next((column for column in choices if column in names), "")
-            for choices in aliases.values()
-        )
-        if all(matched):
-            candidates[name] = matched
-
+    candidates = {n: _scd2_roles(t) for n, t in tabled.items()}
+    candidates = {n: r for n, r in candidates.items() if r.get("flag") and len(r) >= 2}
     if not candidates:
+        # The columns *were* read (so this is not a permission gap) - there is
+        # simply no SCD2 pattern. The reason string is the whole value of an N/A.
         return not_applicable(
-            f"Column metadata is present, but no SCD2 pattern was found across "
-            f"{len(readable)} table(s) (start date + end date + current flag)"
+            f"Column metadata was read for {len(tabled)} table(s), but none carries an "
+            f"SCD2 start-date / end-date / current-flag pattern, so no table is "
+            f"versioned as SCD Type 2"
         )
 
-    canonical = ("valid_from", "valid_to", "is_current")
-    compliant = [name for name, matched in candidates.items() if matched == canonical]
-    deviations = [
-        f"{name}: {'/'.join(matched)}"
-        for name, matched in sorted(candidates.items())
-        if matched != canonical
-    ]
+    complete = {n: r for n, r in candidates.items() if len(r) == 3}
+    incomplete = {n: r for n, r in candidates.items() if len(r) < 3}
+    nonstandard = sorted({
+        col for roles in candidates.values() for col in roles.values()
+        if col not in _SCD2_STANDARD
+    })
+
     evidence = (
-        f"{len(compliant)} of {len(candidates)} SCD2 candidate table(s) use canonical "
-        "valid_from/valid_to/is_current"
+        f"{len(complete)} of {len(candidates)} SCD2 table(s) carry the full "
+        f"start-date / end-date / current-flag trio"
     )
-    if deviations:
-        evidence += f"; non-standard SCD2 column names: {'; '.join(deviations[:10])}"
-        if len(deviations) > 10:
-            evidence += f"; plus {len(deviations) - 10} more"
-    return covered(len(compliant), len(candidates), evidence)
+    if incomplete:
+        missing = "; ".join(
+            f"{n} lacks {', '.join(sorted({'start', 'end', 'flag'} - set(r)))}"
+            for n, r in sorted(incomplete.items())[:5]
+        )
+        evidence += f". Incomplete: {missing}"
+    if nonstandard:
+        evidence += (
+            f". Non-standard column names in use ({', '.join(nonstandard[:8])}) - the "
+            f"point names valid_from / valid_to / is_current, so a consumer cannot "
+            f"rely on one spelling across the estate"
+        )
+    return covered(len(complete), len(candidates), evidence)
 
 
 # =============================================================================
@@ -1691,13 +1878,13 @@ def table_scd2(ctx: CheckContext) -> Verdict:
 #
 # The store-aware ones read ``store``/``store_kind``, which the crawler fills in
 # from the SQL analytics endpoint a table's columns were read through. An empty
-# store means the endpoint could not be read — *unknown*, never a mismatch — so
+# store means the endpoint could not be read â€” *unknown*, never a mismatch â€” so
 # every one of them excludes those tables and reports N/A when nothing is left.
 # =============================================================================
 
 #: N/A reason when no table could be attributed to an owning store.
 _NO_STORE = (
-    "No table could be attributed to an owning Lakehouse/Warehouse — the SQL "
+    "No table could be attributed to an owning Lakehouse/Warehouse â€” the SQL "
     "analytics endpoints were not readable, so store membership is unknown"
 )
 
@@ -1705,7 +1892,7 @@ _NO_STORE = (
 @check(
     id="TB-WH-MODELED", ref="1.2.6",
     title="Gold Warehouse is consumption-ready and modeled (star schema) for the semantic layer",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
 )
 def warehouse_is_modeled(ctx: CheckContext) -> Verdict:
@@ -1713,7 +1900,7 @@ def warehouse_is_modeled(ctx: CheckContext) -> Verdict:
 
     **What it can determine.** Which tables are *known* to live in a Warehouse
     (from the SQL endpoint they were read through), and whether each such
-    Warehouse carries both fact-named and dimension-named tables — the readable
+    Warehouse carries both fact-named and dimension-named tables â€” the readable
     signature of a star schema.
 
     **What it cannot.** Whether the semantic layer in a *different* workspace
@@ -1744,20 +1931,21 @@ def warehouse_is_modeled(ctx: CheckContext) -> Verdict:
         return not_applicable(_NO_STORE)
 
     modeled, detail = [], []
+    roles = table_roles(tables, _models(ctx))
     for store, store_tables in sorted(by_store.items()):
-        facts = [n for n in store_tables if is_fact(n)]
-        dims = [n for n in store_tables if is_dimension(n)]
+        facts = [n for n in store_tables if roles.get(n) == "fact"]
+        dims = [n for n in store_tables if roles.get(n) == "dimension"]
         if facts and dims:
             modeled.append(store)
             detail.append(f"{store}: {len(facts)} fact / {len(dims)} dimension table(s)")
         else:
             detail.append(
-                f"{store}: {len(facts)} fact / {len(dims)} dimension table(s) — not modeled"
+                f"{store}: {len(facts)} fact / {len(dims)} dimension table(s) â€” not modeled"
             )
     return covered(
         len(modeled), len(by_store),
         f"{len(modeled)} of {len(by_store)} Warehouse(s) hold both fact and dimension "
-        f"tables — {'; '.join(detail)}. Whether a semantic model in another workspace "
+        f"tables â€” {'; '.join(detail)}. Whether a semantic model in another workspace "
         f"consumes them is not readable here.",
     )
 
@@ -1765,16 +1953,16 @@ def warehouse_is_modeled(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-AUDIT-SEPARATED", ref="1.2.8",
     title="Audit Tables role clearly defined and separated from business data",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
 def audit_tables_separated(ctx: CheckContext) -> Verdict:
     """Audit/DQ tables live in a store of their own rather than beside business tables.
 
-    **What it can determine.** Which tables are audit-shaped — either their name
+    **What it can determine.** Which tables are audit-shaped â€” either their name
     says so (audit / log / quality / exception / reject) or their columns are
-    dominated by lineage columns — and which store holds each, so it can say
+    dominated by lineage columns â€” and which store holds each, so it can say
     whether audit data is concentrated in a dedicated store or scattered through
     the business stores.
 
@@ -1813,7 +2001,7 @@ def audit_tables_separated(ctx: CheckContext) -> Verdict:
             if name not in set(audit_names) and not is_platform_table(name)
         ]
         business = len(business_names)
-        # A store is an audit store when audit tables dominate it — a couple of
+        # A store is an audit store when audit tables dominate it â€” a couple of
         # reference tables alongside the logs is "few", not a mixed store.
         dedicated = business <= len(audit_names) // 4
         if dedicated:
@@ -1822,12 +2010,12 @@ def audit_tables_separated(ctx: CheckContext) -> Verdict:
             f"{store}: {len(audit_names)} audit ({_sample(audit_names)}) / "
             f"{business} business"
             + (f" ({_sample(business_names)})" if business else "")
-            + f" — {'dedicated' if dedicated else 'mixed'}"
+            + f" â€” {'dedicated' if dedicated else 'mixed'}"
         )
     return covered(
         separated, total_audit,
         f"{separated} of {total_audit} audit table(s) sit in a store dedicated to audit "
-        f"data — {'; '.join(detail)}",
+        f"data â€” {'; '.join(detail)}",
     )
 
 
@@ -1841,7 +2029,7 @@ def _sample(names: list[str], limit: int = 3) -> str:
 @check(
     id="TB-CONFORMED-DIM", ref="4.4.9",
     title="Cross-domain conformed dimensions shared, not duplicated per domain",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
 )
 def conformed_dimensions(ctx: CheckContext) -> Verdict:
@@ -1872,9 +2060,10 @@ def conformed_dimensions(ctx: CheckContext) -> Verdict:
 
     stores_by_purpose: dict[tuple[str, ...], set[str]] = {}
     judged = 0
+    roles = table_roles(tables, _models(ctx))
     for store, store_tables in by_store.items():
         for name in store_tables:
-            if not is_dimension(name):
+            if roles.get(name) != "dimension":
                 continue
             purpose = purpose_tokens(name)
             if not purpose:
@@ -1909,12 +2098,12 @@ def conformed_dimensions(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-FACT-PURITY", ref="4.5.3",
     title="Fact tables contain only foreign keys and measures (no descriptive attributes)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
 def fact_tables_have_no_descriptive_attributes(ctx: CheckContext) -> Verdict:
-    """Fact tables carry keys, measures and lineage columns — descriptions belong in dimensions.
+    """Fact tables carry keys, measures and lineage columns â€” descriptions belong in dimensions.
 
     **What it can determine.** Text-typed columns on a fact table that are
     neither a key/identifier nor an audit/lineage column. Those are descriptive
@@ -1928,11 +2117,11 @@ def fact_tables_have_no_descriptive_attributes(ctx: CheckContext) -> Verdict:
     tables = ctx.workspace.tables
     if not tables:
         return not_applicable(_NO_TABLES)
-    facts = {n: t for n, t in tables.items()
-             if is_fact(n) and any(c.get("type") for c in columns(t))}
+    facts = {n: t for n, t in facts_in(tables, _models(ctx)).items()
+             if any(c.get("type") for c in columns(t))}
     if not facts:
         return not_applicable(
-            "No fact table with readable column types — nothing to judge for "
+            "No fact table with readable column types â€” nothing to judge for "
             "descriptive attributes"
         )
 
@@ -1961,7 +2150,7 @@ def fact_tables_have_no_descriptive_attributes(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-DIM-DENORM", ref="4.5.4",
     title="Dimension tables are denormalized appropriately (star over snowflake unless justified)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -1973,8 +2162,8 @@ def dimensions_are_denormalized(ctx: CheckContext) -> Verdict:
     ``category_sk`` beside a ``dim_category``). That is the snowflake shape the
     point warns about.
 
-    **What it cannot.** Whether a snowflake was justified — a genuinely large,
-    slowly-changing outrigger is a legitimate exception — so the evidence names
+    **What it cannot.** Whether a snowflake was justified â€” a genuinely large,
+    slowly-changing outrigger is a legitimate exception â€” so the evidence names
     the links for review rather than asserting they are wrong. A key pointing at
     a dimension that is not in this workspace is not counted, because it cannot
     be confirmed.
@@ -1982,7 +2171,7 @@ def dimensions_are_denormalized(ctx: CheckContext) -> Verdict:
     tables = ctx.workspace.tables
     if not tables:
         return not_applicable(_NO_TABLES)
-    dims = {n: t for n, t in tables.items() if is_dimension(n) and columns(t)}
+    dims = {n: t for n, t in dimensions_in(tables, _models(ctx)).items() if columns(t)}
     if not dims:
         return not_applicable(_NO_DIMS)
 
@@ -2007,7 +2196,7 @@ def dimensions_are_denormalized(ctx: CheckContext) -> Verdict:
     return covered(
         len(flat), len(dims),
         f"{len(flat)} of {len(dims)} dimension(s) are flat"
-        + (f"; snowflake links: {'; '.join(sorted(snowflaked)[:3])} — confirm each is a "
+        + (f"; snowflake links: {'; '.join(sorted(snowflaked)[:3])} â€” confirm each is a "
            f"justified outrigger" if snowflaked else ""),
     )
 
@@ -2022,72 +2211,226 @@ def dimensions_are_denormalized(ctx: CheckContext) -> Verdict:
 #: words for the same reason. An SCD marker must name *row validity* or *row
 #: change*, never an arbitrary date range.
 #:
-#: ``is_active``/``is_deleted`` are excluded for the same reason — they are
+#: ``is_active``/``is_deleted`` are excluded for the same reason â€” they are
 #: business state flags. A row being active says nothing about whether its
 #: history is versioned.
-_SCD_MARKERS: frozenset[str] = frozenset({
-    "valid_from", "valid_to", "validfrom", "validto", "valid_until", "validuntil",
-    "effective_from", "effective_to", "effectivefrom", "effectiveto",
-    "effective_start_date", "effective_end_date",
-    "row_effective_date", "row_expiry_date", "record_start_date", "record_end_date",
-    "is_current", "iscurrent", "current_flag", "currentflag", "current_ind",
-    "row_hash", "rowhash", "hash_diff", "hashdiff", "row_version", "rowversion",
-    "record_version", "scd_type", "scdtype",
+#: Columns that mark the *start* of a row version. Vocabulary drawn from the
+#: frameworks that actually generate these columns: dbt snapshots
+#: (``dbt_valid_from``), Data Vault 2.0 (``load_date``), SQL Server temporal
+#: tables (``SysStartTime``), and Microsoft's own ADF/Synapse SCD-2 data flow,
+#: which uses ``StartDate``/``EndDate``/``IsActive``
+#: (``learn.microsoft.com/azure/data-factory/data-flow-scd-type-2``).
+_SCD_START_MARKERS: frozenset[str] = frozenset({
+    "valid_from", "validfrom", "valid_start_date", "dbt_valid_from",
+    "effective_from", "effectivefrom", "effective_start_date",
+    "row_effective_date", "record_start_date", "dw_valid_from", "dw_start_date",
+    "load_date", "load_dts", "sysstarttime", "sys_start_time",
+    "meta_valid_from", "_scd_start_date", "__start_at",
 })
+
+#: Names that *may* be row-versioning columns but are far more often ordinary
+#: business attributes: a contract term, a promotion window, an employee's
+#: tenure, a product revision. ``is_audit_column`` already refuses to read
+#: ``start_date`` as lineage metadata for exactly this reason, and the
+#: vocabularies must agree - a dimension holding a business date range is not
+#: thereby a Type 2 dimension.
+#:
+#: They count only alongside a current-row flag. That combination is Microsoft's
+#: own ADF/Synapse SCD-2 output (``StartDate``/``EndDate``/``IsActive``) and is
+#: not a shape a business date range takes: a contract term does not carry
+#: ``is_current``.
+_SCD_START_AMBIGUOUS: frozenset[str] = frozenset({
+    "start_date", "startdate", "start_dt", "begin_date", "begin_dt",
+    "effective_date", "effectivedate", "eff_date", "eff_dt",
+})
+
+#: Columns that mark the *end* of a row version - the half most often missing.
+_SCD_END_MARKERS: frozenset[str] = frozenset({
+    "valid_to", "validto", "valid_until", "validuntil", "dbt_valid_to",
+    "expiry_date", "expiration_date",
+    "row_expiry_date", "row_expiration_date", "record_end_date",
+    "effective_to", "effectiveto", "effective_end_date",
+    "thru_date", "through_date", "dw_valid_to", "dw_end_date",
+    "load_end_date", "load_end_dts", "sysendtime", "sys_end_time",
+    "meta_valid_to", "_scd_end_date", "__end_at",
+})
+
+#: The end-date counterparts to ``_SCD_START_AMBIGUOUS`` - same reasoning.
+_SCD_END_AMBIGUOUS: frozenset[str] = frozenset({
+    "end_date", "enddate", "end_dt", "finish_date", "finish_dt",
+})
+
+#: A convenience flag. On its own it proves nothing - ``is_active`` is just as
+#: likely to be a soft-delete marker - so it never establishes SCD 2 alone.
+_SCD_FLAG_MARKERS: frozenset[str] = frozenset({
+    "is_current", "iscurrent", "current_flag", "currentflag", "curr_flag",
+    "current_ind", "current_indicator", "current_record_flag", "is_current_record",
+    "active_flag", "activeflag", "is_active", "isactive", "active_ind",
+    "is_latest", "islatest", "latest_flag", "dw_is_current", "row_is_current",
+})
+
+#: A monotonic version is the documented alternative to an end date: paired with
+#: a start date it identifies which row supersedes which.
+_SCD_VERSION_MARKERS: frozenset[str] = frozenset({
+    "version", "version_number", "row_version", "rowversion",
+    "record_version", "scd_version", "revision",
+})
+
+#: Change-detection hashes. Evidence of *how* changes are spotted, never of row
+#: versioning itself - a hash column alone is as likely to be deduplication.
+_SCD_HASH_MARKERS: frozenset[str] = frozenset({
+    "row_hash", "rowhash", "record_hash", "hash_diff", "hashdiff",
+    "dbt_scd_id", "checksum", "change_hash", "delta_hash",
+})
+
+#: Type 3 keeps the prior value in a second column beside the current one.
+_SCD3_PREVIOUS = re.compile(
+    r"^(?:prev|previous|prior|old|former|original)[_-]\w+"
+    r"|\w+[_-](?:prev|previous|prior|old|former|original)$",
+    re.IGNORECASE,
+)
+
+
+def _scd_shape(table: dict) -> str:
+    """Classify one dimension's SCD implementation from its column names.
+
+    Returns ``"complete"``, ``"incomplete"``, ``"type3"`` or ``"none"``.
+
+    **The rule follows Kimball.** Design Tip #107 names three metadata columns
+    for Type 2 - row effective date, row expiry date, current row indicator -
+    and the validity *pair* is what makes row versioning work: a start date says
+    when a version began, an end date says when it was superseded. A version
+    number or a change hash is the documented alternative machinery.
+
+    A lone current flag is deliberately **not** enough. ``is_active`` is just as
+    likely to be a soft-delete marker, and a flag with no validity window cannot
+    say which row was current *when* - which is the entire point of Type 2.
+
+    Ambiguous business names (``start_date``, ``end_date``) count only when a
+    current-row flag sits beside them: that combination is Microsoft's own
+    ADF/Synapse SCD-2 output, and is not a shape a contract term ever takes.
+
+    Validity columns must also carry a temporal *type*. ``valid_from int`` is
+    not a date whatever it is called. Columns with no readable type stay
+    eligible - an absent type is not evidence against.
+    """
+    names = {c.replace(" ", "").replace("-", "_").lower() for c in col_names(table)}
+    # A validity column must be able to hold a point in time. `valid_from int`
+    # or `start_date varchar` is not a date, whatever it is called - a free
+    # filter against a false positive, using type data already in the snapshot.
+    # Columns whose type is unreadable stay eligible: an absent type is not
+    # evidence against, and this check must not degrade on a partial crawl.
+    dated = {
+        (c.get("name") or "").replace(" ", "").replace("-", "_").lower()
+        for c in columns(table)
+        if not column_type(c) or is_timestamp_column(c)
+    }
+    has_flag = bool(names & _SCD_FLAG_MARKERS)
+    has_start = bool(dated & _SCD_START_MARKERS) or (
+        has_flag and bool(dated & _SCD_START_AMBIGUOUS))
+    has_end = bool(dated & _SCD_END_MARKERS) or (
+        has_flag and bool(dated & _SCD_END_AMBIGUOUS))
+    has_version = bool(names & _SCD_VERSION_MARKERS)
+    has_hash = bool(names & _SCD_HASH_MARKERS)
+
+    if has_start and (has_end or has_version):
+        return "complete"
+    # A change hash is unambiguous SCD machinery - no business column is called
+    # ``hash_diff`` - so it stands on its own as a declared change-handling
+    # strategy, even though it versions nothing by itself.
+    if has_hash:
+        return "complete"
+    if has_start or has_end or has_flag or has_version:
+        return "incomplete"
+    if sum(1 for name in names if _SCD3_PREVIOUS.match(name)) >= 2:
+        return "type3"
+    return "none"
 
 
 @check(
     id="TB-SCD-STRATEGY", ref="4.5.8",
     title="SCD strategy defined and implemented per dimension (Type 1 / Type 2 / Hybrid)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
 def scd_strategy_per_dimension(ctx: CheckContext) -> Verdict:
-    """Each dimension shows a declared change-handling strategy in its schema.
+    """Each dimension's change-handling strategy is evident, and *complete*.
 
-    **What it can determine.** Whether a dimension carries Type-2/hybrid markers
-    (validity dates, a current flag, a row hash, a version) — the only schema
-    evidence that a strategy was *chosen* per dimension.
+    **What counts as complete.** Kimball's Type 2 needs a validity *pair* - a
+    start date plus either an end date or a version number - because that is
+    what says which row was current at a given time. Microsoft's own ADF/Synapse
+    SCD-2 data flow generates exactly that shape (``StartDate`` / ``EndDate`` /
+    ``IsActive``), as do dbt snapshots (``dbt_valid_from`` / ``dbt_valid_to``)
+    and SQL Server temporal tables (``SysStartTime`` / ``SysEndTime``).
 
-    **What it cannot.** Whether an overwrite-in-place (Type 1) dimension was a
-    deliberate decision or an unexamined default: both look identical in the
-    schema. Type 1 is a legitimate strategy, so a dimension with no markers is
-    never a hard FAIL. The bands reflect exactly that: **3** when every dimension
-    declares its handling in the schema, **2** when some do (the estate knows the
-    pattern and applied it where needed), and **1** — partial, not zero — when
-    none do, because the tables may all be correctly Type 1 with the decision
-    recorded somewhere this check cannot read.
+    **Why a lone flag is not enough.** An earlier version accepted *any single*
+    marker, so a dimension carrying only ``is_current`` scored as a declared
+    strategy - and an estate where every dimension looked like that scored a
+    full pass. That is the broken half-implementation the point warns about:
+    ``is_active`` is as often a soft-delete marker, and without dates nothing
+    records *when* a row was current. Those now score as incomplete.
 
-    Broader than ``TB-SCD2`` (ref 4.5.9), which asks only whether dimensions
-    *already identified as Type 2* carry the full valid_from/valid_to/is_current
-    triple. This one asks whether any strategy is evident at all.
+    **Type 1 is legitimate, so it is never a hard failure.** A dimension with no
+    markers may be a deliberate overwrite-in-place with the decision recorded
+    somewhere unreadable. The floor is 1, not 0.
+
+    **What it cannot determine.** Whether the ETL actually maintains the
+    columns, whether the flag stays in sync with the dates, or whether Type 1
+    was chosen rather than defaulted into. Column names show declared *intent*,
+    never operational correctness.
+
+    Broader than ``TB-SCD2`` (ref 4.5.9), which asks whether dimensions already
+    identified as Type 2 carry the full trio. This asks which strategy - if
+    any - each dimension declares.
     """
     tables = ctx.workspace.tables
     if not tables:
         return not_applicable(_NO_TABLES)
-    dims = {n: t for n, t in tables.items() if is_dimension(n) and columns(t)}
+    dims = {n: t for n, t in dimensions_in(tables, _models(ctx)).items() if columns(t)}
     if not dims:
         return not_applicable(_NO_DIMS)
 
-    declared = [n for n, t in dims.items()
-                if any(c.replace(" ", "") in _SCD_MARKERS for c in col_names(t))]
-    if len(declared) == len(dims):
+    shapes = {name: _scd_shape(table) for name, table in dims.items()}
+    complete = sorted(n for n, s in shapes.items() if s == "complete")
+    incomplete = sorted(n for n, s in shapes.items() if s == "incomplete")
+    type3 = sorted(n for n, s in shapes.items() if s == "type3")
+    plain = sorted(n for n, s in shapes.items() if s == "none")
+    declared = complete + type3
+
+    detail = ""
+    if incomplete:
+        detail = (
+            f". {len(incomplete)} carry a partial marker set "
+            f"({', '.join(incomplete[:4])}) - a current flag with no validity dates, "
+            f"or a start date with no end date or version, cannot record which row "
+            f"was current when, so row versioning is not demonstrated"
+        )
+
+    if declared and not incomplete and not plain:
         return graded(
             3,
-            f"All {len(dims)} dimension(s) declare their change handling in the schema "
-            f"(validity dates, current flag, row hash or version)",
+            f"All {len(dims)} dimension(s) declare a complete change-handling strategy "
+            f"({len(complete)} with a validity pair, {len(type3)} keeping previous "
+            f"values)",
         )
     if declared:
         return graded(
             2,
-            f"{len(declared)} of {len(dims)} dimension(s) declare an SCD strategy "
-            f"({', '.join(sorted(declared)[:4])}); the rest overwrite in place (Type 1 "
-            f"by default), which may be correct but is not evident in the schema",
+            f"{len(declared)} of {len(dims)} dimension(s) declare a complete SCD "
+            f"strategy ({', '.join(declared[:4])}); {len(plain)} overwrite in place "
+            f"(Type 1 by default), which may be correct but is not evident in the "
+            f"schema{detail}",
+        )
+    if incomplete:
+        return graded(
+            1,
+            f"None of the {len(dims)} dimension(s) declares a complete SCD strategy"
+            f"{detail}. Confirm whether row history is genuinely tracked",
         )
     return graded(
         1,
-        f"None of the {len(dims)} dimension(s) carry SCD markers — all are Type 1 by "
+        f"None of the {len(dims)} dimension(s) carry SCD markers - all are Type 1 by "
         f"default. That is a legitimate strategy, but no schema evidence shows it was "
         f"chosen per dimension; confirm and record the decision",
     )
@@ -2096,17 +2439,21 @@ def scd_strategy_per_dimension(ctx: CheckContext) -> Verdict:
 # =============================================================================
 # 4.5.2 — fact grain, and 4.5.11 — degenerate / junk dimension candidates
 #
-# Both points are only *partly* readable, and the two halves are named in each
+# Both points are only *partly* readable, and the limit is named in each
 # docstring rather than blurred:
 #
 # * 4.5.2 asks for a grain that is "clearly defined **and documented**". No
 #   Fabric REST call and no SQL analytics endpoint query returns a table
-#   description, an extended property or a column comment, so the documented
-#   half is out of reach entirely. Only the "clearly defined" half is scored.
+#   description, an extended property or a column comment (verified against the
+#   Fabric T-SQL surface area and the Lakehouse List Tables reference), so the
+#   documented half is out of reach entirely. Only the "clearly defined" half is
+#   scored.
 # * 4.5.11 asks for degenerate/junk dimensions "where appropriate". Whether a
 #   modelling choice is appropriate is a judgement, and the deciding fact
-#   (cardinality) needs row data, which this tool must not fetch. That point is
-#   therefore reported as an unscored note listing candidates for review.
+#   (cardinality) needs row data this tool must not fetch. The *detection* is
+#   still factual - a key resolving to no dimension is a readable gap - so the
+#   check scores the share of facts free of those shapes and names the rest as
+#   candidates for review.
 # =============================================================================
 
 #: A grain needs at least this many independent components to be identifiable
@@ -2145,22 +2492,22 @@ def _grain_components(name: str, table: dict) -> set[tuple[str, ...]]:
 @check(
     id="TB-FACT-GRAIN", ref="4.5.2",
     title="Fact table grain clearly defined and documented for each fact table",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
 def fact_grain_is_identifiable(ctx: CheckContext) -> Verdict:
-    """Each fact table's schema shows what one row *is* — the keys that define its grain.
+    """Each fact table's schema shows what one row *is* â€” the keys that define its grain.
 
     **What it can determine.** For every fact table with readable columns, the
     distinct grain components its schema declares: foreign keys resolving to
     something other than the fact itself (``customer_sk``, ``product_id``,
     ``date_sk``) plus a time component from a non-key timestamp column. Two or
-    more such components mean the schema states a grain — "one row per customer
-    per day" — that a reviewer can read off the table. Fewer means the grain is
+    more such components mean the schema states a grain â€” "one row per customer
+    per day" â€” that a reviewer can read off the table. Fewer means the grain is
     not evident from the schema at all.
 
-    **What it cannot — half the checklist point.** *Documented* is not readable.
+    **What it cannot â€” half the checklist point.** *Documented* is not readable.
     No Fabric REST endpoint and no SQL analytics endpoint query this tool makes
     returns a table description, an extended property, or a column comment, so
     whether the grain is written down anywhere is out of reach and is **not**
@@ -2172,16 +2519,16 @@ def fact_grain_is_identifiable(ctx: CheckContext) -> Verdict:
     **Siblings.** ``TB-FACT-PURITY`` (ref 4.5.3) asks whether a fact carries
     descriptive text it should not; this asks whether it carries enough keys to
     say what a row means. ``NB-GRAIN-UNIQUE`` (ref 5.4.9) reads notebook code for
-    a duplicate-grain assertion — code, not schema, and uniqueness, not
+    a duplicate-grain assertion â€” code, not schema, and uniqueness, not
     definition.
     """
     tables = ctx.workspace.tables
     if not tables:
         return not_applicable(_NO_TABLES)
-    facts = {n: t for n, t in tables.items() if is_fact(n) and columns(t)}
+    facts = {n: t for n, t in facts_in(tables, _models(ctx)).items() if columns(t)}
     if not facts:
         return not_applicable(
-            "No fact table with readable column metadata — there is no grain to read"
+            "No fact table with readable column metadata â€” there is no grain to read"
         )
 
     defined, undefined = [], []
@@ -2193,7 +2540,7 @@ def fact_grain_is_identifiable(ctx: CheckContext) -> Verdict:
             undefined.append(f"{name} ({len(components)} grain key(s))")
     return covered(
         len(defined), len(facts),
-        f"{len(defined)} of {len(facts)} fact table(s) declare a readable grain — at least "
+        f"{len(defined)} of {len(facts)} fact table(s) declare a readable grain â€” at least "
         f"{_MIN_GRAIN_COMPONENTS} distinct grain key(s) in the schema"
         + (f"; grain not evident on {'; '.join(undefined[:3])}" if undefined else "")
         + ". Whether the grain is *documented* is not readable from any Fabric or SQL "
@@ -2201,10 +2548,13 @@ def fact_grain_is_identifiable(ctx: CheckContext) -> Verdict:
     )
 
 
-#: Column names that read as a low-cardinality flag or indicator — the kind of
+#: Column names that read as a low-cardinality flag or indicator - the kind of
 #: attribute a junk dimension is built to collapse. Matched on the whole
 #: (lower-cased) name so ``is_active``, ``paid_flag`` and ``order_status`` count
 #: while ``flag_description`` does not.
+#:
+#: Split into two confidences, because they behave differently against real
+#: schemas. See ``_UNAMBIGUOUS_FLAG`` below.
 _FLAG_COLUMN = re.compile(
     r"^(?:is|has|can|was|are)_\w+$|"
     r"^\w+_(?:flag|flg|ind|indicator|status|type|code|category|reason)$|"
@@ -2212,8 +2562,47 @@ _FLAG_COLUMN = re.compile(
     re.IGNORECASE,
 )
 
+#: The half of the pattern that is unambiguous on its own. Nobody names a
+#: comment field ``is_active`` or a description ``paid_flag`` - the ``is_``/
+#: ``has_`` prefix and the ``_flag``/``_ind`` suffix state the column's shape
+#: in the name itself.
+#:
+#: **Why the distinction earns its place.** The junk half also requires the
+#: declared type to look narrow, so a ``rejection_reason varchar(500)`` cannot
+#: pass on its name alone. But Lakehouse Delta tables usually declare a bare
+#: ``string`` with no width, and requiring a width there silenced the check
+#: completely: on a real estate every one of 51 findings disappeared, including
+#: genuine ones like ``store_and_fwd_flag``. Trading 51 false positives for zero
+#: findings is not an improvement.
+#:
+#: So these names are trusted without a width, and the vaguer suffixes -
+#: ``_type``, ``_status``, ``_code``, ``_category``, ``_reason``, which are the
+#: ones that actually caused the false positives - still need the type to agree.
+_UNAMBIGUOUS_FLAG = re.compile(
+    r"^(?:is|has|can|was|are)_\w+$|"
+    r"^\w+_(?:flag|flg|ind|indicator)$|"
+    r"^(?:flag|indicator)$",
+    re.IGNORECASE,
+)
+
+
+def _is_junk_candidate(column: dict) -> bool:
+    """True when a column is plausibly a junk-dimension input.
+
+    An unambiguous flag name stands alone. A vaguer suffix needs the declared
+    type to be narrow as well - or to be absent, since an unreadable type is
+    not evidence against a column.
+    """
+    name = (column.get("name") or "").strip()
+    if not _FLAG_COLUMN.match(name):
+        return False
+    if _UNAMBIGUOUS_FLAG.match(name):
+        return True
+    return not column_type(column) or is_low_cardinality_shape(column)
+
+
 #: Below this many flag columns on one fact, collapsing them into a junk
-#: dimension buys nothing — the pattern exists to remove *several* low-value
+#: dimension buys nothing - the pattern exists to remove *several* low-value
 #: columns, not one.
 _MIN_JUNK_CANDIDATES = 3
 
@@ -2221,101 +2610,138 @@ _MIN_JUNK_CANDIDATES = 3
 @check(
     id="TB-DEGENERATE-JUNK-DIM", ref="4.5.11",
     title="Degenerate and junk dimensions used where appropriate",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.LOW,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
 def degenerate_and_junk_dimension_candidates(ctx: CheckContext) -> Verdict:
-    """Report fact columns shaped like a degenerate or junk dimension — unscored, for review.
-
-    **Deliberately unscored (a `note`).** The point says "where appropriate", and
-    appropriateness is a modelling judgement no API can make: a degenerate
-    dimension is *correct* when an order number genuinely has no attributes of
-    its own, and *wrong* when the attributes exist and were simply never
-    modelled. The deciding fact for a junk dimension — column cardinality — needs
-    row data, which this tool must not fetch. Scoring either way would be a
-    guess, so this reports the candidates and names them instead.
+    """Fact tables carry no unmodelled key or uncollapsed flag cluster.
 
     **What it can determine.** *Degenerate candidates*: key-shaped columns on a
     fact table whose referent matches no dimension table in this workspace and is
     not the fact's own identity (``order_number`` on ``fact_sales`` with no
-    ``dim_order``) — the exact shape of a degenerate dimension. *Junk
+    ``dim_order``) - the exact shape of a degenerate dimension. *Junk
     candidates*: three or more flag/indicator/status-shaped columns on one fact,
     the cluster a junk dimension exists to collapse.
 
-    **What it cannot.** Column cardinality (no row data is read), whether the
-    referenced dimension lives in another workspace, whether a degenerate column
-    is intentional, or whether an existing junk dimension is already in use
-    somewhere it cannot see. Every name below is a *candidate for review*, never
-    a finding.
+    **Declared relationships outrank the name test.** A column that participates
+    in a semantic-model relationship is *stated* by the modeller to resolve to
+    another table, so it is never reported as unmodelled - whatever it is called.
+    Only columns with no declared relationship fall through to the name-based
+    test. That turns the strongest half of this check from an inference into a
+    fact the estate itself asserts, and removes the false positives from
+    dimensions whose names do not resemble their foreign keys.
+
+    **Declared types constrain the vaguer half of the junk test.** A junk
+    dimension collapses *low-cardinality* columns. An unambiguous flag name -
+    ``is_returned``, ``store_and_fwd_flag`` - is trusted on its own, because
+    nobody names a comment field that way. A vaguer suffix (``_type``,
+    ``_status``, ``_code``, ``_category``, ``_reason``) also needs its declared
+    type to look narrow, so ``rejection_reason varchar(500)`` no longer counts.
+    Columns whose type is unreadable are kept: an unreadable type is not
+    evidence against. The split matters because Lakehouse Delta tables usually
+    declare a bare ``string`` with no width; requiring a width everywhere
+    silenced this half of the check entirely on a real estate.
+
+    **Scored on the share of fact tables that are clean.** An earlier version
+    reported the candidates as an unscored ``note``, reasoning that "where
+    appropriate" is a modelling judgement. It is - but the *detection* is not:
+    a key that resolves to no dimension is a readable, factual gap in the model,
+    and reporting it as INFO meant accurate findings never influenced anything.
+    The verdict now scores how many facts are free of these shapes; the named
+    candidates remain what a reviewer confirms.
+
+    **What it cannot.** Column cardinality (no row data is read - the type is a
+    shape proxy), whether the referenced dimension lives in another workspace,
+    whether a degenerate column is intentional, or whether an existing junk
+    dimension is already in use somewhere it cannot see. Where no semantic model
+    is readable there are no declared relationships, and the check falls back
+    entirely to names - a Bronze/landing workspace gets the weaker test, and the
+    evidence says so. A named table is a *candidate for review*: the check
+    reports the shape, not the intent.
 
     **Sibling.** ``TB-FACT-PURITY`` (ref 4.5.3) scores *text* attributes on a
     fact that belong on a dimension. This looks at key- and flag-shaped columns,
-    which that check deliberately ignores, and judges neither.
+    which that check deliberately ignores.
     """
     tables = ctx.workspace.tables
     if not tables:
         return not_applicable(_NO_TABLES)
-    facts = {n: t for n, t in tables.items() if is_fact(n) and columns(t)}
+    facts = {n: t for n, t in facts_in(tables, _models(ctx)).items() if columns(t)}
     if not facts:
         return not_applicable(
-            "No fact table with readable column metadata — no degenerate or junk "
+            "No fact table with readable column metadata â€” no degenerate or junk "
             "dimension candidate can be identified"
         )
 
     dimension_purposes = {
-        purpose_tokens(n) for n in tables if is_dimension(n) and purpose_tokens(n)
+        purpose_tokens(n) for n in dimensions_in(tables, _models(ctx)) if purpose_tokens(n)
     }
 
     degenerate: list[str] = []
     junk: list[str] = []
+    # A relationship is the modeller declaring that this column resolves to a
+    # dimension. Where one exists the name test is not consulted at all - the
+    # estate has already answered the question the name was being used to guess.
+    modelled = related_columns(_models(ctx))
     for name, table in sorted(facts.items()):
         own = purpose_tokens(name)
+        table_key = normalise_table_name(name)
         orphan_keys = sorted({
             column.get("name") or ""
             for column in columns(table)
             if (referent := key_referent(column.get("name") or ""))
             and referent != own
             and referent not in dimension_purposes
+            and (table_key, normalise_column(column.get("name") or "")) not in modelled
         })
         if orphan_keys:
             degenerate.append(f"{name}: {', '.join(orphan_keys[:4])}")
+        # A junk dimension collapses *low-cardinality* columns. An unambiguous
+        # flag name (`is_*`, `*_flag`) is trusted on its own; a vaguer suffix
+        # (`*_type`, `*_reason`) needs the declared type to agree, because that
+        # is where the false positives came from.
         flags = sorted({
             (column.get("name") or "")
             for column in columns(table)
-            if _FLAG_COLUMN.match((column.get("name") or "").strip())
+            if _is_junk_candidate(column)
         })
         if len(flags) >= _MIN_JUNK_CANDIDATES:
             junk.append(f"{name}: {len(flags)} flag column(s) ({', '.join(flags[:4])})")
 
+    flagged = {entry.split(":")[0] for entry in degenerate} | {entry.split(":")[0] for entry in junk}
+    clean = len(facts) - len(flagged)
+
     if not degenerate and not junk:
-        return note(
-            f"No degenerate or junk dimension candidate found across {len(facts)} fact "
-            f"table(s): every key column resolves to a dimension in this workspace and no "
-            f"fact carries {_MIN_JUNK_CANDIDATES}+ flag/status columns. Whether the "
-            f"existing model uses the patterns *appropriately* is a modelling judgement "
-            f"this check does not make."
+        return covered(
+            len(facts), len(facts),
+            f"All {len(facts)} fact table(s) are free of degenerate/junk dimension "
+            f"candidates: every key column resolves to a dimension in this workspace "
+            f"and no fact carries {_MIN_JUNK_CANDIDATES}+ flag/status columns"
         )
     parts = []
     if degenerate:
         parts.append(
             f"{len(degenerate)} fact table(s) carry a key with no matching dimension "
-            f"(degenerate-dimension candidates) — {'; '.join(degenerate[:3])}"
+            f"(degenerate-dimension candidates) - {'; '.join(degenerate[:3])}"
         )
     if junk:
         parts.append(
             f"{len(junk)} fact table(s) carry {_MIN_JUNK_CANDIDATES}+ flag/status columns "
-            f"(junk-dimension candidates) — {'; '.join(junk[:3])}"
+            f"(junk-dimension candidates) - {'; '.join(junk[:3])}"
         )
-    return note(
-        "; ".join(parts)
-        + ". Reported for review, not scored: cardinality is not readable without querying "
-          "rows, and whether each pattern is appropriate here is a modelling judgement."
+    return covered(
+        clean, len(facts),
+        f"{clean} of {len(facts)} fact table(s) carry no degenerate or junk dimension "
+        f"candidate. " + "; ".join(parts)
+        + ". Each named table is a candidate for review: cardinality is not readable "
+          "without querying rows, and whether the pattern is appropriate here is a "
+          "modelling judgement this check does not make."
     )
 
 
 # =============================================================================
-# 4.4.1 — Warehouse schema organization
+# 4.4.1 â€” Warehouse schema organization
 # =============================================================================
 
 #: Words that mark a schema as the *landing / work* area rather than a
@@ -2375,7 +2801,7 @@ def _schema_score(schemas: dict[str, int]) -> int:
 @check(
     id="TB-WH-SCHEMAS", ref="4.4.1",
     title="Warehouse schema organization is logical (by domain schema, plus staging schema)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=True,
 )
@@ -2390,7 +2816,7 @@ def warehouse_schema_organization(ctx: CheckContext) -> Verdict:
     Warehouse's schemas.
 
     Only tables *known* to live in a Warehouse are judged (``in_warehouse``), the
-    same gating the other store-aware checks use — a Lakehouse has no comparable
+    same gating the other store-aware checks use â€” a Lakehouse has no comparable
     schema concept, and a table whose owning store could not be read is unknown,
     never a finding.
 
@@ -2437,13 +2863,12 @@ def warehouse_schema_organization(ctx: CheckContext) -> Verdict:
     if not qualified:
         return not_applicable(
             f"None of the {len(warehouse_tables)} Warehouse table(s) read carries a "
-            f"schema qualifier — the SQL-endpoint reader records the table name "
-            f"without its INFORMATION_SCHEMA.TABLE_SCHEMA — so schema organisation "
+            f"schema qualifier â€” the SQL-endpoint reader records the table name "
+            f"without its INFORMATION_SCHEMA.TABLE_SCHEMA â€” so schema organisation "
             f"cannot be assessed from this snapshot"
         )
 
     scores = {store: _schema_score(counts) for store, counts in by_store.items()}
-    business_tables = len(warehouse_tables) - excluded_system
     detail = "; ".join(
         f"'{store}': " + ", ".join(
             f"{schema or '(unqualified)'} ({count} table(s))"
@@ -2453,8 +2878,8 @@ def warehouse_schema_organization(ctx: CheckContext) -> Verdict:
     )
     return graded(
         sum(scores.values()) // len(scores),
-        f"{len(by_store)} Warehouse(s) judged on schema layout — {detail}. "
-        f"{qualified} of {business_tables} business Warehouse table(s) carry a schema "
+        f"{len(by_store)} Warehouse(s) judged on schema layout â€” {detail}. "
+        f"{qualified} of {len(warehouse_tables)} Warehouse table(s) carry a schema "
         f"qualifier; a Warehouse holding everything in dbo, or with no staging "
         f"schema separate from its presentation schemas, scores below full. "
         f"Excluded {excluded_system} Fabric system-schema table(s).",
@@ -2462,7 +2887,7 @@ def warehouse_schema_organization(ctx: CheckContext) -> Verdict:
 
 
 # =============================================================================
-# 4.4.2 — Warehouse naming *consistency* (one convention, whichever it is)
+# 4.4.2 â€” Warehouse naming *consistency* (one convention, whichever it is)
 # =============================================================================
 
 #: A name written entirely in one convention. Order matters when matching:
@@ -2479,9 +2904,9 @@ _NAMING_STYLES: tuple[tuple[str, re.Pattern[str]], ...] = (
 def naming_style(name: str) -> str:
     """Which single naming convention ``name`` is written in, or ``"mixed"``.
 
-    ``"mixed"`` covers everything that follows no one convention — a space in
+    ``"mixed"`` covers everything that follows no one convention â€” a space in
     the name, ``Customer_ID`` mixing Pascal with underscores, ``LDP Course
-    Name/Domain`` — and is what makes an estate's naming *inconsistent*
+    Name/Domain`` â€” and is what makes an estate's naming *inconsistent*
     regardless of which convention it chose.
     """
     text = (name or "").strip()
@@ -2525,15 +2950,15 @@ def _dominant(styles: list[str]) -> tuple[str, int]:
 @check(
     id="TB-WH-NAME-CONSISTENCY", ref="4.4.2",
     title="Table and column naming conventions are consistent across the Warehouse",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.LOW,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
 def warehouse_naming_is_internally_consistent(ctx: CheckContext) -> Verdict:
-    """Every Warehouse table and column follows *one* convention — whichever one.
+    """Every Warehouse table and column follows *one* convention â€” whichever one.
 
     Each name is classified as ``snake_case``, ``UPPER_CASE``, ``PascalCase``,
-    ``camelCase``, or ``mixed`` (no single convention — a space, or Pascal words
+    ``camelCase``, or ``mixed`` (no single convention â€” a space, or Pascal words
     joined by underscores). The dominant convention is then found separately for
     table names and for column names, and the score is the share of names that
     follow their own group's dominant convention. A Warehouse written entirely
@@ -2544,7 +2969,7 @@ def warehouse_naming_is_internally_consistent(ctx: CheckContext) -> Verdict:
     the share of columns that are specifically ``snake_case``, across *every*
     table in the workspace. Two differences, both real: this one is scoped to
     tables known to live in a **Warehouse** (``in_warehouse``), and it mandates
-    **no particular convention** — it measures internal consistency, so an
+    **no particular convention** â€” it measures internal consistency, so an
     all-PascalCase Warehouse passes here and fails there, which is the intended
     distinction between "follow the house style" and "follow snake_case".
 
@@ -2587,7 +3012,7 @@ def warehouse_naming_is_internally_consistent(ctx: CheckContext) -> Verdict:
     else:
         detail += ("; no column metadata was read, so column naming is not "
                    "included in this score")
-    detail += (". Consistency is what is scored — any one convention counts, "
+    detail += (". Consistency is what is scored â€” any one convention counts, "
                "provided the Warehouse sticks to it.")
     return covered(compliant, total, detail)
 
@@ -2605,7 +3030,7 @@ _VIEW_DDL = re.compile(
     re.IGNORECASE,
 )
 
-#: A stored procedure or a user-defined function — abstraction over the physical
+#: A stored procedure or a user-defined function â€” abstraction over the physical
 #: tables for *writes* and reusable logic, but not the semantic-facing read
 #: surface a view provides.
 _PROC_DDL = re.compile(
@@ -2621,7 +3046,7 @@ _MAX_NAMED_SOURCES = 5
 @check(
     id="WS-VIEW-ABSTRACTION", ref="4.4.7",
     title="Views/stored procedures used to abstract the semantic-facing layer from physical tables",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS,
     requires=[Resource.TABLE_SCHEMAS, Resource.PIPELINE_DEFINITIONS,
               Resource.NOTEBOOK_DEFINITIONS],
@@ -2711,7 +3136,7 @@ def workspace_defines_a_view_layer_over_its_tables(ctx: CheckContext) -> Verdict
             2,
             f"No view definition found, but {len(proc_sources)} pipeline(s)/notebook(s) "
             f"define a stored procedure or function over the workspace's {tables} table(s): "
-            f"{', '.join(proc_sources[:_MAX_NAMED_SOURCES])} — logic is abstracted, but "
+            f"{', '.join(proc_sources[:_MAX_NAMED_SOURCES])} â€” logic is abstracted, but "
             f"consumers still read the physical tables directly." + caveat,
         )
     return graded(
@@ -2731,7 +3156,7 @@ def workspace_defines_a_view_layer_over_its_tables(ctx: CheckContext) -> Verdict
 #: ingestion or staging store. Matched with :func:`name_words`, the shared
 #: name-token splitter, so ``LH_Sales_Gold``, ``lh-sales-gold`` and
 #: ``SalesGoldMart`` all yield the same tokens. A Warehouse needs no name match
-#: at all (see the check docstring) — this list only promotes a *Lakehouse* or a
+#: at all (see the check docstring) â€” this list only promotes a *Lakehouse* or a
 #: *SemanticModel* into the serving population.
 _SERVING_ITEM_WORDS: frozenset[str] = frozenset({
     "gold", "serving", "serve", "curated", "mart", "marts", "datamart",
@@ -2744,8 +3169,8 @@ _NAME_MARKED_SERVING_TYPES = ("Lakehouse", "SemanticModel")
 #: Default freshness SLA, in hours. Deliberately **48**, not 24: the readable
 #: signal is a *run/refresh* timestamp, so a perfectly healthy daily batch that
 #: ran 25 hours before the audit would fail a 24-hour window purely on when the
-#: audit happened to be run. 48 hours still catches the real defect — a serving
-#: item that has not refreshed for days — without failing an estate for clock
+#: audit happened to be run. 48 hours still catches the real defect â€” a serving
+#: item that has not refreshed for days â€” without failing an estate for clock
 #: jitter. Tune per project with ``gold_freshness_sla_hours``.
 _DEFAULT_SLA_HOURS = 48
 
@@ -2758,7 +3183,7 @@ def _serving_items(ctx: CheckContext) -> list[Item]:
     Every **Warehouse** qualifies by type: a Fabric Warehouse exists to be
     queried by reports, so it *is* the serving surface regardless of what it is
     called. A **Lakehouse** or **SemanticModel** qualifies only when its name
-    carries a serving token — a Bronze/Silver lakehouse is not Gold, and nothing
+    carries a serving token â€” a Bronze/Silver lakehouse is not Gold, and nothing
     else in the item list distinguishes them.
     """
     serving: list[Item] = []
@@ -2775,18 +3200,18 @@ def _serving_items(ctx: CheckContext) -> list[Item]:
 @check(
     id="WS-GOLD-FRESHNESS", ref="5.4.7",
     title="Freshness validation: Gold tables updated within defined SLA",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS,
     requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=True,
 )
 def gold_items_refreshed_within_sla(ctx: CheckContext) -> Verdict:
     """The Gold/serving items refreshed within the freshness SLA window.
 
-    **What it measures — an actual elapsed time, not a coded control.** Each
+    **What it measures â€” an actual elapsed time, not a coded control.** Each
     serving item's last run/refresh (``Item.last_run_utc``, filled from the
     job-scheduler history and, for semantic models, the Power BI refresh
     history) is compared against a window read from
-    ``gold_freshness_sla_hours`` (default 48 hours — long enough that a healthy
+    ``gold_freshness_sla_hours`` (default 48 hours â€” long enough that a healthy
     daily batch is not failed for the hour the audit happened to run).
 
     **What counts as Gold.** Every Warehouse, because a Fabric Warehouse exists
@@ -2796,18 +3221,18 @@ def gold_items_refreshed_within_sla(ctx: CheckContext) -> Verdict:
     :func:`name_words` splitter.
 
     **What it cannot determine.** This is the item's **last run/refresh**, which
-    is the closest readable proxy for "the Gold *table* was updated" — Delta
+    is the closest readable proxy for "the Gold *table* was updated" â€” Delta
     table commit times are not fetched, so a run that succeeded while writing
     nothing still reads as fresh, and a table updated by a pipeline in another
     workspace reads as stale here. It also cannot read the *agreed* SLA: the
     window is a project setting, not something the tenant publishes.
 
     **Missing timestamps are excluded, never counted stale.** An item with no
-    readable last-run stamp leaves the denominator entirely — "we could not read
+    readable last-run stamp leaves the denominator entirely â€” "we could not read
     when it last ran" is not "it is out of SLA". When no serving item exists, or
     none of them has a readable stamp, the check is N/A.
 
-    **Sibling — ``NB-TIMELINESS-CONTROL`` (5.2.3), and the difference matters.**
+    **Sibling â€” ``NB-TIMELINESS-CONTROL`` (5.2.3), and the difference matters.**
     That compatibility ID now checks whether pipeline refresh/data activities
     have a custom execution timeout chosen for their SLA. This check reads no
     pipeline policy: it asks whether the serving items were in fact refreshed
@@ -2837,7 +3262,7 @@ def gold_items_refreshed_within_sla(ctx: CheckContext) -> Verdict:
         return not_applicable(
             f"None of the {len(serving)} Gold/serving item(s) carries a readable last "
             "run/refresh timestamp, so how recently they were updated cannot be measured "
-            "— unknown recency is never reported as stale"
+            "â€” unknown recency is never reported as stale"
         )
 
     try:
@@ -2861,11 +3286,11 @@ def gold_items_refreshed_within_sla(ctx: CheckContext) -> Verdict:
     )
     if stale:
         detail += (f"; stale: {', '.join(stale[:_MAX_NAMED_STALE])}"
-                   + (f", …(+{len(stale) - _MAX_NAMED_STALE} more)"
+                   + (f", â€¦(+{len(stale) - _MAX_NAMED_STALE} more)"
                       if len(stale) > _MAX_NAMED_STALE else ""))
     if excluded:
         detail += (f". {excluded} further serving item(s) had no readable timestamp and are "
                    "excluded rather than counted stale")
-    detail += (". This is the item's last run/refresh — the closest readable proxy for "
+    detail += (". This is the item's last run/refresh â€” the closest readable proxy for "
                "\"the Gold table was updated\"; Delta commit times are not fetched.")
     return covered(len(readable) - len(stale), len(readable), detail)

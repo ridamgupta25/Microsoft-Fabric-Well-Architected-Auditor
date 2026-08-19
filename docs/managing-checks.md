@@ -168,7 +168,7 @@ flag then updates **automatically and everywhere at once**:
 # backend/src/auditfast/core/validation.py
 VALIDATED_CHECKLIST: dict[str, str] = {
     "2.4.1":  "All pipeline activities have appropriate retry policies configured",
-    "IMPL-15": "Workspace is assigned to a Fabric capacity [WS-CAPACITY]",
+    "13.3.1": "Workspace is assigned to a Fabric capacity [WS-CAPACITY]",
     # ...add a "<ref>": "<checklist item>" line to validate a point; delete it
     #    to send the matching check(s) back to "Pending validation".
 }

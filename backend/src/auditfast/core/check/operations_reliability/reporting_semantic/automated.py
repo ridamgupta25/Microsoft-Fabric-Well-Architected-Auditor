@@ -28,7 +28,7 @@ BI_CONTENT_TYPES: frozenset[str] = frozenset({"SemanticModel", "Report", "Pagina
 @check(
     id="WS-BI-DEPLOY", ref="14.5.4",
     title="Semantic models and reports are source-controlled and deployed via pipeline (Dev → QA → Prod)",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DEVOPS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.REPORTING,),
     requires=[Resource.WORKSPACE, Resource.ITEMS, Resource.GIT], required=True,
 )
@@ -94,13 +94,18 @@ MODEL_LAYERS = (Layer.REPORTING, Layer.MIXED)
 #: …and the ones that also hold the pipelines which load them.
 REFRESH_LAYERS = (Layer.PREP, Layer.OPERATIONS, Layer.REPORTING, Layer.MIXED)
 
-#: The pipeline activity that refreshes a Power BI / Fabric semantic model.
+#: The pipeline activity that refreshes a Power BI / Fabric *semantic model*.
+#: A dataflow refresh is deliberately excluded here — it loads data, it does not
+#: refresh the model — and is counted as an upstream load below instead.
 _REFRESH_ACTIVITY_TYPES = {
-    "PBISemanticModelRefresh", "RefreshDataflow", "DatasetRefresh",
+    "PBISemanticModelRefresh", "DatasetRefresh",
 }
 #: Activities that constitute "the Gold load" — the work a refresh should follow.
+#: A dataflow refresh and a child-pipeline invocation both produce data upstream
+#: of the model, so a model refresh sequenced behind either is orchestrated.
 _LOAD_ACTIVITY_TYPES = {
     "Copy", "Script", "TridentNotebook", "SqlServerStoredProcedure",
+    "RefreshDataflow", "ExecutePipeline",
 }
 
 #: Metadata proxies for a "large" Import model in SM-INCREMENTAL-REFRESH. Row
@@ -113,7 +118,7 @@ _WIDE_MODEL_COLUMNS = 100
 @check(
     id="SM-REFRESH-ORCHESTRATED", ref="14.5.1",
     title="Refresh strategy aligned with upstream load completion",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=REFRESH_LAYERS,
     requires=[Resource.PIPELINE_DEFINITIONS, Resource.ITEMS], required=False,
 )
@@ -126,7 +131,11 @@ def sm_refresh_orchestrated(ctx: CheckContext) -> Verdict:
 
     Read from the pipeline definitions rather than from schedule times: the
     Fabric job-schedule API is not among the resources the provider fetches, and
-    an orchestrated refresh is the stronger signal anyway.
+    an orchestrated refresh is the stronger signal anyway. A dataflow refresh is
+    an upstream *load*, not a model refresh, so a model refresh sequenced behind
+    one counts as orchestrated. When no pipeline triggers a semantic-model
+    refresh at all, the models refresh on their own schedule — invisible here —
+    so the verdict is N/A, never a FAIL.
     """
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
@@ -157,9 +166,11 @@ def sm_refresh_orchestrated(ctx: CheckContext) -> Verdict:
         return graded(1, f"Pipeline(s) {', '.join(sorted(refresh_only))} refresh a model but "
                          f"the refresh is not sequenced after a load activity — it can "
                          f"start while the load is still running")
-    return binary(False, f"{len(models)} semantic model(s) and {len(pipelines)} pipeline(s), "
-                         f"but no pipeline triggers a refresh — the model runs on its own "
-                         f"clock with no guarantee the Gold load has finished")
+    return not_applicable(
+        f"{len(models)} semantic model(s) and {len(pipelines)} pipeline(s), but no "
+        f"pipeline triggers a semantic-model refresh — the models refresh on their own "
+        f"schedule, which the Fabric job-schedule API (not fetched) would be needed to "
+        f"align against the load, so orchestration cannot be judged here")
 
 
 #: The Fabric item that watches for a condition and raises an alert.
@@ -169,7 +180,7 @@ _ALERT_ITEM_TYPES: frozenset[str] = frozenset({"Reflex"})
 @check(
     id="SM-REFRESH-ALERT", ref="14.5.3",
     title="Refresh failures alert the owning team",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.MONITORING, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=(Layer.REPORTING,),
     requires=[Resource.ITEMS, Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE,
               Resource.PIPELINE_DEFINITIONS],
@@ -315,7 +326,7 @@ def _pipelines_with_guarded_refresh(ctx: CheckContext) -> list[str]:
 @check(
     id="SM-INCREMENTAL-REFRESH", ref="14.5.2",
     title="Incremental refresh configured for large Import models",
-    pillar=Pillar.OPERATIONS, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
     layers=MODEL_LAYERS,
     requires=[Resource.SEMANTIC_MODEL_DEFINITIONS],
     required=False,

@@ -289,7 +289,14 @@ def test_1_2_5_still_fails_a_silver_notebook_without_cleansing():
     assert verdict.score == 0
 
 
-def test_1_2_5_passes_a_silver_notebook_with_cleansing():
+def test_1_2_5_scores_a_silver_notebook_on_how_many_aspects_it_applies():
+    """A rename (conforming) and a cast is 2 of the 3 scored aspects - a partial.
+
+    ``dropna`` is deliberately *not* counted as cleansing: dropping a row is not
+    the same as repairing a value, and the cleansing vocabulary names the repair
+    operations (trim / regexp_replace / fillna / coalesce). Deduplication is
+    detected but reported as unscored context, so it does not lift the band.
+    """
     code = (
         "df = df.dropDuplicates(['id']).dropna(subset=['id'])\n"
         "df = df.withColumnRenamed('CustomerID', 'customer_id')\n"
@@ -299,13 +306,46 @@ def test_1_2_5_passes_a_silver_notebook_with_cleansing():
     defn = _notebook(code)
     ws = _ws(notebooks={"nb": defn})
     verdict = _run("NB-SILVER-QUALITY", ws, "nb", defn)
-    assert verdict.score == 3
+    assert verdict.score is not None and 0 < verdict.score < 3
+    assert "2 of 3" in verdict.evidence
+    assert "Not found: cleansing" in verdict.evidence
+    assert "deduplication also applied" in verdict.evidence
 
 
-def test_1_2_5_awards_partial_credit_when_only_deduplication_is_missing():
-    """The MLC Silver mapping cleans, conforms, and casts but does not deduplicate."""
+def test_1_2_3_and_1_2_5_use_the_highest_layer_a_notebook_writes():
+    """A Bronze-to-Silver promotion notebook produces *silver*.
+
+    It writes a bronze staging table first, so taking the first matching write
+    target classified every promotion notebook as bronze - on a real estate 8 of
+    8 notebooks resolved to bronze, which failed Silver notebooks against the
+    Bronze raw-capture rule and left 1.2.5 with nothing to judge.
+    """
     code = (
-        "df = df.dropna(subset=['customer_id'])\n"
+        "raw.write.saveAsTable('bronze.stg_customer')\n"
+        "clean = raw.dropDuplicates(['id']).withColumn('d', to_date('d'))\n"
+        "clean.write.saveAsTable('silver.dim_customer')\n"
+    )
+    defn = _notebook(code)
+    ws = _ws(notebooks={"nb": defn})
+
+    bronze = _run("NB-BRONZE-METADATA", ws, "nb", defn)
+    assert bronze.score is None, "a silver producer is not judged by the Bronze rule"
+
+    silver = _run("NB-SILVER-QUALITY", ws, "nb", defn)
+    assert silver.score is not None, "the silver branch must be reachable"
+    assert "silver.dim_customer" in silver.evidence
+
+
+def test_1_2_5_passes_when_only_deduplication_is_missing_since_it_is_unscored():
+    """The MLC Silver mapping cleanses, conforms and casts but never deduplicates.
+
+    Whether the source needs dedup cannot be seen from the code, so its absence is
+    reported as context and never scored: applying the three scored disciplines is
+    a full pass, not a partial. This is the MLC reference-table case the reviewer
+    flagged - dedup is not implemented because the key does not repeat.
+    """
+    code = (
+        "df = df.withColumn('name', trim(col('name')))\n"
         "df = df.withColumnRenamed('CustomerID', 'customer_id')\n"
         "df = df.withColumn('event_date', to_date('event_date'))\n"
         "df.write.saveAsTable('Silver_MLC_Lakehouse.dim_customer')\n"
@@ -314,9 +354,10 @@ def test_1_2_5_awards_partial_credit_when_only_deduplication_is_missing():
     ws = _ws(notebooks={"CC_Mapping_Bronze_to_Silver": defn})
     verdict = _run("NB-SILVER-QUALITY", ws, "CC_Mapping_Bronze_to_Silver", defn)
 
-    assert verdict.score == 2
-    assert "present: cleansing, conforming, type standardization" in verdict.evidence
-    assert "missing: deduplication" in verdict.evidence
+    assert verdict.score == 3
+    assert "3 of 3" in verdict.evidence
+    assert "Silver_MLC_Lakehouse" in verdict.evidence
+    assert "deduplication not detected (not scored" in verdict.evidence
 
 
 def test_1_2_5_lists_all_missing_controls_for_an_untreated_silver_write():
@@ -326,7 +367,10 @@ def test_1_2_5_lists_all_missing_controls_for_an_untreated_silver_write():
     verdict = _run("NB-SILVER-QUALITY", ws, "nb", defn)
 
     assert verdict.score == 0
-    assert "missing: cleansing, deduplication, conforming, type standardization" in verdict.evidence
+    assert "0 of 3" in verdict.evidence
+    assert ("Not found: type standardization, cleansing, conforming"
+            in verdict.evidence)
+    assert "deduplication not detected" in verdict.evidence
 
 
 @pytest.mark.parametrize("check_id", ["NB-BRONZE-METADATA", "NB-SILVER-QUALITY"])
@@ -409,7 +453,7 @@ def test_4_5_1_still_fails_when_no_dimension_exists():
     assert "no dimension tables" in verdict.evidence
 
 
-# -- IMPL-04 sensitivity labels -----------------------------------------------
+# -- 13.2.3 sensitivity labels -----------------------------------------------
 
 
 def test_label_is_read_from_either_documented_spelling():

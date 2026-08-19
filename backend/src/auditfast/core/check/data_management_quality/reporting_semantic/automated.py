@@ -21,7 +21,7 @@ from auditfast.core.check._dax import (
 )
 from auditfast.core.check._dax import normalised as dax_normalised
 from auditfast.core.check._semantic import is_row_identifier
-from auditfast.core.check.helpers import Verdict, covered, not_applicable, note
+from auditfast.core.check.helpers import Verdict, binary, covered, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
@@ -127,7 +127,7 @@ def _offender_breakdown(offenders: dict[str, list[str]], limit: int = _MAX_NAMED
     id="SM-FK-SURROGATE",
     ref="5.4.1",
     title="Fact-dimension referential integrity: all FKs in fact tables match dimension surrogate keys",
-    pillar=Pillar.DATA,
+    pillar=Pillar.DATA_QUALITY,
     scope=Scope.SEMANTIC_MODEL,
     severity=Severity.HIGH,
     layers=SEMANTIC_LAYERS,
@@ -170,7 +170,7 @@ def sm_fk_surrogate(ctx: CheckContext) -> Verdict:
     id="SM-FK-RI-DATA",
     ref="5.4.1",
     title="Fact FK values resolve to dimension surrogate keys (no orphans)",
-    pillar=Pillar.DATA,
+    pillar=Pillar.DATA_QUALITY,
     scope=Scope.WORKSPACE,
     severity=Severity.HIGH,
     layers=SEMANTIC_LAYERS,
@@ -210,7 +210,7 @@ def sm_fk_ri_data(ctx: CheckContext) -> Verdict:
 
 @check(
     id="R-BIDI-REL", ref="14.1.1", title="Star schema followed in the semantic model (single-direction relationships, no unnecessary bidirectional filters)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
 def single_direction_relationships(ctx: CheckContext) -> list[Verdict]:
@@ -261,7 +261,7 @@ def single_direction_relationships(ctx: CheckContext) -> list[Verdict]:
 
 @check(
     id="R-MEASURE-DUP", ref="14.1.3", title="Measures centralized (no duplicated calculation logic across reports)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
 def measures_not_duplicated(ctx: CheckContext) -> list[Verdict]:
@@ -312,7 +312,7 @@ def measures_not_duplicated(ctx: CheckContext) -> list[Verdict]:
 
 @check(
     id="R-DAX-VAR", ref="14.1.4", title="DAX follows good practices (variables, no repeated sub-expressions, avoids expensive iterators where avoidable)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
 def complex_measures_use_variables(ctx: CheckContext) -> list[Verdict]:
@@ -385,7 +385,7 @@ def complex_measures_use_variables(ctx: CheckContext) -> list[Verdict]:
         headline += ". Measures needing attention — " + _offender_breakdown(offenders)
     verdicts = [covered(compliant, total, headline)]
     verdicts += [
-        note(_measure_detail(names, "break a DAX practice"), obj=model_name)
+        binary(False, _measure_detail(names, "break a DAX practice"), obj=model_name)
         for model_name, names in sorted(offenders.items())
     ]
     return verdicts
@@ -401,60 +401,107 @@ def _table_key(value: object) -> str:
     return str(value or "").strip().lower()
 
 
-def _active_edges(model: dict[str, Any]) -> list[tuple[str, str]]:
-    """``(table_a, table_b)`` for every *active* relationship, endpoints sorted.
+def _directed_filter_graph(
+    model: dict[str, Any],
+) -> tuple[dict[str, set[str]], set[tuple[str, str]], int]:
+    """The model's filter-propagation graph, as *directed* edges.
 
-    Self-relationships (both ends on one table) and relationships missing an
-    endpoint carry no filter path between two tables, so they are dropped rather
-    than guessed at.
+    A relationship propagates a filter from its "one" side to its "many" side —
+    from the ``to`` endpoint (the dimension key) to the ``from`` endpoint (the
+    fact's foreign key). A both-directions relationship propagates each way. That
+    direction is exactly what separates a genuine ambiguity from an ordinary star
+    or galaxy schema: two fact tables sharing a dimension form an *undirected*
+    cycle, but every edge still points dimension -> fact, so no table is reachable
+    by two routes and there is nothing for the engine to disambiguate.
+
+    Returns the adjacency map, the set of unordered table pairs joined by more
+    than one active relationship (ambiguous outright), and the count of usable
+    active relationships (to decide whether a second path is even possible).
     """
-    edges: list[tuple[str, str]] = []
+    adjacency: dict[str, set[str]] = {}
+    pair_counts: Counter[tuple[str, str]] = Counter()
+    usable = 0
     for rel in _relationships(model):
         if not _is_active(rel):
             continue
-        left = _table_key(rel.get("from_table") or rel.get("fromTable"))
-        right = _table_key(rel.get("to_table") or rel.get("toTable"))
-        if not left or not right or left == right:
+        many = _table_key(rel.get("from_table") or rel.get("fromTable"))
+        one = _table_key(rel.get("to_table") or rel.get("toTable"))
+        if not many or not one or many == one:
             continue
-        edges.append((left, right) if left <= right else (right, left))
-    return edges
+        usable += 1
+        adjacency.setdefault(one, set()).add(many)
+        behaviour = str(
+            rel.get("cross_filter") or rel.get("crossFilteringBehavior") or ""
+        ).strip().lower()
+        if behaviour == "bothdirections":
+            adjacency.setdefault(many, set()).add(one)
+        pair_counts[(many, one) if many <= one else (one, many)] += 1
+    duplicates = {pair for pair, seen in pair_counts.items() if seen > 1}
+    return adjacency, duplicates, usable
 
 
-def _redundant_pairs(edges: list[tuple[str, str]]) -> list[tuple[str, str]]:
-    """Table pairs that a second *active* filter path also connects.
+def _ambiguous_pairs(
+    adjacency: dict[str, set[str]], duplicates: set[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """Table pairs a second *active* filter route can reach.
 
-    Union-find over the distinct edges, walked in sorted order so the answer is
-    the same on every run: an edge whose endpoints are *already* connected by the
-    edges accepted before it closes a cycle, and a cycle in a relationship graph
-    means at least two active routes exist between some pair of tables. A pair
-    joined by more than one active relationship is ambiguous outright and is
-    reported too.
+    A pair joined by more than one active relationship is ambiguous outright. For
+    the rest, a bounded depth-first walk counts distinct *simple* directed paths
+    out of each source; a target reached by two different routes — the diamond of
+    a snowflake short-cut, or a bidirectional loop — is the second filter path the
+    engine would have to choose between. A single-direction star or galaxy schema
+    forms no such diamond, so it is not flagged.
+
+    The walk is capped so a pathological bidirectional graph cannot run away;
+    exhausting the cap can only *under*-report, never invent an ambiguity.
     """
-    duplicates = sorted({pair for pair, n in Counter(edges).items() if n > 1})
+    pairs: set[tuple[str, str]] = set(duplicates)
+    nodes = sorted(set(adjacency) | {t for outs in adjacency.values() for t in outs})
+    budget = 200_000
+    for source in nodes:
+        reached: dict[str, int] = {}
+        stack: list[tuple[str, frozenset[str]]] = [(source, frozenset((source,)))]
+        while stack and budget > 0:
+            node, visited = stack.pop()
+            for nxt in sorted(adjacency.get(node, ())):
+                if nxt in visited:
+                    continue
+                budget -= 1
+                reached[nxt] = reached.get(nxt, 0) + 1
+                if reached[nxt] == 2:
+                    pairs.add((source, nxt) if source <= nxt else (nxt, source))
+                stack.append((nxt, visited | frozenset((nxt,))))
+    return sorted(pairs)
 
-    parent: dict[str, str] = {}
 
-    def find(node: str) -> str:
-        parent.setdefault(node, node)
-        while parent[node] != node:
-            parent[node] = parent[parent[node]]
-            node = parent[node]
-        return node
+def _many_to_many_pairs(model: dict[str, Any]) -> list[tuple[str, str]]:
+    """Active relationships declared many-to-many on both ends — i.e. no bridge.
 
-    closes_cycle: list[tuple[str, str]] = []
-    for left, right in sorted(set(edges)):
-        root_left, root_right = find(left), find(right)
-        if root_left == root_right:
-            closes_cycle.append((left, right))
-        else:
-            parent[root_left] = root_right
-    return sorted(set(duplicates) | set(closes_cycle))
+    A conformed bridge uses two many-to-one relationships through an intermediate
+    table; a relationship whose *own* endpoints are both ``many`` is a direct
+    many-to-many, the "many-to-many without a bridge" the checklist names. TMSL
+    omits the cardinality fields for a standard many-to-one relationship, so only
+    an *explicit* ``many``/``many`` is flagged — a defaulted relationship is not.
+    Inactive relationships propagate no filter, so only active ones are judged.
+    """
+    pairs: set[tuple[str, str]] = set()
+    for rel in _relationships(model):
+        if not _is_active(rel):
+            continue
+        frm = str(rel.get("from_cardinality") or rel.get("fromCardinality") or "").strip().lower()
+        to = str(rel.get("to_cardinality") or rel.get("toCardinality") or "").strip().lower()
+        if frm == "many" and to == "many":
+            many = _table_key(rel.get("from_table") or rel.get("fromTable"))
+            one = _table_key(rel.get("to_table") or rel.get("toTable"))
+            if many and one and many != one:
+                pairs.add((many, one) if many <= one else (one, many))
+    return sorted(pairs)
 
 
 @check(
     id="R-REL-AMBIGUOUS", ref="14.1.2",
     title="Relationships correctly defined (cardinality, active/inactive) with no ambiguous filter paths",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
 def relationships_have_no_ambiguous_paths(ctx: CheckContext) -> list[Verdict]:
@@ -463,24 +510,34 @@ def relationships_have_no_ambiguous_paths(ctx: CheckContext) -> list[Verdict]:
     Two or more active routes between the same pair of tables make filter
     propagation non-deterministic: the engine picks a path, and a measure that
     looks correct returns a silently different number depending on which one it
-    took. The relationship graph is built per model from the *active*
-    relationships and two defects are named:
+    took. A *directed* filter-propagation graph is built per model from the
+    *active* relationships (dimension -> fact, both ways for a bidirectional
+    relationship) and two defects are named:
 
     * a pair of tables joined by more than one active relationship;
-    * a cycle in the graph — an edge whose endpoints another chain of active
-      relationships already connects, so a second route exists.
+    * a pair a second *directed* filter route also reaches — the diamond of a
+      snowflake short-cut or a bidirectional loop. Because direction is honoured,
+      a star or galaxy schema where several facts share a dimension is **not**
+      flagged: its relationships form an undirected cycle, yet every edge points
+      dimension -> fact, so no table is reachable two ways.
 
     Inactive relationships are counted and reported alongside, because a
     modeller who hit ambiguity usually deactivated one leg to escape it: they
     are the fingerprint of the problem, not a defect in themselves (a
     ``USERELATIONSHIP`` role-playing dimension is a legitimate use).
 
-    **What it cannot determine.** Cardinality (``fromCardinality`` /
-    ``toCardinality``) is not carried by the parsed TMSL projection, so the
-    "many-to-many without a bridge" half of the point is *not* judged here and
-    the evidence says so; nothing is inferred about it. Whether a particular
-    inactive relationship is deliberate is a modelling judgement and is
-    reported, never scored.
+    **Cardinality is assessed structurally.** The parsed TMSL now carries each
+    relationship's declared ``fromCardinality`` / ``toCardinality`` (definition
+    metadata, never row data). A relationship declared ``many`` on both ends is a
+    direct many-to-many with no bridge table — the "cardinality" half of this
+    point — and is flagged as a defect alongside ambiguous paths. TMSL omits the
+    fields for an ordinary many-to-one relationship, so only an *explicit*
+    many/many is flagged; a defaulted relationship is left alone.
+
+    **What it cannot determine.** Whether a particular inactive relationship is
+    deliberate is a modelling judgement and is reported, never scored. Row-level
+    cardinality (actual distinct-value counts) still needs the rows and is never
+    read.
 
     Distinct from ``R-BIDI-REL`` (ref 14.1.1), which judges only the *direction*
     of cross-filtering on each relationship in isolation. A model can filter in
@@ -500,34 +557,48 @@ def relationships_have_no_ambiguous_paths(ctx: CheckContext) -> list[Verdict]:
     inactive_total = 0
     offenders: dict[str, str] = {}
     for name, defn in models.items():
-        edges = _active_edges(defn)
+        adjacency, duplicates, usable = _directed_filter_graph(defn)
         inactive_total += sum(1 for r in _relationships(defn) if not _is_active(r))
-        if len(edges) < 2:
-            # One (or no) active relationship cannot form a second path.
+        m2m = _many_to_many_pairs(defn)
+        # A model is judged when there is something to assess: a second filter
+        # path is only *possible* with two active relationships, but a direct
+        # many-to-many relationship is a defect on its own, so a model carrying
+        # one is judged even with a single relationship.
+        if usable < 2 and not m2m:
             continue
         judged += 1
-        ambiguous = _redundant_pairs(edges)
-        if not ambiguous:
+        ambiguous = _ambiguous_pairs(adjacency, duplicates) if usable >= 2 else []
+        reasons: list[str] = []
+        if ambiguous:
+            named = ", ".join(f"{left} <-> {right}" for left, right in ambiguous[:10])
+            more = f" (+{len(ambiguous) - 10} more)" if len(ambiguous) > 10 else ""
+            reasons.append(
+                f"{len(ambiguous)} table pair(s) reachable by more than one active "
+                f"filter path: {named}{more}"
+            )
+        if m2m:
+            named = ", ".join(f"{left} <-> {right}" for left, right in m2m[:10])
+            more = f" (+{len(m2m) - 10} more)" if len(m2m) > 10 else ""
+            reasons.append(
+                f"{len(m2m)} direct many-to-many relationship(s) with no bridge "
+                f"table: {named}{more}"
+            )
+        if not reasons:
             clean += 1
             continue
-        named = ", ".join(f"{left} <-> {right}" for left, right in ambiguous[:10])
-        more = f" (+{len(ambiguous) - 10} more)" if len(ambiguous) > 10 else ""
-        offenders[name] = (
-            f"{len(ambiguous)} table pair(s) reachable by more than one active "
-            f"relationship path: {named}{more}"
-        )
+        offenders[name] = "; ".join(reasons)
 
     if not judged:
         return [not_applicable(
-            "No semantic model defines two or more active relationships, so no "
-            "second filter path can exist"
+            "No semantic model defines two or more active relationships or a "
+            "many-to-many relationship, so there is no filter path or cardinality "
+            "defect to assess"
         )]
 
     detail = (
         f"{clean} of {judged} semantic model(s) have exactly one active filter path "
-        f"between any two tables; {inactive_total} inactive relationship(s) across the "
-        f"workspace. Relationship cardinality is not part of the parsed model "
-        f"definition, so many-to-many without a bridge is not assessed here."
+        f"between any two tables and no direct many-to-many relationship; "
+        f"{inactive_total} inactive relationship(s) across the workspace"
     )
     verdicts: list[Verdict] = [covered(clean, judged, detail)]
     verdicts += [note(reason, obj=model_name) for model_name, reason in sorted(offenders.items())]
@@ -542,30 +613,31 @@ def relationships_have_no_ambiguous_paths(ctx: CheckContext) -> list[Verdict]:
 @check(
     id="R-MODEL-HIDDEN-KEYS", ref="14.1.8",
     title="Model naming and organization are consumer-friendly (display folders, hidden keys)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.LOW,
     layers=[Layer.REPORTING], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
 )
 def key_columns_are_hidden(ctx: CheckContext) -> list[Verdict]:
-    """Key and technical columns are hidden from the report field list.
+    """Key columns are hidden, and fields are filed into display folders.
 
     A surrogate key, a GUID, or an ``…ID`` column carries no meaning to a report
     author: leaving it visible invites someone to drag it onto a visual and
     aggregate a key. TMSL states ``isHidden`` per column and ``isKey`` where the
-    modeller marked one, so the *hidden-keys* half of this point is directly
-    readable and is what this check scores — the share of key-shaped columns
-    that are hidden.
+    modeller marked one, so the hidden-keys half is directly readable.
 
-    **What it cannot determine: display folders.** ``displayFolder`` is present
-    in the raw TMSL but is *not* carried by this project's parsed projection
-    (``clients/tmsl.py``), and extending that parser would invalidate every
-    semantic-model snapshot already in the knowledge base until a re-crawl. So
-    the folder-organisation half of the point is deliberately **not** scored
-    here, and the evidence says so rather than implying a model without folders
-    was assessed and passed.
+    **Display folders are now scored too.** ``displayFolder`` is a TMSL column
+    and measure property and is returned by ``getDefinition``; it was simply not
+    carried by this project's parsed projection, so the check previously
+    declared the folder half unassessable. The parser now keeps it, and a model
+    that files *no* field into a folder is reported - which is the readable
+    shape of an unorganised model. Snapshots taken before that parser change
+    carry no folder data at all; those are reported as unassessed rather than
+    failed, so an old snapshot cannot manufacture a finding.
 
-    Key-shaped is judged by ``is_row_identifier`` — the model's own ``isKey``
-    flag, or a key-shaped name — so it is the same vocabulary the table checks
-    use. A model with no key-shaped column has nothing to hide and is N/A.
+    **Both halves are scored, and each offending model is a scored row.** The
+    per-model breakdown used to be an unscored ``note``, so a model exposing
+    every key to report authors contributed nothing to the verdict. Key-shaped
+    is judged by ``is_row_identifier`` - the model's own ``isKey`` flag or a
+    key-shaped name - the same vocabulary the table checks use.
     """
     if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
         return [not_applicable(_UNREADABLE)]
@@ -575,7 +647,16 @@ def key_columns_are_hidden(ctx: CheckContext) -> list[Verdict]:
 
     total = hidden = 0
     offenders: dict[str, list[str]] = {}
+    foldered_models = 0
+    folder_assessable = 0
     for name, defn in models.items():
+        fields = list(defn.get("columns") or []) + list(defn.get("measures") or [])
+        # "display_folder" absent entirely means the snapshot predates the parser
+        # change; "" means the modeller filed nothing. Only the second is a finding.
+        if any("display_folder" in field for field in fields):
+            folder_assessable += 1
+            if any(str(field.get("display_folder") or "").strip() for field in fields):
+                foldered_models += 1
         for column in defn.get("columns") or []:
             if not is_row_identifier(column):
                 continue
@@ -595,17 +676,24 @@ def key_columns_are_hidden(ctx: CheckContext) -> list[Verdict]:
             "technical column to hide from report consumers"
         )]
 
+    if not folder_assessable:
+        folders = (". Display folders are not in this snapshot (it predates the "
+                   "parser change), so folder organisation is not assessed")
+    else:
+        folders = (f". {foldered_models} of {folder_assessable} model(s) file at least "
+                   f"one field into a display folder")
+
     verdicts: list[Verdict] = [covered(
         hidden, total,
         f"{hidden} of {total} key-shaped column(s) across {len(models)} semantic "
-        f"model(s) are hidden from the report view. Display folders are not part "
-        f"of the parsed model definition, so folder organisation is not assessed.",
+        f"model(s) are hidden from the report view{folders}",
     )]
     for model_name, names in sorted(offenders.items()):
         shown = ", ".join(sorted(names)[:_MAX_NAMED_COLUMNS])
         more = (f" (+{len(names) - _MAX_NAMED_COLUMNS} more)"
                 if len(names) > _MAX_NAMED_COLUMNS else "")
-        verdicts.append(note(
+        verdicts.append(binary(
+            False,
             f"{len(names)} key-shaped column(s) visible to report authors: {shown}{more}",
             obj=model_name,
         ))
@@ -657,7 +745,7 @@ def _reports_by_model(reports: list[dict]) -> dict[str, list[dict]]:
 @check(
     id="R-REPORT-SHARED-MODEL", ref="14.3.4",
     title="Reports use the shared certified model rather than private ad-hoc extracts",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=[Layer.REPORTING],
     requires=[Resource.REPORTS], required=False,
 )

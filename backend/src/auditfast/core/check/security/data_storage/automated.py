@@ -12,8 +12,8 @@ from auditfast.core.models import CheckContext
 
 
 @check(
-    id="WS-LABELS", ref="IMPL-04", title="Sensitivity labels applied across Fabric items",
-    pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    id="WS-LABELS", ref="13.2.3", title="Sensitivity labels applied across Fabric items",
+    pillar=Pillar.SECURITY_ACCESS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     requires=[Resource.ITEMS], required=True,
 )
 def sensitivity_labels(ctx: CheckContext) -> Verdict:
@@ -57,7 +57,7 @@ def sensitivity_labels(ctx: CheckContext) -> Verdict:
 
 @check(
     id="WS-RLS", ref="6.2.1", title="Row-Level Security (RLS) implemented on the Gold Warehouse and/or semantic models where required",
-    pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.CRITICAL,
+    pillar=Pillar.SECURITY_ACCESS, scope=Scope.WORKSPACE, severity=Severity.CRITICAL,
     layers=[Layer.STORAGE],
     requires=[Resource.SEMANTIC_MODEL_DEFINITIONS, Resource.ITEMS,
               Resource.WAREHOUSE_SECURITY],
@@ -107,6 +107,12 @@ def rls_on_semantic_models(ctx: CheckContext) -> list[Verdict]:
         else:
             failing_models.append((name, "Defines no RLS role"))
 
+    # Semantic models are read one definition at a time, so the crawl can return
+    # *some* of them. Those that could not be read are unknown, never failing -
+    # the same rule the Warehouse branch below already applied.
+    model_stat = ctx.workspace.read_failures.get(Resource.SEMANTIC_MODEL_DEFINITIONS.value, {})
+    unread_models = max(0, int(model_stat.get("attempted", 0)) - int(model_stat.get("read", 0)))
+
     # Warehouses: assessed only when the SQL analytics endpoint answered.
     security = ctx.workspace.warehouse_security or {}
     protected_warehouses: list[str] = []
@@ -148,7 +154,7 @@ def rls_on_semantic_models(ctx: CheckContext) -> list[Verdict]:
         f"RLS NOT ENABLED - Warehouses: {issues(failing_warehouses)}. "
         f"NOT ASSESSED - Warehouses: {names(unread_warehouses)}. "
         f"NOT ASSESSED - Semantic model inventory: "
-        f"{'none' if models_available else 'definitions unavailable'}. "
+        f"{'definitions unavailable' if not models_available else (f'{unread_models} definition(s) could not be read' if unread_models else 'none')}. "
         f"NOT ASSESSED - Warehouse inventory: "
         f"{'none' if items_available else 'workspace items unavailable'}. "
         "A semantic model is marked enabled when at least one defined role contains a "
@@ -189,7 +195,7 @@ def rls_on_semantic_models(ctx: CheckContext) -> list[Verdict]:
 
 @check(
     id="WS-OLS", ref="6.2.2", title="Column-Level Security / Object-Level Security applied for sensitive fields",
-    pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.CRITICAL,
+    pillar=Pillar.SECURITY_ACCESS, scope=Scope.WORKSPACE, severity=Severity.CRITICAL,
     layers=[Layer.STORAGE], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
 def ols_on_semantic_models(ctx: CheckContext) -> list[Verdict]:
@@ -247,7 +253,7 @@ _SAMPLE_LIMIT = 8
 @check(
     id="WS-DDM", ref="6.2.3",
     title="Dynamic Data Masking applied in the Warehouse for sensitive columns where appropriate",
-    pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.SECURITY_ACCESS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=True,
 )
