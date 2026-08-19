@@ -18,10 +18,13 @@ import base64
 import contextlib
 import json
 import logging
+import os
 import re
+import threading
 import time
 from collections import Counter
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from typing import Any
 
@@ -71,6 +74,27 @@ _SYSTEM_PRINCIPALS: frozenset[str] = frozenset({
 })
 
 
+def _bounded_int_env(name: str, default: int, low: int, high: int) -> int:
+    """Read an int from the environment, clamped to ``[low, high]``."""
+    try:
+        return max(low, min(int(os.environ.get(name, default)), high))
+    except (TypeError, ValueError):
+        return default
+
+
+#: Per-workspace fan-out: how many item definitions are fetched at once while
+#: crawling a single workspace. Each getDefinition is a slow long-running
+#: operation, so fetching them concurrently is the crawl's biggest speed-up.
+_ITEM_FETCH_WORKERS = _bounded_int_env("AUDITFAST_MAX_PARALLEL_ITEM_FETCHES", 4, 1, 16)
+
+#: Process-wide ceiling on concurrent item-definition calls, shared across every
+#: workspace and audit, so parallel crawls together never exceed what the Fabric
+#: APIs tolerate (beyond which throttling would erase the gain).
+_DEFINITION_GATE = threading.BoundedSemaphore(
+    _bounded_int_env("AUDITFAST_MAX_INFLIGHT_ITEM_FETCHES", 32, 1, 32)
+)
+
+
 class LiveFabricProvider:
     """Reads a live Fabric tenant with a delegated, read-only OAuth2 token."""
 
@@ -83,6 +107,14 @@ class LiveFabricProvider:
 
         self._session = requests.Session()
         self._session.headers.update({"Authorization": f"Bearer {token}"})
+        # One connection pool wide enough that parallel workspace crawls share it
+        # without serialising on a too-small default (10).
+        adapter = requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
+        #: Guards the shared session's auth header and the lazily-built sub-clients
+        #: so several workspaces can be crawled concurrently on one provider.
+        self._lock = threading.Lock()
         self._timeout = timeout
         self._token_refresher = token_refresher
         #: A Power BI-audience token (``https://analysis.windows.net/powerbi/api``)
@@ -175,11 +207,36 @@ class LiveFabricProvider:
         log.info("access token expired, attempting silent refresh")
         new_token = self._token_refresher()
         if new_token:
-            self._session.headers.update({"Authorization": f"Bearer {new_token}"})
+            with self._lock:
+                self._session.headers.update({"Authorization": f"Bearer {new_token}"})
             log.info("token refreshed, resuming crawl")
             return True
         log.warning("token refresh failed, could not acquire new token")
         return False
+
+    def _fetch_items_parallel(self, items: list, worker):
+        """Run ``worker(item)`` for every item concurrently, results in input order.
+
+        Bounded by the process-wide definition gate so several workspaces (and
+        several audits) crawling at once never exceed the Fabric APIs' tolerance.
+        ``worker`` handles its own errors and returns a value; it must not raise.
+        """
+        results: list = [None] * len(items)
+        if not items:
+            return results
+        max_workers = min(_ITEM_FETCH_WORKERS, len(items))
+
+        def _run(index: int, obj):
+            with _DEFINITION_GATE:
+                return index, worker(obj)
+
+        with ThreadPoolExecutor(max_workers=max_workers,
+                                thread_name_prefix="item-fetch") as pool:
+            futures = [pool.submit(_run, i, obj) for i, obj in enumerate(items)]
+            for future in as_completed(futures):
+                index, value = future.result()
+                results[index] = value
+        return results
 
     #: getDefinition statuses worth retrying — transient throttling / 5xx.
     _RETRYABLE = frozenset({429, 500, 502, 503, 504})
@@ -1048,7 +1105,9 @@ class LiveFabricProvider:
         if not self._powerbi_token:
             return None
         from .powerbi import PowerBIClient
-        self._powerbi_client = PowerBIClient(self._powerbi_token, timeout=self._timeout)
+        with self._lock:
+            if self._powerbi_client is None:
+                self._powerbi_client = PowerBIClient(self._powerbi_token, timeout=self._timeout)
         return self._powerbi_client
 
     def _onelake(self):
@@ -1058,7 +1117,9 @@ class LiveFabricProvider:
         if not self._storage_token:
             return None
         from .onelake import OneLakeClient
-        self._onelake_client = OneLakeClient(self._storage_token, timeout=self._timeout)
+        with self._lock:
+            if self._onelake_client is None:
+                self._onelake_client = OneLakeClient(self._storage_token, timeout=self._timeout)
         return self._onelake_client
 
     def _semantic_model_last_refresh(self, workspace_id: str, item_id: str) -> tuple[str | None, str]:
@@ -1387,10 +1448,11 @@ class LiveFabricProvider:
 
         if Resource.ENVIRONMENT_DEFINITIONS in wanted:
             environments = [i for i in ctx.items if i.type == "Environment"]
+            fetched = self._fetch_items_parallel(
+                environments, lambda it: self._environment_definition(workspace_id, it.id))
             attempted = read = forbidden = transient = 0
-            for item in environments:
+            for item, (definition, failure) in zip(environments, fetched):
                 attempted += 1
-                definition, failure = self._environment_definition(workspace_id, item.id)
                 if failure == "forbidden":
                     forbidden += 1
                 elif failure == "transient":
@@ -1418,12 +1480,12 @@ class LiveFabricProvider:
         # The expensive one — one call per pipeline. Only paid for when a
         # selected check actually reads a pipeline definition.
         if Resource.PIPELINE_DEFINITIONS in wanted:
+            pipelines = [i for i in ctx.items if i.type == "DataPipeline"]
+            fetched = self._fetch_items_parallel(
+                pipelines, lambda it: self._pipeline_definition(workspace_id, it.id))
             attempted = read = forbidden = transient = empty = 0
-            for item in ctx.items:
-                if item.type != "DataPipeline":
-                    continue
+            for item, (definition, failure) in zip(pipelines, fetched):
                 attempted += 1
-                definition, failure = self._pipeline_definition(workspace_id, item.id)
                 if failure == "forbidden":
                     forbidden += 1
                 elif failure == "transient":
@@ -1440,29 +1502,33 @@ class LiveFabricProvider:
         # Notebook definitions: same one-call-per-item getDefinition pattern.
         if Resource.NOTEBOOK_DEFINITIONS in wanted:
             found = [i for i in ctx.items if i.type == "Notebook"]
+
+            def _notebook_bundle(it):
+                definition, failure = self._notebook_definition(workspace_id, it.id)
+                monitoring = self._notebook_monitoring(workspace_id, it.id) if definition else {}
+                return definition, failure, monitoring
+
+            fetched = self._fetch_items_parallel(found, _notebook_bundle)
             attempted = read = forbidden = transient = empty = 0
-            for item in found:
+            for item, (definition, failure, monitoring) in zip(found, fetched):
                 attempted += 1
-                definition, failure = self._notebook_definition(workspace_id, item.id)
                 if failure == "forbidden":
                     forbidden += 1
                 elif failure == "transient":
                     transient += 1
                 elif definition:
                     read += 1
-                    if definition:
-                        binding = self._environment_binding(definition)
-                        environment = ctx.environments.get(binding)
-                        if environment:
-                            definition["_auditfast_environment"] = {
-                                "id": environment.get("id", binding),
-                                "name": environment.get("display_name", binding),
-                                "runtime_version": environment.get("runtime_version"),
-                            }
-                        monitoring = self._notebook_monitoring(workspace_id, item.id)
-                        if monitoring:
-                            definition["_auditfast_monitoring"] = monitoring
-                        ctx.notebooks[item.display_name or item.id] = definition
+                    binding = self._environment_binding(definition)
+                    environment = ctx.environments.get(binding)
+                    if environment:
+                        definition["_auditfast_environment"] = {
+                            "id": environment.get("id", binding),
+                            "name": environment.get("display_name", binding),
+                            "runtime_version": environment.get("runtime_version"),
+                        }
+                    if monitoring:
+                        definition["_auditfast_monitoring"] = monitoring
+                    ctx.notebooks[item.display_name or item.id] = definition
             self._record_failures(ctx, Resource.NOTEBOOK_DEFINITIONS,
                                   attempted, read, forbidden, transient, empty)
             log.info("fetch %s: %d notebooks found, %d definitions read",
@@ -1473,10 +1539,11 @@ class LiveFabricProvider:
         # N/A rather than failing when they are absent.
         if Resource.TABLE_SCHEMAS in wanted:
             lakehouses = [i for i in ctx.items if i.type == "Lakehouse"]
+            fetched = self._fetch_items_parallel(
+                lakehouses, lambda it: self._lakehouse_tables(workspace_id, it.id))
             attempted = read = forbidden = transient = 0
-            for item in lakehouses:
+            for item, (tables, failure) in zip(lakehouses, fetched):
                 attempted += 1
-                tables, failure = self._lakehouse_tables(workspace_id, item.id)
                 if failure == "forbidden":
                     forbidden += 1
                 elif failure == "transient":
@@ -1521,9 +1588,11 @@ class LiveFabricProvider:
                     workspace_id, len(lakehouses),
                 )
             elif onelake is not None:
-                for item in lakehouses:
+                fetched = self._fetch_items_parallel(
+                    lakehouses,
+                    lambda it: onelake.lakehouse_files_summary(workspace_id, it.id))
+                for item, (summary, failure) in zip(lakehouses, fetched):
                     attempted += 1
-                    summary, failure = onelake.lakehouse_files_summary(workspace_id, item.id)
                     if failure == "forbidden":
                         forbidden += 1
                     elif failure == "transient":
@@ -1554,10 +1623,11 @@ class LiveFabricProvider:
         # pull, so runtime data never enters the knowledge base.
         if Resource.WAREHOUSE_AUDIT in wanted:
             warehouses = [i for i in ctx.items if i.type == "Warehouse"]
+            fetched = self._fetch_items_parallel(
+                warehouses, lambda it: self._warehouse_audit(workspace_id, it.id))
             attempted = read = forbidden = transient = empty = 0
-            for item in warehouses:
+            for item, (settings, failure) in zip(warehouses, fetched):
                 attempted += 1
-                settings, failure = self._warehouse_audit(workspace_id, item.id)
                 if failure == "forbidden":
                     forbidden += 1
                 elif failure == "transient":
@@ -1581,10 +1651,11 @@ class LiveFabricProvider:
         # trigger-depth check reports N/A rather than failing a present Activator.
         if Resource.ACTIVATOR_DEFINITIONS in wanted:
             reflexes = [i for i in ctx.items if i.type in ("Reflex", "Activator")]
+            fetched = self._fetch_items_parallel(
+                reflexes, lambda it: self._reflex_definition(workspace_id, it.id))
             attempted = read = forbidden = transient = empty = 0
-            for item in reflexes:
+            for item, (summary, failure) in zip(reflexes, fetched):
                 attempted += 1
-                summary, failure = self._reflex_definition(workspace_id, item.id)
                 if failure == "forbidden":
                     forbidden += 1
                 elif failure == "transient":
@@ -1604,13 +1675,14 @@ class LiveFabricProvider:
 
         # OneLake shortcuts per lakehouse (governance/lineage: external references).
         if Resource.SHORTCUTS in wanted:
+            shortcut_lakehouses = [i for i in ctx.items if i.type == "Lakehouse"]
+            fetched = self._fetch_items_parallel(
+                shortcut_lakehouses,
+                lambda it: self._item_shortcuts(workspace_id, it.id))
             total = 0
             attempted = failed = 0
-            for item in ctx.items:
-                if item.type != "Lakehouse":
-                    continue
+            for item, (shortcuts, known) in zip(shortcut_lakehouses, fetched):
                 attempted += 1
-                shortcuts, known = self._item_shortcuts(workspace_id, item.id)
                 if not known:
                     failed += 1
                     continue
@@ -1625,12 +1697,12 @@ class LiveFabricProvider:
 
         # Semantic-model measures + relationships, parsed from the TMSL definition.
         if Resource.SEMANTIC_MODEL_DEFINITIONS in wanted:
+            models = [i for i in ctx.items if i.type == "SemanticModel"]
+            fetched = self._fetch_items_parallel(
+                models, lambda it: self._semantic_model_definition(workspace_id, it.id))
             attempted = read = forbidden = transient = empty = 0
-            for item in ctx.items:
-                if item.type != "SemanticModel":
-                    continue
+            for item, (model, failure) in zip(models, fetched):
                 attempted += 1
-                model, failure = self._semantic_model_definition(workspace_id, item.id)
                 if failure == "forbidden":
                     forbidden += 1
                 elif failure == "transient":
@@ -1652,15 +1724,14 @@ class LiveFabricProvider:
         # ``notifyOption``, which is how "a refresh failure alerts the owning
         # team" is actually configured. No refresh rows are read.
         if Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE in wanted:
+            schedule_models = [i for i in ctx.items if i.type == "SemanticModel"]
+            fetched = self._fetch_items_parallel(
+                schedule_models,
+                lambda it: self._semantic_model_refresh_schedule(workspace_id, it.id))
             attempted = read = forbidden = transient = 0
             schedule_reasons: dict[str, int] = {}
-            for item in ctx.items:
-                if item.type != "SemanticModel":
-                    continue
+            for item, (schedule, failure) in zip(schedule_models, fetched):
                 attempted += 1
-                schedule, failure = self._semantic_model_refresh_schedule(
-                    workspace_id, item.id
-                )
                 if failure == "forbidden":
                     forbidden += 1
                     reason = _SCHEDULE_FORBIDDEN_REASON
