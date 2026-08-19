@@ -41,6 +41,35 @@ def test_parse_tmsl_extracts_measures_and_relationships():
     assert rel["from_table"] == "Sales"
     assert rel["to_table"] == "Date"
     assert rel["cross_filter"] == "oneDirection"
+    # Cardinality is omitted in the fixture, so it defaults to empty (not unknown).
+    assert rel["from_cardinality"] == ""
+    assert rel["to_cardinality"] == ""
+
+
+def test_parse_tmsl_captures_explicit_relationship_cardinality():
+    doc = {"model": {"tables": [{"name": "Sales"}, {"name": "Account"}], "relationships": [
+        {"name": "m2m", "fromTable": "Sales", "fromColumn": "k",
+         "toTable": "Account", "toColumn": "k",
+         "fromCardinality": "many", "toCardinality": "many"},
+    ]}}
+    rel = parse_tmsl(doc)["relationships"][0]
+    assert rel["from_cardinality"] == "many"
+    assert rel["to_cardinality"] == "many"
+
+
+def test_parse_tmsl_captures_declared_data_categories():
+    """``dataCategory`` is a modeller stating a table is reference data.
+
+    Microsoft's star-schema guidance is explicit that no property marks a table
+    as fact or dimension, so this - with relationship cardinality - is the
+    closest thing to a declared role, and outranks any shape inference.
+    """
+    parsed = parse_tmsl({"model": {"tables": [
+        {"name": "Date", "dataCategory": "Time"},
+        {"name": "Customer", "dataCategory": "Customers"},
+        {"name": "Sales"},
+    ]}})
+    assert parsed["data_categories"] == {"Date": "Time", "Customer": "Customers"}
 
 
 def test_parse_tmsl_tolerates_bare_model_and_garbage():
@@ -50,6 +79,9 @@ def test_parse_tmsl_tolerates_bare_model_and_garbage():
         "storage": {}, "refresh_policies": [], "aggregations": [],
         "columns": [],
         "direct_lake_behavior": "",
+        # Declared dataCategory per table - a role signal the classifier prefers
+        # over any inference, and empty on a model that declares none.
+        "data_categories": {},
     }
     # A bare model object (no "model" envelope) still parses.
     assert parse_tmsl({"tables": [{"name": "T", "measures": []}]})["tables"] == ["T"]
@@ -96,7 +128,7 @@ def test_parse_tmsl_captures_column_declarations_but_no_row_data():
     for column in columns:
         assert set(column) == {
             "table", "name", "data_type", "source_provider_type",
-            "source_column", "is_hidden", "is_key",
+            "source_column", "is_hidden", "is_key", "display_folder",
         }
 
 
@@ -201,6 +233,9 @@ def test_storage_is_populated_per_table():
     assert "import" in storage["FactSales"]["modes"]
     assert storage["FactSales"]["native_query_partitions"] == 1, \
         "an M partition carrying its own query text is an in-model transformation"
+    assert storage["FactSales"]["native_query_expressions"] == [
+        "let Source = Sql.Database(...)"
+    ], "the partition query text is kept so a check can classify it"
 
 
 def test_direct_lake_mode_is_derived_from_the_source_type():
@@ -235,8 +270,10 @@ def test_a_model_with_no_partitions_still_parses():
     """The original fixture has no partitions at all - it must not raise."""
     model = parse_tmsl(_TMSL)
     assert model["storage"] == {"Sales": {"modes": [], "source_types": [],
-                                          "native_query_partitions": 0},
+                                          "native_query_partitions": 0,
+                                          "native_query_expressions": []},
                                 "Date": {"modes": [], "source_types": [],
-                                         "native_query_partitions": 0}}
+                                         "native_query_partitions": 0,
+                                         "native_query_expressions": []}}
     assert model["refresh_policies"] == []
     assert model["aggregations"] == []

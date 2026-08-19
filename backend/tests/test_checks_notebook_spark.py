@@ -35,6 +35,11 @@ def _ctx(obj, settings=None) -> CheckContext:
     )
 
 
+def _nb_cells(*sources: str) -> dict:
+    """A notebook with one code cell per source string."""
+    return {"cells": [{"cell_type": "code", "source": s} for s in sources]}
+
+
 # -- DELTA-MERGE ---------------------------------------------------------------
 
 def test_merge_single_statement_passes():
@@ -103,6 +108,39 @@ def test_merge_ignores_python_commented_dml():
         "# spark.sql('DELETE FROM t')\n# spark.sql('INSERT INTO t SELECT * FROM s')"
     )))
     assert v.status is Status.NA
+
+
+def test_merge_failure_suggests_consolidating_into_merge_into():
+    v = delta_merge(_ctx(_nb(
+        "spark.sql('DELETE FROM t WHERE 1=1')\nspark.sql('INSERT INTO t SELECT * FROM s')"
+    )))
+    assert v.score == 0
+    assert "t (DELETE + INSERT)" in v.evidence
+    assert "MERGE INTO" in v.evidence
+    assert "atomically" in v.evidence
+
+
+def test_merge_scattered_dml_across_cells_is_na():
+    # An ad-hoc / scratch notebook: independent one-off statements on the same
+    # control table live in SEPARATE cells (register a row here, fix a watermark
+    # there), so they are not one logical upsert and must not be fused into a fake
+    # DELETE+INSERT+UPDATE "merge candidate".
+    v = delta_merge(_ctx(_nb_cells(
+        "spark.sql('UPDATE meta.loadlist SET watermark = current_timestamp()')",
+        "spark.sql('INSERT INTO meta.loadlist (t) VALUES (1)')",
+        "spark.sql('DELETE FROM other.hist WHERE run_id = 1')",
+    )))
+    assert v.status is Status.NA
+
+
+def test_merge_sequential_dml_within_one_cell_still_fails():
+    # The genuine anti-pattern - a delete-then-reinsert of one table written
+    # together in a single cell - is still flagged.
+    v = delta_merge(_ctx(_nb_cells(
+        "spark.sql('DELETE FROM t WHERE 1=1')\nspark.sql('INSERT INTO t SELECT * FROM s')",
+    )))
+    assert v.score == 0
+    assert "t (DELETE + INSERT)" in v.evidence
 
 
 # -- DELTA-OPTIMIZE ------------------------------------------------------------
@@ -393,7 +431,8 @@ def test_bound_environment_runtime_is_primary_evidence():
     verdict = spark_runtime(_ctx(notebook))
     assert verdict.score == 3
     assert "Validation Environment" in verdict.evidence
-    assert "Spark 3.5.0" in verdict.evidence
+    # Runtime 1.3 carries Spark 3.5.5, per the published runtime table.
+    assert "Spark 3.5.5" in verdict.evidence
 
 
 def test_bound_old_environment_runtime_fails():

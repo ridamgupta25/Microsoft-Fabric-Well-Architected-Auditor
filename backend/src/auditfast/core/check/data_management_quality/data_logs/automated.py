@@ -56,7 +56,7 @@ _MIN_STRUCTURED_COLUMNS = 3
 @check(
     id="TB-CONFIG-SINGLE-STORE", ref="4.6.2",
     title="Metadata DB is the single source of ingestion/orchestration configuration",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
 )
 def config_lives_in_one_store(ctx: CheckContext) -> Verdict:
@@ -114,7 +114,7 @@ def config_lives_in_one_store(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-AUDIT-QUERYABLE", ref="4.6.8",
     title="Audit Tables support operational queries (structured, queryable schema)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -277,7 +277,7 @@ def _immutability_verdict(rewritten: set[str], appended: set[str], where: str) -
 @check(
     id="NB-AUDIT-IMMUTABLE", ref="4.6.5",
     title="Audit records are immutable / append-only (no in-place overwrite of history)",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    pillar=Pillar.DATA_MODELING, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=_AUDIT_WRITER_NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS],
     required=True,
 )
@@ -318,7 +318,7 @@ def notebook_audit_history_is_append_only(ctx: CheckContext) -> Verdict:
 @check(
     id="PL-AUDIT-IMMUTABLE", ref="4.6.5",
     title="Audit records are immutable / append-only (no in-place overwrite of history)",
-    pillar=Pillar.DATA, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    pillar=Pillar.DATA_MODELING, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=_AUDIT_WRITER_PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS],
     required=True,
 )
@@ -389,7 +389,7 @@ _FRAMEWORK_PRINCIPALS: frozenset[str] = frozenset({
 @check(
     id="WS-METADATA-WRITE", ref="4.6.3",
     title="Metadata DB access is restricted (only framework identities can write)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.ROLE_ASSIGNMENTS],
     required=True,
 )

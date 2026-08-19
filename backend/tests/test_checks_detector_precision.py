@@ -141,7 +141,7 @@ def test_retry_values_finds_nested_retry_policy():
     })
     result = retry_values(_ctx(pipeline))
     assert result.score == _PASS
-    assert "Copy table" in result.evidence
+    assert "1 of 1" in result.evidence
 
 
 @pytest.mark.parametrize(
@@ -149,7 +149,6 @@ def test_retry_values_finds_nested_retry_policy():
     [
         ({"retry": 1000, "retryIntervalInSeconds": 60}, "count 1000 exceeds maximum 10"),
         ({"retry": 3}, "missing or non-positive interval"),
-        ({"retry": "infinite", "retryIntervalInSeconds": "soon"}, "invalid retry count 'infinite'"),
     ],
 )
 def test_retry_values_invalid_policy_fails_with_activity_evidence(policy, expected):
@@ -158,6 +157,24 @@ def test_retry_values_invalid_policy_fails_with_activity_evidence(policy, expect
     assert result.score == _FAIL
     assert "Copy orders" in result.evidence
     assert expected in result.evidence
+
+
+def test_retry_values_unreadable_policy_is_na_not_fail():
+    """A retry set by a run-time expression is unknowable, not wrong.
+
+    An earlier implementation ran ``int()`` over the raw value and counted the
+    resulting TypeError as a failing activity, which is a false FAIL on a
+    pipeline that may be configured perfectly - the value simply cannot be read
+    from the definition. It must leave the scored population instead.
+    """
+    pipeline = _pipe({
+        "name": "Copy orders", "type": "Copy",
+        "policy": {"retry": {"value": "@pipeline().parameters.n", "type": "Expression"},
+                   "retryIntervalInSeconds": 60},
+    })
+    result = retry_values(_ctx(pipeline))
+    assert result.status is Status.NA
+    assert result.score is None
 
 
 # -- NB-LATE-ARRIVING ---------------------------------------------------------
@@ -456,6 +473,32 @@ def test_flag_domain_validation_passes():
     assert nb_flag_domain(_ctx(_nb(code))).score == _PASS
 
 
+def test_flag_domain_passes_when_a_flag_is_normalised_by_when_otherwise():
+    code = (
+        "df = spark.read.json('Files/events.json')\n"
+        "df = df.withColumn('is_active', when(col('is_active') == 'Y', True).otherwise(False))"
+    )
+    assert nb_flag_domain(_ctx(_nb(code))).score == _PASS
+
+
+def test_flag_domain_fails_on_a_boolean_type_declaration_alone():
+    """Declaring a BooleanType column sets a type; it does not restrict values."""
+    code = (
+        "df = spark.read.json('Files/events.json')\n"
+        "schema = StructType([StructField('amount', BooleanType())])"
+    )
+    assert nb_flag_domain(_ctx(_nb(code))).score == _FAIL
+
+
+def test_flag_domain_fails_on_a_generic_when_otherwise():
+    """A when/otherwise with no flag column and no flag literal is generic logic."""
+    code = (
+        "df = spark.read.csv('Files/events.csv')\n"
+        "df = df.withColumn('bucket', when(col('amount') > 100, 'big').otherwise('small'))"
+    )
+    assert nb_flag_domain(_ctx(_nb(code))).score == _FAIL
+
+
 def test_ingestion_controls_are_na_without_relevant_input_or_write():
     context = _ctx(_nb("print('no input or write')"))
     assert nb_source_metadata(context).status is Status.NA
@@ -476,16 +519,43 @@ raw.write.saveAsTable('bronze_events')
     assert nb_bronze_metadata(_ctx(_nb(code))).score == _PASS
 
 
-def test_silver_quality_is_partial_with_only_dedup_and_type_conformance():
+def test_silver_quality_scores_each_aspect_separately():
+    """Two of the three scored aspects is a partial, not a pass.
+
+    The point scores cleansing, conforming and type standardization. Dedup is
+    detected but reported as unscored context, so it never lifts or lowers the
+    band; scoring the ratio of the three is what makes the evidence checkable.
+    """
     code = """
 silver = spark.read.table('bronze_events')
-silver = silver.dropDuplicates(['event_id']).withColumn('event_date', to_date('event_date'))
+silver = (silver.dropDuplicates(['event_id'])
+          .withColumn('event_date', to_date('event_date'))
+          .withColumn('name', trim(col('name'))))
 silver.write.saveAsTable('silver_events')
 """
     verdict = nb_silver_quality(_ctx(_nb(code)))
-    assert verdict.score == 1
-    assert "present: deduplication, type standardization" in verdict.evidence
-    assert "missing: cleansing, conforming" in verdict.evidence
+    assert verdict.score is not None and verdict.score < _PASS
+    assert "2 of 3" in verdict.evidence
+    assert "Not found: conforming" in verdict.evidence
+    assert "deduplication also applied" in verdict.evidence
+
+
+def test_silver_quality_passes_when_every_aspect_is_present():
+    """All three scored aspects present - cast, trim (cleansing), rename (conforming).
+
+    Dedup is also applied here, but it is reported as context, not scored.
+    """
+    code = """
+silver = spark.read.table('bronze_events')
+silver = (silver.dropDuplicates(['event_id'])
+          .withColumn('event_date', to_date('event_date'))
+          .withColumn('name', trim(col('name')))
+          .withColumnRenamed('src_id', 'source_id'))
+silver.write.saveAsTable('silver_events')
+"""
+    verdict = nb_silver_quality(_ctx(_nb(code)))
+    assert verdict.score == _PASS
+    assert "3 of 3" in verdict.evidence
 
 
 def test_bulk_pipeline_passes_with_parallel_copy():
@@ -562,6 +632,27 @@ def test_bulk_move_passes_with_staging_and_copy_command():
     assert "allowCopyCommand=true" in verdict.evidence
 
 
+def test_bulk_move_credits_truncate_reload_and_table_lock():
+    # A TRUNCATE-then-INSERT full reload with a bulk table lock is a genuine bulk
+    # pattern (one set-based clear plus a bulk insert), the opposite of row-by-row.
+    # It must not be mislabelled "default Copy settings".
+    pipeline = _pipe({
+        "name": "Reload dim", "type": "Copy",
+        "typeProperties": {
+            "sink": {
+                "type": "FabricSqlDatabaseSink",
+                "writeBehavior": "insert",
+                "sqlWriterUseTableLock": True,
+                "preCopyScript": "TRUNCATE TABLE [raw].[dim_site]",
+            },
+        },
+    })
+    verdict = pl_bulk_move(_ctx(pipeline))
+    assert verdict.score == _PASS
+    assert "sqlWriterUseTableLock=true" in verdict.evidence
+    assert "preCopyScript truncate/reload" in verdict.evidence
+
+
 def test_bulk_move_fails_only_explicit_row_by_row_logic():
     pipeline = _pipe({
         "name": "Insert row by row", "type": "Script",
@@ -574,8 +665,36 @@ def test_bulk_move_fails_only_explicit_row_by_row_logic():
 
 # -- DQ RULES / RESTART / AUDIT LOG / FAILURE ALERT ---------------------------
 
-def test_dq_rules_are_codified():
+def test_dq_rules_are_scored_per_discipline():
+    """One assertion is not a rule framework, so it is a partial, not a pass.
+
+    An earlier version passed on any single token from a bundled pattern, which
+    scored full marks for "DQ rules codified in code/config" on a notebook whose
+    only quality logic was ``drop_duplicates``.
+    """
     code = "df = spark.read.json('Files/input.json')\nassert df.filter(df.id.isNull()).count() == 0"
+    verdict = nb_dq_rules(_ctx(_nb(code)))
+    assert verdict.score is not None and verdict.score < _PASS
+    assert "assertions / expectations" in verdict.evidence
+    assert "null / domain checks" in verdict.evidence
+
+
+def test_dq_rules_do_not_pass_on_deduplication_alone():
+    """Deduplication is housekeeping, not a rule that judges a record."""
+    code = "df = spark.read.json('Files/in.json')\ndf = df.drop_duplicates()\ndf.write.saveAsTable('t')"
+    verdict = nb_dq_rules(_ctx(_nb(code)))
+    assert verdict.score is not None and verdict.score < _PASS
+
+
+def test_dq_rules_pass_when_every_discipline_is_codified():
+    code = (
+        "from pyspark.sql.types import StructType, StructField\n"
+        "df = spark.read.schema(StructType([])).json('Files/in.json')\n"
+        "assert df.count() > 0\n"
+        "clean = df.filter(df.id.isNotNull() & df.status.isin(['A', 'B']))\n"
+        "rejected = df.join(clean, 'id', 'left_anti')\n"
+        "rejected.write.saveAsTable('quarantine_rows')\n"
+    )
     assert nb_dq_rules(_ctx(_nb(code))).score == _PASS
 
 
@@ -1000,6 +1119,37 @@ def test_historical_separation_full_load_name_alone_is_na(name):
     assert "no historical/backfill load signal" in verdict.evidence
 
 
+def test_historical_separation_ignores_project_schema_literal_in_definition():
+    # Regression (real MLC_ADAGE data): PL_IN_WHITMPK_TBL_FullLoad was scored
+    # PARTIAL only because the historical detector matched the project's own
+    # 'ADAGE' schema name buried in a Copy sink's typeProperties - an incidental
+    # data value, not a load-intent signal - while its structurally identical
+    # twin PL_IN_WHITM_TBL_FullLoad (which names the schema via an expression)
+    # was N/A. A full-load pipeline with no historical/backfill naming must be
+    # N/A regardless of the schema / table names it writes to.
+    copy_to_adage_schema = {
+        "name": "ACT_MT_Copy_ingestBlobdataForFullLoad",
+        "type": "Copy",
+        "typeProperties": {
+            "sink": {
+                "type": "LakehouseTableSink",
+                "tableActionOption": "OverwriteSchema",
+                "datasetSettings": {
+                    "typeProperties": {
+                        "schema": {"value": "ADAGE", "type": "Expression"},
+                        "table": {"value": "IN_WHITM", "type": "Expression"},
+                    }
+                },
+            }
+        },
+    }
+    verdict = pl_historical_separation(
+        _named_pipe_ctx("PL_IN_WHITMPK_TBL_FullLoad", copy_to_adage_schema)
+    )
+    assert verdict.status is Status.NA
+    assert "no historical/backfill load signal" in verdict.evidence
+
+
 # -- PL-DEADLETTER structural routing ----------------------------------------
 
 def test_deadletter_ignores_error_words_inside_copy_column_mappings():
@@ -1029,7 +1179,7 @@ def test_deadletter_passes_copy_redirect_incompatible_rows():
     }
     verdict = pl_deadletter(_named_pipe_ctx("PL_Copy_Redirect", copy))
     assert verdict.score == _PASS
-    assert "redirects incompatible rows" in verdict.evidence
+    assert "Incompatible rows are redirected" in verdict.evidence
 
 
 def test_deadletter_passes_failed_dependency_to_quarantine_activity():
@@ -1044,7 +1194,10 @@ def test_deadletter_passes_failed_dependency_to_quarantine_activity():
     )
     verdict = pl_deadletter(pipeline)
     assert verdict.score == _PASS
-    assert "Failed dependency" in verdict.evidence
+    # The activity's own name marks it as the quarantine step, which is the
+    # stronger signal and is reported ahead of the [Failed] dependency.
+    assert "quarantine/reject step is present" in verdict.evidence
+    assert "Write quarantine log" in verdict.evidence
 
 
 def test_deadletter_is_na_without_any_failed_record_signal():
@@ -1052,8 +1205,8 @@ def test_deadletter_is_na_without_any_failed_record_signal():
         "PL_Ordinary_Copy",
         {"name": "Copy customer rows", "type": "Copy"},
     ))
-    assert verdict.status is Status.NA
-    assert "no failed-record validation or routing signal" in verdict.evidence
+    assert verdict.score == _FAIL
+    assert "no structural failed-record route" in verdict.evidence
 
 
 # -- NB-DEADLETTER rejected-row persistence ----------------------------------
@@ -1124,19 +1277,56 @@ def test_scd2_detects_alias_trio_and_flags_non_standard_names():
         "columns": [
             {"name": "customer_key"}, {"name": "effective_date"},
             {"name": "end_date"}, {"name": "active_flag"},
+            {"name": "customer_name", "type": "varchar"},
+            {"name": "city", "type": "varchar"},
         ],
     }
     verdict = table_scd2(_tables_ctx(dim_customer=table))
-    assert verdict.score == _FAIL
-    assert "non-standard SCD2 column names" in verdict.evidence
-    assert "effective_date/end_date/active_flag" in verdict.evidence
+    assert verdict.score == _PASS          # the trio is complete
+    assert "Non-standard column names in use" in verdict.evidence
+    assert "effective_date" in verdict.evidence
 
 
 def test_scd2_no_pattern_reason_acknowledges_readable_column_metadata():
-    table = {"columns": [{"name": "customer_key"}, {"name": "customer_name"}]}
-    verdict = table_scd2(_tables_ctx(PROD_PRICE_TMLC=table))
+    """The N/A must say the columns *were* read, so the gap is not read as a failure."""
+    table = {
+        "columns": [
+            {"name": "customer_key"},
+            {"name": "customer_name", "type": "varchar"},
+            {"name": "city", "type": "varchar"},
+        ],
+    }
+    verdict = table_scd2(_tables_ctx(dim_customer=table))
     assert verdict.status is Status.NA
-    assert "Column metadata is present, but no SCD2 pattern was found" in verdict.evidence
+    assert "Column metadata was read" in verdict.evidence
+
+
+def test_scd2_detects_the_trio_on_a_non_dimension_table():
+    """SCD2 history tables are often Silver tables the role classifier reads as
+    unknown/fact, so the scan must cover every table, not only dimensions."""
+    table = {
+        "columns": [
+            {"name": "product_code", "type": "varchar"},
+            {"name": "price", "type": "decimal"},
+            {"name": "valid_from"}, {"name": "valid_until"}, {"name": "active_flag"},
+        ],
+    }
+    verdict = table_scd2(_tables_ctx(price_versions=table))
+    assert verdict.score == _PASS
+    assert "Non-standard column names in use" in verdict.evidence
+
+
+def test_scd2_bare_start_end_pair_without_a_flag_is_not_scd2():
+    """A start/end date pair with no current-flag is a validity period, not SCD2."""
+    table = {
+        "columns": [
+            {"name": "product_code", "type": "varchar"},
+            {"name": "effective_date"}, {"name": "expiration_date"},
+        ],
+    }
+    verdict = table_scd2(_tables_ctx(prod_price=table))
+    assert verdict.status is Status.NA
+    assert "no table is versioned as SCD Type 2" in verdict.evidence
 
 
 # -- PL-COPY-PARALLEL (lone copy → N/A) ----------------------------------------

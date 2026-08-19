@@ -14,6 +14,8 @@ cardinality, because measuring it would need the rows.
 """
 from __future__ import annotations
 
+import re
+
 from auditfast.core.check._semantic import (
     high_cardinality_shape,
     is_row_identifier,
@@ -32,12 +34,48 @@ MODEL_LAYERS = (Layer.REPORTING, Layer.MIXED)
 #: to the source. ``dual`` lets the engine pick per query.
 _REAL_MODES = {"directlake", "import", "directquery", "dual"}
 
+#: Power Query functions that reshape data inside the partition — a merge, an
+#: append, a group-by, a pivot, or a manual ``#table`` entry — the transforms a
+#: warehouse view would otherwise own.
+_TRANSFORM_M = re.compile(
+    r"Table\.(Combine|Join|NestedJoin|Group|Pivot|Unpivot|FromRows|FromList|"
+    r"FromRecords|FromColumns)\b|#table\s*\(",
+    re.IGNORECASE,
+)
+#: A native SQL partition query that itself joins, groups, unions or pivots is
+#: doing the reshape the warehouse should. A plain ``SELECT ... FROM`` is not.
+_TRANSFORM_SQL = re.compile(
+    r"\bJOIN\b|\bGROUP\s+BY\b|\bUNION\b|\bPIVOT\b|\bUNPIVOT\b|\bHAVING\b",
+    re.IGNORECASE,
+)
+
+
+def _is_transforming_query(expression: str) -> bool:
+    """True when a partition query reshapes data rather than just reading a source."""
+    text = expression or ""
+    return bool(_TRANSFORM_M.search(text) or _TRANSFORM_SQL.search(text))
+
+
 #: Metadata proxies for a "performance-critical" (large) model in SM-AGGREGATIONS.
 #: Real size (rows, VertiPaq footprint, cardinality) is never in the KB, so a
 #: model counts as large if it carries an incremental-refresh policy, is wide
 #: (this many column declarations), or has at least this many tables.
 _WIDE_MODEL_COLUMNS = 100
 _LARGE_MODEL_TABLES = 5
+
+#: DAX aggregation functions. A measure whose expression calls one of these
+#: summarizes detail rows into a total — the "summarizations" the checklist point
+#: asks for, distinct from a formal ``alternateOf`` aggregation *table*. Matched
+#: on a function-call boundary so ``SUM(`` counts but a column merely named
+#: "sum_amount" does not.
+_AGG_DAX = re.compile(
+    r"\b(?:SUM|SUMX|AVERAGE|AVERAGEX|AVERAGEA|MIN|MINX|MINA|MAX|MAXX|MAXA|"
+    r"COUNT|COUNTX|COUNTA|COUNTAX|COUNTROWS|DISTINCTCOUNT|DISTINCTCOUNTNOBLANK|"
+    r"PRODUCT|PRODUCTX|GEOMEAN|GEOMEANX|MEDIAN|MEDIANX|"
+    r"PERCENTILEX?\.(?:INC|EXC)|VARX?\.(?:S|P)|STDEVX?\.(?:S|P)|"
+    r"SUMMARIZE|SUMMARIZECOLUMNS|GROUPBY)\s*\(",
+    re.IGNORECASE,
+)
 
 
 def _model(ctx: CheckContext) -> dict | None:
@@ -50,7 +88,7 @@ def _model(ctx: CheckContext) -> dict | None:
 @check(
     id="SM-STORAGE-MODE", ref="14.2.1",
     title="Storage mode chosen deliberately (Direct Lake / Import / DirectQuery)",
-    pillar=Pillar.PERFORMANCE, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
     layers=MODEL_LAYERS, requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
 )
 def sm_storage_mode(ctx: CheckContext) -> Verdict:
@@ -96,7 +134,7 @@ def sm_storage_mode(ctx: CheckContext) -> Verdict:
 @check(
     id="SM-DIRECTLAKE-FALLBACK", ref="14.2.2",
     title="Direct Lake fallback behaviour is set deliberately",
-    pillar=Pillar.PERFORMANCE, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
     layers=MODEL_LAYERS, requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
 )
 def sm_directlake_fallback(ctx: CheckContext) -> Verdict:
@@ -131,35 +169,61 @@ def sm_directlake_fallback(ctx: CheckContext) -> Verdict:
 @check(
     id="SM-AGGREGATIONS", ref="14.2.4",
     title="Aggregations used for performance-critical models",
-    pillar=Pillar.PERFORMANCE, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
     layers=MODEL_LAYERS, requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
 )
 def sm_aggregations(ctx: CheckContext) -> Verdict:
-    """A large Import/DirectQuery model summarizes its detail with aggregations.
+    """A model summarizes its detail with aggregation tables or aggregate measures.
 
-    Gated to the models where aggregations actually pay: Direct Lake reads
-    columnar Delta directly, so an aggregation table is usually redundant there
-    and its absence must not be reported as a finding.
+    The checklist point credits *"aggregations / summarizations"*, so both count:
+
+    * a formal aggregation table (``alternateOf`` — the Manage-Aggregations /
+      automatic-aggregations feature), the strongest signal; or
+    * aggregate DAX **measures** (``SUM`` / ``AVERAGE`` / ``COUNT`` / …) that
+      summarize detail into totals — what most models actually use.
+
+    Presence of either is credited (PASS) in any storage mode. Only when neither
+    exists does the verdict fall through: a Direct Lake model is N/A (columnar
+    Delta makes aggregation tables usually redundant), and any other model is
+    also **N/A, never a FAIL** — whether a model genuinely *needs* aggregations
+    depends on fact-table row counts and VertiPaq footprint, and rows are never
+    read into the knowledge base, so the tool cannot assert it *should* have them.
     """
     model = _model(ctx)
     if model is None:
         return not_applicable("Semantic model definitions could not be read from Fabric")
 
+    # A formal aggregation table is the strongest signal, and it counts in any mode.
+    aggregations = model.get("aggregations") or []
+    if aggregations:
+        tables = sorted({a.get("table", "") for a in aggregations if a.get("table")})
+        return binary(True, f"{len(aggregations)} aggregation column(s) declared on: "
+                            f"{', '.join(tables)}")
+
+    # Aggregate measures satisfy the "summarizations" half of the point.
+    summarizing = sorted({
+        str(m.get("name") or "") for m in (model.get("measures") or [])
+        if m.get("name") and _AGG_DAX.search(str(m.get("expression") or ""))
+    })
+    if summarizing:
+        shown = ", ".join(summarizing[:5])
+        more = f" (+{len(summarizing) - 5} more)" if len(summarizing) > 5 else ""
+        return binary(True, f"No formal aggregation table, but {len(summarizing)} measure(s) "
+                            f"summarize detail with DAX aggregations: {shown}{more}")
+
+    # Neither aggregation tables nor summarizing measures. Direct Lake first —
+    # there an aggregation table is usually redundant, so absence is not a finding.
     storage = model.get("storage") or {}
     modes = {m.lower() for f in storage.values() for m in f.get("modes") or []}
     if not modes & {"import", "directquery", "dual"}:
         return not_applicable("Model is Direct Lake only — aggregation tables are not "
                               "the relevant optimization")
 
-    aggregations = model.get("aggregations") or []
-    if aggregations:
-        tables = sorted({a.get("table", "") for a in aggregations if a.get("table")})
-        return binary(True, f"{len(aggregations)} aggregation column(s) declared on: "
-                            f"{', '.join(tables)}")
-    # Absence is only meaningful once the model is big enough to care about.
-    # "Big" is judged from metadata proxies, not row counts: an incremental-
-    # refresh policy is only set on tables too large to fully reload, and a wide
-    # column footprint drives VertiPaq cost far more than table count alone.
+    # Absence is not a defect this tool can assert. Whether a model *needs*
+    # aggregations depends on fact-table row counts and VertiPaq footprint, and
+    # rows are never read into the knowledge base — so a missing aggregation
+    # table is "cannot determine", never a FAIL. The metadata size is reported
+    # for context, but it does not turn absence into a finding.
     table_count = len(model.get("tables") or [])
     column_count = len(model.get("columns") or [])
     incremental = model.get("refresh_policies") or []
@@ -170,17 +234,19 @@ def sm_aggregations(ctx: CheckContext) -> Verdict:
         signals.append(f"{column_count} columns")
     if table_count >= _LARGE_MODEL_TABLES:
         signals.append(f"{table_count} tables")
-    if not signals:
-        return not_applicable(f"Small model ({table_count} tables, {column_count} columns, "
-                              f"no incremental refresh) — aggregations are not warranted")
-    return binary(False, f"Performance-critical Import/DirectQuery model ({'; '.join(signals)}) "
-                         f"with no aggregation tables — every visual scans detail rows")
+    context = f" (metadata size: {'; '.join(signals)})" if signals else ""
+    return not_applicable(
+        f"Model '{ctx.obj_name}' declares no aggregation tables and no summarizing "
+        f"measures{context}. Aggregations are an optional optimization that only pays on "
+        f"very large fact tables; whether this model needs them depends on row counts, "
+        f"which are never read into the knowledge base, so their absence is not scored"
+    )
 
 
 @check(
     id="SM-COLUMN-SHAPE", ref="14.2.3",
     title="Model size and column cardinality optimized (reduce high-cardinality columns where possible)",
-    pillar=Pillar.PERFORMANCE, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
     layers=MODEL_LAYERS, requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
 )
 def sm_column_shape(ctx: CheckContext) -> Verdict:
@@ -202,9 +268,10 @@ def sm_column_shape(ctx: CheckContext) -> Verdict:
     * *full-precision datetime* — a temporal column carrying a time of day rather
       than a date. Split into a date key plus a time key it costs two small
       dictionaries instead of one enormous one.
-    * *free text* — an unbounded ``varchar(max)``/``text``/``json`` source type,
-      or a name saying description/comment/address/url. Not something a user
-      slices by, and expensive to keep.
+    * *free text* — an unbounded ``varchar(max)``/``text``/``json`` source type.
+      A column is **not** judged free text on its name alone: a ``Description``
+      column mapped one-to-one to a low-cardinality key carries that key's
+      cardinality, which the name cannot reveal and the rows are never read.
     * *row identifier* — a column the model marks ``isKey``, or whose name is
       key-shaped, that **no relationship uses**. That is an identity column
       imported for no modelling reason: the "unnecessary columns imported" half
@@ -284,16 +351,26 @@ def sm_column_shape(ctx: CheckContext) -> Verdict:
 @check(
     id="SM-QUERY-TRANSFORM", ref="14.2.6",
     title="Warehouse serves the model directly (no per-refresh transformation)",
-    pillar=Pillar.PERFORMANCE, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
     layers=MODEL_LAYERS, requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
 )
 def sm_query_transform(ctx: CheckContext) -> Verdict:
-    """Tables bind to a warehouse table or view, not to inline query logic.
+    """Tables read a warehouse table or view, not reshape data inline.
 
-    A partition carrying its own native SQL or Power Query expression re-runs
-    that transformation on every refresh, and it hides the logic from the
-    warehouse where it could be tested and reused. Binding to a table or view
-    pushes the work upstream and makes the model a thin serving layer.
+    Reading a warehouse table or view — a source navigation, or a plain
+    ``SELECT ... FROM`` — pushes the work upstream where it can be tested and
+    reused, and makes the model a thin serving layer. What re-runs an expensive
+    reshape on every refresh, and hides the logic from the warehouse, is a
+    partition that *transforms* inline: a Power Query merge, append, group-by,
+    pivot or manual ``#table`` entry, or a native SQL query that itself joins,
+    groups or unions. Only those are flagged; a partition that merely navigates
+    to a source object or runs a plain query is treated as warehouse-served.
+
+    **What it cannot determine.** It classifies the *saved query text*, not query
+    performance: a plain ``SELECT`` from a view that hides heavy logic reads as
+    warehouse-served here, which is the intended verdict — the work lives in the
+    warehouse. Snapshots taken before the partition query text was captured carry
+    only the coarse "has a native query" count, and fall back to it.
     """
     model = _model(ctx)
     if model is None:
@@ -305,12 +382,26 @@ def sm_query_transform(ctx: CheckContext) -> Verdict:
     if not bound:
         return not_applicable("Model has no data-bearing partitions to assess")
 
-    transforming = sorted(n for n, f in bound.items() if f.get("native_query_partitions"))
+    transforming: list[str] = []
+    for name, facts in bound.items():
+        expressions = facts.get("native_query_expressions")
+        if expressions is None:
+            # Pre-capture snapshot: only the count survived, so fall back to it.
+            if facts.get("native_query_partitions"):
+                transforming.append(name)
+            continue
+        if any(_is_transforming_query(expr) for expr in expressions):
+            transforming.append(name)
+    transforming.sort()
+
     clean = len(bound) - len(transforming)
     evidence = (f"Semantic model '{ctx.obj_name}': {clean} of {len(bound)} table(s) "
-                "bind directly to a warehouse table/view rather than inline query logic")
+                "read a warehouse table/view or run a plain source query rather than "
+                "transforming data inline")
     if transforming:
-        evidence += f" — inline transformation in: {', '.join(transforming)}"
-    evidence += (". This verdict inspects saved semantic-model partition metadata; it "
-                 "does not measure SQL, DAX, refresh, or interactive query performance")
+        evidence += (" — inline transformation (merge/append/group-by/pivot/manual entry) "
+                     f"in: {', '.join(transforming)}")
+    evidence += (". A partition that only navigates to a source object or runs a plain "
+                 "SELECT is treated as warehouse-served; this reads saved partition "
+                 "metadata, not SQL, DAX, refresh, or interactive query performance")
     return covered(clean, len(bound), evidence)
