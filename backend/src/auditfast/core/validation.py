@@ -208,6 +208,7 @@ VALIDATED_CHECKLIST: dict[str, str] = {
     "4.5.6":  "Surrogate keys used for dimension tables (not business keys as PKs in facts)",
     "1.1.9":  "Data Prep workspaces (`MLC_DATAPREP_*`) contain only Pipelines and Notebooks — no Lakehouses or Warehouses (all storage resides in the Data Store workspace)",
     "3.1.2":  "Notebooks are parameterized using Fabric notebook parameters or widgets",
+    "3.5.2":  "Partition count appropriate (not 200 default for small/medium data)",
     "14.2.4": "Aggregations / summarizations used for performance-critical reports where needed",
     "14.5.2": "Incremental refresh configured for large Import models where applicable",
     "2.2.2":  "Full load reserved only for small reference/dimension tables or initial loads",
