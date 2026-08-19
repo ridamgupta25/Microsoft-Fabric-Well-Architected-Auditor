@@ -477,6 +477,89 @@ def normalise_table_name(name: str) -> str:
     return re.sub(r"[\s\-_]+", "", text)
 
 
+def related_columns(
+    semantic_models: dict[str, dict] | None,
+) -> set[tuple[str, str]]:
+    """``{(normalised table, normalised column)}`` for every column in a relationship.
+
+    **Why this matters.** A relationship is the modeller *stating* that this
+    column resolves to that table. Where one exists, a check never has to guess
+    from the column's name whether it points at a dimension - the estate has
+    already said so.
+
+    Both ends are returned. The "many" end is the fact's foreign key (the column
+    a degenerate-dimension test asks about); the "one" end is the dimension's own
+    key. Either way the column participates in a declared join, which is the fact
+    a caller needs.
+
+    Inactive relationships are included deliberately: a column reachable only via
+    ``USERELATIONSHIP`` is still modelled, not orphaned.
+
+    Empty when no model is readable - the normal case for a Bronze workspace.
+    Callers must read that as "no declarative evidence", never "no relationships
+    exist", and fall back to name-based evidence rather than reporting a finding.
+    """
+    if not semantic_models:
+        return set()
+    pairs: set[tuple[str, str]] = set()
+    for model in semantic_models.values():
+        if not isinstance(model, dict):
+            continue
+        for rel in model.get("relationships") or []:
+            if not isinstance(rel, dict):
+                continue
+            for table_key, column_key in (("from_table", "from_column"),
+                                          ("to_table", "to_column")):
+                table = normalise_table_name(str(rel.get(table_key) or ""))
+                column = normalise_column(str(rel.get(column_key) or ""))
+                if table and column:
+                    pairs.add((table, column))
+    return pairs
+
+
+#: Declared types whose value set is inherently small - the columns a junk
+#: dimension exists to collapse. A ``bit`` holds two values; a ``varchar(500)``
+#: holds free text and is no junk-dimension candidate whatever it is called.
+_LOW_CARDINALITY_TYPES = (
+    "bit", "boolean", "bool", "tinyint", "byte",
+)
+
+#: Character width above which a column reads as prose rather than a coded
+#: value. ``order_status varchar(10)`` and ``payment_type varchar(20)`` are the
+#: classic junk-dimension inputs; ``rejection_reason varchar(500)`` is a
+#: comment field. The line is drawn generously - this check only *names
+#: candidates* for a reviewer, so excluding a real one costs more than
+#: including a doubtful one.
+_MAX_CODED_VALUE_WIDTH = 50
+
+
+def is_low_cardinality_shape(col: dict) -> bool:
+    """True when a column's *declared type* suggests a small set of values.
+
+    A shape proxy, not a measured distinct count - no rows are ever read.
+    Booleans and narrow character types qualify; wide character types do not,
+    because a 500-character column holds prose and collapsing prose into a junk
+    dimension buys nothing.
+
+    Used to stop a name pattern alone deciding that ``rejection_reason
+    varchar(500)`` is a junk-dimension candidate: the name matches, the shape
+    says otherwise.
+    """
+    declared = column_type(col)
+    if not declared:
+        return False
+    if declared.startswith(_LOW_CARDINALITY_TYPES):
+        return True
+    if declared.startswith(_TEXT_TYPES):
+        width = re.search(r"\((\d+)\)", declared)
+        # An unbounded string (`varchar`, `string`, `varchar(max)`) states no
+        # width, so it cannot be shown to be narrow.
+        return bool(width) and int(width.group(1)) <= _MAX_CODED_VALUE_WIDTH
+    # Small integers and enumerated numeric codes are already covered above;
+    # anything else (dates, decimals, blobs) is not a junk-dimension input.
+    return False
+
+
 #: ``dataCategory`` values that name a table as descriptive reference data.
 #: From the TMSL table object: 1-TIME, 6-ACCOUNTS, 7-CUSTOMERS, 8-PRODUCTS,
 #: 15-ORGANIZATION, 17-GEOGRAPHY. Power BI sets "Time" automatically when a
