@@ -91,7 +91,7 @@ _CODE_STANDARDIZATION = re.compile(
 
 @check(
     id="WS-LAYER-CONTENT", ref="1.1.1", title="Clear separation of concerns across the 67 workspaces (Data Prep / Data Store / Data Consumption × Dev / QA / Prod)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     requires=[Resource.ITEMS], required=True,
 )
 def layer_content(ctx: CheckContext) -> Verdict:
@@ -111,7 +111,7 @@ def layer_content(ctx: CheckContext) -> Verdict:
 
 @check(
     id="WS-LAYER-SEP", ref="1.1.9", title="Layer separation: each workspace holds only the item types appropriate to its layer role — e.g. Data Prep workspaces contain only Pipelines/Notebooks, with all storage (Lakehouses/Warehouses) kept in the Data Store layer",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     requires=[Resource.ITEMS], required=True,
 )
 def layer_separation(ctx: CheckContext) -> Verdict:
@@ -143,7 +143,7 @@ def layer_separation(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-SCHEMA-VALIDATE", ref="5.2.1",
     title="Schema validation: incoming records match expected schema (column count, names, data types) — incl. EAM JSON",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=(Layer.OPERATIONS,), requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def notebook_schema_validation(ctx: CheckContext) -> Verdict:
@@ -169,7 +169,7 @@ def notebook_schema_validation(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-FORMAT-VALIDATE", ref="5.2.4",
     title="Format validation: expected encoding (UTF-8), delimiters, and JSON structure for EAM",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def notebook_format_validation(ctx: CheckContext) -> Verdict:
@@ -197,7 +197,7 @@ def notebook_format_validation(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-STANDARDIZE", ref="5.3.5",
     title="Standardization: consistent formatting (dates, codes)",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def notebook_standardization(ctx: CheckContext) -> Verdict:

@@ -1098,6 +1098,37 @@ def test_historical_separation_full_load_name_alone_is_na(name):
     assert "no historical/backfill load signal" in verdict.evidence
 
 
+def test_historical_separation_ignores_project_schema_literal_in_definition():
+    # Regression (real MLC_ADAGE data): PL_IN_WHITMPK_TBL_FullLoad was scored
+    # PARTIAL only because the historical detector matched the project's own
+    # 'ADAGE' schema name buried in a Copy sink's typeProperties - an incidental
+    # data value, not a load-intent signal - while its structurally identical
+    # twin PL_IN_WHITM_TBL_FullLoad (which names the schema via an expression)
+    # was N/A. A full-load pipeline with no historical/backfill naming must be
+    # N/A regardless of the schema / table names it writes to.
+    copy_to_adage_schema = {
+        "name": "ACT_MT_Copy_ingestBlobdataForFullLoad",
+        "type": "Copy",
+        "typeProperties": {
+            "sink": {
+                "type": "LakehouseTableSink",
+                "tableActionOption": "OverwriteSchema",
+                "datasetSettings": {
+                    "typeProperties": {
+                        "schema": {"value": "ADAGE", "type": "Expression"},
+                        "table": {"value": "IN_WHITM", "type": "Expression"},
+                    }
+                },
+            }
+        },
+    }
+    verdict = pl_historical_separation(
+        _named_pipe_ctx("PL_IN_WHITMPK_TBL_FullLoad", copy_to_adage_schema)
+    )
+    assert verdict.status is Status.NA
+    assert "no historical/backfill load signal" in verdict.evidence
+
+
 # -- PL-DEADLETTER structural routing ----------------------------------------
 
 def test_deadletter_ignores_error_words_inside_copy_column_mappings():

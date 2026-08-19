@@ -38,7 +38,7 @@ def _options(partial_guidance: str, no_guidance: str) -> list[CheckOption]:
 questionnaire_check(
     id="GOV-ACCESS-AUDIT", ref="7.4.3",
     title="Data access audit trail exists (who accessed what data, when)",
-    pillar=Pillar.GOVERNANCE, severity=Severity.MEDIUM, layers=_LAYERS,
+    pillar=Pillar.COMPLIANCE, severity=Severity.MEDIUM, layers=_LAYERS,
     question=(
         "Is there a retained, queryable record of who accessed which data and when — one you "
         f"could produce on request? ({_WHY})"

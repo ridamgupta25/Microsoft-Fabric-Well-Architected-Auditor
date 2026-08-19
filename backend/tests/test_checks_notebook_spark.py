@@ -403,7 +403,8 @@ def test_bound_environment_runtime_is_primary_evidence():
     verdict = spark_runtime(_ctx(notebook))
     assert verdict.score == 3
     assert "Validation Environment" in verdict.evidence
-    assert "Spark 3.5.0" in verdict.evidence
+    # Runtime 1.3 carries Spark 3.5.5, per the published runtime table.
+    assert "Spark 3.5.5" in verdict.evidence
 
 
 def test_bound_old_environment_runtime_fails():

@@ -277,11 +277,37 @@ def test_scd_strategy_full_credit_when_every_dimension_declares_one():
 
 
 def test_scd_strategy_partial_when_only_some_dimensions_declare_one():
+    """A validity *pair* is what declares a strategy - a lone date is not.
+
+    This case used to pass ``valid_from`` alone. That is a partial marker set:
+    it cannot say when a row stopped being current (it may simply be an insert
+    timestamp), so it now scores the same band as Type 1 rather than counting as
+    row versioning. The test's intent is unchanged - one dimension declares a
+    strategy and one does not, so the estate scores 2 - but the declaring
+    dimension now carries the complete pair that earns it.
+    """
+    ctx = _ctx(
+        dim_customer=_table(("customer_sk", "bigint"), ("valid_from", "timestamp"),
+                            ("valid_to", "timestamp")),
+        dim_product=_table(("product_sk", "bigint"), ("product_name", "varchar(50)")),
+    )
+    assert scd_strategy_per_dimension(ctx).score == 2
+
+
+def test_scd_strategy_scores_a_lone_validity_date_as_incomplete():
+    """The reviewer's defect, pinned: one marker is not a declared strategy.
+
+    ``valid_from`` with no end date, no version and no flag cannot record which
+    row was current when. Scoring it as declared is what let a half-built estate
+    read as a clean pass.
+    """
     ctx = _ctx(
         dim_customer=_table(("customer_sk", "bigint"), ("valid_from", "timestamp")),
         dim_product=_table(("product_sk", "bigint"), ("product_name", "varchar(50)")),
     )
-    assert scd_strategy_per_dimension(ctx).score == 2
+    verdict = scd_strategy_per_dimension(ctx)
+    assert verdict.score == _PARTIAL
+    assert "partial marker set" in verdict.evidence
 
 
 def test_scd_strategy_is_never_a_hard_fail_for_plain_type_1_dimensions():

@@ -128,7 +128,7 @@ def test_parse_tmsl_captures_column_declarations_but_no_row_data():
     for column in columns:
         assert set(column) == {
             "table", "name", "data_type", "source_provider_type",
-            "source_column", "is_hidden", "is_key",
+            "source_column", "is_hidden", "is_key", "display_folder",
         }
 
 

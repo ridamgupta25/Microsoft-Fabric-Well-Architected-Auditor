@@ -125,7 +125,7 @@ _RESTART_BOUNDARY = re.compile(
 
 @check(
     id="PL-RETRY", ref="2.4.1", title="All pipeline activities have appropriate retry policies configured (copy, notebook, lookup, web, ForEach)",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def retry_policy(ctx: CheckContext) -> Verdict:
@@ -138,7 +138,7 @@ def retry_policy(ctx: CheckContext) -> Verdict:
 
 @check(
     id="PL-FAILPATH", ref="2.4.3", title="On-failure paths defined for critical activities",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def failure_path(ctx: CheckContext) -> Verdict:
@@ -154,7 +154,7 @@ def failure_path(ctx: CheckContext) -> Verdict:
 
 @check(
     id="PL-NOTIFY", ref="2.4.5", title="Pipeline failure triggers notification (Data Activator, email, Teams)",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def failure_notification(ctx: CheckContext) -> Verdict:
@@ -181,7 +181,7 @@ def failure_notification(ctx: CheckContext) -> Verdict:
 @check(
     id="PL-RESTART", ref="9.1.1",
     title="Failed pipelines can be restarted from point of failure (not full re-run)",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    pillar=Pillar.RELIABILITY, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def restart_from_failure(ctx: CheckContext) -> Verdict:
@@ -220,8 +220,8 @@ def restart_from_failure(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-TIMEOUT", ref="IMPL-23", title="Pipeline activities set an explicit timeout (not Fabric's multi-day default) [PL-TIMEOUT]",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.LOW,
+    id="PL-TIMEOUT", ref="13.4.1", title="Pipeline activities set an explicit timeout (not Fabric's multi-day default) [PL-TIMEOUT]",
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def explicit_timeouts(ctx: CheckContext) -> Verdict:
@@ -252,7 +252,7 @@ def explicit_timeouts(ctx: CheckContext) -> Verdict:
 @check(
     id="PL-POISON", ref="9.1.3",
     title="Poison message / corrupt file handling (quarantine, not crash)",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    pillar=Pillar.RELIABILITY, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def poison_message_handling(ctx: CheckContext) -> Verdict:
@@ -305,7 +305,7 @@ def poison_message_handling(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-BADRECORDS", ref="9.1.3",
     title="Poison message / corrupt file handling (quarantine, not crash)",
-    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    pillar=Pillar.RELIABILITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def notebook_bad_records(ctx: CheckContext) -> Verdict:
@@ -338,7 +338,7 @@ def notebook_bad_records(ctx: CheckContext) -> Verdict:
 
 @check(
     id="PL-RETRY-VALUES", ref="2.4.2", title="Retry count and interval follow reasonable patterns (not infinite retries)",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def retry_values(ctx: CheckContext) -> Verdict:
@@ -508,7 +508,7 @@ def _retry_is_dynamic(activity: dict) -> bool:
 @check(
     id="PL-IDEMPOTENT", ref="2.4.6",
     title="Idempotency ensured — re-running a failed pipeline does not produce duplicates",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    pillar=Pillar.RELIABILITY, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def pipeline_idempotent(ctx: CheckContext) -> Verdict:
@@ -548,7 +548,7 @@ def pipeline_idempotent(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-IDEMPOTENT", ref="9.3.1",
     title="All pipelines and notebooks are idempotent (safe to re-run)",
-    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    pillar=Pillar.RELIABILITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def notebook_idempotent(ctx: CheckContext) -> Verdict:
@@ -614,7 +614,7 @@ def _failure_branch_targets(acts: list[dict]) -> list[str]:
 @check(
     id="PL-DEADLETTER", ref="2.4.4",
     title="Failed records captured to dead-letter / quarantine area (not silently dropped or halting good records)",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def pl_deadletter(ctx: CheckContext) -> Verdict:
@@ -723,7 +723,7 @@ _ANY_WRITE = re.compile(
 @check(
     id="NB-DEADLETTER", ref="5.1.10",
     title="DQ quarantine pattern: failed records routed to error tables with failure reason",
-    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_deadletter(ctx: CheckContext) -> Verdict:
@@ -924,7 +924,7 @@ def _explicit_transaction(code: str) -> bool:
 @check(
     id="NB-TXN-BOUNDARY", ref="9.3.3",
     title="Transaction boundaries defined for multi-step operations (incl. Warehouse loads)",
-    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    pillar=Pillar.RELIABILITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def notebook_transaction_boundary(ctx: CheckContext) -> Verdict:
@@ -1013,7 +1013,7 @@ _NB_REMOTE_CALL = re.compile(
 @check(
     id="NB-RETRY-BACKOFF", ref="9.1.2",
     title="Transient failure handling: notebook retries with backoff",
-    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.RELIABILITY, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_retry_backoff(ctx: CheckContext) -> Verdict:
@@ -1113,7 +1113,7 @@ def _integrity_methods(code: str) -> list[str]:
 @check(
     id="NB-POST-FAILURE-INTEGRITY", ref="9.3.4",
     title="Data integrity validated across layers after failures",
-    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.RELIABILITY, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_post_failure_integrity(ctx: CheckContext) -> Verdict:
@@ -1286,7 +1286,7 @@ def _merge_grade(text: str, subject: str) -> Verdict:
 @check(
     id="NB-MERGE-KEYED", ref="9.3.2",
     title="Merge/upsert patterns prevent duplicates on re-execution",
-    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    pillar=Pillar.RELIABILITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def notebook_merge_keyed(ctx: CheckContext) -> Verdict:
@@ -1331,7 +1331,7 @@ def notebook_merge_keyed(ctx: CheckContext) -> Verdict:
 @check(
     id="PL-MERGE-KEYED", ref="9.3.2",
     title="Merge/upsert patterns prevent duplicates on re-execution",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    pillar=Pillar.RELIABILITY, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def pipeline_merge_keyed(ctx: CheckContext) -> Verdict:

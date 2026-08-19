@@ -162,6 +162,10 @@ def _table_columns(table: dict, table_name: str) -> list[dict]:
             "source_column": str(column.get("sourceColumn") or ""),
             "is_hidden": bool(column.get("isHidden", False)),
             "is_key": bool(column.get("isKey", False)),
+            # The folder a report author sees this column filed under. TMSL carries
+            # it per column; without it the "model organisation" half of ref 14.1.8
+            # was unassessable and the check said so rather than judging it.
+            "display_folder": str(column.get("displayFolder") or ""),
         })
     return out
 
@@ -230,6 +234,7 @@ def parse_tmsl(document: dict) -> dict:
                 "description": measure.get("description", "") or "",
                 "is_hidden": bool(measure.get("isHidden", False)),
                 "format_string": measure.get("formatString", "") or "",
+                "display_folder": str(measure.get("displayFolder") or ""),
             })
 
     relationships: list[dict] = []
