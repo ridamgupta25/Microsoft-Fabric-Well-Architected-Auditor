@@ -2640,13 +2640,56 @@ def pl_full_load(ctx: CheckContext) -> Verdict:
 # -- 2.2.3 historical (Adage) load separated from ongoing incremental ----------
 _HISTORICAL = re.compile(
     r"historical|back[_ -]?fill|backfill|full[_ -]?history|one[_ -]?time[_ -]?load|"
-    r"initial[_ -]?load|adage|reload[_ -]?history",
+    r"initial[_ -]?load|reload[_ -]?history",
     re.IGNORECASE,
 )
 _ONGOING = re.compile(
     r"incremental|daily|hourly|delta[_ -]?load|watermark|cdc|ongoing|scheduled",
     re.IGNORECASE,
 )
+
+
+def _load_intent_text(pipeline_name: str, activities: list[dict]) -> str:
+    """Identifiers that carry *load intent* - the pipeline name and each
+    activity's name - joined for keyword matching.
+
+    Deliberately excludes activity ``typeProperties`` (schema / table / column
+    names, expressions, connection ids). Those are incidental data values:
+    matching a load-mode keyword against them flagged a routine full-load
+    pipeline as a "historical/backfill" load merely because it wrote to the
+    project's own ``ADAGE`` schema, and flipped the verdict between two
+    structurally identical pipelines on such a token. Intent is what the author
+    *named* the pipeline and its steps, not the data they happen to touch.
+    """
+    parts = [pipeline_name or ""]
+    parts.extend(str((a or {}).get("name") or "") for a in activities)
+    return "\n".join(parts)
+
+
+def _gate_condition_text(activity: dict) -> str:
+    """A Switch / IfCondition's *branch condition* - its name, boolean / selector
+    expression and any Switch case labels - without the nested branch bodies.
+
+    A load-mode gate is identified by what it branches *on*, not by what sits
+    inside its branches, so a container is not read as a load-mode gate just
+    because a nested activity name or value contains a load-mode word.
+    """
+    props = activity.get("typeProperties") or {}
+
+    def _expr(value: object) -> str:
+        return str(value.get("value") if isinstance(value, dict) else (value or ""))
+
+    parts = [
+        str(activity.get("name") or ""),
+        _expr(props.get("expression")),   # IfCondition predicate
+        _expr(props.get("on")),           # Switch selector
+    ]
+    parts.extend(
+        str((c or {}).get("value") or "")
+        for c in (props.get("cases") or [])
+        if isinstance(c, dict)
+    )
+    return "\n".join(parts)
 
 
 @check(
@@ -2661,14 +2704,23 @@ def pl_historical_separation(ctx: CheckContext) -> Verdict:
     Narrower than ``PL-LOADMODE`` (2.2.5), which asks whether *any* initial /
     incremental separation exists. This fires only when a historical or backfill
     load is actually present, and asks whether it is kept off the routine path.
+
+    **What counts as the signal.** Historical/backfill and ongoing/incremental
+    intent are read from load-bearing *identifiers* - the pipeline name and its
+    activity names (see :func:`_load_intent_text`) - never from the serialized
+    definition. Searching the whole JSON matched incidental data values (a
+    ``schema`` / ``table`` name in a Copy sink), so a plain full-load pipeline
+    read as "historical" merely because it wrote to the project's ``ADAGE``
+    schema, and the verdict flipped between structurally identical pipelines on
+    such a token. Intent is what the author named, not the data touched.
     """
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
-    blob = json.dumps(ctx.obj)
     acts = walk_activities(ctx.obj)
+    intent = _load_intent_text(ctx.obj_name, acts)
     historical_in_name = bool(_HISTORICAL.search(ctx.obj_name))
-    historical_in_definition = bool(_HISTORICAL.search(blob))
-    if not historical_in_definition and not historical_in_name:
+    historical_signal = bool(_HISTORICAL.search(intent))
+    if not historical_signal:
         return not_applicable(
             f"Pipeline '{ctx.obj_name}' contains no historical/backfill load signal"
         )
@@ -2681,7 +2733,8 @@ def pl_historical_separation(ctx: CheckContext) -> Verdict:
     gating_branches = [
         a for a in acts
         if (a.get("type") or "") in {"Switch", "IfCondition"}
-        and (_HISTORICAL.search(json.dumps(a)) or _LOAD_MODE.search(json.dumps(a)))
+        and (_HISTORICAL.search(_gate_condition_text(a))
+             or _LOAD_MODE.search(_gate_condition_text(a)))
     ]
     if gating_branches:
         gate = gating_branches[0]
@@ -2692,7 +2745,7 @@ def pl_historical_separation(ctx: CheckContext) -> Verdict:
             "incremental path cannot enter it without the branch condition",
         )
 
-    if _ONGOING.search(blob):
+    if _ONGOING.search(intent):
         return binary(
             False,
             f"Pipeline '{ctx.obj_name}' contains both historical/backfill and ongoing "
