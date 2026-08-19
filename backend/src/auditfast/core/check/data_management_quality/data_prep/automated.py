@@ -1596,11 +1596,18 @@ _UNKNOWN_MONITORED = re.compile(
 )
 #: A real dimensional unknown-member fallback. A generic string value such as
 #: ``city = "Unknown"`` is ordinary null cleansing, not a surrogate member.
+#:
+#: The ``-1`` forms require a *numeric* -1 (a surrogate key), so each is guarded
+#: with ``(?<![\"'])`` to reject a quoted ``"-1"`` string. Legacy IFS/COM feeds
+#: store a boolean true as -1, so ``bool_value.isin("-1","1","true","yes","y")``
+#: is a flag tidy-up (scored by 5.5.7), not a surrogate-key orphan fallback -
+#: without the guard the quoted ``"-1"`` false-matched ``when(...-1`` and this
+#: completeness monitor fired on notebooks with no dimension lookup at all.
 _UNKNOWN_MEMBER_USE = re.compile(
     r"unknown[_\s]?member|inferred[_\s]?member|is_inferred|"
-    r"coalesce\s*\([^\n]{0,80}?-1|fillna\s*\([^\n]{0,60}?-1|"
-    r"\.na\.fill\s*\([^\n]{0,60}?-1|otherwise\s*\([^\n]{0,40}?-1|"
-    r"when\s*\([^\n]{0,80}?-1",
+    r"coalesce\s*\([^\n]{0,80}?(?<![\"'])-1|fillna\s*\([^\n]{0,60}?(?<![\"'])-1|"
+    r"\.na\.fill\s*\([^\n]{0,60}?(?<![\"'])-1|otherwise\s*\([^\n]{0,40}?(?<![\"'])-1|"
+    r"when\s*\([^\n]{0,80}?(?<![\"'])-1",
     re.IGNORECASE,
 )
 
