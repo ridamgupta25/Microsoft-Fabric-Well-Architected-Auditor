@@ -247,6 +247,12 @@ def parse_tmsl(document: dict) -> dict:
             "to_table": to_table,
             "to_column": rel.get("toColumn", ""),
             "cross_filter": rel.get("crossFilteringBehavior", "") or "",
+            #: Declared relationship cardinality — structural metadata (never row
+            #: data). TMSL omits these for a standard many-to-one relationship, so
+            #: an empty string means "defaulted", not "unknown"; both ends set to
+            #: ``many`` is a direct many-to-many relationship (no bridge).
+            "from_cardinality": str(rel.get("fromCardinality", "") or "").strip().lower(),
+            "to_cardinality": str(rel.get("toCardinality", "") or "").strip().lower(),
             "is_active": bool(rel.get("isActive", True)),
         })
 
