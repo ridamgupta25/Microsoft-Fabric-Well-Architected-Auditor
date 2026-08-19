@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 
+from auditfast.core.check._notebook import executable_code, strip_sql_comments
 from auditfast.core.enums import Layer
 
 #: Layers whose workspaces are expected to hold transformation notebooks.
@@ -70,6 +71,34 @@ def sequential_dml_by_target(code: str) -> dict[str, set[str]]:
         target = _normalize_sql_target(match.group("target"))
         operations.setdefault(target, set()).add("insert")
     return operations
+
+
+def sequential_dml_violations(definition: dict) -> dict[str, list[str]]:
+    """Tables hit by more than one DML *kind* within a single code cell.
+
+    The sequential ``DELETE`` + ``INSERT`` / ``UPDATE`` anti-pattern is one
+    logical upsert of one dataset, written together — a delete-then-reinsert
+    reload that should be a single ``MERGE``. It is therefore detected **per code
+    cell**, not across the whole notebook: aggregating over every cell fuses the
+    independent one-off statements of an ad-hoc / scratch notebook (register a
+    metadata row in one cell, fix a watermark in another, drop a stale table in a
+    third) into a fake "upsert" and wrongly fails it. Each cell is comment-
+    stripped (Python ``#`` and SQL ``--`` / ``/* */``) so a disabled statement
+    never counts.
+    """
+    merged: dict[str, set[str]] = {}
+    for cell in (definition or {}).get("cells") or []:
+        if cell.get("cell_type") != "code":
+            continue
+        source = cell.get("source")
+        text = "".join(source) if isinstance(source, list) else (source or "")
+        code = strip_sql_comments(
+            executable_code({"cells": [{"cell_type": "code", "source": text}]})
+        )
+        for target, operations in sequential_dml_by_target(code).items():
+            if len(operations) > 1:
+                merged.setdefault(target, set()).update(operations)
+    return {target: sorted(operations) for target, operations in merged.items()}
 
 # -- Delta maintenance ---------------------------------------------------------
 # The Delta ``OPTIMIZE`` SQL command (``OPTIMIZE <table>`` — a table token must
