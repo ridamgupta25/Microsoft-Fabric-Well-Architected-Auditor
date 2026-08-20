@@ -405,8 +405,10 @@ def run_audit(
                 except Exception as exc:  # noqa: BLE001 - reported in Phase 3
                     crawled[idx] = exc
 
-    # Phase 3 — evaluate each workspace's checks, in target order.
-    for idx, (workspace_id, layer, factor, specs, resources) in enumerate(plan):
+    # Phase 3 — evaluate each workspace's checks, in target order. ``resources``
+    # was consumed during the crawl phase and is unpacked only to keep the plan
+    # tuple's shape explicit at the point of use.
+    for idx, (workspace_id, layer, factor, specs, _resources) in enumerate(plan):
         outcome = crawled[idx]
         if isinstance(outcome, WorkspaceAccessError):
             results.append(access_error_result(workspace_id, layer, str(outcome)))

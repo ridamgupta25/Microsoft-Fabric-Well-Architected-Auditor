@@ -390,14 +390,36 @@ def has_timestamp_column(table: dict) -> bool:
     return any(is_timestamp_column(c) for c in columns(table))
 
 
+def _leaf(name: str) -> str:
+    """The table name without its schema or store prefix, lower-cased.
+
+    Tables arrive under several spellings: a Lakehouse table keeps its bare
+    name, a Warehouse table is filed as ``<schema>.<table>``, and a name
+    collision between two stores is re-filed as ``<store>.<table>``. Any test
+    that reads the *table's own* name has to look past those prefixes.
+    """
+    return (name or "").strip().lower().rsplit(".", 1)[-1]
+
+
 def is_dimension(name: str) -> bool:
-    """Name-only dimension test. Prefer :func:`table_role` - see its docstring."""
-    return (name or "").lower().startswith("dim")
+    """Name-only dimension test. Prefer :func:`table_role` - see its docstring.
+
+    The **leaf** name is tested, because a Warehouse table arrives
+    schema-qualified: ``dbo.dim_product`` starts with ``dbo``, not ``dim``, so
+    matching the whole string silently excluded every Warehouse dimension from
+    the name test. They then had to survive the column-shape heuristic instead,
+    and a small dimension - a key, a code and a flag - does not, so the checks
+    that ask about dimensions never saw them at all.
+    """
+    return _leaf(name).startswith("dim")
 
 
 def is_fact(name: str) -> bool:
-    """Name-only fact test. Prefer :func:`table_role` - see its docstring."""
-    return (name or "").lower().startswith(("fact", "fct"))
+    """Name-only fact test. Prefer :func:`table_role` - see its docstring.
+
+    Leaf-scoped for the same reason as :func:`is_dimension`.
+    """
+    return _leaf(name).startswith(("fact", "fct"))
 
 
 #: A fact must carry at least this many key columns. One key is a lookup table
