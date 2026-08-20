@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import pytest
 
-from auditfast.core.check.registry import GROUP_REGISTRY, CheckRegistry
 from auditfast.core.check.data_management_quality.data_storage.group import (
     aggregate_consistency,
     cross_layer_reconciliation,
 )
+from auditfast.core.check.registry import GROUP_REGISTRY, CheckRegistry
 from auditfast.core.engine import run_audit
 from auditfast.core.enums import Layer, Resource, Scope, Status
 from auditfast.core.models import GroupContext, GroupMemberContext, WorkspaceContext
