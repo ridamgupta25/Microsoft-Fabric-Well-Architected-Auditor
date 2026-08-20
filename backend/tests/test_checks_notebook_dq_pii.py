@@ -201,6 +201,54 @@ def test_an_attribute_style_pii_reference_triggers():
     assert verdict.status is not Status.NA
 
 
+# --- terms that are ordinary technical vocabulary are not personal data ----
+#
+# These were the reviewer's false findings. A corroboration rule ("two weak
+# terms must co-occur") was tried first and was not enough, because two innocent
+# terms corroborate each other exactly as well as two real ones. The terms were
+# removed instead.
+
+def test_a_fully_qualified_table_name_is_not_a_person():
+    """23 notebooks were failed for holding a table name ending in full_name."""
+    verdict = _pii(
+        "source_table_full_name = 'lakehouse.schema.sites'\n"
+        "dest_full_name = 'lakehouse.schema.sites_clean'\n"
+        "df.write.saveAsTable(dest_full_name)\n"
+    )
+    assert verdict.status is Status.NA
+
+
+def test_a_plant_called_mobile_is_not_a_phone_number():
+    verdict = _pii(
+        "df = df.filter(col('site') == 'Mobile')\n"
+        "df = df.filter(col('product') == 'Mobile Brokered Stone')\n"
+    )
+    assert verdict.status is Status.NA
+
+
+def test_a_gl_account_number_is_not_personal_data():
+    verdict = _pii(
+        "df = df.select('account_number', 'voucher_id', 'gl_period')\n"
+        "df.write.saveAsTable('silver_gl_vouchers')\n"
+    )
+    assert verdict.status is Status.NA
+
+
+def test_two_innocent_terms_together_are_still_not_personal_data():
+    """The case the old corroboration rule got wrong: both terms are innocent."""
+    verdict = _pii(
+        "dest_full_name = 'lakehouse.dbo.parts'\n"
+        "df = df.filter(col('plant') == 'Mobile')\n"
+    )
+    assert verdict.status is Status.NA
+
+
+def test_a_genuine_personal_column_still_triggers_after_the_narrowing():
+    """Narrowing must not silence the check on real personal data."""
+    verdict = _pii("df = df.select('customer_email', 'ssn', 'date_of_birth')\n")
+    assert verdict.status is not Status.NA
+
+
 # --- grading -------------------------------------------------------------
 
 def test_masked_and_validated_scores_full():

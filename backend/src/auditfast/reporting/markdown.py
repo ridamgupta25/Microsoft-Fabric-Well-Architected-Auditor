@@ -213,7 +213,7 @@ def build_markdown(
                     f"| {r.severity.value} | {r.ref} | {r.title} | "
                     f"{r.pillar} | {r.workspace} | {r.status.value} | {ev} |")
             lines.append("")
-        
+
         ext_passing = [r for r in external if r.status == Status.PASS]
         if ext_passing:
             lines.append(f"### Passing ({len(ext_passing)})")
