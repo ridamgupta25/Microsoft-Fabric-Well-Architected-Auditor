@@ -104,6 +104,38 @@ def build_markdown(project_name: str, agg: dict, results: list, errors: list | N
                 f"{r.pillar} | {r.workspace} | {obj} | {r.status.value} | {ev} | {rec} |")
     lines.append("")
 
+    # External checks (from CSV) — separate section to distinguish from automated
+    external = [r for r in results if r.source == "external"]
+    if external:
+        lines.append("## External Checks (from CSV)")
+        lines.append("")
+        lines.append("These checks were loaded from an external CSV file (e.g., AdminChecks.csv) "
+                     "and are included in the overall score. They are marked here for clarity.")
+        lines.append("")
+        ext_findings = [r for r in external if r.status in (Status.FAIL, Status.PARTIAL)]
+        if ext_findings:
+            lines.append(f"### Failing / Partial ({len(ext_findings)})")
+            lines.append("")
+            lines.append("| Severity | Ref | Check | Pillar | Workspace | Status | Evidence |")
+            lines.append("|----------|-----|-------|--------|-----------|--------|----------|")
+            for r in ext_findings:
+                ev = (r.evidence or "").replace("|", "\\|")
+                lines.append(
+                    f"| {r.severity.value} | {r.ref} | {r.title} | "
+                    f"{r.pillar} | {r.workspace} | {r.status.value} | {ev} |")
+            lines.append("")
+        
+        ext_passing = [r for r in external if r.status == Status.PASS]
+        if ext_passing:
+            lines.append(f"### Passing ({len(ext_passing)})")
+            lines.append("")
+            lines.append("| Ref | Check | Pillar | Workspace |")
+            lines.append("|-----|-------|--------|-----------|")
+            for r in ext_passing:
+                lines.append(
+                    f"| {r.ref} | {r.title} | {r.pillar} | {r.workspace} |")
+            lines.append("")
+
     # Not assessed (N/A): checks whose data could not be read. These are the
     # "why are checks missing?" answer — grouped by reason so a permission or
     # access gap is visible instead of the checks silently vanishing.

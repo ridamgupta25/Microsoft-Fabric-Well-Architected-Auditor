@@ -57,6 +57,7 @@ async def submit_audit(
         organization_id=organization_id,
         auth_session=request.auth_session,
         weight_by_environment=request.weight_by_environment,
+        external_checks_csv=request.external_checks_csv,
         source=request.source,
         snapshots=request.snapshots,
     )

@@ -411,6 +411,7 @@ def run_audit(
     storage_token: str | None = None,
     sql_token_refresher=None,
     weight_by_environment: bool = False,
+    external_checks_csv: str | Path | None = None,
     source: str = "live",
     snapshots: Sequence[dict] | None = None,
 ) -> AuditRun:
@@ -423,6 +424,10 @@ def run_audit(
     pass ``refresh=True`` to force a fresh live crawl and rebuild the KB. With
     ``source="kb"`` the run reads only saved snapshots — the archive plus any
     ``snapshots`` uploaded with the request — and needs no token.
+
+    ``external_checks_csv``, if given, loads additional check results from a CSV
+    file (e.g., AdminChecks.csv) and merges them with the automated results.
+    Raises AuditError if the CSV is invalid.
     """
     config = load_project(project_path)
     provider = build_provider(config, token, refresh=refresh, token_refresher=token_refresher,
@@ -455,7 +460,51 @@ def run_audit(
         groups=group_targets,
     )
 
-    run = _build_run(config.name, raw_results)
+    # Merge external checks if provided
+    if external_checks_csv:
+        from .external_checks_service import load_external_checks, ExternalCheckError
+        
+        try:
+            # Strip surrounding whitespace and stray quotes (Windows "Copy as path"
+            # wraps the path in double quotes, which would otherwise be taken literally).
+            raw_csv = str(external_checks_csv).strip().strip('"').strip("'").strip()
+
+            # Resolve CSV path: if relative, resolve it relative to project root (parent of config dir)
+            csv_path = Path(raw_csv)
+            if not csv_path.is_absolute():
+                # Try relative to project root first (parent of config.yaml directory)
+                project_root = Path(config.path).parent
+                candidate = project_root / csv_path
+                if candidate.exists():
+                    csv_path = candidate
+                # Otherwise fall back to cwd (current working directory)
+            
+            target_ws_ids = {ws_id for ws_id, _ in targets}
+            external_results, warnings = load_external_checks(
+                csv_path,
+                target_workspaces=target_ws_ids,
+            )
+            
+            if warnings:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    f"Loaded external checks with {len(warnings)} warning(s):\n" +
+                    "\n".join(f"  - {w}" for w in warnings)
+                )
+            
+            # Merge: workspace-agnostic (external checks added regardless of workspace)
+            # Simply append external checks to automated results without requiring workspace
+            # match. This allows external checks from different workspaces to contribute to
+            # the overall audit score. External checks keep their original workspace from CSV.
+            merged_results = raw_results + external_results
+        
+        except ExternalCheckError as e:
+            raise AuditError(f"Cannot load external checks: {e}")
+    else:
+        merged_results = raw_results
+
+    run = _build_run(config.name, merged_results)
     run.groups = groups
     run.weighted_by_environment = bool(weights)
     served = bool(getattr(provider, "served_from_cache", False))
