@@ -29,7 +29,6 @@ from auditfast.core.check.data_management_quality.data_prep.automated import (
     nb_eam_ingest,
     nb_flag_domain,
     nb_language,
-    nb_late_arriving,
     nb_no_display,
     nb_no_udf,
     nb_silver_quality,
@@ -175,65 +174,6 @@ def test_retry_values_unreadable_policy_is_na_not_fail():
     result = retry_values(_ctx(pipeline))
     assert result.status is Status.NA
     assert result.score is None
-
-
-# -- NB-LATE-ARRIVING ---------------------------------------------------------
-
-def test_late_arriving_generic_delta_ingest_is_not_dimensional_scope():
-    code = """
-raw = spark.read.json(source_path)
-normalised = raw.withColumn("DATAFIELD", upper(col("DATAFIELD")))
-typed = apply_data_types(normalised)
-typed.write.format("delta").mode("overwrite").saveAsTable(target_table)
-insert_count = typed.count()
-update_count = 0
-delete_count = 0
-"""
-    result = nb_late_arriving(_ctx(_nb(code)))
-    assert result.status is Status.NA
-    assert "no provable dimensional fact load" in result.evidence.lower()
-
-
-def test_late_arriving_fact_lookup_without_fallback_fails_with_specific_evidence():
-    code = """
-fact_sales = source.alias("f").join(dim_customer.alias("d"), col("f.customer_id") == col("d.customer_id"), "left")
-fact_sales.write.mode("append").saveAsTable("gold.fact_sales")
-"""
-    result = nb_late_arriving(_ctx(_nb(code)))
-    assert result.score == _FAIL
-    assert "unknown/inferred-member fallback" in result.evidence
-    assert "backfill" in result.evidence
-
-
-def test_late_arriving_unknown_member_and_backfill_passes():
-    code = """
-fact_sales = source.alias("f").join(dim_customer.alias("d"), col("f.customer_id") == col("d.customer_id"), "left")
-fact_sales = fact_sales.withColumn("customer_key", coalesce(col("d.customer_key"), lit(-1)))
-fact_sales.write.mode("append").saveAsTable("gold.fact_sales")
-DeltaTable.forName(spark, "gold.dim_customer").alias("target").merge(
-    source.alias("source"), "target.customer_id = source.customer_id"
-).whenMatchedUpdateAll().execute()
-"""
-    result = nb_late_arriving(_ctx(_nb(code)))
-    assert result.score == _PASS
-    assert "fallback" in result.evidence.lower()
-    assert "backfill" in result.evidence.lower()
-
-
-def test_late_arriving_fallback_without_backfill_fails():
-    code = """
-fact_sales = source.alias("f").join(dim_customer.alias("d"), col("f.customer_id") == col("d.customer_id"), "left")
-fact_sales = fact_sales.withColumn("customer_key", coalesce(col("d.customer_key"), lit(-1)))
-fact_sales.write.mode("append").saveAsTable("gold.fact_sales")
-"""
-    result = nb_late_arriving(_ctx(_nb(code)))
-    assert result.score == _FAIL
-    assert "backfill" in result.evidence.lower()
-
-
-def test_late_arriving_check_applies_to_data_storage():
-    spec = next(spec for spec in REGISTRY if spec.id == "NB-LATE-ARRIVING")
-    assert spec.applies_to(Layer.STORAGE)
 
 
 # -- PL-NOTIFY -----------------------------------------------------------------

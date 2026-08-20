@@ -1572,28 +1572,13 @@ def pl_idempotent_load(ctx: CheckContext) -> Verdict:
     return not_applicable("Script activities run no INSERT/MERGE load statement")
 
 
-# -- MLC Cat-1: dimensional load quality (4.5.10, 5.4.4, 5.4.6) ---------------
+# -- MLC Cat-1: dimensional load quality (5.4.4, 5.4.6) ----------------------
 #: The notebook is doing dimensional work at all — otherwise these checks have
 #: nothing to judge and must report N/A rather than fail a Bronze ingest.
 _DIM_REF = re.compile(r"\bdim[_\s.]|\bdimension\b", re.IGNORECASE)
 _FACT_REF = re.compile(r"\bfact[_\s.]|\bfct[_\s.]", re.IGNORECASE)
 _DIM_CONTEXT = re.compile(r"\bdim[_\s.]|\bdimension\b|\bfact[_\s.]|\bfct[_\s.]", re.IGNORECASE)
 
-#: A late-arriving fact is given an inferred / unknown member instead of being
-#: dropped: a stub dimension row, or the conventional -1 surrogate key.
-#: The -1 forms all allow a nested call — ``coalesce(col("x"), lit(-1))`` is the
-#: common Spark idiom — so match "-1 appears shortly after the call", not a
-#: bracket-exact shape.
-_LATE_ARRIVING = re.compile(
-    r"inferred[_\s]?member|late[_\s]?arriv|unknown[_\s]?member|is_inferred|"
-    r"coalesce\s*\([^\n]{0,80}?-1|"
-    r"fillna\s*\([^\n]{0,60}?-1|"
-    r"\.na\.fill\s*\([^\n]{0,60}?-1|"
-    r"otherwise\s*\([^\n]{0,40}?-1|"
-    r"when\s*\([^\n]{0,80}?-1|"
-    r"['\"]unknown['\"]",
-    re.IGNORECASE,
-)
 #: Unknown/orphan member usage is counted or logged, not just silently allowed.
 _UNKNOWN_MONITORED = re.compile(
     r"unknown[_\s]?(?:count|rate|pct|percent|usage)|orphan[_\s]?(?:count|rate|pct)|"
@@ -1628,19 +1613,6 @@ _FACT_DIM_JOIN = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-#: The inferred row is later updated when the real dimension member arrives.
-#: Accept explicit lifecycle names and statically identifiable Delta/SQL merges
-#: into a dimension; a generic MERGE elsewhere is not backfill evidence.
-_INFERRED_MEMBER_BACKFILL = re.compile(
-    r"backfill[_\s]?(?:dimension|member)|"
-    r"update[_\s]?(?:inferred|unknown)[_\s]?member|"
-    r"DeltaTable\.forName\s*\([^\n]{0,160}?dim[_\s.]?[A-Za-z0-9_]*[^\n]{0,160}?\)"
-    r"[\s\S]{0,500}?\.merge\s*\([\s\S]{0,500}?whenMatchedUpdate|"
-    r"merge\s+into\s+(?:[`\[\]\w]+\.)*[`\[]?dim[_\s.]?[A-Za-z0-9_`\]]*"
-    r"[\s\S]{0,500}?when\s+matched[\s\S]{0,120}?update",
-    re.IGNORECASE,
-)
-
 _FACT_WRITE_RECEIVER = re.compile(
     r"\b(?:fact|fct)(?:_[A-Za-z0-9]+)*\s*\.write\b",
     re.IGNORECASE,
@@ -1657,72 +1629,6 @@ def _fact_write_evidence(code: str) -> str:
     if receiver:
         return f"write receiver '{' '.join(receiver.group(0).split())}'"
     return ""
-
-
-# NB-LATE-ARRIVING (4.5.10): flags a fact→dimension load with no unknown/inferred-member
-# fallback. Was: raw code + any ``.join(`` gate → false-FAILed metadata/DQ notebooks whose
-# only "join" was a Python ``str.join`` or whose ``dim``/``fact`` sat in a comment.
-# Updated 2026-08-12: strip comments, require a real DataFrame/SQL join (``_FACT_DIM_JOIN``),
-# and N/A a dimension-build/upsert that never references a fact (``_DIM_UPSERT`` w/o ``_FACT_REF``).
-@check(
-    id="NB-LATE-ARRIVING", ref="4.5.10",
-    title="Late-arriving dimensions and facts handled (unknown/inferred member pattern)",
-    pillar=Pillar.DATA_MODELING, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
-    layers=(*NOTEBOOK_LAYERS, Layer.STORAGE),
-    requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
-)
-def nb_late_arriving(ctx: CheckContext) -> Verdict:
-    """A fact arriving before its dimension gets an inferred member, not dropped.
-
-    Commented-out code is ignored and only a genuine fact→dimension join counts
-    (a Spark ``df.join(`` or SQL ``… JOIN … ON`` — never a Python ``str.join``),
-    so a metadata/DQ notebook whose only "join" builds a string, or whose only
-    ``dim``/``fact`` mention sits in a comment, is N/A rather than FAIL. A notebook
-    that merely *builds* a dimension (an SCD upsert) is also N/A — the fallback
-    belongs in the fact load. Without the pattern the load either discards the
-    fact (silent data loss) or fails outright; the evidence is a stub/unknown
-    member: an ``is_inferred`` flag, an explicit "unknown" member, or the
-    conventional ``-1`` surrogate key substituted when the lookup misses.
-    """
-    code = strip_sql_comments(executable_code(ctx.obj))
-    fact_write = _fact_write_evidence(code)
-    dimensional_lookup = bool(
-        _FACT_REF.search(code) and _DIM_REF.search(code) and _FACT_DIM_JOIN.search(code)
-    )
-    if not (fact_write or dimensional_lookup):
-        return not_applicable(
-            f"Notebook '{ctx.obj_name}' has no provable dimensional fact load: no "
-            f"fact-named write target/receiver or fact-to-dimension lookup. Generic "
-            f"JSON-to-Delta ingestion and audit row counts do not establish that "
-            f"late-arriving member handling applies"
-        )
-
-    fallback = _LATE_ARRIVING.search(code)
-    backfill = _INFERRED_MEMBER_BACKFILL.search(code)
-    scope = fact_write or "fact-to-dimension lookup"
-    if fallback and backfill:
-        fallback_signal = " ".join(fallback.group(0).split())
-        backfill_signal = " ".join(backfill.group(0).split())
-        return binary(
-            True,
-            f"Notebook '{ctx.obj_name}' has {scope}, routes unresolved dimension "
-            f"keys through fallback '{fallback_signal}', and backfills inferred "
-            f"members (matched '{backfill_signal}')",
-        )
-
-    missing = []
-    if not dimensional_lookup:
-        missing.append("a dimension-key lookup")
-    if not fallback:
-        missing.append("an unknown/inferred-member fallback such as surrogate key -1")
-    if not backfill:
-        missing.append("backfill of inferred members when dimension rows arrive")
-    return binary(
-        False,
-        f"Notebook '{ctx.obj_name}' has {scope} but lacks {', '.join(missing)}; "
-        f"late-arriving facts can be dropped, fail the load, or remain permanently "
-        f"assigned to an unknown member",
-    )
 
 
 def _describe_unknown_fallback(match_text: str) -> str:
