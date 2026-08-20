@@ -222,6 +222,7 @@ def build_result(
     status = verdict.status or status_from_score(verdict.score or 0)
     passed = status is Status.PASS
     unjudged = not verdict.scored
+    finding = status in (Status.FAIL, Status.PARTIAL)
 
     return CheckResult(
         check_id=spec.id,
@@ -234,8 +235,11 @@ def build_result(
         evidence=verdict.evidence,
         # Guidance is only useful where there is something to fix.
         recommendation="" if (passed or unjudged) else remediation.get(spec.ref),
-        # Severity describes the *finding*, so a passing check is never "High".
-        severity=Severity.INFO if (passed or unjudged) else spec.severity,
+        # Severity describes the *finding*: a FAIL/PARTIAL row carries the spec
+        # severity even when it is an unscored detail row (so a named per-object
+        # defect is not shown as "Informational"); a pass, a note, or an N/A never
+        # does.
+        severity=spec.severity if finding else Severity.INFO,
         workspace=workspace.name,
         layer=workspace.layer,
         obj=verdict.obj if verdict.obj is not None else obj_name,
@@ -261,6 +265,7 @@ def build_group_result(
     status = verdict.status or status_from_score(verdict.score or 0)
     passed = status is Status.PASS
     unjudged = not verdict.scored
+    finding = status in (Status.FAIL, Status.PARTIAL)
 
     return CheckResult(
         check_id=spec.id,
@@ -272,7 +277,7 @@ def build_group_result(
         coverage=verdict.coverage,
         evidence=verdict.evidence,
         recommendation="" if (passed or unjudged) else remediation.get(spec.ref),
-        severity=Severity.INFO if (passed or unjudged) else spec.severity,
+        severity=spec.severity if finding else Severity.INFO,
         workspace=group_name,
         layer=Layer.MIXED,
         obj=verdict.obj if verdict.obj is not None else "",

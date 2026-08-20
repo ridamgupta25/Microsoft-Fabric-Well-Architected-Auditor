@@ -26,7 +26,11 @@ _TRANSACTIONAL_LOAD = (
     "BEGIN TRY BEGIN TRANSACTION; INSERT INTO dbo.fact_sales SELECT * FROM stg.sales; "
     "COMMIT; END TRY BEGIN CATCH ROLLBACK; END CATCH"
 )
-_BARE_LOAD = "INSERT INTO dbo.fact_sales SELECT * FROM stg.sales"
+#: A genuinely multi-statement load with no error handling — the case that IS
+#: judged (a single statement is atomic and exempt).
+_MULTI_UNGUARDED = (
+    "TRUNCATE TABLE dbo.fact_sales; INSERT INTO dbo.fact_sales SELECT * FROM stg.sales"
+)
 
 
 def _pipe(*activities: dict) -> dict:
@@ -215,28 +219,73 @@ def test_try_catch_is_na_when_only_copy_activities_load():
 
 
 def test_try_catch_judges_readable_sql_regardless_of_copy_count():
-    """One readable load is a verdict about that load - Copy count is irrelevant."""
+    """One multi-statement load is a verdict about that load - Copy count is irrelevant."""
     pipelines = {"P": _pipe(
-        _script("Readable", _BARE_LOAD),
+        _script("Readable", _MULTI_UNGUARDED),
         *[_copy(f"Copy {i}") for i in range(10)],
     )}
     workspace = _ws(pipelines=pipelines)
     verdict = wh_try_catch_transactions(_ctx(None, workspace))[0]
     assert verdict.score == 0
-    assert "0 of 1 readable SQL load" in verdict.evidence
+    assert "0 of 1 multi-statement SQL load" in verdict.evidence
     assert "10 Copy activity/activities load without SQL and are out of scope" in verdict.evidence
 
 
 def test_try_catch_scores_mixed_readable_loads():
     pipelines = {"P": _pipe(
         _script("Good", _TRANSACTIONAL_LOAD),
-        _script("Bad", _BARE_LOAD),
+        _script("Bad", _MULTI_UNGUARDED),
     )}
     workspace = _ws(pipelines=pipelines)
     verdict = wh_try_catch_transactions(_ctx(None, workspace))[0]
     assert verdict.score is not None
-    assert "1 of 2 readable SQL load" in verdict.evidence
+    assert "1 of 2 multi-statement SQL load" in verdict.evidence
     assert "out of scope" not in verdict.evidence
+
+
+def test_try_catch_is_na_when_only_single_statement_loads():
+    """A lone single-statement load (TRUNCATE or MERGE) is atomic - nothing to wrap."""
+    merge = ("MERGE INTO dbo.fact t USING stg s ON t.id = s.id "
+             "WHEN MATCHED THEN UPDATE SET t.a = s.a")
+    pipelines = {"P": _pipe(
+        _script("Wipe", "TRUNCATE TABLE dbo.stg_a"),
+        _script("Merge", merge),
+    )}
+    verdict = wh_try_catch_transactions(_ctx(None, _ws(pipelines=pipelines)))[0]
+    assert verdict.status is Status.NA
+    assert verdict.score is None
+    assert "single-statement (atomic) load" in verdict.evidence
+    assert "no multi-statement load procedure to assess" in verdict.evidence
+
+
+def test_try_catch_excludes_single_statement_loads_from_the_denominator():
+    """A single-statement load does not inflate the denominator past the multi-step ones."""
+    pipelines = {"P": _pipe(
+        _script("Atomic", "TRUNCATE TABLE dbo.stg_a"),
+        _script("Load", _MULTI_UNGUARDED),
+    )}
+    verdict = wh_try_catch_transactions(_ctx(None, _ws(pipelines=pipelines)))[0]
+    assert verdict.score == 0
+    assert "0 of 1 multi-statement SQL load" in verdict.evidence
+    assert "1 single-statement (atomic) load(s)" in verdict.evidence
+
+
+def test_try_catch_exempts_a_lone_atomic_merge():
+    """A single unguarded MERGE is atomic - exempt, not a finding (the reviewer's fix)."""
+    merge = ("MERGE INTO dbo.fact_sales t USING stg.sales s ON t.id = s.id "
+             "WHEN MATCHED THEN UPDATE SET t.amt = s.amt")
+    verdict = wh_try_catch_transactions(
+        _ctx(None, _ws(pipelines={"P": _pipe(_script("Merge", merge))})))[0]
+    assert verdict.status is Status.NA
+    assert "single-statement (atomic) load" in verdict.evidence
+
+
+def test_try_catch_flags_a_multi_statement_load_without_handling():
+    """A genuinely multi-step load with no TRY...CATCH is still a real finding."""
+    verdict = wh_try_catch_transactions(
+        _ctx(None, _ws(pipelines={"P": _pipe(_script("Load", _MULTI_UNGUARDED))})))[0]
+    assert verdict.score == 0
+    assert "0 of 1 multi-statement SQL load" in verdict.evidence
 
 
 def test_try_catch_unreadable_definitions_are_na():
@@ -254,7 +303,7 @@ def test_try_catch_reads_stored_procedure_bodies():
     )
     verdict = wh_try_catch_transactions(_ctx(None, workspace))[0]
     assert verdict.score == 3
-    assert "1 of 1 readable SQL load" in verdict.evidence
+    assert "1 of 1 multi-statement SQL load" in verdict.evidence
 
 
 def test_try_catch_reports_a_called_procedure_whose_body_is_missing():
