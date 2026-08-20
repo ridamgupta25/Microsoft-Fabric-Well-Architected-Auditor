@@ -267,6 +267,8 @@ export interface AuditRequest {
   auth_session?: string | null;
   /** Opt-in: weight each workspace's checks by its environment level (1..10). */
   weight_by_environment?: boolean;
+  /** Path to external checks CSV (e.g., AdminChecks.csv). */
+  external_checks_csv?: string | null;
   /** `live` reads the tenant; `kb` replays saved snapshots with no sign-in. */
   source?: AuditSource;
   /** Uploaded snapshots to audit, when `source` is `kb`. */
@@ -304,6 +306,8 @@ export interface CheckResult {
   common: boolean;
   /** True once the check has completed Phase 1 validation; false while pending. */
   validated: boolean;
+  /** Source: 'automated' or 'external' (from CSV). */
+  source?: string;
 }
 
 export interface WorkspaceError {

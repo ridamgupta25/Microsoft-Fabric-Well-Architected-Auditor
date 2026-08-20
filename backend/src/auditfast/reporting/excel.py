@@ -97,31 +97,40 @@ def build_excel(path: str, project_name: str, agg: dict, results: list) -> None:
     # -- Checks sheet ----------------------------------------------------------
     cs = wb.create_sheet("Checks")
     headers = ["Workspace", "Layer role", "Object", "Check ID", "Ref", "Title",
-               "Validation", "Pillar", "Status", "Score", "Severity", "Evidence",
-               "Recommendation"]
+               "Validation", "Pillar", "Status", "Score", "Severity", "Source",
+               "Evidence", "Recommendation"]
     cs.append(headers)
     style_header(cs, row=1, ncols=len(headers))
     val_col = headers.index("Validation") + 1
+    source_col = headers.index("Source") + 1
     validated_fill = PatternFill("solid", fgColor="C6EFCE")
     pending_fill = PatternFill("solid", fgColor="F2F2F2")
     validated_font = Font(color="006100")
     pending_font = Font(color="808080")
+    external_fill = PatternFill("solid", fgColor="FFF2CC")  # Light yellow for external
+    external_font = Font(color="9C6500")
     for res in results:
         cs.append([
             res.workspace, res.workspace_role, res.obj, res.check_id, res.ref, res.title,
             validation_label(res.ref),
             res.pillar, res.status.value,
             "" if res.score is None else res.score,
-            res.severity.value, res.evidence, res.recommendation,
+            res.severity.value, res.source, res.evidence, res.recommendation,
         ])
-        cell = cs.cell(row=cs.max_row, column=val_col)
+        val_cell = cs.cell(row=cs.max_row, column=val_col)
         if is_validated(res.ref):
-            cell.fill = validated_fill
-            cell.font = validated_font
+            val_cell.fill = validated_fill
+            val_cell.font = validated_font
         else:
-            cell.fill = pending_fill
-            cell.font = pending_font
-    widths = [22, 16, 22, 14, 8, 34, 16, 22, 10, 7, 12, 46, 52]
+            val_cell.fill = pending_fill
+            val_cell.font = pending_font
+        
+        # Highlight external checks
+        if res.source == "external":
+            src_cell = cs.cell(row=cs.max_row, column=source_col)
+            src_cell.fill = external_fill
+            src_cell.font = external_font
+    widths = [22, 16, 22, 14, 8, 34, 16, 22, 10, 7, 12, 12, 46, 52]
     for i, w in enumerate(widths, start=1):
         cs.column_dimensions[cs.cell(row=1, column=i).column_letter].width = w
     cs.freeze_panes = "A2"
