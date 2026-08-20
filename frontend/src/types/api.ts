@@ -253,6 +253,10 @@ export interface WorkspaceSelection {
   id: string;
   role?: string | null;
   name?: string | null;
+  /** Project group name (cross-workspace). Absent for an isolated workspace. */
+  group?: string | null;
+  /** Environment position within its group: 1 = dev .. 10 = prod. */
+  environment_level?: number | null;
 }
 
 export interface AuditRequest {
@@ -261,6 +265,10 @@ export interface AuditRequest {
   workspaces: WorkspaceSelection[];
   /** Completed sign-in session id. Required only for a `live` audit. */
   auth_session?: string | null;
+  /** Opt-in: weight each workspace's checks by its environment level (1..10). */
+  weight_by_environment?: boolean;
+  /** Path to external checks CSV (e.g., AdminChecks.csv). */
+  external_checks_csv?: string | null;
   /** `live` reads the tenant; `kb` replays saved snapshots with no sign-in. */
   source?: AuditSource;
   /** Uploaded snapshots to audit, when `source` is `kb`. */
@@ -298,6 +306,8 @@ export interface CheckResult {
   common: boolean;
   /** True once the check has completed Phase 1 validation; false while pending. */
   validated: boolean;
+  /** Source: 'automated' or 'external' (from CSV). */
+  source?: string;
 }
 
 export interface WorkspaceError {
@@ -321,6 +331,18 @@ export interface WorkspaceScore {
   by_pillar: Record<string, number | null>;
 }
 
+export interface GroupMember {
+  id: string;
+  name?: string | null;
+  role?: string | null;
+  environment_level?: number | null;
+}
+
+export interface WorkspaceGroup {
+  name: string;
+  workspaces: GroupMember[];
+}
+
 export interface AuditReport {
   audit_id?: string | null;
   /** True while the audit is still running — results so far only. */
@@ -336,6 +358,10 @@ export interface AuditReport {
   counts: Record<string, number>;
   total_scored: number;
   results: CheckResult[];
+  /** Project workspace groups (cross-workspace). Empty for isolated-only runs. */
+  groups?: WorkspaceGroup[];
+  /** True when the roll-ups were weighted by environment level. */
+  weighted_by_environment?: boolean;
   errors: WorkspaceError[];
   files: Record<string, string>;
   /** Provenance of the run's data (live crawl, cache, or saved-KB replay). */

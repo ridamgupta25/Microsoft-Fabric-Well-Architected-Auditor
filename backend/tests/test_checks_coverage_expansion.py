@@ -238,9 +238,14 @@ def test_offending_measures_are_named_against_their_model():
     assert "Bad Measure" in details[0].evidence
 
 
-def test_scored_dax_verdict_names_the_models_and_problem_measures():
-    """The aggregate row is self-contained: it names every model it checked and the
-    measures that break a practice, so the reviewer needn't cross-reference detail rows."""
+def test_scored_dax_verdict_names_the_models_and_points_to_the_detail_rows():
+    """The aggregate names every model it checked and how many need attention.
+
+    It deliberately does NOT repeat the failing measures: doing so produced a
+    single cell holding hundreds of names with each measure's model buried in a
+    semicolon-separated run, so a reviewer could not tell which measure belonged
+    to which model. Each model has its own row carrying its own measures.
+    """
     no_var_only = " + ".join(f"SUM(t[a{i}])" for i in range(40))  # >400 chars, no VAR
     passing = "DIVIDE(SUM(Sales[Amount]), SUM(Sales[Quantity]), 0) + AVERAGE(Sales[Discount])"
     assert len(_normalised(no_var_only)) > 400
@@ -248,11 +253,17 @@ def test_scored_dax_verdict_names_the_models_and_problem_measures():
         {"name": "Bad Measure", "expression": no_var_only},
         {"name": "Good Measure", "expression": passing},
     ]}}
-    scored = _scored(complex_measures_use_variables(_model_ctx(models)))
+    verdicts = complex_measures_use_variables(_model_ctx(models))
+    scored = _scored(verdicts)
     assert scored.status is None                       # the scored aggregate, not a note
     assert "1 of 2" in scored.evidence
     assert "SalesModel" in scored.evidence             # every model it checked is named
-    assert "Bad Measure (no VAR)" in scored.evidence   # the failing measure + its fault
+    assert "1 model(s) carry at least one measure needing attention" in scored.evidence
+
+    # ...and the failing measure is on its own row, attributed to its model.
+    rows = {v.obj: v.evidence for v in verdicts if v.obj}
+    assert "SalesModel" in rows
+    assert "Bad Measure (no VAR)" in rows["SalesModel"]
     assert "Good Measure" not in scored.evidence       # a compliant measure is not flagged
 
 
@@ -1171,7 +1182,7 @@ def test_surrogate_generated_requires_surrogate_plus_generation_hint():
             ]),
         },
     )
-    verdict = table_surrogate_generated(ctx)
+    verdict = table_surrogate_generated(ctx)[0]
     assert verdict.score == 1
 
 
@@ -1186,7 +1197,7 @@ def test_relationships_declared_fails_when_fact_has_no_modeled_relationship():
             "model": {"tables": ["fact_sales", "dim_customer"], "relationships": []}
         },
     )
-    assert table_relationships_declared(ctx).score == 0
+    assert table_relationships_declared(ctx)[0].score == 0
 
 
 def test_relationships_declared_passes_when_fact_is_linked_in_model_relationships():
@@ -1211,7 +1222,7 @@ def test_relationships_declared_passes_when_fact_is_linked_in_model_relationship
             }
         },
     )
-    assert table_relationships_declared(ctx).score == 3
+    assert table_relationships_declared(ctx)[0].score == 3
 
 
 # =============================================================================
@@ -1416,6 +1427,24 @@ def test_unknown_dimension_member_with_monitoring_passes():
     verdict = nb_unknown_monitored(_nb_ctx(code))
     assert verdict.score == 3
     assert "unknown_count" in verdict.evidence
+
+
+def test_boolean_isin_minus_one_is_not_a_surrogate_key():
+    """A quoted "-1" in a boolean tidy-up (isin) is not a -1 surrogate key.
+
+    Legacy IFS/COM systems store a boolean true as -1, so
+    ``bool_value.isin("-1","1","true","yes","y")`` maps those strings to True.
+    The ``-1`` is a *string* literal inside a membership test, not a numeric
+    surrogate-key fallback, so the completeness monitor does not apply - even
+    when incidental dim/fact table *names* and a CDC ``.join(`` appear elsewhere
+    in the notebook and satisfy the fact-to-dimension gate.
+    """
+    code = ('name_map = {"r5events": "fct_events", "r5meters": "dim_meters"}\n'
+            'delta = old.join(new, keys, "left_anti").count()\n'
+            'df = df.withColumn("flag", '
+            'F.when(bool_value.isin("-1","1","true","yes","y"), F.lit(True))'
+            '.when(bool_value.isin("0","false","no","n"), F.lit(False)))\n')
+    assert nb_unknown_monitored(_nb_ctx(code)).status is Status.NA
 
 
 def test_layer_names_in_comments_do_not_create_reconciliation_scope():

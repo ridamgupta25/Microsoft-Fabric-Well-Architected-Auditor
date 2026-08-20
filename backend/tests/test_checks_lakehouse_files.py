@@ -55,7 +55,7 @@ def test_file_size_check_scores_healthy_bucket_share():
         buckets={"under_16mb": 1, "16_128mb": 0, "128mb_1gb": 4, "over_1gb": 0},
     )})
 
-    verdict = lakehouse_file_sizes_avoid_small_files(ctx)
+    verdict = lakehouse_file_sizes_avoid_small_files(ctx)[0]
     assert verdict.score == 2
     assert "4 of 5" in verdict.evidence
     assert "1 obvious non-data" in verdict.evidence
@@ -68,14 +68,14 @@ def test_file_size_check_fails_when_files_are_all_small():
         buckets={"under_16mb": 3, "16_128mb": 0, "128mb_1gb": 0, "over_1gb": 0},
     )})
 
-    assert lakehouse_file_sizes_avoid_small_files(ctx).score == 0
+    assert lakehouse_file_sizes_avoid_small_files(ctx)[0].score == 0
 
 
 def test_file_size_check_is_na_when_listing_unavailable_or_empty():
-    assert lakehouse_file_sizes_avoid_small_files(_ctx(unavailable=True)).status is Status.NA
+    assert lakehouse_file_sizes_avoid_small_files(_ctx(unavailable=True))[0].status is Status.NA
 
     empty = _ctx({"Lakehouse": _summary(file_count=1, excluded_file_count=1)})
-    assert lakehouse_file_sizes_avoid_small_files(empty).status is Status.NA
+    assert lakehouse_file_sizes_avoid_small_files(empty)[0].status is Status.NA
 
 
 def test_hierarchy_check_passes_with_source_and_date_segments():
