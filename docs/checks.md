@@ -108,8 +108,8 @@ The flag renders everywhere at once:
 |---------|----------------|
 | Catalog page / `GET /api/v1/catalog/checks` | a `validated` field + *Validation* column |
 | UI audit report | a *Validation* column + Validated/Pending filter on the Findings table |
-| Excel report | a colour-coded *Validation* column on the `Checks` sheet + a *Validation coverage* block on the `Scorecard` |
-| Markdown report | a *Validation* column + a coverage line under *Overall* |
+| Excel report | a *Validation* column on the consolidated `Checklist` sheet + a *Coverage and Validation* block on `Summary` |
+| Markdown report | a *Validation* column in `Checklist` + the same executive-level coverage block |
 
 Editing the checklist changes no scores, counts, or rows, so there is **nothing
 to re-pin**. See [managing-checks.md](managing-checks.md) §4 for the full how-to.

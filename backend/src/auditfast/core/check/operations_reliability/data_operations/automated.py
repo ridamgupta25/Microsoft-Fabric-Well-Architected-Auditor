@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import re
 
-from auditfast.core.check._notebook import executable_code
 from auditfast.core.check._pipeline import script_sql, walk_activities
 from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable, note
 from auditfast.core.check.registry import check
@@ -73,8 +72,8 @@ def _style_issues(name: str) -> str:
 
 
 @check(
-    id="WS-NAME", ref="IMPL-24", title="Workspace name follows the organization naming convention (e.g., <Domain>-<Env>-<Project>) [WS-NAME]",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    id="WS-NAME", ref="13.1.3", title="Workspace name follows the organization naming convention (e.g., <Domain>-<Env>-<Project>) [WS-NAME]",
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.LOW,
     requires=[Resource.WORKSPACE, Resource.ITEMS], required=False,
 )
 def naming_convention(ctx: CheckContext) -> Verdict:
@@ -116,7 +115,7 @@ def naming_convention(ctx: CheckContext) -> Verdict:
 
 @check(
     id="WS-GIT", ref="11.1.1", title="Git integration enabled for Fabric workspaces",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DEVOPS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     requires=[Resource.GIT], required=True,
 )
 def git_connected(ctx: CheckContext) -> Verdict:
@@ -130,7 +129,7 @@ def git_connected(ctx: CheckContext) -> Verdict:
 
 @check(
     id="WS-DEPLOY", ref="11.2.1", title="Fabric Deployment Pipelines configured (Dev → QA → Prod) for all three layer workspaces",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DEVOPS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     requires=[Resource.WORKSPACE], required=True,
 )
 def deployment_pipeline(ctx: CheckContext) -> Verdict:
@@ -162,7 +161,7 @@ GIT_DERIVED_TYPES: frozenset[str] = frozenset({"SQLEndpoint"})
 @check(
     id="WS-GIT-COVERAGE", ref="11.1.2",
     title="All pipelines, notebooks, semantic models, and Warehouse artifacts source-controlled",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DEVOPS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.GIT, Resource.ITEMS], required=True,
 )
 def git_covers_every_artifact(ctx: CheckContext) -> Verdict:
@@ -254,7 +253,7 @@ def _store_purpose(name: str) -> tuple[str, ...]:
 @check(
     id="WS-SINGLE-SOURCE", ref="1.1.8",
     title="Single source of truth — no duplicate data stores serving the same purpose across domains or layers",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.ITEMS], required=True,
 )
 def single_source_of_truth(ctx: CheckContext) -> Verdict:
@@ -352,7 +351,7 @@ def _foreign_tiers_in(text: str) -> set[str]:
 @check(
     id="WS-ENV-ISOLATION", ref="1.1.3",
     title="Environment isolation enforced (Dev / QA / Prod workspaces have no shared mutable artifacts or cross-env dependencies)",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=(Layer.OPERATIONS,),
     requires=[Resource.WORKSPACE, Resource.PIPELINE_DEFINITIONS], required=True,
 )
@@ -431,7 +430,7 @@ EVENT_SOURCE_TYPES: frozenset[str] = frozenset({
 @check(
     id="WS-ACTIVATOR", ref="10.5.1",
     title="Data Activator (or equivalent) triggers configured for critical events",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.MONITORING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.ITEMS, Resource.ACTIVATOR_DEFINITIONS],
     required=True,
 )
@@ -569,7 +568,7 @@ _PROMOTED_TIERS: frozenset[str] = frozenset({"QA", "UAT", "Staging", "Pre-Prod",
 @check(
     id="WS-BRANCH", ref="11.1.4",
     title="Branching strategy defined (feature branches, main, release)",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DEVOPS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.GIT], required=True,
 )
 def branching_strategy(ctx: CheckContext) -> Verdict:
@@ -658,7 +657,7 @@ _PIPELINE_EXPRESSION = re.compile(
 @check(
     id="WS-WH-DEPLOY", ref="11.4.2",
     title="Warehouse deployments are automated and environment-parameterized (not manual T-SQL in Prod)",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.DEVOPS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=(Layer.OPERATIONS,),
     requires=[Resource.WORKSPACE, Resource.ITEMS, Resource.GIT,
               Resource.PIPELINE_DEFINITIONS], required=True,
@@ -752,7 +751,7 @@ SEMANTIC_REFRESH_TYPES: frozenset[str] = frozenset({
 @check(
     id="WS-SM-DEPLOY", ref="11.4.5",
     title="Semantic model deployment is versioned and part of the Data Consumption pipeline",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DEVOPS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,),
     requires=[Resource.WORKSPACE, Resource.ITEMS, Resource.GIT,
               Resource.PIPELINE_DEFINITIONS], required=True,
@@ -818,111 +817,6 @@ def semantic_model_deployment(ctx: CheckContext) -> Verdict:
 
 
 # =============================================================================
-# 11.5.1 — unit tests for critical transformation logic
-# =============================================================================
-
-#: The word "test" standing alone or opening a CamelCase name — ``TestSalesLoad``,
-#: ``NB_unit_test``, and ``Run Unit Tests`` match; ``Latest_Load``, ``Contest``,
-#: and ``Tested_Rows`` do not. The case-insensitivity is scoped to the word so
-#: the trailing ``[A-Z0-9]`` boundary stays case-*sensitive* — that boundary is
-#: what separates ``TestSales`` from ``Tested``.
-_TEST_NAME_RE = re.compile(
-    r"(?:^|[_\-\s.])(?i:unit[_\-\s]?)?(?i:tests?|testing)(?=$|[_\-\s.]|[A-Z0-9])"
-)
-#: A real testing framework, or a test function/class declaration. Matched
-#: against *executable* code only, so a commented-out import proves nothing.
-_TEST_FRAMEWORK_RE = re.compile(
-    r"\bimport\s+unittest\b|\bfrom\s+unittest\b|unittest\.TestCase|unittest\.main\s*\(|"
-    r"\bimport\s+pytest\b|\bfrom\s+pytest\b|@pytest\.|pytest\.main\s*\(|"
-    r"\bimport\s+nutter\b|\bfrom\s+nutter\b|"
-    r"\bfrom\s+chispa\b|\bimport\s+chispa\b|assert_df_equality|assertDataFrameEqual|"
-    r"great_expectations|\bimport\s+soda\b|\bimport\s+deequ\b|pydeequ|"
-    r"^\s*def\s+test_\w+\s*\(|^\s*class\s+Test\w*\s*\(",
-    re.IGNORECASE | re.MULTILINE,
-)
-#: The notebook actually transforms data — i.e. it has logic worth unit testing.
-_TRANSFORM_WRITE_RE = re.compile(
-    r"\.write\b|saveAsTable\s*\(|\bINSERT\s+INTO\b|\bMERGE\s+INTO\b|"
-    r"\bCREATE\s+(?:OR\s+REPLACE\s+)?TABLE\b|\.saveAsTable\b",
-    re.IGNORECASE,
-)
-
-
-@check(
-    id="WS-UNIT-TESTS", ref="11.5.1",
-    title="Unit tests exist for critical transformation logic",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=(Layer.OPERATIONS,),
-    requires=[Resource.NOTEBOOK_DEFINITIONS, Resource.PIPELINE_DEFINITIONS], required=True,
-)
-def unit_tests_exist(ctx: CheckContext) -> Verdict:
-    """A workspace that transforms data holds tests in proportion to that logic.
-
-    A test asset is a notebook whose *name* marks it as a test, or whose
-    executable code uses a testing framework (``unittest``, ``pytest``,
-    ``chispa``, ``nutter``, Great Expectations, Deequ) or declares a ``test_``
-    function / ``Test`` class. A pipeline activity named as a test counts too,
-    since a test notebook is usually invoked from one.
-
-    Scored as *coverage*, not presence: the point asks that critical
-    transformation logic is tested, so nine test notebooks beside sixty untested
-    transforms is a partial result. Deliberately not satisfied by a bare
-    ``assert`` in load code: asserting a row count on production data is a
-    data-quality gate, not a unit test of the transformation logic. Comments are
-    stripped first, so a commented-out ``import pytest`` proves nothing.
-    """
-    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
-        return not_applicable("Notebook definitions could not be read from Fabric")
-
-    notebooks = ctx.workspace.notebooks
-    if not notebooks:
-        return not_applicable(
-            "Workspace has no notebook definitions, so there is no transformation "
-            "logic here to unit test"
-        )
-
-    transforming: list[str] = []
-    test_notebooks: list[str] = []
-    for name, definition in notebooks.items():
-        code = executable_code(definition)
-        if _TEST_NAME_RE.search(name) or _TEST_FRAMEWORK_RE.search(code):
-            test_notebooks.append(name)
-        elif _TRANSFORM_WRITE_RE.search(code):
-            transforming.append(name)
-
-    test_activities: list[str] = []
-    if ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
-        for pipeline_name, definition in ctx.workspace.pipelines.items():
-            for activity in walk_activities(definition):
-                if _TEST_NAME_RE.search(str(activity.get("name") or "")):
-                    test_activities.append(f"{pipeline_name}/{activity.get('name')}")
-
-    if not transforming and not test_notebooks:
-        return not_applicable(
-            f"None of the {len(notebooks)} notebook(s) writes a table, so the "
-            "workspace holds no transformation logic to unit test"
-        )
-
-    if not test_notebooks and not test_activities:
-        return binary(False, f"{len(transforming)} transformation notebook(s) write tables, "
-                             f"but no test notebook, test framework, or test activity was "
-                             f"found anywhere in the workspace")
-
-    # Coverage, not mere presence. The point asks that critical transformation
-    # logic *is* tested, so a handful of test notebooks beside a large body of
-    # untested transforms is a partial result, not a pass. One test asset is
-    # credited per transformation notebook; the helper clamps the ratio, so a
-    # workspace with more tests than transforms is simply fully covered.
-    tests = len(test_notebooks) + len(test_activities)
-    found = ", ".join(sorted(test_notebooks + test_activities)[:3])
-    return covered(
-        tests, len(transforming),
-        f"{len(test_notebooks)} test notebook(s) and {len(test_activities)} test "
-        f"activity(ies) against {len(transforming)} transformation notebook(s): {found}",
-    )
-
-
-# =============================================================================
 # 9.2.4 — critical Gold data has a secondary copy or export
 # =============================================================================
 
@@ -973,7 +867,7 @@ def _copy_sink_types(definition: dict) -> set[str]:
 @check(
     id="WS-GOLD-SECONDARY-COPY", ref="9.2.4",
     title="Critical Gold-layer data has a secondary copy or export mechanism",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.RELIABILITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=(Layer.OPERATIONS,),
     requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS, Resource.SHORTCUTS],
     required=True,
@@ -1090,7 +984,7 @@ def gold_data_has_a_secondary_copy(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-TIER-DECLARED", ref="11.3.1",
     title="Separate workspaces for Dev, QA, and Production per layer",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DEVOPS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.WORKSPACE],
     required=False,
 )
@@ -1113,7 +1007,7 @@ def environment_tier_is_declared(ctx: CheckContext) -> Verdict:
     facts a reviewer needs to assemble the estate-wide picture across the
     workspaces in the report.
 
-    **Related, and genuinely different.** ``WS-NAME`` (IMPL-24) scores naming
+    **Related, and genuinely different.** ``WS-NAME`` (13.1.3) scores naming
     style; ``WS-ENV-ISOLATION`` (1.1.3) scores whether this workspace's pipelines
     reach into another tier; ``WS-DEPLOY`` (11.2.1) scores deployment-pipeline
     assignment. None of them reports the tier itself, which is what the estate
@@ -1173,7 +1067,7 @@ def _medallion_tiers(name: str) -> set[str]:
 @check(
     id="WS-MEDALLION", ref="1.1.5",
     title="Medallion architecture properly implemented (Bronze Lakehouse -> Silver Lakehouse -> Gold Warehouse) with clear layer boundaries",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.WORKSPACE, Resource.ITEMS], required=True,
 )
 def medallion_architecture(ctx: CheckContext) -> Verdict:

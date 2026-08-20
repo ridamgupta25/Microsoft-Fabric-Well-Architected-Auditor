@@ -17,7 +17,7 @@ from auditfast.core.models import GroupContext
 @group_check(
     id="XW-CU-ALERTS", ref="12.2.7",
     title="CU consumption alerts configured for proactive throttling prevention",
-    pillar=Pillar.COST, severity=Severity.MEDIUM,
+    pillar=Pillar.COST_MANAGEMENT, severity=Severity.MEDIUM,
     requires=[Resource.ACTIVATOR_DEFINITIONS], required=False,
 )
 def cu_alerts_consistent(ctx: GroupContext) -> Verdict:

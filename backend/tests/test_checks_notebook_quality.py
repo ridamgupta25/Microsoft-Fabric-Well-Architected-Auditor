@@ -436,12 +436,19 @@ def test_pii_tokenised_is_partial_with_format_validation_but_no_masking():
     assert verdict.score == _PARTIAL_LOW
 
 
-def test_pii_tokenised_fails_when_raw_pii_is_carried_through():
+def test_pii_tokenised_is_partial_when_raw_pii_is_carried_through():
+    """Unmasked PII is a partial, not a zero.
+
+    Masking can live in a view or a stored procedure this check cannot read, so
+    declaring "raw PII is carried through unchanged" claims more than the
+    evidence supports. The finding still stands - it just says confirm.
+    """
     verdict = notebook_pii_is_tokenised(_nb_ctx(
         'out = df.select("email", "phone_number")\n'
         'out.write.saveAsTable("silver_customer")\n'
     ))
-    assert verdict.score == _FAIL
+    assert verdict.score == _PARTIAL_LOW
+    assert "confirm before treating this as unprotected" in verdict.evidence
 
 
 def test_pii_tokenised_is_na_without_a_pii_column():

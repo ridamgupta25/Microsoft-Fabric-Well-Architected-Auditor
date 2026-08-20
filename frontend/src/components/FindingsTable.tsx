@@ -149,6 +149,7 @@ export function FindingsTable({ results }: { results: CheckResult[] }) {
                 <th scope="col">Object</th>
                 <th scope="col">Status</th>
                 <th scope="col">Score</th>
+                <th scope="col">Source</th>
                 <th scope="col">Evidence</th>
                 <th scope="col">Recommendation</th>
               </tr>
@@ -165,6 +166,15 @@ export function FindingsTable({ results }: { results: CheckResult[] }) {
                   <td className="whitespace-nowrap">{finding.obj || finding.workspace}</td>
                   <td><StatusBadge status={finding.status} /></td>
                   <td className="whitespace-nowrap"><CheckScore score={finding.score} /></td>
+                  <td className="whitespace-nowrap">
+                    <span className={`inline-block rounded-full px-2 py-0.5 text-xs font-medium ${
+                      finding.source === "external"
+                        ? "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200"
+                        : "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400"
+                    }`}>
+                      {finding.source === "external" ? "External" : "Automated"}
+                    </span>
+                  </td>
                   <td className="min-w-[16rem]">{finding.evidence}</td>
                   <td className="min-w-[18rem] text-slate-600 dark:text-slate-400">
                     {finding.recommendation || "—"}

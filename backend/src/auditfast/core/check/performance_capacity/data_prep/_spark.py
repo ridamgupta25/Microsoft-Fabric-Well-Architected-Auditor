@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 
+from auditfast.core.check._notebook import executable_code, strip_sql_comments
 from auditfast.core.enums import Layer
 
 #: Layers whose workspaces are expected to hold transformation notebooks.
@@ -70,6 +71,34 @@ def sequential_dml_by_target(code: str) -> dict[str, set[str]]:
         target = _normalize_sql_target(match.group("target"))
         operations.setdefault(target, set()).add("insert")
     return operations
+
+
+def sequential_dml_violations(definition: dict) -> dict[str, list[str]]:
+    """Tables hit by more than one DML *kind* within a single code cell.
+
+    The sequential ``DELETE`` + ``INSERT`` / ``UPDATE`` anti-pattern is one
+    logical upsert of one dataset, written together — a delete-then-reinsert
+    reload that should be a single ``MERGE``. It is therefore detected **per code
+    cell**, not across the whole notebook: aggregating over every cell fuses the
+    independent one-off statements of an ad-hoc / scratch notebook (register a
+    metadata row in one cell, fix a watermark in another, drop a stale table in a
+    third) into a fake "upsert" and wrongly fails it. Each cell is comment-
+    stripped (Python ``#`` and SQL ``--`` / ``/* */``) so a disabled statement
+    never counts.
+    """
+    merged: dict[str, set[str]] = {}
+    for cell in (definition or {}).get("cells") or []:
+        if cell.get("cell_type") != "code":
+            continue
+        source = cell.get("source")
+        text = "".join(source) if isinstance(source, list) else (source or "")
+        code = strip_sql_comments(
+            executable_code({"cells": [{"cell_type": "code", "source": text}]})
+        )
+        for target, operations in sequential_dml_by_target(code).items():
+            if len(operations) > 1:
+                merged.setdefault(target, set()).update(operations)
+    return {target: sorted(operations) for target, operations in merged.items()}
 
 # -- Delta maintenance ---------------------------------------------------------
 # The Delta ``OPTIMIZE`` SQL command (``OPTIMIZE <table>`` — a table token must
@@ -244,11 +273,28 @@ def parse_version(value: str) -> tuple[int, int, int] | None:
 
 
 def fabric_runtime_to_spark(value: str) -> tuple[int, int, int] | None:
-    """Map Fabric Environment runtime versions to Spark major versions."""
+    """Map a Fabric Environment runtime version to its Spark version.
+
+    Fabric names its runtimes ``1.1``/``1.2``/``1.3``/``2.0`` and documents the
+    Spark version each carries
+    (``learn.microsoft.com/fabric/data-engineering/runtime``). The mapping is
+    published, not inferred, so it belongs in a table rather than a heuristic.
+
+    **Runtime 2.0 was missing**, so a workspace on the newest runtime resolved to
+    ``None`` and its check reported "runtime not recognized" - the best-configured
+    estate was the one that could not be judged. Unknown values still return
+    ``None`` (an honest N/A) rather than being guessed at, so a future runtime
+    behaves the same way until it is added here.
+    """
     runtime = parse_version(value)
     if runtime is None:
         return None
-    mapping = {"1.1": (3, 3, 0), "1.2": (3, 4, 0), "1.3": (3, 5, 0)}
+    mapping = {
+        "1.1": (3, 3, 0),      # retired
+        "1.2": (3, 4, 0),      # end of support
+        "1.3": (3, 5, 5),      # GA
+        "2.0": (4, 1, 0),      # GA - recommended for production
+    }
     return mapping.get(f"{runtime[0]}.{runtime[1]}")
 
 
@@ -281,6 +327,44 @@ def partitioned_sql_reads(
                        for column in columns)
         reads.append((table, filtered))
     return reads
+
+
+def discover_partitioned_tables(tables: dict[str, dict] | None) -> dict[str, list[str]]:
+    """Partitioned tables discovered from the workspace's lakehouse/Delta metadata.
+
+    Returns ``{bare_table_name: [partition_column, ...]}`` for every table whose
+    listing actually declares partition columns (``partitionColumns``, populated
+    by the OneLake partition listing). The key is the *bare* — unqualified — table
+    name, its last dotted segment, so a schema-qualified notebook read
+    (``schema.table``) matches a lakehouse-qualified metadata key
+    (``lakehouse.table``); a *schema* token is therefore never mistaken for a
+    table. Tables that declare no partition columns are omitted, so an empty
+    result means "there is no partition metadata to assess", never "every table is
+    unpartitioned".
+    """
+    discovered: dict[str, list[str]] = {}
+    for name, meta in (tables or {}).items():
+        columns = [
+            str(column).strip()
+            for column in ((meta or {}).get("partitionColumns") or [])
+            if str(column).strip()
+        ]
+        if not columns:
+            continue
+        bare = str(name).split(".")[-1].strip("`[]\" ").lower()
+        if not bare:
+            continue
+        existing = discovered.setdefault(bare, [])
+        for column in columns:
+            if column not in existing:
+                existing.append(column)
+    return discovered
+
+
+def partition_columns_for(read_table: str, partitioned: dict[str, list[str]]) -> list[str]:
+    """The declared partition columns for a SQL read's table, matched by bare name."""
+    segment = str(read_table).strip("`").lower().rsplit(".", 1)[-1]
+    return partitioned.get(segment, [])
 
 
 def monitoring(definition: dict) -> dict:

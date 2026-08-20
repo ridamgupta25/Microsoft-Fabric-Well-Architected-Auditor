@@ -134,20 +134,64 @@ def _matching_paren(text: str, open_index: int) -> int | None:
     return None
 
 
-def repeated_subexpressions(expression: str) -> list[str]:
-    """Substantial function-call sub-expressions written more than once.
+#: A ``VAR`` definition boundary. DAX allows ``VAR name = <expr>`` repeatedly,
+#: closed by a single ``RETURN``, so splitting on these keywords divides an
+#: expression into the units that are actually evaluated independently.
+#:
+#: ``\b`` rather than ``\s`` on the leading side: a measure is normally written
+#: with each ``var`` at the start of its own line, so requiring a preceding
+#: space silently failed to split anything. The trailing ``\s`` is kept so
+#: ``VARIANCE(`` and a column named ``[Variance]`` are not boundaries.
+_VAR_BOUNDARY = re.compile(r"\b(?:VAR|RETURN)\s", re.IGNORECASE)
 
-    This is what a ``VAR`` exists to prevent: computing the same thing twice.
-    Assigning it to a variable and reusing the name leaves one occurrence, so a
-    measure that uses VAR properly reports nothing here.
+
+def _evaluation_blocks(expression: str) -> list[str]:
+    """Split an expression at ``VAR``/``RETURN`` boundaries.
+
+    Each block is a unit DAX evaluates on its own. Two blocks that happen to
+    contain the same call are doing separate jobs; only a repeat *inside* one
+    block is the same value computed twice.
     """
-    seen: dict[str, int] = {}
-    for span in call_spans(expression):
-        key = _WHITESPACE.sub(" ", span).strip().upper()
-        if len(key) < _MIN_SUBEXPR_CHARS:
-            continue
-        seen[key] = seen.get(key, 0) + 1
-    return [span for span, count in seen.items() if count > 1]
+    parts = _VAR_BOUNDARY.split(expression)
+    return [part for part in parts if part.strip()]
+
+
+def repeated_subexpressions(expression: str) -> list[str]:
+    """Substantial function-call sub-expressions written twice **in one block**.
+
+    This is what a ``VAR`` exists to prevent: computing the same thing twice
+    within a single evaluation. Assigning it to a variable and reusing the name
+    leaves one occurrence, so a measure that uses VAR properly reports nothing.
+
+    **Scoped per VAR, deliberately.** Counting repeats across the whole
+    expression penalised well-structured measures: a measure with ten VARs, each
+    building a different string but all testing
+    ``SELECTEDVALUE('T'[Type])``, was reported as repeating a sub-expression -
+    when those are ten separate branches, not duplicated work. The more VARs a
+    measure declared, the more likely it was to be flagged, which is backwards.
+
+    **A note on the advice this implies.** Replacing a repeat with a VAR is only
+    safe when both occurrences sit in the same filter context: a VAR is
+    evaluated once, where it is defined, so
+    ``DIVIDE(v, CALCULATE(v, ALL(Product)))`` returns 1 rather than the intended
+    ratio (SQLBI, "Variables in DAX"). This is not a Microsoft Best Practice
+    Analyzer rule - it appears in no published BPA rule set - so it is reported
+    as a readability signal, never as a correctness defect.
+    """
+    #: Counted per block, not once across the expression. Sharing one counter
+    #: would defeat the split: two blocks each containing the call would still
+    #: total two, which is precisely the false positive this scoping removes.
+    found: list[str] = []
+    for block in _evaluation_blocks(expression):
+        seen: dict[str, int] = {}
+        for span in call_spans(block):
+            key = _WHITESPACE.sub(" ", span).strip().upper()
+            if len(key) < _MIN_SUBEXPR_CHARS:
+                continue
+            seen[key] = seen.get(key, 0) + 1
+        found.extend(span for span, count in seen.items()
+                     if count > 1 and span not in found)
+    return found
 
 
 def nested_iterators(expression: str) -> bool:

@@ -71,7 +71,7 @@ _NOTIFY_NAME = re.compile(r"notif|alert|email|teams|activator", re.IGNORECASE)
 @check(
     id="NB-AUDIT-LOG", ref="4.6.4",
     title="Audit Tables capture data quality logs, row counts, null checks, and exceptions",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=(Layer.LOGS,), requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def audit_tables_capture_quality_logs(ctx: CheckContext) -> Verdict:
@@ -94,7 +94,7 @@ def audit_tables_capture_quality_logs(ctx: CheckContext) -> Verdict:
 @check(
     id="PL-FAILURE-ALERT", ref="10.1.4",
     title="Alerting on pipeline failure (Data Activator or equivalent)",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    pillar=Pillar.MONITORING, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=(Layer.LOGS,), requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def pipeline_failure_alert(ctx: CheckContext) -> Verdict:
@@ -159,7 +159,7 @@ def _named(items, types: frozenset[str]) -> list[str]:
 @check(
     id="WS-EVENTHOUSE-TELEMETRY", ref="10.3.1",
     title="Eventhouse/KQL DB used for high-volume or real-time telemetry where appropriate",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.MONITORING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.LOGS,), requires=[Resource.ITEMS], required=True,
 )
 def eventhouse_for_telemetry(ctx: CheckContext) -> Verdict:
@@ -213,7 +213,7 @@ def eventhouse_for_telemetry(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-KQL-QUERIES", ref="10.3.2",
     title="KQL queries exist for common operational investigations and are version-controlled",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.MONITORING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.LOGS,), requires=[Resource.ITEMS, Resource.GIT], required=True,
 )
 def kql_queries_version_controlled(ctx: CheckContext) -> Verdict:
@@ -305,7 +305,7 @@ def _has_row_count_column(table: dict) -> bool:
 @check(
     id="WS-INGEST-VOLUME", ref="10.3.4",
     title="Ingestion volume monitored (no silent drop or over-ingestion)",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.MONITORING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.LOGS,), requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=True,
 )
@@ -405,7 +405,7 @@ _RUN_HISTORY_WRITE = re.compile(
 @check(
     id="WS-RUN-HISTORY-EXPORT", ref="10.1.1",
     title="Pipeline run history monitored beyond Fabric's default retention",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.MONITORING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.LOGS,),
     requires=[Resource.PIPELINE_DEFINITIONS, Resource.NOTEBOOK_DEFINITIONS],
     required=True,
@@ -531,7 +531,7 @@ def _has_date_table(model: dict) -> bool:
 @check(
     id="WS-MONITOR-TREND", ref="10.4.4",
     title="Historical trend analysis enabled (not just current-state)",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.MONITORING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.LOGS,), requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
 def monitoring_models_support_trend_analysis(ctx: CheckContext) -> Verdict:
@@ -683,7 +683,7 @@ def _warehouse_loaders(ctx: CheckContext) -> dict[str, str]:
 @check(
     id="OPS-WH-LOAD-MONITORED", ref="10.1.5",
     title="Warehouse load jobs monitored (duration, failures, row counts)",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.MONITORING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.LOGS,),
     requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY, Resource.PIPELINE_DEFINITIONS,
               Resource.NOTEBOOK_DEFINITIONS, Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
@@ -821,7 +821,7 @@ def _median_interval_hours(stamps: list[str]) -> float | None:
 @check(
     id="OPS-MONITOR-REFRESH", ref="10.4.2",
     title="Refresh frequency of monitoring data is adequate (near-real-time or hourly)",
-    pillar=Pillar.OPERATIONS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.MONITORING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.LOGS,), requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY],
     required=True,
 )
@@ -834,8 +834,9 @@ def monitoring_refresh_cadence(ctx: CheckContext) -> Verdict:
     a day is partial; daily is weak; weekly or less scores nothing. Items are
     selected by name (monitor / telemetry / audit / log / metric / SLA /
     heartbeat …); an alert or notification item is not itself monitoring data, so
-    it is not selected. In a Data Logs workspace, where every runnable item is
-    part of the monitoring estate, all of them are used when no name matches.
+    it is not selected. In a Data Logs workspace — or a Mixed workspace, which
+    plays the Data Logs role too — every runnable item is part of the monitoring
+    estate, so all of them are used when no name matches.
 
     **What it cannot.** It does not read the *configured* schedule — the job
     scheduler's schedule API is not called — so a job configured hourly but
@@ -869,12 +870,16 @@ def monitoring_refresh_cadence(ctx: CheckContext) -> Verdict:
         item_id: stamps for item_id, stamps in history.items()
         if _MONITORING_NAME.search(_name(item_id))
     }
-    candidates = named or (history if ctx.workspace.layer is Layer.LOGS else {})
+    # A Data Logs workspace is entirely a monitoring estate; a Mixed workspace
+    # plays that role too (it is why this Logs-layer check runs on it at all), so
+    # both fall back to judging every item's cadence when nothing is named.
+    monitoring_estate = ctx.workspace.layer in (Layer.LOGS, Layer.MIXED)
+    candidates = named or (history if monitoring_estate else {})
     if not candidates:
         return not_applicable(
             f"None of the {len(history)} item(s) with a run history is identifiable as "
-            f"monitoring-oriented by name, and this workspace is not tagged Data Logs, "
-            f"so there is no monitoring cadence to judge"
+            f"monitoring-oriented by name, and this workspace is not tagged Data Logs "
+            f"or Mixed, so there is no monitoring cadence to judge"
         )
 
     intervals: dict[str, float] = {}
@@ -922,7 +927,7 @@ def _retention_policy(eventhouse: Any) -> Any:
     id="EVENTHOUSE-RETENTION",
     ref="10.3.3",
     title="Eventhouse retention configured",
-    pillar=Pillar.OPERATIONS,
+    pillar=Pillar.MONITORING,
     scope=Scope.EVENTHOUSE,
     layers=[Layer.LOGS],
     severity=Severity.MEDIUM,

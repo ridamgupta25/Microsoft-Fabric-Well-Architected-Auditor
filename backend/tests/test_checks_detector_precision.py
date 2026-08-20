@@ -29,7 +29,6 @@ from auditfast.core.check.data_management_quality.data_prep.automated import (
     nb_eam_ingest,
     nb_flag_domain,
     nb_language,
-    nb_late_arriving,
     nb_no_display,
     nb_no_udf,
     nb_silver_quality,
@@ -175,65 +174,6 @@ def test_retry_values_unreadable_policy_is_na_not_fail():
     result = retry_values(_ctx(pipeline))
     assert result.status is Status.NA
     assert result.score is None
-
-
-# -- NB-LATE-ARRIVING ---------------------------------------------------------
-
-def test_late_arriving_generic_delta_ingest_is_not_dimensional_scope():
-    code = """
-raw = spark.read.json(source_path)
-normalised = raw.withColumn("DATAFIELD", upper(col("DATAFIELD")))
-typed = apply_data_types(normalised)
-typed.write.format("delta").mode("overwrite").saveAsTable(target_table)
-insert_count = typed.count()
-update_count = 0
-delete_count = 0
-"""
-    result = nb_late_arriving(_ctx(_nb(code)))
-    assert result.status is Status.NA
-    assert "no provable dimensional fact load" in result.evidence.lower()
-
-
-def test_late_arriving_fact_lookup_without_fallback_fails_with_specific_evidence():
-    code = """
-fact_sales = source.alias("f").join(dim_customer.alias("d"), col("f.customer_id") == col("d.customer_id"), "left")
-fact_sales.write.mode("append").saveAsTable("gold.fact_sales")
-"""
-    result = nb_late_arriving(_ctx(_nb(code)))
-    assert result.score == _FAIL
-    assert "unknown/inferred-member fallback" in result.evidence
-    assert "backfill" in result.evidence
-
-
-def test_late_arriving_unknown_member_and_backfill_passes():
-    code = """
-fact_sales = source.alias("f").join(dim_customer.alias("d"), col("f.customer_id") == col("d.customer_id"), "left")
-fact_sales = fact_sales.withColumn("customer_key", coalesce(col("d.customer_key"), lit(-1)))
-fact_sales.write.mode("append").saveAsTable("gold.fact_sales")
-DeltaTable.forName(spark, "gold.dim_customer").alias("target").merge(
-    source.alias("source"), "target.customer_id = source.customer_id"
-).whenMatchedUpdateAll().execute()
-"""
-    result = nb_late_arriving(_ctx(_nb(code)))
-    assert result.score == _PASS
-    assert "fallback" in result.evidence.lower()
-    assert "backfill" in result.evidence.lower()
-
-
-def test_late_arriving_fallback_without_backfill_fails():
-    code = """
-fact_sales = source.alias("f").join(dim_customer.alias("d"), col("f.customer_id") == col("d.customer_id"), "left")
-fact_sales = fact_sales.withColumn("customer_key", coalesce(col("d.customer_key"), lit(-1)))
-fact_sales.write.mode("append").saveAsTable("gold.fact_sales")
-"""
-    result = nb_late_arriving(_ctx(_nb(code)))
-    assert result.score == _FAIL
-    assert "backfill" in result.evidence.lower()
-
-
-def test_late_arriving_check_applies_to_data_storage():
-    spec = next(spec for spec in REGISTRY if spec.id == "NB-LATE-ARRIVING")
-    assert spec.applies_to(Layer.STORAGE)
 
 
 # -- PL-NOTIFY -----------------------------------------------------------------
@@ -473,6 +413,32 @@ def test_flag_domain_validation_passes():
     assert nb_flag_domain(_ctx(_nb(code))).score == _PASS
 
 
+def test_flag_domain_passes_when_a_flag_is_normalised_by_when_otherwise():
+    code = (
+        "df = spark.read.json('Files/events.json')\n"
+        "df = df.withColumn('is_active', when(col('is_active') == 'Y', True).otherwise(False))"
+    )
+    assert nb_flag_domain(_ctx(_nb(code))).score == _PASS
+
+
+def test_flag_domain_fails_on_a_boolean_type_declaration_alone():
+    """Declaring a BooleanType column sets a type; it does not restrict values."""
+    code = (
+        "df = spark.read.json('Files/events.json')\n"
+        "schema = StructType([StructField('amount', BooleanType())])"
+    )
+    assert nb_flag_domain(_ctx(_nb(code))).score == _FAIL
+
+
+def test_flag_domain_fails_on_a_generic_when_otherwise():
+    """A when/otherwise with no flag column and no flag literal is generic logic."""
+    code = (
+        "df = spark.read.csv('Files/events.csv')\n"
+        "df = df.withColumn('bucket', when(col('amount') > 100, 'big').otherwise('small'))"
+    )
+    assert nb_flag_domain(_ctx(_nb(code))).score == _FAIL
+
+
 def test_ingestion_controls_are_na_without_relevant_input_or_write():
     context = _ctx(_nb("print('no input or write')"))
     assert nb_source_metadata(context).status is Status.NA
@@ -494,27 +460,31 @@ raw.write.saveAsTable('bronze_events')
 
 
 def test_silver_quality_scores_each_aspect_separately():
-    """Two of four aspects is a partial, not a pass.
+    """Two of the three scored aspects is a partial, not a pass.
 
-    The point names cleansing, deduplication, conforming *and* type
-    standardization. An earlier version passed on any one of them and then
-    claimed all four in its evidence, which reported deduplication on notebooks
-    performing none. Scoring the ratio is what makes the evidence checkable.
+    The point scores cleansing, conforming and type standardization. Dedup is
+    detected but reported as unscored context, so it never lifts or lowers the
+    band; scoring the ratio of the three is what makes the evidence checkable.
     """
     code = """
 silver = spark.read.table('bronze_events')
-silver = silver.dropDuplicates(['event_id']).withColumn('event_date', to_date('event_date'))
+silver = (silver.dropDuplicates(['event_id'])
+          .withColumn('event_date', to_date('event_date'))
+          .withColumn('name', trim(col('name'))))
 silver.write.saveAsTable('silver_events')
 """
     verdict = nb_silver_quality(_ctx(_nb(code)))
     assert verdict.score is not None and verdict.score < _PASS
-    assert "2 of 4" in verdict.evidence
-    assert "deduplication" in verdict.evidence
-    assert "Not found: cleansing, conforming" in verdict.evidence
+    assert "2 of 3" in verdict.evidence
+    assert "Not found: conforming" in verdict.evidence
+    assert "deduplication also applied" in verdict.evidence
 
 
 def test_silver_quality_passes_when_every_aspect_is_present():
-    """All four aspects present - dedup, cast, trim (cleansing), rename (conforming)."""
+    """All three scored aspects present - cast, trim (cleansing), rename (conforming).
+
+    Dedup is also applied here, but it is reported as context, not scored.
+    """
     code = """
 silver = spark.read.table('bronze_events')
 silver = (silver.dropDuplicates(['event_id'])
@@ -525,7 +495,7 @@ silver.write.saveAsTable('silver_events')
 """
     verdict = nb_silver_quality(_ctx(_nb(code)))
     assert verdict.score == _PASS
-    assert "4 of 4" in verdict.evidence
+    assert "3 of 3" in verdict.evidence
 
 
 def test_bulk_pipeline_passes_with_parallel_copy():
@@ -600,6 +570,27 @@ def test_bulk_move_passes_with_staging_and_copy_command():
     assert verdict.score == _PASS
     assert "enableStaging=true" in verdict.evidence
     assert "allowCopyCommand=true" in verdict.evidence
+
+
+def test_bulk_move_credits_truncate_reload_and_table_lock():
+    # A TRUNCATE-then-INSERT full reload with a bulk table lock is a genuine bulk
+    # pattern (one set-based clear plus a bulk insert), the opposite of row-by-row.
+    # It must not be mislabelled "default Copy settings".
+    pipeline = _pipe({
+        "name": "Reload dim", "type": "Copy",
+        "typeProperties": {
+            "sink": {
+                "type": "FabricSqlDatabaseSink",
+                "writeBehavior": "insert",
+                "sqlWriterUseTableLock": True,
+                "preCopyScript": "TRUNCATE TABLE [raw].[dim_site]",
+            },
+        },
+    })
+    verdict = pl_bulk_move(_ctx(pipeline))
+    assert verdict.score == _PASS
+    assert "sqlWriterUseTableLock=true" in verdict.evidence
+    assert "preCopyScript truncate/reload" in verdict.evidence
 
 
 def test_bulk_move_fails_only_explicit_row_by_row_logic():
@@ -1068,6 +1059,37 @@ def test_historical_separation_full_load_name_alone_is_na(name):
     assert "no historical/backfill load signal" in verdict.evidence
 
 
+def test_historical_separation_ignores_project_schema_literal_in_definition():
+    # Regression (real MLC_ADAGE data): PL_IN_WHITMPK_TBL_FullLoad was scored
+    # PARTIAL only because the historical detector matched the project's own
+    # 'ADAGE' schema name buried in a Copy sink's typeProperties - an incidental
+    # data value, not a load-intent signal - while its structurally identical
+    # twin PL_IN_WHITM_TBL_FullLoad (which names the schema via an expression)
+    # was N/A. A full-load pipeline with no historical/backfill naming must be
+    # N/A regardless of the schema / table names it writes to.
+    copy_to_adage_schema = {
+        "name": "ACT_MT_Copy_ingestBlobdataForFullLoad",
+        "type": "Copy",
+        "typeProperties": {
+            "sink": {
+                "type": "LakehouseTableSink",
+                "tableActionOption": "OverwriteSchema",
+                "datasetSettings": {
+                    "typeProperties": {
+                        "schema": {"value": "ADAGE", "type": "Expression"},
+                        "table": {"value": "IN_WHITM", "type": "Expression"},
+                    }
+                },
+            }
+        },
+    }
+    verdict = pl_historical_separation(
+        _named_pipe_ctx("PL_IN_WHITMPK_TBL_FullLoad", copy_to_adage_schema)
+    )
+    assert verdict.status is Status.NA
+    assert "no historical/backfill load signal" in verdict.evidence
+
+
 # -- PL-DEADLETTER structural routing ----------------------------------------
 
 def test_deadletter_ignores_error_words_inside_copy_column_mappings():
@@ -1217,6 +1239,34 @@ def test_scd2_no_pattern_reason_acknowledges_readable_column_metadata():
     verdict = table_scd2(_tables_ctx(dim_customer=table))
     assert verdict.status is Status.NA
     assert "Column metadata was read" in verdict.evidence
+
+
+def test_scd2_detects_the_trio_on_a_non_dimension_table():
+    """SCD2 history tables are often Silver tables the role classifier reads as
+    unknown/fact, so the scan must cover every table, not only dimensions."""
+    table = {
+        "columns": [
+            {"name": "product_code", "type": "varchar"},
+            {"name": "price", "type": "decimal"},
+            {"name": "valid_from"}, {"name": "valid_until"}, {"name": "active_flag"},
+        ],
+    }
+    verdict = table_scd2(_tables_ctx(price_versions=table))
+    assert verdict.score == _PASS
+    assert "Non-standard column names in use" in verdict.evidence
+
+
+def test_scd2_bare_start_end_pair_without_a_flag_is_not_scd2():
+    """A start/end date pair with no current-flag is a validity period, not SCD2."""
+    table = {
+        "columns": [
+            {"name": "product_code", "type": "varchar"},
+            {"name": "effective_date"}, {"name": "expiration_date"},
+        ],
+    }
+    verdict = table_scd2(_tables_ctx(prod_price=table))
+    assert verdict.status is Status.NA
+    assert "no table is versioned as SCD Type 2" in verdict.evidence
 
 
 # -- PL-COPY-PARALLEL (lone copy → N/A) ----------------------------------------

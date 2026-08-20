@@ -6,16 +6,18 @@ model. Each check is workspace-scoped and aggregates across every table found.
 """
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
 
-from auditfast.core.check._notebook import executable_code, notebook_code
+from auditfast.core.check._notebook import NOTEBOOK_LAYERS, executable_code, strip_sql_comments
 from auditfast.core.check._pipeline import activities as pipeline_activities
 from auditfast.core.check._pipeline import script_sql
 from auditfast.core.check._recency import parse_stamp
 from auditfast.core.check._tables import (
     TABLE_LAYERS,
     col_names,
+    column_type,
     columns,
     dimensions_in,
     facts_in,
@@ -25,13 +27,17 @@ from auditfast.core.check._tables import (
     is_audit_column,
     is_audit_table,
     is_key_column,
+    is_low_cardinality_shape,
     is_platform_table,
     is_snake_case,
     is_text_column,
     is_timestamp_column,
     key_referent,
     name_words,
+    normalise_column,
+    normalise_table_name,
     purpose_tokens,
+    related_columns,
     store_of,
     table_roles,
     tables_by_store,
@@ -58,18 +64,42 @@ _NO_COLS = "No lakehouse/warehouse table column metadata available"
 _DATE_NAME = re.compile(r"(date|timestamp|_dt$|_time$)", re.IGNORECASE)
 
 
-# T-SQL cursor and pandas row-by-row iteration anti-patterns (3.6.7).
-# Note: .collect()/.toPandas() are separately caught by NB-COLLECT; this
-# targets explicit SQL cursor syntax and pandas row iterators that are
-# semantically cursor-equivalent.
-_CURSOR = re.compile(
-    r"\bDECLARE\s+\w+\s+CURSOR\b"    # T-SQL cursor declaration
-    r"|\bFETCH\s+NEXT\b"               # T-SQL cursor fetch
-    r"|\bWHILE\s+@@FETCH_STATUS\b"     # T-SQL cursor loop
-    r"|\.iterrows\s*\(\s*\)"           # pandas row-by-row iteration
-    r"|\.itertuples\s*\(\s*\)",        # pandas tuple-by-tuple iteration
-    re.IGNORECASE,
+#: Row-by-row processing, in the two languages a Fabric notebook actually uses.
+#:
+#: **T-SQL cursors** belong to Warehouse routines, not notebooks - a Fabric
+#: notebook is Spark - so those patterns are applied to ``sql_routines`` by the
+#: Warehouse checks and are deliberately absent here.
+#:
+#: **The Spark anti-patterns** are what a notebook can genuinely do wrong:
+#: pulling a distributed DataFrame onto the driver and then looping over it.
+#: ``collect()`` and ``toPandas()`` alone are not enough - both are legitimate
+#: for a small result - so each is paired with the iteration that follows it,
+#: which is what turns a materialisation into row-by-row processing.
+_ROW_BY_ROW = (
+    ("pandas .iterrows()", re.compile(r"\.iterrows\s*\(\s*\)")),
+    ("pandas .itertuples()", re.compile(r"\.itertuples\s*\(\s*\)")),
+    # ``for row in df.collect():`` - the classic driver-side loop. The receiver
+    # is matched loosely because a real call is chained
+    # (``spark.table('x').collect()``), not a bare name.
+    ("loop over collect()", re.compile(
+        r"for\s+\w+\s+in\s+[^\n:]*?\.collect\s*\(\s*\)", re.IGNORECASE)),
+    ("loop over toPandas()", re.compile(
+        r"for\s+\w+\s+in\s+[^\n:]*?\.toPandas\s*\(\s*\)", re.IGNORECASE)),
+    # ``for i in range(df.count()):`` then indexing - iteration by row number.
+    ("loop over row count", re.compile(
+        r"for\s+\w+\s+in\s+range\s*\(\s*[^\n:]*?\.count\s*\(\s*\)", re.IGNORECASE)),
+    # ``.rdd.map(...)`` with a Python lambda is per-row Python, not set-based.
+    ("rdd row map", re.compile(r"\.rdd\s*\.\s*(?:map|foreach)\s*\(", re.IGNORECASE)),
 )
+
+#: A ``collect()``/``toPandas()`` whose result is *assigned* and then iterated a
+#: few lines later - the same anti-pattern spread over two statements, which a
+#: single-line pattern misses. The right-hand side is matched loosely because a
+#: real call is chained (``spark.table('silver.sales').collect()``), not a bare
+#: name: an earlier ``[\w.]*`` version matched only the simplest possible form
+#: and silently missed every realistic one.
+_COLLECT_ASSIGNED = re.compile(
+    r"(\w+)\s*=\s*[^\n=]*?\.(?:collect|toPandas)\s*\(\s*\)", re.IGNORECASE)
 
 #: Table/schema name patterns that indicate a staging area.
 #: Keys in ctx.workspace.tables are either plain lakehouse names ("StagingTemp")
@@ -112,7 +142,6 @@ _STATS_UPDATE_SQL = re.compile(
     r"\bUPDATE\s+STATISTICS\b|\bsp_updatestats\b|\bANALYZE\s+TABLE\b.*\bCOMPUTE\s+STATISTICS\b",
     re.IGNORECASE | re.DOTALL,
 )
-_TABLES_PATH = re.compile(r"(?:^|/)tables(?:/|$)", re.IGNORECASE)
 _SHORTCUTS_PATH = re.compile(r"(?:^|/)shortcuts(?:/|$)", re.IGNORECASE)
 _BRONZE_TOKEN = re.compile(r"(?:^|[/_\-.])bronze(?:[/_\-.]|$)", re.IGNORECASE)
 _SILVER_TOKEN = re.compile(r"(?:^|[/_\-.])silver(?:[/_\-.]|$)", re.IGNORECASE)
@@ -200,7 +229,7 @@ def _domain_from_path(path: str) -> tuple[str | None, str | None]:
 @check(
     id="WS-WH-LOAD", ref="3.6.1",
     title="Gold Warehouse load pattern is defined and consistent",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
     required=True,
 )
@@ -264,27 +293,63 @@ def wh_load_pattern(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-NO-CURSOR", ref="3.6.2",
     title="Silver-to-Gold transformations are set-based (no row-by-row cursors)",
-    pillar=Pillar.DATA, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_no_cursor(ctx: CheckContext) -> Verdict:
-    """Set-based SQL and DataFrame operations rather than T-SQL cursors or pandas row iteration."""
+    """Transformations run set-based rather than looping over rows on the driver.
+
+    **Scoped to what a notebook can actually do.** An earlier version searched
+    notebook code for T-SQL cursor syntax (``DECLARE ... CURSOR``,
+    ``FETCH NEXT``, ``WHILE @@FETCH_STATUS``). A Fabric notebook is Spark, so
+    that syntax cannot appear in one and those patterns could never fire; the
+    cursor question belongs to Warehouse routines and is asked there. What is
+    checked here is the Spark equivalent: materialising a distributed DataFrame
+    on the driver and then iterating it.
+
+    ``collect()`` and ``toPandas()`` on their own are **not** flagged - both are
+    legitimate for a small result, and ``NB-COLLECT`` already judges unbounded
+    materialisation. The signal is the *iteration*: a loop over the collected
+    result, whether written inline or one statement later.
+
+    **What it cannot determine.** Whether a small driver-side loop is
+    justified - iterating 12 month names is not the anti-pattern this describes.
+    The evidence names the construct found so a reviewer can judge the scale.
+    """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
-    code = notebook_code(ctx.obj)
-    hits = _CURSOR.findall(code)
+    code = executable_code(ctx.obj)
+    if not code.strip():
+        return not_applicable("Notebook has no executable code to assess")
+
+    found: list[str] = []
+    for label, pattern in _ROW_BY_ROW:
+        hits = pattern.findall(code)
+        if hits:
+            found.append(f"{label} x{len(hits)}")
+
+    # A collect()/toPandas() assigned to a name, then looped over separately.
+    for match in _COLLECT_ASSIGNED.finditer(code):
+        variable = re.escape(match.group(1))
+        if re.search(rf"for\s+\w+\s+in\s+{variable}\b", code):
+            found.append("loop over a collected DataFrame")
+            break
+
+    if not found:
+        return binary(True, "No row-by-row iteration found - transformations run "
+                            "set-based on the Spark engine")
     return binary(
-        not hits,
-        f"{len(hits)} cursor/row-iteration pattern(s) detected "
-        "(T-SQL CURSOR / .iterrows() / .itertuples())" if hits
-        else "No T-SQL cursors or row-by-row iteration patterns â€” set-based transformations",
+        False,
+        f"Row-by-row processing found ({', '.join(sorted(set(found)))}). Each pulls "
+        f"rows onto the driver and loops over them, so the work runs single-threaded "
+        f"instead of across the cluster; confirm the volume justifies it",
     )
 
 
 @check(
     id="WS-STAGING", ref="3.6.3",
     title="Staging tables/schema used for Warehouse loads before merge into final tables",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
 )
 def wh_staging_pattern(ctx: CheckContext) -> Verdict:
@@ -304,51 +369,108 @@ def wh_staging_pattern(ctx: CheckContext) -> Verdict:
         "(stg_* / staging_* / stage_*) â€” a staging schema buffers loads before the final merge",
     )
 
+
+def _is_load_procedure(sql: str) -> bool:
+    """True when SQL is a genuinely multi-statement load worth a transaction.
+
+    A load needs TRY...CATCH + BEGIN/COMMIT/ROLLBACK only when it runs **more than
+    one statement**, so a failure part-way through could leave the target in a
+    partially loaded state. A **single** statement — whether a lone ``MERGE``,
+    ``INSERT ... SELECT``, ``CTAS`` / ``CREATE TABLE AS``, or ``TRUNCATE`` — is
+    atomic: it either completes or rolls itself back, with nothing to wrap. Such
+    single-statement loads are excluded from the denominator rather than failed
+    for lacking a wrapper they do not need, so the atomic-statement exemption
+    applies to every statement kind consistently. Comments are stripped first so a
+    commented-out statement neither qualifies a script nor inflates its statement
+    count.
+    """
+    body = strip_sql_comments(sql)
+    if not _WAREHOUSE_SQL_LOAD.search(body):
+        return False
+    statements = [s for s in body.split(";") if s.strip()]
+    return len(statements) > 1
+
+
 @check(
     id="WS-WH-TRYCATCH", ref="3.6.5",
     title="Warehouse/lakehouse load SQL uses TRY...CATCH with transaction handling",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
     required=True,
 )
-def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
+def wh_try_catch_transactions(ctx: CheckContext) -> list[Verdict]:
     """Load SQL wraps transactional changes in TRY...CATCH.
 
-    **Two sources of SQL.** Stored procedures and functions declared in the
-    Warehouse, now read from ``INFORMATION_SCHEMA.ROUTINES`` - which is where a
-    ``SqlServerStoredProcedure`` activity's logic actually lives - plus the
-    inline T-SQL a pipeline runs through a Script activity. Before the routine
-    bodies were fetched, a pipeline that called a stored procedure was recorded
-    as an *opaque* load and the whole check reported N/A: the logic existed, it
-    simply had not been read.
+    **Only readable SQL is judged.** Two sources carry it: stored procedures and
+    functions declared in the Warehouse (read from ``INFORMATION_SCHEMA.ROUTINES``,
+    which is where a ``SqlServerStoredProcedure`` activity's logic actually lives)
+    and the inline T-SQL a pipeline runs through a Script activity.
 
-    **What it cannot determine.** Whether a ``Copy`` activity's implicit load is
-    transactional - it runs no SQL of its own - so those are still counted as
-    opaque and named in the evidence rather than judged.
+    **Only genuinely multi-statement loads count toward the denominator.** A load
+    needs TRY...CATCH + BEGIN/COMMIT/ROLLBACK only when it runs more than one
+    statement, so a failure part-way through can leave the target partially
+    loaded. A **single** statement is atomic — it either completes or rolls itself
+    back — whether it is a lone ``MERGE``, ``INSERT ... SELECT``, ``CTAS`` or
+    ``TRUNCATE``; the atomic-statement exemption applies to every statement kind
+    consistently, so a single load is excluded rather than failed for lacking a
+    wrapper it does not need. Lumping trivial single-statement scripts in with
+    real multi-step loads produced an inconsistent "0 of 5" that failed atomic
+    statements; the honest denominator counts only the multi-statement loads, and
+    a workspace whose SQL is entirely single-statement (or Copy-only) is N/A, not
+    FAIL.
+
+    **A Copy activity is out of scope, not un-judged.** It runs no SQL of its own -
+    Fabric generates the load internally and the pipeline definition contains
+    nothing to read - so there is no error handling for this check to find, ever.
+    Counting Copy activities as unreadable loads made the check look blind on
+    estates that simply do not use SQL for loading: on one workspace 109 of 114
+    "loads" were Copy activities, and the verdict read as though 96% of the estate
+    were hidden. They are now excluded from the population entirely and reported
+    separately as context.
+
+    **The failing loads are named.** An earlier version listed only the
+    *compliant* ones, so a reviewer saw "5 of 12" and the names of the 5 already
+    fine - nothing to act on. Each load missing the handling now gets its own
+    named row, unscored so that one checklist point does not vote once per load.
+
+    **When nothing readable exists the answer is N/A, never FAIL.** A workspace
+    that loads exclusively through Copy activities has no SQL error-handling
+    practice to assess - that is not the same finding as having a bad one.
     """
     if not ctx.workspace.has(Resource.ITEMS):
-        return not_applicable("Workspace items could not be read from Fabric")
+        return [not_applicable("Workspace items could not be read from Fabric")]
 
     storage_items = [
         item for item in ctx.workspace.items
         if item.type in {"Warehouse", "Lakehouse"}
     ]
     if not storage_items:
-        return not_applicable("No Warehouse/Lakehouse items found in this workspace")
+        return [not_applicable("No Warehouse/Lakehouse items found in this workspace")]
 
     inspected: list[tuple[str, bool]] = []
-    opaque_loads: list[str] = []
+    copy_loads: list[str] = []
+    unread_routines: list[str] = []
+    atomic_loads: list[str] = []
 
     # Stored procedures and functions declared in the Warehouse itself.
     for routine in ctx.workspace.sql_routines:
         text = str(routine.get("definition") or "")
-        if not _WAREHOUSE_SQL_LOAD.search(text):
+        if not _WAREHOUSE_SQL_LOAD.search(strip_sql_comments(text)):
             continue
         marker = f"{routine.get('store', '')}/{routine.get('name', '')}"
+        if not _is_load_procedure(text):
+            # A single-statement load (a lone MERGE / INSERT...SELECT / CTAS /
+            # TRUNCATE) is atomic and has nothing to wrap in a transaction.
+            atomic_loads.append(marker)
+            continue
         inspected.append((
             marker,
             bool(_TRY_CATCH_SQL.search(text)) and bool(_TXN_SQL.search(text)),
         ))
+
+    declared_routines = {
+        str(r.get("name") or "").lower() for r in ctx.workspace.sql_routines
+    }
 
     if ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         for pipeline_name, pipeline_def in ctx.workspace.pipelines.items():
@@ -359,41 +481,102 @@ def wh_try_catch_transactions(ctx: CheckContext) -> Verdict:
 
                 if activity_type == "Script":
                     text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
-                    if not _WAREHOUSE_SQL_LOAD.search(text):
+                    if not _WAREHOUSE_SQL_LOAD.search(strip_sql_comments(text)):
+                        continue
+                    if not _is_load_procedure(text):
+                        atomic_loads.append(marker)
                         continue
                     has_try_catch = bool(_TRY_CATCH_SQL.search(text))
                     has_transaction = bool(_TXN_SQL.search(text))
                     inspected.append((marker, has_try_catch and has_transaction))
                     continue
 
-                if activity_type in ("SqlServerStoredProcedure", "StoredProcedure", "Copy"):
-                    opaque_loads.append(marker)
+                if activity_type == "Copy":
+                    # No SQL exists to read, by design - not a gap in the crawl.
+                    copy_loads.append(marker)
+                    continue
+
+                if activity_type in ("SqlServerStoredProcedure", "StoredProcedure"):
+                    # The body lives in the Warehouse. If the routine list did not
+                    # carry it, that *is* a gap worth reporting - unlike a Copy.
+                    called = str((activity.get("typeProperties") or {}).get(
+                        "storedProcedureName") or "").split(".")[-1].strip("[]").lower()
+                    if not called or called not in declared_routines:
+                        unread_routines.append(marker)
 
     if not inspected:
-        if opaque_loads:
-            return not_applicable(
-                f"{len(opaque_loads)} load activity/activities run through a stored "
-                "procedure or Copy whose SQL is not in this snapshot, and the "
-                "Warehouse declared no routine body to read, so TRY...CATCH "
-                "handling cannot be verified. " + _SQL_PERMISSION_HINT
+        if unread_routines:
+            return [not_applicable(
+                f"{len(unread_routines)} pipeline activity/activities call a stored "
+                f"procedure whose body is not in this snapshot, so TRY...CATCH "
+                f"handling cannot be verified: {_named(unread_routines)}. "
+                + _SQL_PERMISSION_HINT
+            )]
+        if atomic_loads:
+            copy_note = (
+                f" A further {len(copy_loads)} Copy activity/activities load without SQL."
+                if copy_loads else ""
             )
-        return not_applicable("No inspectable scripted SQL load activity was found")
+            return [not_applicable(
+                f"This workspace's only readable SQL loads are {len(atomic_loads)} "
+                f"single-statement (atomic) load(s) such as a lone MERGE or TRUNCATE "
+                f"({_named(atomic_loads)}); a single statement is atomic — it either "
+                f"completes or rolls itself back — so there is nothing to wrap in "
+                f"TRY...CATCH with BEGIN/COMMIT/ROLLBACK and no multi-statement load "
+                f"procedure to assess.{copy_note}"
+            )]
+        if copy_loads:
+            return [not_applicable(
+                f"This workspace loads through {len(copy_loads)} Copy activity/activities "
+                f"and declares no SQL load routine. A Copy activity runs no SQL of its "
+                f"own - Fabric generates the load internally - so there is no error "
+                f"handling to assess, which is not the same as having none"
+            )]
+        return [not_applicable("No SQL load routine or Script activity was found to assess")]
 
     compliant = [name for name, ok in inspected if ok]
+    offenders = [name for name, ok in inspected if not ok]
     evidence = (
-        f"{len(compliant)} of {len(inspected)} inspectable SQL load(s) use "
+        f"{len(compliant)} of {len(inspected)} multi-statement SQL load(s) use "
         "TRY...CATCH and BEGIN/COMMIT/ROLLBACK transaction handling"
-        + (f"; compliant: {', '.join(compliant[:5])}" if compliant else "")
     )
-    if opaque_loads:
-        evidence += (f". {len(opaque_loads)} Copy/stored-procedure activity/activities "
-                     f"run no readable SQL and are not judged")
-    return covered(len(compliant), len(inspected), evidence)
+    # Name the loads that are *missing* the handling. The previous version listed
+    # only the compliant ones, so a reviewer could see the size of the gap but not
+    # which store or pipeline it was in - the finding said "5 of 12" and named the
+    # 5 that were already fine.
+    if offenders:
+        evidence += (f". No TRY...CATCH with transaction handling in: "
+                     f"{_named(offenders)} - a failure part-way through leaves the "
+                     f"target in a partially loaded state")
+    if compliant:
+        evidence += f". Compliant: {_named(compliant)}"
+    if copy_loads:
+        evidence += (f". A further {len(copy_loads)} Copy activity/activities load without "
+                     f"SQL and are out of scope for this check")
+    if unread_routines:
+        evidence += (f". {len(unread_routines)} activity/activities call a stored procedure "
+                     f"whose body could not be read: {_named(unread_routines)}")
+    if atomic_loads:
+        evidence += (f". {len(atomic_loads)} single-statement (atomic) load(s) "
+                     f"(e.g. a lone MERGE or TRUNCATE) were excluded from the "
+                     f"denominator — a single statement is atomic and needs no "
+                     f"transaction wrapper")
+
+    verdicts: list[Verdict] = [covered(len(compliant), len(inspected), evidence)]
+    # Unscored per-object rows so the report's Object column names each load,
+    # without one checklist point voting once per load on a large estate.
+    for name in offenders:
+        verdicts.append(note(
+            "SQL load with no TRY...CATCH and transaction handling - a failure part-way "
+            "through leaves the target partially loaded, with no rollback",
+            obj=name,
+        ))
+    return verdicts
 
 @check(
     id="WS-WH-INCREMENTAL", ref="3.6.6",
     title="Warehouse loads avoid unnecessary full reloads",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
     required=True,
 )
@@ -455,12 +638,39 @@ def wh_incremental_loads(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-WH-STATS", ref="3.6.7",
     title="Statistics are updated after significant Warehouse loads",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS],
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS,
+    requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS, Resource.TABLE_SCHEMAS],
     required=True,
 )
 def wh_stats_updated_after_loads(ctx: CheckContext) -> Verdict:
-    """Significant inspectable SQL loads are paired with statistics maintenance."""
+    """Statistics keep pace with Warehouse loads - which Fabric now handles itself.
+
+    **The engine refreshes statistics automatically, so a load with no explicit
+    ``UPDATE STATISTICS`` is not a finding.** Microsoft documents that *"if the
+    query engine determines that existing statistics relevant to query no longer
+    accurately reflect the data, those statistics are automatically refreshed"*,
+    using the same recompilation threshold as SQL Server 2016, and that proactive
+    refresh - which front-loads updates after data changes - is *"enabled by
+    default"* (``learn.microsoft.com/fabric/data-warehouse/statistics``). It
+    applies to the SQL analytics endpoint as well as the Warehouse.
+
+    An earlier version scored every readable load that did not run statistics
+    maintenance as non-compliant. On Fabric that is the normal configuration, so
+    the check was penalising estates for not doing work the platform performs -
+    and asking them to add maintenance that buys nothing.
+
+    **What is still worth reporting.** Microsoft documents one residual use:
+    pre-warming statistics *"if there's a large enough window between your table
+    transformations and your query workload"*, so the first production query
+    does not pay for the refresh. A load that does this is doing something
+    genuinely useful, and gets credit; a load that does not is fine.
+
+    **What it cannot determine.** Whether statistics are accurate or fresh - the
+    engine owns that - or whether any particular table would benefit from
+    pre-warming. Sibling ``WS-STATS-STRATEGY`` (4.4.6) asks the same question
+    from the store's side rather than the load's.
+    """
     if not ctx.workspace.has(Resource.ITEMS):
         return not_applicable("Workspace items could not be read from Fabric")
 
@@ -474,72 +684,71 @@ def wh_stats_updated_after_loads(ctx: CheckContext) -> Verdict:
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
 
-    pipeline_loads: dict[str, list[str]] = {}
-    pipeline_stats: dict[str, list[str]] = {}
-    opaque_loads: list[str] = []
+    loads: set[str] = set()
+    prewarming: set[str] = set()
 
     for pipeline_name, pipeline_def in ctx.workspace.pipelines.items():
         for activity in pipeline_activities(pipeline_def):
-            activity_type = str(activity.get("type", "") or "")
-            activity_name = activity.get("name", activity_type) or activity_type
-            marker = f"{pipeline_name}/{activity_name}"
-
-            if activity_type == "Script":
-                text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
-                if _WAREHOUSE_SQL_LOAD.search(text):
-                    pipeline_loads.setdefault(pipeline_name, []).append(marker)
-                if _STATS_UPDATE_SQL.search(text):
-                    pipeline_stats.setdefault(pipeline_name, []).append(marker)
+            if str(activity.get("type", "") or "") != "Script":
                 continue
+            text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
+            if _WAREHOUSE_SQL_LOAD.search(text):
+                loads.add(pipeline_name)
+            if _STATS_UPDATE_SQL.search(text):
+                prewarming.add(pipeline_name)
 
-            if activity_type in ("Copy", "SqlServerStoredProcedure", "StoredProcedure"):
-                opaque_loads.append(marker)
+    for routine in ctx.workspace.sql_routines:
+        body = str(routine.get("definition") or "")
+        name = str(routine.get("name") or "stored procedure")
+        if _WAREHOUSE_SQL_LOAD.search(body):
+            loads.add(name)
+        if _STATS_UPDATE_SQL.search(body):
+            prewarming.add(name)
 
-    inspectable_pipelines = sorted(pipeline_loads)
+    engine = ("Fabric refreshes statistics automatically when the optimizer finds them "
+              "stale, and proactive refresh front-loads updates after data changes "
+              "(on by default), so a load that runs no UPDATE STATISTICS is correctly "
+              "configured")
 
-    # Statistics maintenance also lives in stored procedures, and the Warehouse's
-    # own ``sys.stats`` says whether user-created statistics exist at all - a
-    # second, structural answer to the same question.
-    routine_loads = [
-        r for r in ctx.workspace.sql_routines
-        if _WAREHOUSE_SQL_LOAD.search(str(r.get("definition") or ""))
-    ]
-    routine_stats = [
-        r for r in routine_loads
-        if _STATS_UPDATE_SQL.search(str(r.get("definition") or ""))
-    ]
-
-    if not inspectable_pipelines and not routine_loads:
-        if opaque_loads:
-            return not_applicable(
-                f"{len(opaque_loads)} load activity/activities run through a Copy or "
-                "stored procedure whose SQL is not in this snapshot, and the "
-                "Warehouse declared no routine body to read, so post-load "
-                "statistics maintenance cannot be verified. " + _SQL_PERMISSION_HINT
-            )
-        return not_applicable("No significant readable SQL warehouse/lakehouse load was found")
-
-    total = len(inspectable_pipelines) + len(routine_loads)
-    compliant_pipelines = [name for name in inspectable_pipelines if pipeline_stats.get(name)]
-    compliant = len(compliant_pipelines) + len(routine_stats)
-    evidence = (
-        f"{compliant} of {total} readable load(s) also run statistics maintenance "
-        "(UPDATE STATISTICS / sp_updatestats / ANALYZE TABLE)"
+    # Verified, not assumed: a store with AUTO_CREATE/UPDATE_STATISTICS switched
+    # off does not get the automatic maintenance these loads otherwise rely on.
+    auto_off = sorted(
+        store for store, opts in (ctx.workspace.warehouse_options or {}).items()
+        if opts.get("auto_create_stats") is False or opts.get("auto_update_stats") is False
     )
-    if routine_loads:
-        evidence += (f"; {len(routine_stats)} of {len(routine_loads)} Warehouse stored "
-                     f"procedure(s) that load data maintain statistics")
-    if opaque_loads:
-        evidence += f"; {len(opaque_loads)} Copy activity/activities run no readable SQL"
-    if compliant_pipelines:
-        evidence += f"; compliant pipelines: {', '.join(compliant_pipelines[:5])}"
+    if auto_off and loads:
+        return graded(
+            1,
+            f"{len(loads)} readable load path(s) feed store(s) where automatic statistics "
+            f"are switched OFF ({_named(auto_off)}). Those loads run no UPDATE STATISTICS "
+            f"and the engine will not refresh for them either, so plans are built from "
+            f"stale or missing histograms",
+        )
 
-    return covered(compliant, total, evidence)
+    if prewarming:
+        return graded(
+            3,
+            f"{engine}. {len(prewarming)} load path(s) additionally pre-warm statistics "
+            f"({_named(sorted(prewarming))}) - the one case Microsoft still documents for "
+            f"manual maintenance, removing first-query latency after a batch load",
+        )
+    if loads:
+        return graded(
+            3,
+            f"{engine}, and automatic statistics are confirmed ON for every readable "
+            f"store. {len(loads)} readable load path(s) rely on that automatic "
+            f"maintenance. Pre-warming statistics in a maintenance window would remove "
+            f"first-query latency, but is an optimisation rather than a requirement",
+        )
+    return not_applicable(
+        "No readable SQL warehouse/lakehouse load was found, so there is no load path "
+        "to assess for statistics handling"
+    )
 
 
 @check(
     id="TB-NAMING", ref="4.2.1", title="Tables use meaningful, consistent naming conventions (agreed standard)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
 )
 def table_naming(ctx: CheckContext) -> Verdict:
@@ -553,7 +762,7 @@ def table_naming(ctx: CheckContext) -> Verdict:
 
 @check(
     id="TB-MANAGED-DELTA", ref="4.1.1", title="Lakehouse Tables (managed) used for structured data; Files section for raw/unstructured",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
 )
 def table_managed_delta(ctx: CheckContext) -> Verdict:
@@ -570,11 +779,29 @@ def table_managed_delta(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-SHORTCUT-GOVERNANCE", ref="4.1.3",
     title="Shortcuts avoid circular and ungoverned access paths",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS], required=True,
 )
 def shortcut_governance(ctx: CheckContext) -> Verdict:
-    """Shortcut paths are structurally governed and avoid loop-prone patterns."""
+    """Shortcut paths are structurally governed and avoid loop-prone patterns.
+
+    A shortcut is flagged only for a genuine structural smell: a missing target
+    type (ungoverned), a ``..`` traversal segment, a nested ``Shortcuts`` path
+    (loop-prone), or a true duplicate — the *same* shortcut (parent path **and**
+    name) listed twice.
+
+    A shortcut rooted under ``Tables`` is **not** flagged. The Fabric List
+    Shortcuts API returns ``path`` as the parent folder a shortcut sits in
+    (``Tables`` / ``Files`` / a subpath), so a OneLake table shortcut naturally
+    reports ``path = Tables`` — and that is the supported, recommended way to
+    surface a Delta table across lakehouses without copying data. It is neither
+    circular nor ungoverned. Because ``path`` is the *parent* folder rather than
+    a per-shortcut path, two distinct shortcuts in one folder share it, so
+    duplicate detection keys on the folder **plus the shortcut name** — otherwise
+    every second table shortcut reads as a false duplicate. Whether an *external*
+    target is allowed is the neighbouring ``WS-SHORTCUT-SCOPE`` (4.1.2)
+    question, not this one.
+    """
     if not ctx.workspace.has(Resource.SHORTCUTS):
         return not_applicable(
             "Shortcut metadata could not be read. Request Workspace.Read.All + OneLake.Read.All "
@@ -588,7 +815,7 @@ def shortcut_governance(ctx: CheckContext) -> Verdict:
     risky: list[str] = []
 
     for lakehouse_name, shortcuts in (ctx.workspace.shortcuts or {}).items():
-        seen_paths: set[str] = set()
+        seen_identities: set[str] = set()
         for row in (shortcuts or []):
             total += 1
             name = str((row or {}).get("name") or "")
@@ -596,19 +823,22 @@ def shortcut_governance(ctx: CheckContext) -> Verdict:
             target_type = str((row or {}).get("target_type") or "")
             normalized = path.replace("\\", "/").strip().strip("/")
             normalized_low = normalized.lower()
+            # ``path`` is the parent folder (``Tables`` / ``Files`` / a subpath),
+            # not a per-shortcut path, so a shortcut's identity is that folder
+            # plus its own name. Keying duplicate detection on the folder alone
+            # made every second table shortcut a false duplicate.
+            identity = f"{normalized_low}/{name.strip().lower()}"
 
             issues: list[str] = []
             if not target_type.strip():
                 issues.append("missing target type")
             if ".." in normalized_low:
                 issues.append("path traversal segment '..'")
-            if _TABLES_PATH.search(normalized_low):
-                issues.append("shortcut rooted under Tables path")
             if _SHORTCUTS_PATH.search(normalized_low):
                 issues.append("nested Shortcut path (loop-prone)")
-            if normalized_low in seen_paths and normalized_low:
+            if identity != "/" and identity in seen_identities:
                 issues.append("duplicate shortcut path")
-            seen_paths.add(normalized_low)
+            seen_identities.add(identity)
 
             if issues:
                 risky.append(
@@ -629,7 +859,7 @@ def shortcut_governance(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-LH-BRONZE-SILVER-SEP", ref="4.1.4",
     title="Bronze and Silver lakehouse responsibilities are clearly separated per domain",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS, Resource.TABLE_SCHEMAS], required=True,
 )
 def bronze_silver_separation(ctx: CheckContext) -> Verdict:
@@ -676,7 +906,7 @@ def bronze_silver_separation(ctx: CheckContext) -> Verdict:
 @check(
     id="WS-LH-TAXONOMY", ref="4.1.5",
     title="Bronze/Silver domain folders follow a consistent workspace taxonomy",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS, Resource.TABLE_SCHEMAS], required=True,
 )
 def bronze_silver_taxonomy(ctx: CheckContext) -> Verdict:
@@ -735,7 +965,7 @@ def bronze_silver_taxonomy(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-PARTITION-STRATEGY", ref="4.2.2",
     title="Partitioning or clustering strategy is defined for large tables",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.LAKEHOUSE_FILES],
     required=True,
 )
@@ -798,7 +1028,7 @@ def table_partition_strategy(ctx: CheckContext) -> Verdict:
 
 @check(
     id="TB-AUDITCOLS", ref="4.2.5", title="Audit columns present (created_date, modified_date, source_system, batch_id)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -895,7 +1125,7 @@ def _table_stores(ctx: CheckContext) -> str:
 
 @check(
     id="TB-STARSCHEMA", ref="4.5.1", title="Star schema design implemented (fact + dimension tables, not flat wide tables)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.ITEMS], required=True,
 )
 def table_star_schema(ctx: CheckContext) -> Verdict:
@@ -988,7 +1218,7 @@ def _fact_width_note(facts: dict[str, dict]) -> str:
 @check(
     id="TB-DATATYPE-SIZING", ref="4.4.3",
     title="Data types are appropriate and sized correctly",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=True,
 )
@@ -1048,55 +1278,139 @@ def table_type_sizing(ctx: CheckContext) -> Verdict:
     )
 
 
+#: How many offending object names one evidence string carries. Enough to act
+#: on, few enough to stay readable in a report cell - the same limit the other
+#: naming checks in this module use.
+_MAX_NAMED_TABLES = 5
+
+
+def _named(names: list[str]) -> str:
+    """``"a, b, c (+4 more)"`` - a bounded, sorted list of offenders.
+
+    A finding that reports only a ratio ("43 of 80 dimensions") tells a reviewer
+    the size of the problem and nothing about where it is. Naming the objects is
+    what makes the row actionable.
+    """
+    shown = ", ".join(names[:_MAX_NAMED_TABLES])
+    extra = len(names) - _MAX_NAMED_TABLES
+    return f"{shown} (+{extra} more)" if extra > 0 else shown
+
+
 @check(
     id="TB-SURROGATE-GEN", ref="4.4.4",
     title="Surrogate keys are implemented for dimensions with a generated-key pattern",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=True,
 )
-def table_surrogate_generated(ctx: CheckContext) -> Verdict:
+def table_surrogate_generated(ctx: CheckContext) -> list[Verdict]:
     """Dimension schemas include surrogate keys with generation-oriented naming hints.
 
-    This is a schema-level proxy for generated-key patterns. It cannot inspect ETL
-    code paths (hash/window/key-table logic), so it looks for surrogate-key columns
-    plus a generation hint in the declared column names.
+    **Declared evidence first.** Fabric Warehouse supports ``IDENTITY`` columns,
+    and Microsoft names them the way to build a surrogate key: *"IDENTITY columns
+    enable automatic generation of these surrogate keys when inserting new rows
+    into a table"* (``learn.microsoft.com/fabric/data-warehouse/identity``). The
+    crawl reads ``sys.identity_columns``, so where a table declares one this
+    check reports a fact rather than an inference.
+
+    **Names are the fallback, not the primary signal.** Nothing in Fabric flags
+    a column as "a surrogate key" - it is a design convention - and a Lakehouse
+    Delta table has no ``IDENTITY`` concept at all, so on Lakehouse tables the
+    naming proxy is all there is. It cannot inspect ETL code paths
+    (hash/window/key-table logic) either. The evidence says which basis was used.
+
+    **Each offending dimension is its own scored row.** A single workspace-level
+    ratio ("43 of 80") named no object, so a reviewer could not act on it: the
+    report's Object column was empty and the affected tables were invisible.
+    Following ``R-MODEL-HIDDEN-KEYS`` (14.1.8), the summary verdict is followed
+    by one row per offending table carrying its name.
+
+    **The two ways a dimension fails are different problems**, so they read
+    differently. A dimension with *no surrogate key at all* is keyed on its
+    business key - and Microsoft is explicit that "a surrogate key is required
+    because there will be duplicate natural keys when multiple versions are
+    stored", so this blocks SCD Type 2 outright. A dimension that *has* a
+    surrogate key but keeps no natural/business key beside it breaks the ETL
+    lookup Kimball describes, where an incoming row is matched by natural key to
+    find its surrogate.
     """
     if not ctx.workspace.tables:
-        return not_applicable(_NO_TABLES)
+        return [not_applicable(_NO_TABLES)]
     dims = {n: t for n, t in dimensions_in(ctx.workspace.tables, _models(ctx)).items()
             if columns(t)}
     if not dims:
-        return not_applicable(_NO_DIMS)
+        return [not_applicable(_NO_DIMS)]
 
-    compliant = 0
-    for table in dims.values():
+    compliant: list[str] = []
+    declared: list[str] = []
+    no_surrogate: list[str] = []
+    no_hint: list[str] = []
+    for name, table in sorted(dims.items()):
         names = col_names(table)
-        has_surrogate = any(
+        identity = [str(c).lower() for c in (table.get("identity_columns") or [])]
+        has_surrogate = bool(identity) or any(
             n.endswith(("_sk", "_key")) or n in {"surrogate_key", "surrogate_id"}
             for n in names
         )
-        has_generated_hint = any(_GENERATED_KEY_HINT.search(n) for n in names)
+        has_generated_hint = bool(identity) or any(
+            _GENERATED_KEY_HINT.search(n) for n in names)
         has_business_hint = any(_BUSINESS_KEY_HINT.search(n) for n in names)
         if has_surrogate and (has_generated_hint or has_business_hint):
-            compliant += 1
+            compliant.append(name)
+            if identity:
+                declared.append(f"{name}.{identity[0]}")
+        elif not has_surrogate:
+            no_surrogate.append(name)
+        else:
+            no_hint.append(name)
 
-    return covered(
-        compliant, len(dims),
-        f"{compliant} of {len(dims)} dimension table(s) include surrogate keys with "
-        "generation-oriented naming evidence",
-    )
+    basis = (f". {len(declared)} confirmed by a declared IDENTITY column "
+             f"({_named(declared)}) rather than inferred from naming"
+             if declared else
+             ". No dimension declares an IDENTITY column, so this rests on column "
+             "naming - Lakehouse Delta tables have no IDENTITY concept, and Fabric "
+             "exposes no flag marking a column as a surrogate key")
+
+    verdicts: list[Verdict] = [covered(
+        len(compliant), len(dims),
+        f"{len(compliant)} of {len(dims)} dimension table(s) implement a surrogate key "
+        f"with a generated-key pattern{basis}",
+    )]
+    # The per-object rows are UNSCORED. They exist so the report names the
+    # affected tables - the reviewer's "object name not captured" - not to vote
+    # again on a verdict the summary already cast.
+    #
+    # Scoring them would let one checklist point dominate the roll-up on a large
+    # estate: a workspace with 120 dimensions emitted 121 scored rows out of ~375
+    # in total, so this single point carried a third of the score, while an
+    # unrelated critical finding still carried one row. It would also punish size
+    # rather than quality - two estates equally bad at surrogate keys would score
+    # very differently purely because one has more tables. The summary's ratio
+    # already reflects the proportion, which is the fair measure.
+    for name in no_surrogate:
+        verdicts.append(note(
+            "No surrogate key column - the dimension is keyed on its business key, so "
+            "no second version of a member can be stored (SCD Type 2 is not possible)",
+            obj=name,
+        ))
+    for name in no_hint:
+        verdicts.append(note(
+            "Surrogate key present but no natural/business key beside it - an "
+            "incremental load cannot match an incoming row back to its dimension row",
+            obj=name,
+        ))
+    return verdicts
 
 
 @check(
     id="TB-REL-DECLARED", ref="4.4.5",
     title="Primary/foreign key relationships are declared where supported",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS,
     requires=[Resource.TABLE_SCHEMAS, Resource.SEMANTIC_MODEL_DEFINITIONS],
     required=True,
 )
-def table_relationships_declared(ctx: CheckContext) -> Verdict:
+def table_relationships_declared(ctx: CheckContext) -> list[Verdict]:
     """Fact tables declare their key relationships somewhere machine-readable.
 
     **Two sources, strongest first.** A Warehouse can declare ``NOT ENFORCED``
@@ -1106,17 +1420,23 @@ def table_relationships_declared(ctx: CheckContext) -> Verdict:
     that never declared any), semantic-model relationships are the fallback:
     they are the same structure expressed in the model rather than the database.
 
+    **Each undeclared fact is its own scored row.** A single ratio named no
+    object, leaving the report's Object column empty and the affected tables
+    invisible. Following ``R-MODEL-HIDDEN-KEYS`` (14.1.8), a summary verdict is
+    followed by one row per fact table that declares nothing.
+
     **What it cannot determine.** Whether a declared relationship is *correct* -
     Fabric does not enforce these constraints, so a declaration is a statement of
     intent, not a guarantee that the data honours it. ``NB-FK-INTEGRITY`` (5.3.2)
     is what looks for code that actually validates the values.
     """
     if not ctx.workspace.tables:
-        return not_applicable(_NO_TABLES)
+        return [not_applicable(_NO_TABLES)]
 
     facts = list(facts_in(ctx.workspace.tables, _models(ctx)))
     if not facts:
-        return not_applicable("No fact-like tables found to assess for declared FK relationships")
+        return [not_applicable(
+            "No fact-like tables found to assess for declared FK relationships")]
 
     # Declared database constraints - the direct answer where they exist.
     with_constraint = {
@@ -1142,10 +1462,10 @@ def table_relationships_declared(ctx: CheckContext) -> Verdict:
         name for name in facts if _norm_name(name) in linked_tables
     }
     if not declared and not models and not with_constraint:
-        return not_applicable(
+        return [not_applicable(
             "Neither declared database constraints nor semantic-model "
             "relationships could be read, so key relationships cannot be assessed"
-        )
+        )]
 
     evidence = (f"{len(declared)} of {len(facts)} fact-like table(s) declare their key "
                 f"relationships")
@@ -1155,92 +1475,156 @@ def table_relationships_declared(ctx: CheckContext) -> Verdict:
     else:
         evidence += (" through semantic-model relationships; no Warehouse FK constraint "
                      "is declared, which Fabric supports as NOT ENFORCED metadata")
-    return covered(len(declared), len(facts), evidence)
+
+    verdicts: list[Verdict] = [covered(len(declared), len(facts), evidence)]
+    # Unscored, for the reason given on TB-SURROGATE-GEN above: these rows name
+    # the affected tables, they do not re-cast the summary's verdict. On a
+    # 133-fact estate, scoring them would give this one point 126 votes out of
+    # ~375 rows and would penalise a large estate over a small one with the same
+    # proportion of gaps.
+    for name in sorted(set(facts) - declared):
+        verdicts.append(note(
+            "No declared relationship - neither a Warehouse FK constraint nor a "
+            "semantic-model relationship, so nothing machine-readable states how this "
+            "table joins to its dimensions",
+            obj=name,
+        ))
+    return verdicts
 
 
 @check(
     id="WS-STATS-STRATEGY", ref="4.4.6",
     title="Statistics maintenance strategy is defined and automated",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=TABLE_LAYERS, requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS], required=True,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=TABLE_LAYERS,
+    requires=[Resource.ITEMS, Resource.PIPELINE_DEFINITIONS, Resource.TABLE_SCHEMAS],
+    required=True,
 )
-def stats_strategy_defined(ctx: CheckContext) -> Verdict:
-    """A statistics-maintenance strategy is defined and automated.
+def stats_strategy_defined(ctx: CheckContext) -> list[Verdict]:
+    """Statistics exist, and nothing has disabled their automatic maintenance.
 
-    Three sources of evidence, strongest first: statistics objects the Warehouse
-    actually holds (``sys.stats``, counted per table during the crawl), stored
-    procedures that maintain them, and pipeline Script activities that run
-    ``UPDATE STATISTICS``. The first is structural - it says statistics exist,
-    not merely that some code mentions them.
+    **Fabric maintains statistics itself, so "no manual strategy" is not a
+    finding.** The engine *"automatically creates those statistics if they don't
+    already exist"* whenever the optimizer needs them, and *"if the query engine
+    determines that existing statistics relevant to query no longer accurately
+    reflect the data, those statistics are automatically refreshed"*
+    (``learn.microsoft.com/fabric/data-warehouse/statistics``). Proactive refresh
+    is *"enabled by default"*. This applies to the SQL analytics endpoint as well
+    as the Warehouse.
+
+    An earlier version scored a workspace down for having no pipeline or stored
+    procedure running ``UPDATE STATISTICS``. On Fabric that is the normal,
+    correct configuration, so the check reported a gap that no longer exists.
+
+    **But passing on the strength of that alone would be an assumption, not an
+    audit.** ``sys.stats.no_recompute`` is the one readable setting that turns the
+    automatic refresh *off* for a statistics object - a deliberate act, and the
+    only way an estate genuinely ends up with stale statistics on Fabric. The
+    crawl now reads it, so this check verifies that nothing has been disabled
+    rather than trusting that the platform is doing its job.
+
+    **Pre-warming earns credit, never a requirement.** Microsoft documents one
+    residual use for manual statistics: running them *"if there's a large enough
+    window between your table transformations and your query workload"*, which
+    removes first-query latency after a batch load.
+
+    **What it cannot determine.** Whether a given statistic is *accurate*, or
+    whether a heavily-queried table would benefit from pre-warming. A table with
+    no statistics is expected rather than a gap - they are created on first
+    query.
     """
     if not ctx.workspace.has(Resource.ITEMS):
-        return not_applicable("Workspace items could not be read from Fabric")
+        return [not_applicable("Workspace items could not be read from Fabric")]
 
-    storage_items = [item for item in ctx.workspace.items if item.type in {"Warehouse", "Lakehouse"}]
+    storage_items = [item for item in ctx.workspace.items
+                     if item.type in {"Warehouse", "Lakehouse"}]
     if not storage_items:
-        return not_applicable("No Warehouse/Lakehouse items found in this workspace")
+        return [not_applicable("No Warehouse/Lakehouse items found in this workspace")]
 
-    inspectable = 0
-    automated = 0
-    opaque = 0
+    tables = ctx.workspace.tables or {}
+    options = ctx.workspace.warehouse_options or {}
+    if not tables and not options:
+        return [not_applicable(
+            "Neither the tables a store holds nor its database options could be read, "
+            "so statistics handling is not assessable. " + _SQL_PERMISSION_HINT
+        )]
 
-    if ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
-        for _, pipeline_def in (ctx.workspace.pipelines or {}).items():
-            for activity in pipeline_activities(pipeline_def):
-                activity_type = str(activity.get("type", "") or "")
-                if activity_type == "Script":
-                    text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
-                    if _STATS_UPDATE_SQL.search(text):
-                        inspectable += 1
-                        automated += 1
-                    elif _WAREHOUSE_SQL_LOAD.search(text):
-                        inspectable += 1
-                    continue
+    with_stats = sum(1 for table in tables.values() if table.get("statistics"))
 
-                if activity_type in ("Copy", "SqlServerStoredProcedure", "StoredProcedure"):
-                    opaque += 1
-
-    # Stored procedures that load data: do they maintain statistics too?
-    for routine in ctx.workspace.sql_routines:
-        text = str(routine.get("definition") or "")
-        if _STATS_UPDATE_SQL.search(text):
-            inspectable += 1
-            automated += 1
-        elif _WAREHOUSE_SQL_LOAD.search(text):
-            inspectable += 1
-
-    # Statistics the Warehouse actually holds - the structural signal.
-    tables_with_stats = sum(
-        1 for table in (ctx.workspace.tables or {}).values()
-        if table.get("statistics")
+    # The genuinely auditable setting. Fabric maintains statistics itself, so no
+    # manual schedule is required - but a user can switch that automatic
+    # behaviour off, and Microsoft says OFF "can cause suboptimal query plans and
+    # degraded query performance". `None` means unreadable, never "off".
+    auto_off = sorted(
+        store for store, opts in options.items()
+        if opts.get("auto_create_stats") is False or opts.get("auto_update_stats") is False
+    )
+    checked = sorted(
+        store for store, opts in options.items()
+        if opts.get("auto_create_stats") is not None or opts.get("auto_update_stats") is not None
     )
 
-    if inspectable == 0:
-        if tables_with_stats:
-            return note(
-                f"No load automation could be inspected for a statistics strategy, but "
-                f"{tables_with_stats} table(s) carry statistics objects, so statistics "
-                f"exist even though nothing readable maintains them on a schedule"
-            )
-        if opaque:
-            return not_applicable(
-                f"{opaque} load activity/activities run through a Copy or stored "
-                "procedure whose SQL is not in this snapshot, and no Warehouse "
-                "routine was readable, so a statistics strategy cannot be verified. "
-                + _SQL_PERMISSION_HINT
-            )
-        return not_applicable("No readable storage-load automation was found to evaluate statistics strategy")
+    prewarming: list[str] = []
+    if ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        for name, pipeline_def in (ctx.workspace.pipelines or {}).items():
+            for activity in pipeline_activities(pipeline_def):
+                if str(activity.get("type", "") or "") != "Script":
+                    continue
+                text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
+                if _STATS_UPDATE_SQL.search(text):
+                    prewarming.append(name)
+                    break
+    for routine in ctx.workspace.sql_routines:
+        if _STATS_UPDATE_SQL.search(str(routine.get("definition") or "")):
+            prewarming.append(str(routine.get("name") or "stored procedure"))
 
-    evidence = (f"{automated} of {inspectable} readable load automation step(s) include "
-                f"statistics maintenance")
-    if tables_with_stats:
-        evidence += f"; {tables_with_stats} table(s) carry statistics objects"
-    return covered(automated, inspectable, evidence,
-                   obj="readable load automation steps")
+    engine = ("Fabric creates and refreshes statistics automatically at query time "
+              "(incremental and proactive refresh are on by default), so no manual "
+              "maintenance schedule is required")
 
+    if auto_off:
+        verdicts: list[Verdict] = [covered(
+            len(checked) - len(auto_off), max(len(checked), 1),
+            f"{len(auto_off)} store(s) have AUTO_CREATE_STATISTICS or "
+            f"AUTO_UPDATE_STATISTICS switched OFF ({_named(auto_off)}). That disables the "
+            f"automatic maintenance Fabric otherwise performs, and Microsoft documents the "
+            f"OFF state as causing suboptimal query plans and degraded query performance",
+        )]
+        for store in auto_off:
+            verdicts.append(note(
+                "Automatic statistics creation or update is switched off for this store "
+                "(ALTER DATABASE ... SET AUTO_CREATE_STATISTICS / AUTO_UPDATE_STATISTICS "
+                "OFF), so query plans will be built from missing or stale histograms",
+                obj=store,
+            ))
+        return verdicts
+
+    verified = (f", and automatic statistics are confirmed ON for all {len(checked)} "
+                f"readable store(s)" if checked else
+                ". The database options that would disable it could not be read for any "
+                "store, so that half is unverified")
+
+    if prewarming:
+        return [graded(
+            3,
+            f"{engine}{verified}. {len(prewarming)} load step(s) additionally pre-warm "
+            f"statistics ({_named(sorted(set(prewarming)))}), removing first-query latency "
+            f"after a batch load - the one case Microsoft still documents for manual "
+            f"CREATE/UPDATE STATISTICS"
+            + (f". {with_stats} table(s) already carry statistics objects"
+               if with_stats else ""),
+        )]
+
+    return [graded(
+        3,
+        f"{engine}{verified}. {with_stats} of {len(tables)} readable table(s) already "
+        f"carry statistics objects; the rest acquire them on first query. No load step "
+        f"pre-warms statistics, which is optional - it only removes first-query latency "
+        f"after a batch load",
+    )]
 @check(
     id="TB-DATEDIM", ref="4.5.7", title="Date/Time dimension exists with all required attributes (fiscal periods, quarter, holidays)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.ITEMS], required=False,
 )
 def table_date_dimension(ctx: CheckContext) -> Verdict:
@@ -1311,7 +1695,7 @@ def table_date_dimension(ctx: CheckContext) -> Verdict:
 
 @check(
     id="TB-SURROGATE", ref="4.5.6", title="Surrogate keys used for dimension tables (not business keys as PKs in facts)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -1361,7 +1745,7 @@ def table_surrogate_keys(ctx: CheckContext) -> Verdict:
 
 @check(
     id="TB-COL-NAMING", ref="4.2.3", title="Column naming is consistent and self-documenting",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.LOW,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -1421,7 +1805,7 @@ def table_column_naming(ctx: CheckContext) -> Verdict:
 
 @check(
     id="TB-DATATYPES", ref="4.2.4", title="Data types are appropriate (no stringly-typed dates, no oversized varchars)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -1576,7 +1960,7 @@ def _shadow_reason(conn: dict) -> str | None:
 @check(
     id="WS-SHORTCUT-SCOPE", ref="4.1.2",
     title="OneLake used as the single data lake â€” no ungoverned shadow storage",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.SHORTCUTS, Resource.CONNECTIONS], required=False,
 )
 def shortcut_scope(ctx: CheckContext) -> Verdict:
@@ -1689,23 +2073,26 @@ def _scd2_roles(table: dict) -> dict[str, str]:
 
 @check(
     id="TB-SCD2", ref="4.5.9", title="SCD Type 2 includes valid_from, valid_to, and is_current flag correctly maintained (where used)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
 def table_scd2(ctx: CheckContext) -> Verdict:
-    """Slowly-changing dimensions carry a start date, an end date, and a current flag.
+    """A slowly-changing dimension carries a start date, an end date, and a current flag.
 
-    **Judged by role, not by exact name.** The point names
-    ``valid_from``/``valid_to``/``is_current``, but an estate spelling them
-    ``effective_date``/``end_date``/``active_flag`` is implementing the same
+    **Judged by column-role pattern, not by name — across every table.** The
+    point names ``valid_from``/``valid_to``/``is_current``, but an estate spelling
+    them ``effective_date``/``end_date``/``active_flag`` is implementing the same
     pattern and must be scored on whether the *trio is complete*, not on whether
-    it picked the same words. Requiring the canonical spelling reported "no SCD2
-    dimensions" on an estate with dozens of them - a false N/A that hid both the
-    working implementation and its inconsistent naming.
+    it picked the same words. And SCD2 history tables are not always the ones a
+    model or a name calls a "dimension" - on a real estate they are Silver tables
+    the role classifier reads as unknown/fact - so restricting the scan to
+    dimension-role tables reported "no SCD2" on an estate full of it. This scans
+    every table that has column metadata.
 
-    A table counts as an SCD2 candidate once it carries **two** of the three
-    roles: one date alone is an ordinary business date, not row versioning.
+    A table is an SCD2 candidate once it carries a **current-flag** role plus at
+    least one validity date: a bare start/end date pair with no current indicator
+    is an ordinary validity period (a price, a rate), not row versioning.
 
     **What it cannot determine.** Whether ``valid_to`` is actually maintained on
     supersede, or whether exactly one row per key is flagged current - that needs
@@ -1713,26 +2100,19 @@ def table_scd2(ctx: CheckContext) -> Verdict:
     """
     if not ctx.workspace.tables:
         return not_applicable(_NO_TABLES)
-    dims = {n: t for n, t in dimensions_in(ctx.workspace.tables, _models(ctx)).items()
-            if columns(t)}
-    if not dims:
-        # Distinguish "no columns to look at" from "columns read, no SCD2 here":
-        # the reason string is the whole value of an N/A.
-        readable = sum(1 for t in ctx.workspace.tables.values() if columns(t))
-        if readable:
-            return not_applicable(
-                f"Column metadata was read for {readable} table(s) but none is a "
-                f"dimension, so there is no slowly-changing dimension to assess"
-            )
-        return not_applicable(_NO_DIMS)
+    tabled = {n: t for n, t in ctx.workspace.tables.items() if columns(t)}
+    if not tabled:
+        return not_applicable(_NO_COLS)
 
-    candidates = {n: _scd2_roles(t) for n, t in dims.items()}
-    candidates = {n: roles for n, roles in candidates.items() if len(roles) >= 2}
+    candidates = {n: _scd2_roles(t) for n, t in tabled.items()}
+    candidates = {n: r for n, r in candidates.items() if r.get("flag") and len(r) >= 2}
     if not candidates:
+        # The columns *were* read (so this is not a permission gap) - there is
+        # simply no SCD2 pattern. The reason string is the whole value of an N/A.
         return not_applicable(
-            f"Column metadata was read for all {len(dims)} dimension(s), and none "
-            f"carries a start-date / end-date / current-flag trio, so no dimension "
-            f"is versioned as SCD Type 2"
+            f"Column metadata was read for {len(tabled)} table(s), but none carries an "
+            f"SCD2 start-date / end-date / current-flag pattern, so no table is "
+            f"versioned as SCD Type 2"
         )
 
     complete = {n: r for n, r in candidates.items() if len(r) == 3}
@@ -1743,7 +2123,7 @@ def table_scd2(ctx: CheckContext) -> Verdict:
     })
 
     evidence = (
-        f"{len(complete)} of {len(candidates)} SCD2 dimension(s) carry the full "
+        f"{len(complete)} of {len(candidates)} SCD2 table(s) carry the full "
         f"start-date / end-date / current-flag trio"
     )
     if incomplete:
@@ -1781,7 +2161,7 @@ _NO_STORE = (
 @check(
     id="TB-WH-MODELED", ref="1.2.6",
     title="Gold Warehouse is consumption-ready and modeled (star schema) for the semantic layer",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=True,
 )
 def warehouse_is_modeled(ctx: CheckContext) -> Verdict:
@@ -1842,7 +2222,7 @@ def warehouse_is_modeled(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-AUDIT-SEPARATED", ref="1.2.8",
     title="Audit Tables role clearly defined and separated from business data",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -1918,7 +2298,7 @@ def _sample(names: list[str], limit: int = 3) -> str:
 @check(
     id="TB-CONFORMED-DIM", ref="4.4.9",
     title="Cross-domain conformed dimensions shared, not duplicated per domain",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS], required=False,
 )
 def conformed_dimensions(ctx: CheckContext) -> Verdict:
@@ -1987,7 +2367,7 @@ def conformed_dimensions(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-FACT-PURITY", ref="4.5.3",
     title="Fact tables contain only foreign keys and measures (no descriptive attributes)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -2039,7 +2419,7 @@ def fact_tables_have_no_descriptive_attributes(ctx: CheckContext) -> Verdict:
 @check(
     id="TB-DIM-DENORM", ref="4.5.4",
     title="Dimension tables are denormalized appropriately (star over snowflake unless justified)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -2103,43 +2483,175 @@ def dimensions_are_denormalized(ctx: CheckContext) -> Verdict:
 #: ``is_active``/``is_deleted`` are excluded for the same reason â€” they are
 #: business state flags. A row being active says nothing about whether its
 #: history is versioned.
-_SCD_MARKERS: frozenset[str] = frozenset({
-    "valid_from", "valid_to", "validfrom", "validto", "valid_until", "validuntil",
-    "effective_from", "effective_to", "effectivefrom", "effectiveto",
-    "effective_start_date", "effective_end_date",
-    "row_effective_date", "row_expiry_date", "record_start_date", "record_end_date",
-    "is_current", "iscurrent", "current_flag", "currentflag", "current_ind",
-    "row_hash", "rowhash", "hash_diff", "hashdiff", "row_version", "rowversion",
-    "record_version", "scd_type", "scdtype",
+#: Columns that mark the *start* of a row version. Vocabulary drawn from the
+#: frameworks that actually generate these columns: dbt snapshots
+#: (``dbt_valid_from``), Data Vault 2.0 (``load_date``), SQL Server temporal
+#: tables (``SysStartTime``), and Microsoft's own ADF/Synapse SCD-2 data flow,
+#: which uses ``StartDate``/``EndDate``/``IsActive``
+#: (``learn.microsoft.com/azure/data-factory/data-flow-scd-type-2``).
+_SCD_START_MARKERS: frozenset[str] = frozenset({
+    "valid_from", "validfrom", "valid_start_date", "dbt_valid_from",
+    "effective_from", "effectivefrom", "effective_start_date",
+    "row_effective_date", "record_start_date", "dw_valid_from", "dw_start_date",
+    "load_date", "load_dts", "sysstarttime", "sys_start_time",
+    "meta_valid_from", "_scd_start_date", "__start_at",
 })
+
+#: Names that *may* be row-versioning columns but are far more often ordinary
+#: business attributes: a contract term, a promotion window, an employee's
+#: tenure, a product revision. ``is_audit_column`` already refuses to read
+#: ``start_date`` as lineage metadata for exactly this reason, and the
+#: vocabularies must agree - a dimension holding a business date range is not
+#: thereby a Type 2 dimension.
+#:
+#: They count only alongside a current-row flag. That combination is Microsoft's
+#: own ADF/Synapse SCD-2 output (``StartDate``/``EndDate``/``IsActive``) and is
+#: not a shape a business date range takes: a contract term does not carry
+#: ``is_current``.
+_SCD_START_AMBIGUOUS: frozenset[str] = frozenset({
+    "start_date", "startdate", "start_dt", "begin_date", "begin_dt",
+    "effective_date", "effectivedate", "eff_date", "eff_dt",
+})
+
+#: Columns that mark the *end* of a row version - the half most often missing.
+_SCD_END_MARKERS: frozenset[str] = frozenset({
+    "valid_to", "validto", "valid_until", "validuntil", "dbt_valid_to",
+    "expiry_date", "expiration_date",
+    "row_expiry_date", "row_expiration_date", "record_end_date",
+    "effective_to", "effectiveto", "effective_end_date",
+    "thru_date", "through_date", "dw_valid_to", "dw_end_date",
+    "load_end_date", "load_end_dts", "sysendtime", "sys_end_time",
+    "meta_valid_to", "_scd_end_date", "__end_at",
+})
+
+#: The end-date counterparts to ``_SCD_START_AMBIGUOUS`` - same reasoning.
+_SCD_END_AMBIGUOUS: frozenset[str] = frozenset({
+    "end_date", "enddate", "end_dt", "finish_date", "finish_dt",
+})
+
+#: A convenience flag. On its own it proves nothing - ``is_active`` is just as
+#: likely to be a soft-delete marker - so it never establishes SCD 2 alone.
+_SCD_FLAG_MARKERS: frozenset[str] = frozenset({
+    "is_current", "iscurrent", "current_flag", "currentflag", "curr_flag",
+    "current_ind", "current_indicator", "current_record_flag", "is_current_record",
+    "active_flag", "activeflag", "is_active", "isactive", "active_ind",
+    "is_latest", "islatest", "latest_flag", "dw_is_current", "row_is_current",
+})
+
+#: A monotonic version is the documented alternative to an end date: paired with
+#: a start date it identifies which row supersedes which.
+_SCD_VERSION_MARKERS: frozenset[str] = frozenset({
+    "version", "version_number", "row_version", "rowversion",
+    "record_version", "scd_version", "revision",
+})
+
+#: Change-detection hashes. Evidence of *how* changes are spotted, never of row
+#: versioning itself - a hash column alone is as likely to be deduplication.
+_SCD_HASH_MARKERS: frozenset[str] = frozenset({
+    "row_hash", "rowhash", "record_hash", "hash_diff", "hashdiff",
+    "dbt_scd_id", "checksum", "change_hash", "delta_hash",
+})
+
+#: Type 3 keeps the prior value in a second column beside the current one.
+_SCD3_PREVIOUS = re.compile(
+    r"^(?:prev|previous|prior|old|former|original)[_-]\w+"
+    r"|\w+[_-](?:prev|previous|prior|old|former|original)$",
+    re.IGNORECASE,
+)
+
+
+def _scd_shape(table: dict) -> str:
+    """Classify one dimension's SCD implementation from its column names.
+
+    Returns ``"complete"``, ``"incomplete"``, ``"type3"`` or ``"none"``.
+
+    **The rule follows Kimball.** Design Tip #107 names three metadata columns
+    for Type 2 - row effective date, row expiry date, current row indicator -
+    and the validity *pair* is what makes row versioning work: a start date says
+    when a version began, an end date says when it was superseded. A version
+    number or a change hash is the documented alternative machinery.
+
+    A lone current flag is deliberately **not** enough. ``is_active`` is just as
+    likely to be a soft-delete marker, and a flag with no validity window cannot
+    say which row was current *when* - which is the entire point of Type 2.
+
+    Ambiguous business names (``start_date``, ``end_date``) count only when a
+    current-row flag sits beside them: that combination is Microsoft's own
+    ADF/Synapse SCD-2 output, and is not a shape a contract term ever takes.
+
+    Validity columns must also carry a temporal *type*. ``valid_from int`` is
+    not a date whatever it is called. Columns with no readable type stay
+    eligible - an absent type is not evidence against.
+    """
+    names = {c.replace(" ", "").replace("-", "_").lower() for c in col_names(table)}
+    # A validity column must be able to hold a point in time. `valid_from int`
+    # or `start_date varchar` is not a date, whatever it is called - a free
+    # filter against a false positive, using type data already in the snapshot.
+    # Columns whose type is unreadable stay eligible: an absent type is not
+    # evidence against, and this check must not degrade on a partial crawl.
+    dated = {
+        (c.get("name") or "").replace(" ", "").replace("-", "_").lower()
+        for c in columns(table)
+        if not column_type(c) or is_timestamp_column(c)
+    }
+    has_flag = bool(names & _SCD_FLAG_MARKERS)
+    has_start = bool(dated & _SCD_START_MARKERS) or (
+        has_flag and bool(dated & _SCD_START_AMBIGUOUS))
+    has_end = bool(dated & _SCD_END_MARKERS) or (
+        has_flag and bool(dated & _SCD_END_AMBIGUOUS))
+    has_version = bool(names & _SCD_VERSION_MARKERS)
+    has_hash = bool(names & _SCD_HASH_MARKERS)
+
+    if has_start and (has_end or has_version):
+        return "complete"
+    # A change hash is unambiguous SCD machinery - no business column is called
+    # ``hash_diff`` - so it stands on its own as a declared change-handling
+    # strategy, even though it versions nothing by itself.
+    if has_hash:
+        return "complete"
+    if has_start or has_end or has_flag or has_version:
+        return "incomplete"
+    if sum(1 for name in names if _SCD3_PREVIOUS.match(name)) >= 2:
+        return "type3"
+    return "none"
 
 
 @check(
     id="TB-SCD-STRATEGY", ref="4.5.8",
     title="SCD strategy defined and implemented per dimension (Type 1 / Type 2 / Hybrid)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
 def scd_strategy_per_dimension(ctx: CheckContext) -> Verdict:
-    """Each dimension shows a declared change-handling strategy in its schema.
+    """Each dimension's change-handling strategy is evident, and *complete*.
 
-    **What it can determine.** Whether a dimension carries Type-2/hybrid markers
-    (validity dates, a current flag, a row hash, a version) â€” the only schema
-    evidence that a strategy was *chosen* per dimension.
+    **What counts as complete.** Kimball's Type 2 needs a validity *pair* - a
+    start date plus either an end date or a version number - because that is
+    what says which row was current at a given time. Microsoft's own ADF/Synapse
+    SCD-2 data flow generates exactly that shape (``StartDate`` / ``EndDate`` /
+    ``IsActive``), as do dbt snapshots (``dbt_valid_from`` / ``dbt_valid_to``)
+    and SQL Server temporal tables (``SysStartTime`` / ``SysEndTime``).
 
-    **What it cannot.** Whether an overwrite-in-place (Type 1) dimension was a
-    deliberate decision or an unexamined default: both look identical in the
-    schema. Type 1 is a legitimate strategy, so a dimension with no markers is
-    never a hard FAIL. The bands reflect exactly that: **3** when every dimension
-    declares its handling in the schema, **2** when some do (the estate knows the
-    pattern and applied it where needed), and **1** â€” partial, not zero â€” when
-    none do, because the tables may all be correctly Type 1 with the decision
-    recorded somewhere this check cannot read.
+    **Why a lone flag is not enough.** An earlier version accepted *any single*
+    marker, so a dimension carrying only ``is_current`` scored as a declared
+    strategy - and an estate where every dimension looked like that scored a
+    full pass. That is the broken half-implementation the point warns about:
+    ``is_active`` is as often a soft-delete marker, and without dates nothing
+    records *when* a row was current. Those now score as incomplete.
 
-    Broader than ``TB-SCD2`` (ref 4.5.9), which asks only whether dimensions
-    *already identified as Type 2* carry the full valid_from/valid_to/is_current
-    triple. This one asks whether any strategy is evident at all.
+    **Type 1 is legitimate, so it is never a hard failure.** A dimension with no
+    markers may be a deliberate overwrite-in-place with the decision recorded
+    somewhere unreadable. The floor is 1, not 0.
+
+    **What it cannot determine.** Whether the ETL actually maintains the
+    columns, whether the flag stays in sync with the dates, or whether Type 1
+    was chosen rather than defaulted into. Column names show declared *intent*,
+    never operational correctness.
+
+    Broader than ``TB-SCD2`` (ref 4.5.9), which asks whether dimensions already
+    identified as Type 2 carry the full trio. This asks which strategy - if
+    any - each dimension declares.
     """
     tables = ctx.workspace.tables
     if not tables:
@@ -2148,43 +2660,69 @@ def scd_strategy_per_dimension(ctx: CheckContext) -> Verdict:
     if not dims:
         return not_applicable(_NO_DIMS)
 
-    declared = [n for n, t in dims.items()
-                if any(c.replace(" ", "") in _SCD_MARKERS for c in col_names(t))]
-    if len(declared) == len(dims):
+    shapes = {name: _scd_shape(table) for name, table in dims.items()}
+    complete = sorted(n for n, s in shapes.items() if s == "complete")
+    incomplete = sorted(n for n, s in shapes.items() if s == "incomplete")
+    type3 = sorted(n for n, s in shapes.items() if s == "type3")
+    plain = sorted(n for n, s in shapes.items() if s == "none")
+    declared = complete + type3
+
+    detail = ""
+    if incomplete:
+        detail = (
+            f". {len(incomplete)} carry a partial marker set "
+            f"({', '.join(incomplete[:4])}) - a current flag with no validity dates, "
+            f"or a start date with no end date or version, cannot record which row "
+            f"was current when, so row versioning is not demonstrated"
+        )
+
+    if declared and not incomplete and not plain:
         return graded(
             3,
-            f"All {len(dims)} dimension(s) declare their change handling in the schema "
-            f"(validity dates, current flag, row hash or version)",
+            f"All {len(dims)} dimension(s) declare a complete change-handling strategy "
+            f"({len(complete)} with a validity pair, {len(type3)} keeping previous "
+            f"values)",
         )
     if declared:
         return graded(
             2,
-            f"{len(declared)} of {len(dims)} dimension(s) declare an SCD strategy "
-            f"({', '.join(sorted(declared)[:4])}); the rest overwrite in place (Type 1 "
-            f"by default), which may be correct but is not evident in the schema",
+            f"{len(declared)} of {len(dims)} dimension(s) declare a complete SCD "
+            f"strategy ({', '.join(declared[:4])}); {len(plain)} overwrite in place "
+            f"(Type 1 by default), which may be correct but is not evident in the "
+            f"schema{detail}",
+        )
+    if incomplete:
+        return graded(
+            1,
+            f"None of the {len(dims)} dimension(s) declares a complete SCD strategy"
+            f"{detail}. Confirm whether row history is genuinely tracked",
         )
     return graded(
         1,
-        f"None of the {len(dims)} dimension(s) carry SCD markers â€” all are Type 1 by "
+        f"None of the {len(dims)} dimension(s) carry SCD markers - all are Type 1 by "
         f"default. That is a legitimate strategy, but no schema evidence shows it was "
         f"chosen per dimension; confirm and record the decision",
     )
 
 
 # =============================================================================
-# 4.5.2 â€” fact grain, and 4.5.11 â€” degenerate / junk dimension candidates
+# 4.5.2 — fact grain, and 4.5.11 — degenerate / junk dimension candidates
 #
-# Both points are only *partly* readable, and the two halves are named in each
+# Both points are only *partly* readable, and the limit is named in each
 # docstring rather than blurred:
 #
 # * 4.5.2 asks for a grain that is "clearly defined **and documented**". No
 #   Fabric REST call and no SQL analytics endpoint query returns a table
-#   description, an extended property or a column comment, so the documented
-#   half is out of reach entirely. Only the "clearly defined" half is scored.
+#   description, an extended property or a column comment (verified against the
+#   Fabric T-SQL surface area and the Lakehouse List Tables reference), so the
+#   documented half is out of reach entirely. Only the "clearly defined" half is
+#   scored.
 # * 4.5.11 asks for degenerate/junk dimensions "where appropriate". Whether a
 #   modelling choice is appropriate is a judgement, and the deciding fact
-#   (cardinality) needs row data, which this tool must not fetch. That point is
-#   therefore reported as an unscored note listing candidates for review.
+#   (cardinality) needs row data this tool must not fetch. The *detection* is
+#   still factual - a key resolving to no dimension is a readable gap - so the
+#   check scores the share of facts free of those shapes and names the rest as
+#   candidates for review.
 # =============================================================================
 
 #: A grain needs at least this many independent components to be identifiable
@@ -2223,7 +2761,7 @@ def _grain_components(name: str, table: dict) -> set[tuple[str, ...]]:
 @check(
     id="TB-FACT-GRAIN", ref="4.5.2",
     title="Fact table grain clearly defined and documented for each fact table",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -2279,10 +2817,13 @@ def fact_grain_is_identifiable(ctx: CheckContext) -> Verdict:
     )
 
 
-#: Column names that read as a low-cardinality flag or indicator â€” the kind of
+#: Column names that read as a low-cardinality flag or indicator - the kind of
 #: attribute a junk dimension is built to collapse. Matched on the whole
 #: (lower-cased) name so ``is_active``, ``paid_flag`` and ``order_status`` count
 #: while ``flag_description`` does not.
+#:
+#: Split into two confidences, because they behave differently against real
+#: schemas. See ``_UNAMBIGUOUS_FLAG`` below.
 _FLAG_COLUMN = re.compile(
     r"^(?:is|has|can|was|are)_\w+$|"
     r"^\w+_(?:flag|flg|ind|indicator|status|type|code|category|reason)$|"
@@ -2290,8 +2831,47 @@ _FLAG_COLUMN = re.compile(
     re.IGNORECASE,
 )
 
+#: The half of the pattern that is unambiguous on its own. Nobody names a
+#: comment field ``is_active`` or a description ``paid_flag`` - the ``is_``/
+#: ``has_`` prefix and the ``_flag``/``_ind`` suffix state the column's shape
+#: in the name itself.
+#:
+#: **Why the distinction earns its place.** The junk half also requires the
+#: declared type to look narrow, so a ``rejection_reason varchar(500)`` cannot
+#: pass on its name alone. But Lakehouse Delta tables usually declare a bare
+#: ``string`` with no width, and requiring a width there silenced the check
+#: completely: on a real estate every one of 51 findings disappeared, including
+#: genuine ones like ``store_and_fwd_flag``. Trading 51 false positives for zero
+#: findings is not an improvement.
+#:
+#: So these names are trusted without a width, and the vaguer suffixes -
+#: ``_type``, ``_status``, ``_code``, ``_category``, ``_reason``, which are the
+#: ones that actually caused the false positives - still need the type to agree.
+_UNAMBIGUOUS_FLAG = re.compile(
+    r"^(?:is|has|can|was|are)_\w+$|"
+    r"^\w+_(?:flag|flg|ind|indicator)$|"
+    r"^(?:flag|indicator)$",
+    re.IGNORECASE,
+)
+
+
+def _is_junk_candidate(column: dict) -> bool:
+    """True when a column is plausibly a junk-dimension input.
+
+    An unambiguous flag name stands alone. A vaguer suffix needs the declared
+    type to be narrow as well - or to be absent, since an unreadable type is
+    not evidence against a column.
+    """
+    name = (column.get("name") or "").strip()
+    if not _FLAG_COLUMN.match(name):
+        return False
+    if _UNAMBIGUOUS_FLAG.match(name):
+        return True
+    return not column_type(column) or is_low_cardinality_shape(column)
+
+
 #: Below this many flag columns on one fact, collapsing them into a junk
-#: dimension buys nothing â€” the pattern exists to remove *several* low-value
+#: dimension buys nothing - the pattern exists to remove *several* low-value
 #: columns, not one.
 _MIN_JUNK_CANDIDATES = 3
 
@@ -2299,37 +2879,59 @@ _MIN_JUNK_CANDIDATES = 3
 @check(
     id="TB-DEGENERATE-JUNK-DIM", ref="4.5.11",
     title="Degenerate and junk dimensions used where appropriate",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.LOW,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
 def degenerate_and_junk_dimension_candidates(ctx: CheckContext) -> Verdict:
-    """Report fact columns shaped like a degenerate or junk dimension â€” unscored, for review.
-
-    **Deliberately unscored (a `note`).** The point says "where appropriate", and
-    appropriateness is a modelling judgement no API can make: a degenerate
-    dimension is *correct* when an order number genuinely has no attributes of
-    its own, and *wrong* when the attributes exist and were simply never
-    modelled. The deciding fact for a junk dimension â€” column cardinality â€” needs
-    row data, which this tool must not fetch. Scoring either way would be a
-    guess, so this reports the candidates and names them instead.
+    """Fact tables carry no unmodelled key or uncollapsed flag cluster.
 
     **What it can determine.** *Degenerate candidates*: key-shaped columns on a
     fact table whose referent matches no dimension table in this workspace and is
     not the fact's own identity (``order_number`` on ``fact_sales`` with no
-    ``dim_order``) â€” the exact shape of a degenerate dimension. *Junk
+    ``dim_order``) - the exact shape of a degenerate dimension. *Junk
     candidates*: three or more flag/indicator/status-shaped columns on one fact,
     the cluster a junk dimension exists to collapse.
 
-    **What it cannot.** Column cardinality (no row data is read), whether the
-    referenced dimension lives in another workspace, whether a degenerate column
-    is intentional, or whether an existing junk dimension is already in use
-    somewhere it cannot see. Every name below is a *candidate for review*, never
-    a finding.
+    **Declared relationships outrank the name test.** A column that participates
+    in a semantic-model relationship is *stated* by the modeller to resolve to
+    another table, so it is never reported as unmodelled - whatever it is called.
+    Only columns with no declared relationship fall through to the name-based
+    test. That turns the strongest half of this check from an inference into a
+    fact the estate itself asserts, and removes the false positives from
+    dimensions whose names do not resemble their foreign keys.
+
+    **Declared types constrain the vaguer half of the junk test.** A junk
+    dimension collapses *low-cardinality* columns. An unambiguous flag name -
+    ``is_returned``, ``store_and_fwd_flag`` - is trusted on its own, because
+    nobody names a comment field that way. A vaguer suffix (``_type``,
+    ``_status``, ``_code``, ``_category``, ``_reason``) also needs its declared
+    type to look narrow, so ``rejection_reason varchar(500)`` no longer counts.
+    Columns whose type is unreadable are kept: an unreadable type is not
+    evidence against. The split matters because Lakehouse Delta tables usually
+    declare a bare ``string`` with no width; requiring a width everywhere
+    silenced this half of the check entirely on a real estate.
+
+    **Scored on the share of fact tables that are clean.** An earlier version
+    reported the candidates as an unscored ``note``, reasoning that "where
+    appropriate" is a modelling judgement. It is - but the *detection* is not:
+    a key that resolves to no dimension is a readable, factual gap in the model,
+    and reporting it as INFO meant accurate findings never influenced anything.
+    The verdict now scores how many facts are free of these shapes; the named
+    candidates remain what a reviewer confirms.
+
+    **What it cannot.** Column cardinality (no row data is read - the type is a
+    shape proxy), whether the referenced dimension lives in another workspace,
+    whether a degenerate column is intentional, or whether an existing junk
+    dimension is already in use somewhere it cannot see. Where no semantic model
+    is readable there are no declared relationships, and the check falls back
+    entirely to names - a Bronze/landing workspace gets the weaker test, and the
+    evidence says so. A named table is a *candidate for review*: the check
+    reports the shape, not the intent.
 
     **Sibling.** ``TB-FACT-PURITY`` (ref 4.5.3) scores *text* attributes on a
     fact that belong on a dimension. This looks at key- and flag-shaped columns,
-    which that check deliberately ignores, and judges neither.
+    which that check deliberately ignores.
     """
     tables = ctx.workspace.tables
     if not tables:
@@ -2347,48 +2949,63 @@ def degenerate_and_junk_dimension_candidates(ctx: CheckContext) -> Verdict:
 
     degenerate: list[str] = []
     junk: list[str] = []
+    # A relationship is the modeller declaring that this column resolves to a
+    # dimension. Where one exists the name test is not consulted at all - the
+    # estate has already answered the question the name was being used to guess.
+    modelled = related_columns(_models(ctx))
     for name, table in sorted(facts.items()):
         own = purpose_tokens(name)
+        table_key = normalise_table_name(name)
         orphan_keys = sorted({
             column.get("name") or ""
             for column in columns(table)
             if (referent := key_referent(column.get("name") or ""))
             and referent != own
             and referent not in dimension_purposes
+            and (table_key, normalise_column(column.get("name") or "")) not in modelled
         })
         if orphan_keys:
             degenerate.append(f"{name}: {', '.join(orphan_keys[:4])}")
+        # A junk dimension collapses *low-cardinality* columns. An unambiguous
+        # flag name (`is_*`, `*_flag`) is trusted on its own; a vaguer suffix
+        # (`*_type`, `*_reason`) needs the declared type to agree, because that
+        # is where the false positives came from.
         flags = sorted({
             (column.get("name") or "")
             for column in columns(table)
-            if _FLAG_COLUMN.match((column.get("name") or "").strip())
+            if _is_junk_candidate(column)
         })
         if len(flags) >= _MIN_JUNK_CANDIDATES:
             junk.append(f"{name}: {len(flags)} flag column(s) ({', '.join(flags[:4])})")
 
+    flagged = {entry.split(":")[0] for entry in degenerate} | {entry.split(":")[0] for entry in junk}
+    clean = len(facts) - len(flagged)
+
     if not degenerate and not junk:
-        return note(
-            f"No degenerate or junk dimension candidate found across {len(facts)} fact "
-            f"table(s): every key column resolves to a dimension in this workspace and no "
-            f"fact carries {_MIN_JUNK_CANDIDATES}+ flag/status columns. Whether the "
-            f"existing model uses the patterns *appropriately* is a modelling judgement "
-            f"this check does not make."
+        return covered(
+            len(facts), len(facts),
+            f"All {len(facts)} fact table(s) are free of degenerate/junk dimension "
+            f"candidates: every key column resolves to a dimension in this workspace "
+            f"and no fact carries {_MIN_JUNK_CANDIDATES}+ flag/status columns"
         )
     parts = []
     if degenerate:
         parts.append(
             f"{len(degenerate)} fact table(s) carry a key with no matching dimension "
-            f"(degenerate-dimension candidates) â€” {'; '.join(degenerate[:3])}"
+            f"(degenerate-dimension candidates) - {'; '.join(degenerate[:3])}"
         )
     if junk:
         parts.append(
             f"{len(junk)} fact table(s) carry {_MIN_JUNK_CANDIDATES}+ flag/status columns "
-            f"(junk-dimension candidates) â€” {'; '.join(junk[:3])}"
+            f"(junk-dimension candidates) - {'; '.join(junk[:3])}"
         )
-    return note(
-        "; ".join(parts)
-        + ". Reported for review, not scored: cardinality is not readable without querying "
-          "rows, and whether each pattern is appropriate here is a modelling judgement."
+    return covered(
+        clean, len(facts),
+        f"{clean} of {len(facts)} fact table(s) carry no degenerate or junk dimension "
+        f"candidate. " + "; ".join(parts)
+        + ". Each named table is a candidate for review: cardinality is not readable "
+          "without querying rows, and whether the pattern is appropriate here is a "
+          "modelling judgement this check does not make."
     )
 
 
@@ -2453,7 +3070,7 @@ def _schema_score(schemas: dict[str, int]) -> int:
 @check(
     id="TB-WH-SCHEMAS", ref="4.4.1",
     title="Warehouse schema organization is logical (by domain schema, plus staging schema)",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=True,
 )
@@ -2602,7 +3219,7 @@ def _dominant(styles: list[str]) -> tuple[str, int]:
 @check(
     id="TB-WH-NAME-CONSISTENCY", ref="4.4.2",
     title="Table and column naming conventions are consistent across the Warehouse",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.LOW,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=False,
 )
@@ -2698,7 +3315,7 @@ _MAX_NAMED_SOURCES = 5
 @check(
     id="WS-VIEW-ABSTRACTION", ref="4.4.7",
     title="Views/stored procedures used to abstract the semantic-facing layer from physical tables",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS,
     requires=[Resource.TABLE_SCHEMAS, Resource.PIPELINE_DEFINITIONS,
               Resource.NOTEBOOK_DEFINITIONS],
@@ -2829,13 +3446,60 @@ _DEFAULT_SLA_HOURS = 48
 #: How many stale item names to name in the evidence before summarising.
 _MAX_NAMED_STALE = 5
 
+#: Item types whose run/refresh history Fabric actually records. A Warehouse or
+#: Lakehouse is a *store*, not a job: nothing "runs" it, so ``last_run_utc`` is
+#: never populated for one. A freshness check that reads that field on a
+#: Warehouse is asking for a value the platform does not keep - which is why
+#: this check reported "0 of 6 carry a readable timestamp" on every
+#: Warehouse-based estate, and always would have.
+_RUNNABLE_ITEM_TYPES = frozenset({
+    "DataPipeline", "Notebook", "Dataflow", "SparkJobDefinition", "SemanticModel",
+})
+
+
+def _writes_to(definition: dict, item_ids: set[str]) -> set[str]:
+    """Which of ``item_ids`` a pipeline definition references.
+
+    Read from the **id references the definition already carries** - a Fabric
+    activity names its target store by ``artifactId``/``workspaceId``, not by
+    display name - so this is a fact the pipeline states, not two objects paired
+    because their names look alike.
+    """
+    blob = json.dumps(definition)
+    return {item_id for item_id in item_ids if item_id and item_id in blob}
+
+
+def _store_freshness(ctx: CheckContext, store: Item) -> tuple[str | None, str]:
+    """``(timestamp, source)`` for a store that has no run history of its own.
+
+    A Warehouse is refreshed by whatever loads it, so the newest run of a
+    pipeline or notebook that *references this store by id* is the readable
+    proxy for "when was this data last written". Returns ``(None, "")`` when
+    nothing references it, which the caller must treat as unknown rather than
+    stale.
+    """
+    newest: str | None = None
+    source = ""
+    for item in ctx.workspace.items:
+        if item.type not in {"DataPipeline", "Notebook"} or not item.last_run_utc:
+            continue
+        definition = (ctx.workspace.pipelines or {}).get(item.display_name) \
+            or (ctx.workspace.notebooks or {}).get(item.display_name)
+        if not definition or not _writes_to(definition, {store.id}):
+            continue
+        if newest is None or item.last_run_utc > newest:
+            newest = item.last_run_utc
+            source = item.display_name or item.id
+    return newest, source
+
+
 def _serving_items(ctx: CheckContext) -> list[Item]:
     """The workspace's Gold/serving items.
 
     Every **Warehouse** qualifies by type: a Fabric Warehouse exists to be
     queried by reports, so it *is* the serving surface regardless of what it is
     called. A **Lakehouse** or **SemanticModel** qualifies only when its name
-    carries a serving token â€” a Bronze/Silver lakehouse is not Gold, and nothing
+    carries a serving token - a Bronze/Silver lakehouse is not Gold, and nothing
     else in the item list distinguishes them.
     """
     serving: list[Item] = []
@@ -2852,7 +3516,7 @@ def _serving_items(ctx: CheckContext) -> list[Item]:
 @check(
     id="WS-GOLD-FRESHNESS", ref="5.4.7",
     title="Freshness validation: Gold tables updated within defined SLA",
-    pillar=Pillar.DATA, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=TABLE_LAYERS,
     requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=True,
 )
@@ -2873,11 +3537,21 @@ def gold_items_refreshed_within_sla(ctx: CheckContext) -> Verdict:
     :func:`name_words` splitter.
 
     **What it cannot determine.** This is the item's **last run/refresh**, which
-    is the closest readable proxy for "the Gold *table* was updated" â€” Delta
+    is the closest readable proxy for "the Gold *table* was updated" - Delta
     table commit times are not fetched, so a run that succeeded while writing
     nothing still reads as fresh, and a table updated by a pipeline in another
     workspace reads as stale here. It also cannot read the *agreed* SLA: the
     window is a project setting, not something the tenant publishes.
+
+    **A store carries no run history of its own.** Fabric records
+    ``last_run_utc`` only for runnable items - pipelines, notebooks, dataflows,
+    Spark jobs, semantic models. A Warehouse or Lakehouse is a store, so nothing
+    "runs" it. Reading that field on a Warehouse asked for a value the platform
+    does not keep, and the check reported "0 of 6 carry a readable timestamp" on
+    every Warehouse-based estate - a structural mismatch, not a permission gap.
+    Those stores now take their freshness from the newest run of a pipeline or
+    notebook that **references them by id** in its definition, which is the load
+    that writes them.
 
     **Missing timestamps are excluded, never counted stale.** An item with no
     readable last-run stamp leaves the denominator entirely â€” "we could not read
@@ -2908,13 +3582,28 @@ def gold_items_refreshed_within_sla(ctx: CheckContext) -> Verdict:
             "serving / curated / mart / presentation"
         )
 
-    dated = [(i, parse_stamp(i.last_run_utc)) for i in serving]
-    readable = [(i, stamp) for i, stamp in dated if stamp is not None]
+    dated: list[tuple[Item, object, str]] = []
+    for item in serving:
+        stamp = parse_stamp(item.last_run_utc)
+        source = "its own run/refresh history"
+        if stamp is None and item.type in {"Warehouse", "Lakehouse"}:
+            # A store has no run history of its own - Fabric records that only
+            # for runnable items. The load that writes it does, so use the
+            # newest run of a pipeline/notebook that references this store by id.
+            loader_stamp, loader = _store_freshness(ctx, item)
+            stamp = parse_stamp(loader_stamp)
+            if stamp is not None:
+                source = f"the load that writes it ({loader})"
+        dated.append((item, stamp, source))
+
+    readable = [(i, stamp, source) for i, stamp, source in dated if stamp is not None]
     if not readable:
         return not_applicable(
-            f"None of the {len(serving)} Gold/serving item(s) carries a readable last "
-            "run/refresh timestamp, so how recently they were updated cannot be measured "
-            "â€” unknown recency is never reported as stale"
+            f"None of the {len(serving)} Gold/serving item(s) has a readable last-update "
+            f"time. A Warehouse or Lakehouse carries no run history of its own - Fabric "
+            f"records that only for runnable items - and no pipeline or notebook that "
+            f"writes to them has a readable run either, so how recently they were updated "
+            f"cannot be measured. Unknown recency is never reported as stale"
         )
 
     try:
@@ -2926,16 +3615,21 @@ def gold_items_refreshed_within_sla(ctx: CheckContext) -> Verdict:
     now = datetime.now(timezone.utc)
     stale = sorted(
         item.display_name or item.id
-        for item, stamp in readable
+        for item, stamp, _ in readable
         if (now - stamp).total_seconds() > sla_hours * 3600
     )
+    via_loader = sum(1 for _, _, source in readable if source.startswith("the load"))
     excluded = len(serving) - len(readable)
 
     detail = (
         f"{len(readable) - len(stale)} of {len(readable)} Gold/serving item(s) with a "
-        f"readable last run/refresh were updated within the {sla_hours}h SLA "
+        f"readable last update were refreshed within the {sla_hours}h SLA "
         f"(gold_freshness_sla_hours)"
     )
+    if via_loader:
+        detail += (f"; {via_loader} of those are stores whose freshness was read from the "
+                   f"pipeline/notebook that writes them, since a store has no run history "
+                   f"of its own")
     if stale:
         detail += (f"; stale: {', '.join(stale[:_MAX_NAMED_STALE])}"
                    + (f", â€¦(+{len(stale) - _MAX_NAMED_STALE} more)"

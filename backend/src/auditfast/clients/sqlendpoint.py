@@ -577,9 +577,41 @@ _METADATA_STATEMENTS: tuple[tuple[str, str], ...] = (
         FROM INFORMATION_SCHEMA.ROUTINES
     """),
     # Statistics objects, for the statistics-maintenance checks.
+    #
+    # ``no_recompute`` and ``STATS_DATE`` are what make this an audit rather than
+    # an assumption. Fabric creates and refreshes statistics automatically
+    # (learn.microsoft.com/fabric/data-warehouse/statistics), so the absence of a
+    # manual UPDATE STATISTICS is not a finding - but ``no_recompute = 1``
+    # switches that automatic refresh *off* for a statistics object, which is the
+    # one way an estate genuinely ends up with stale statistics. Without reading
+    # it a check can only assert that the platform is doing its job; with it, the
+    # check can verify that nothing has been disabled.
+    #
+    # ``STATS_DATE`` returns the UTC time of the last refresh (NULL if never), so
+    # the same read also shows whether the automatic maintenance is actually
+    # happening on this estate.
     ("stats", """
-        SELECT object_id, name, auto_created, user_created
+        SELECT object_id, name, auto_created, user_created, no_recompute,
+               STATS_DATE(object_id, stats_id) AS last_updated
         FROM sys.stats
+    """),
+    # The database-level automatic-statistics switches. These are the genuinely
+    # auditable setting: a user CAN turn them off
+    # (learn.microsoft.com/sql/t-sql/statements/alter-database-transact-sql-set-options?view=fabric
+    # lists AUTO_CREATE_STATISTICS and AUTO_UPDATE_STATISTICS in the Fabric
+    # Warehouse syntax), and Microsoft says OFF "can cause suboptimal query plans
+    # and degraded query performance".
+    #
+    # This is the read that lets the statistics checks *verify* rather than
+    # assume. NORECOMPUTE looked like the equivalent signal but Fabric rejects
+    # the option outright - "INCREMENTAL, MAXDOP, SAMPLE x ROWS options, and
+    # filter clause are not supported statistics options" - so no_recompute is
+    # always 0 and proves nothing. sys.dm_db_stats_properties, which would give
+    # modification_counter for real staleness, is not available on Warehouse.
+    ("database_options", """
+        SELECT name, is_auto_create_stats_on, is_auto_update_stats_on,
+               is_auto_update_stats_async_on
+        FROM sys.databases
     """),
     # Database-scoped principals and role membership. Workspace role assignments
     # come from Fabric REST and frequently need a permission the sign-in lacks;
@@ -616,6 +648,19 @@ _WAREHOUSE_METADATA_STATEMENTS: tuple[tuple[str, str], ...] = (
     ("key_constraints", """
         SELECT kc.object_id, kc.parent_object_id, kc.name, kc.type
         FROM sys.key_constraints AS kc
+    """),
+    # IDENTITY columns - Microsoft's documented way to generate a surrogate key
+    # in Fabric Warehouse: "IDENTITY columns enable automatic generation of these
+    # surrogate keys when inserting new rows into a table"
+    # (learn.microsoft.com/fabric/data-warehouse/identity). Reading this turns
+    # "the column is named _sk, so it is probably generated" into a declared
+    # fact. Warehouse only - a Lakehouse Delta table has no IDENTITY concept and
+    # returns nothing, which is why this sits in the Warehouse-only batch.
+    ("identity_columns", """
+        SELECT ic.object_id, c.name
+        FROM sys.identity_columns AS ic
+        INNER JOIN sys.columns AS c
+            ON ic.object_id = c.object_id AND ic.column_id = c.column_id
     """),
 )
 

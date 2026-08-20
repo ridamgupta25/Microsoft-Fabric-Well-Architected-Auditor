@@ -17,7 +17,10 @@ does not change.
 """
 from __future__ import annotations
 
+import os
+import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .check.helpers import EMPTY_REMEDIATION, RemediationBook, Verdict, not_applicable
 from .check.registry import GROUP_REGISTRY, REGISTRY, CheckRegistry, GroupCheckRegistry
@@ -42,6 +45,38 @@ GroupMemberTarget = tuple[str, Layer, int]
 
 #: One project group to audit across: its name and its ordered members.
 GroupTarget = tuple[str, tuple[GroupMemberTarget, ...]]
+
+
+def _resolve_max_parallel_workspaces() -> int:
+    """How many workspaces may be crawled at once, from the environment.
+
+    Clamped to 1..8 so a mis-set value can never unleash an unbounded crawl on
+    the tenant (which would only trigger throttling and run slower).
+    """
+    raw = os.environ.get("AUDITFAST_MAX_PARALLEL_WORKSPACES", "8")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 8
+    return max(1, min(value, 8))
+
+
+#: Upper bound on concurrent workspace crawls.
+MAX_PARALLEL_WORKSPACES = _resolve_max_parallel_workspaces()
+
+#: One process-wide gate, shared by every audit, so several concurrent audits
+#: cannot multiply their per-run pools into a tenant-throttling storm: the total
+#: number of workspaces in flight across the whole process never exceeds the cap.
+_FETCH_GATE = threading.BoundedSemaphore(MAX_PARALLEL_WORKSPACES)
+
+
+def _fetch_workspace(
+    provider, workspace_id: str, layer: Layer, resources: set[Resource]
+) -> WorkspaceContext:
+    """Crawl one workspace, holding the process-wide concurrency gate."""
+    with _FETCH_GATE:
+        return provider.fetch(workspace_id, layer, resources)
+
 
 #: Friendly plural names used in the "no objects of this kind" N/A message, so a
 #: check that cannot run for lack of an object still appears with a clear reason.
@@ -160,7 +195,7 @@ def access_error_result(workspace_id: str, layer: Layer, message: str) -> CheckR
     """
     return CheckResult(
         check_id="WS-ACCESS", ref="-", title="Workspace could not be read",
-        pillar=Pillar.FOUNDATION, status=Status.FAIL, score=None, coverage=None,
+        pillar=Pillar.ARCHITECTURE, status=Status.FAIL, score=None, coverage=None,
         evidence=message, recommendation=_ACCESS_RECOMMENDATION,
         severity=Severity.CRITICAL, workspace=workspace_id, layer=layer,
         obj="", scope=Scope.WORKSPACE, scored=False,
@@ -212,7 +247,7 @@ def read_incomplete_result(workspace: WorkspaceContext, resource_value: str, sta
     return CheckResult(
         check_id=READ_INCOMPLETE_CHECK_ID, ref="-",
         title="Incomplete crawl — data could not be read",
-        pillar=Pillar.FOUNDATION, status=Status.NA, score=None, coverage=None,
+        pillar=Pillar.ARCHITECTURE, status=Status.NA, score=None, coverage=None,
         evidence=evidence, recommendation="",
         severity=Severity.HIGH, workspace=workspace.name, layer=workspace.layer,
         obj=label, scope=Scope.WORKSPACE, scored=False,
@@ -241,6 +276,7 @@ def build_result(
     status = verdict.status or status_from_score(verdict.score or 0)
     passed = status is Status.PASS
     unjudged = not verdict.scored
+    finding = status in (Status.FAIL, Status.PARTIAL)
 
     return CheckResult(
         check_id=spec.id,
@@ -260,8 +296,11 @@ def build_result(
             scope=spec.scope,
             evidence=verdict.evidence,
         ),
-        # Severity describes the *finding*, so a passing check is never "High".
-        severity=Severity.INFO if (passed or unjudged) else spec.severity,
+        # Severity describes the *finding*: a FAIL/PARTIAL row carries the spec
+        # severity even when it is an unscored detail row (so a named per-object
+        # defect is not shown as "Informational"); a pass, a note, or an N/A never
+        # does.
+        severity=spec.severity if finding else Severity.INFO,
         workspace=workspace.name,
         layer=workspace.layer,
         obj=verdict.obj if verdict.obj is not None else obj_name,
@@ -287,6 +326,7 @@ def build_group_result(
     status = verdict.status or status_from_score(verdict.score or 0)
     passed = status is Status.PASS
     unjudged = not verdict.scored
+    finding = status in (Status.FAIL, Status.PARTIAL)
 
     return CheckResult(
         check_id=spec.id,
@@ -305,7 +345,7 @@ def build_group_result(
             scope=Scope.GROUP,
             evidence=verdict.evidence,
         ),
-        severity=Severity.INFO if (passed or unjudged) else spec.severity,
+        severity=spec.severity if finding else Severity.INFO,
         workspace=group_name,
         layer=Layer.MIXED,
         obj=verdict.obj if verdict.obj is not None else "",
@@ -400,6 +440,8 @@ def run_audit(
     }
     fetched: dict[str, WorkspaceContext] = {}
 
+    # Phase 1 — plan each workspace's work (cheap; keeps target order).
+    plan: list[tuple[str, Layer, float, list[CheckSpec], set[Resource]]] = []
     for workspace_id, layer in targets:
         factor = weights.get(workspace_id, 1.0) if weights else 1.0
         # Manual (attestation-only) specs are catalogued but never executed.
@@ -413,15 +455,42 @@ def run_audit(
         resources: set[Resource] = registry.required_resources(specs)
         if workspace_id in group_member_ids:
             resources = resources | group_resources
-        try:
-            workspace = provider.fetch(workspace_id, layer, resources)
-        except WorkspaceAccessError as exc:
-            results.append(access_error_result(workspace_id, layer, str(exc)))
+        plan.append((workspace_id, layer, factor, specs, resources))
+
+    # Phase 2 — crawl the planned workspaces concurrently. The crawl is
+    # network-bound and each workspace is independent, so they are fetched in
+    # parallel under the process-wide cap. Evaluation (Phase 3) stays sequential
+    # and in target order, so the report is byte-for-byte a serial run's — only
+    # the wall-clock shrinks.
+    crawled: dict[int, WorkspaceContext | Exception] = {}
+    if plan:
+        workers = min(MAX_PARALLEL_WORKSPACES, len(plan))
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="ws-fetch") as pool:
+            future_to_idx = {
+                pool.submit(_fetch_workspace, provider, wid, lyr, res): idx
+                for idx, (wid, lyr, _factor, _specs, res) in enumerate(plan)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    crawled[idx] = future.result()
+                except Exception as exc:  # noqa: BLE001 - reported in Phase 3
+                    crawled[idx] = exc
+
+    # Phase 3 — evaluate each workspace's checks, in target order. ``resources``
+    # was consumed during the crawl phase and is unpacked only to keep the plan
+    # tuple's shape explicit at the point of use.
+    for idx, (workspace_id, layer, factor, specs, _resources) in enumerate(plan):
+        outcome = crawled[idx]
+        if isinstance(outcome, WorkspaceAccessError):
+            results.append(access_error_result(workspace_id, layer, str(outcome)))
             continue
-        except Exception as exc:  # noqa: BLE001 - any provider failure is reportable
+        if isinstance(outcome, Exception):
             results.append(access_error_result(
-                workspace_id, layer, f"Could not read workspace '{workspace_id}': {exc}"))
+                workspace_id, layer, f"Could not read workspace '{workspace_id}': {outcome}"))
             continue
+        workspace = outcome
         fetched[workspace_id] = workspace
 
         # Surface any partial crawl — definitions/tables that could not be read —

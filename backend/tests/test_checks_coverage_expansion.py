@@ -1,6 +1,6 @@
 """Regression tests for the checks added for refs 4.1.2, 5.2.6, 5.3.1, 5.5.6, 14.1.x,
 and for the Operations · Data Operations checks (1.1.3, 1.1.8, 10.5.1, 11.1.4,
-11.4.2, 11.4.5, 11.5.1).
+11.4.2, 11.4.5).
 
 Every case here is a defect a review found in the first implementation. Each pairs
 the misjudged input with the input that must keep working, so a future rewrite of a
@@ -49,14 +49,12 @@ from auditfast.core.check.operations_reliability.data_logs.automated import (
     kql_queries_version_controlled,
 )
 from auditfast.core.check.operations_reliability.data_operations.automated import (
-    _TEST_NAME_RE,
     activator_configured,
     branching_strategy,
     environment_isolation,
     git_covers_every_artifact,
     semantic_model_deployment,
     single_source_of_truth,
-    unit_tests_exist,
     warehouse_deployment_automated,
 )
 from auditfast.core.check.operations_reliability.data_prep.automated import (
@@ -238,9 +236,14 @@ def test_offending_measures_are_named_against_their_model():
     assert "Bad Measure" in details[0].evidence
 
 
-def test_scored_dax_verdict_names_the_models_and_problem_measures():
-    """The aggregate row is self-contained: it names every model it checked and the
-    measures that break a practice, so the reviewer needn't cross-reference detail rows."""
+def test_scored_dax_verdict_names_the_models_and_points_to_the_detail_rows():
+    """The aggregate names every model it checked and how many need attention.
+
+    It deliberately does NOT repeat the failing measures: doing so produced a
+    single cell holding hundreds of names with each measure's model buried in a
+    semicolon-separated run, so a reviewer could not tell which measure belonged
+    to which model. Each model has its own row carrying its own measures.
+    """
     no_var_only = " + ".join(f"SUM(t[a{i}])" for i in range(40))  # >400 chars, no VAR
     passing = "DIVIDE(SUM(Sales[Amount]), SUM(Sales[Quantity]), 0) + AVERAGE(Sales[Discount])"
     assert len(_normalised(no_var_only)) > 400
@@ -248,11 +251,17 @@ def test_scored_dax_verdict_names_the_models_and_problem_measures():
         {"name": "Bad Measure", "expression": no_var_only},
         {"name": "Good Measure", "expression": passing},
     ]}}
-    scored = _scored(complex_measures_use_variables(_model_ctx(models)))
+    verdicts = complex_measures_use_variables(_model_ctx(models))
+    scored = _scored(verdicts)
     assert scored.status is None                       # the scored aggregate, not a note
     assert "1 of 2" in scored.evidence
     assert "SalesModel" in scored.evidence             # every model it checked is named
-    assert "Bad Measure (no VAR)" in scored.evidence   # the failing measure + its fault
+    assert "1 model(s) carry at least one measure needing attention" in scored.evidence
+
+    # ...and the failing measure is on its own row, attributed to its model.
+    rows = {v.obj: v.evidence for v in verdicts if v.obj}
+    assert "SalesModel" in rows
+    assert "Bad Measure (no VAR)" in rows["SalesModel"]
     assert "Good Measure" not in scored.evidence       # a compliant measure is not flagged
 
 
@@ -446,6 +455,22 @@ def test_orphan_check_is_na_without_a_join():
     assert nb_orphan_detect(_nb_ctx("print(1)\n")).status is Status.NA
 
 
+def test_cdc_incremental_merge_is_not_orphan_detection():
+    # A CDC / SCD2 incremental merge uses left_anti and null-on-join to isolate
+    # new and changed rows to upsert (keyed on the target's own PK), not child
+    # rows missing a parent. The FK orphan-detection check must not read that as
+    # "orphans detected but dropped" - it does not apply, so it is N/A.
+    code = (
+        'df_join = bronze.join(silver_pk_hash, keys, "left")\n'
+        'is_new = F.col("_silver_change_hash").isNull()\n'
+        'df_to_insert = df_join.filter(is_new)\n'
+        'silver_rest = silver.join(expire_pks, keys, "left_anti")\n'
+        'final = silver_rest.unionByName(df_to_insert)\n'
+        'final.write.format("delta").mode("overwrite").saveAsTable("silver.dim")\n'
+    )
+    assert nb_orphan_detect(_nb_ctx(code)).status is Status.NA
+
+
 @pytest.mark.parametrize("source", [
     'columns = ", ".join(df.columns)',
     'message = "\\n".join(lines)',
@@ -472,6 +497,26 @@ def test_a_multiline_sql_anti_join_still_binds_to_its_variable():
             '""")\n'
             'orphans.write.saveAsTable("orphan_log")\n')
     assert nb_orphan_detect(_nb_ctx(code)).score == 3
+
+
+def test_comma_style_sql_join_is_detected_as_a_join():
+    """``FROM a t, b i, c g WHERE ...`` is an implicit inner join that silently
+    drops unmatched rows - exactly the orphan risk - so it must not read as
+    'does not perform joins'."""
+    code = ('df = spark.sql("""\n'
+            "    SELECT t.amt, i.name, g.acct\n"
+            "    FROM in_tran_tmlc t, in_item_tbl i, gl_interface_tmlc g\n"
+            "    WHERE t.item_id = i.item_id AND t.gl_id = g.gl_id\n"
+            '""")\n')
+    verdict = nb_orphan_detect(_nb_ctx(code))
+    assert verdict.score == 0
+    assert "without orphan record detection" in verdict.evidence
+
+
+def test_a_select_column_list_is_not_a_comma_join():
+    """A comma in the SELECT list with a single-table FROM is not an implicit join."""
+    code = 'df = spark.sql("SELECT a, b, c FROM one_table WHERE a > 0")\n'
+    assert nb_orphan_detect(_nb_ctx(code)).status is Status.NA
 
 
 # --- 5.3.9: the validated table must be the merged table ---------------------
@@ -522,7 +567,7 @@ def test_merge_check_is_na_without_a_merge():
 
 # =============================================================================
 # Operations & Reliability · Data Operations — refs 1.1.3, 1.1.8, 10.5.1,
-# 11.1.4, 11.4.2, 11.4.5, 11.5.1
+# 11.1.4, 11.4.2, 11.4.5
 #
 # Every check below is workspace-scoped, so each case builds the workspace the
 # rule is about. The N/A cases are the important ones: "we could not read it"
@@ -848,95 +893,6 @@ def test_semantic_model_deployment_is_na_when_git_is_unreadable():
     assert semantic_model_deployment(ctx).status is Status.NA
 
 
-# --- 11.5.1 unit tests -------------------------------------------------------
-
-@pytest.mark.parametrize("name,expected,why", [
-    ("NB_Test_Sales", True, "test as its own token"),
-    ("TestSalesLoad", True, "test opening a CamelCase name"),
-    ("nb_unit_tests", True, "unit tests suffix"),
-    ("Run Unit Tests", True, "an activity name"),
-    ("NB_Latest_Load", False, "'latest' is not a test"),
-    ("NB_Contest_Rules", False, "'contest' is not a test"),
-    ("NB_Tested_Rows", False, "'tested' is not a test asset"),
-])
-def test_test_name_detector(name: str, expected: bool, why: str):
-    assert bool(_TEST_NAME_RE.search(name)) is expected, why
-
-
-def test_a_test_framework_notebook_satisfies_the_unit_test_check():
-    ctx = _ws_ctx(id="w", notebooks={
-        "NB_Build": _nb(_WRITES),
-        "NB_Checks": _nb("import pytest\n\ndef test_scd2(): assert transform(1) == 2\n"),
-    })
-    verdict = unit_tests_exist(ctx)
-    assert verdict.score == 3
-    assert "NB_Checks" in verdict.evidence
-
-
-def test_transformations_with_no_test_asset_fail():
-    ctx = _ws_ctx(id="w", notebooks={"NB_Build": _nb(_WRITES)})
-    verdict = unit_tests_exist(ctx)
-    assert verdict.score == 0
-    assert "no test notebook" in verdict.evidence
-
-
-def test_a_commented_out_test_framework_does_not_count():
-    ctx = _ws_ctx(id="w", notebooks={"NB_Build": _nb(_WRITES + "# import pytest\n")})
-    assert unit_tests_exist(ctx).score == 0
-
-
-def test_a_row_count_assert_is_not_a_unit_test():
-    """A data-quality gate on production rows is not a test of the transform."""
-    ctx = _ws_ctx(id="w", notebooks={
-        "NB_Build": _nb(_WRITES + "assert df.count() > 0\n")})
-    assert unit_tests_exist(ctx).score == 0
-
-
-def test_a_test_activity_in_a_pipeline_counts():
-    ctx = _ws_ctx(
-        id="w",
-        notebooks={"NB_Build": _nb(_WRITES)},
-        pipelines={"PL_Load": {"properties": {"activities": [
-            {"name": "Run Unit Tests", "type": "TridentNotebook"}]}}},
-    )
-    assert unit_tests_exist(ctx).score == 3
-
-
-def test_a_few_tests_beside_many_transforms_is_partial_not_a_pass():
-    """Presence is not coverage: 1 test against 8 transforms must not score 3.
-
-    Regression for a real workspace where 9 test notebooks covering 61
-    transformation notebooks (15%) reported a clean PASS.
-    """
-    notebooks = {f"NB_Build_{i}": _nb(_WRITES) for i in range(8)}
-    notebooks["NB_Checks"] = _nb("import pytest\n\ndef test_scd2(): assert f(1) == 2\n")
-    ctx = _ws_ctx(id="w", notebooks=notebooks)
-    verdict = unit_tests_exist(ctx)
-    assert verdict.score < 3, "a 1-in-8 coverage ratio is not a passing test posture"
-    assert verdict.coverage == pytest.approx(1 / 8)
-    assert "NB_Checks" in verdict.evidence
-
-
-def test_more_tests_than_transforms_is_fully_covered():
-    """The ratio is clamped, so a test-heavy workspace still passes cleanly."""
-    ctx = _ws_ctx(id="w", notebooks={
-        "NB_Build": _nb(_WRITES),
-        "NB_Checks": _nb("import pytest\n\ndef test_a(): assert 1\n"),
-        "NB_More_Checks": _nb("import pytest\n\ndef test_b(): assert 1\n"),
-    })
-    assert unit_tests_exist(ctx).score == 3
-
-
-def test_unit_tests_is_na_without_notebook_definitions():
-    ctx = _ws_ctx(id="w", unavailable={Resource.NOTEBOOK_DEFINITIONS})
-    assert unit_tests_exist(ctx).status is Status.NA
-
-
-def test_unit_tests_is_na_when_no_notebook_transforms_anything():
-    ctx = _ws_ctx(id="w", notebooks={"NB_Explore": _nb("df = spark.table('t')\ndisplay(df)\n")})
-    assert unit_tests_exist(ctx).status is Status.NA
-
-
 # =============================================================================
 # Operations & Reliability · Data Logs — refs 10.3.1, 10.3.2
 #
@@ -1135,7 +1091,7 @@ def test_surrogate_generated_requires_surrogate_plus_generation_hint():
             ]),
         },
     )
-    verdict = table_surrogate_generated(ctx)
+    verdict = table_surrogate_generated(ctx)[0]
     assert verdict.score == 1
 
 
@@ -1150,7 +1106,7 @@ def test_relationships_declared_fails_when_fact_has_no_modeled_relationship():
             "model": {"tables": ["fact_sales", "dim_customer"], "relationships": []}
         },
     )
-    assert table_relationships_declared(ctx).score == 0
+    assert table_relationships_declared(ctx)[0].score == 0
 
 
 def test_relationships_declared_passes_when_fact_is_linked_in_model_relationships():
@@ -1175,7 +1131,7 @@ def test_relationships_declared_passes_when_fact_is_linked_in_model_relationship
             }
         },
     )
-    assert table_relationships_declared(ctx).score == 3
+    assert table_relationships_declared(ctx)[0].score == 3
 
 
 # =============================================================================
@@ -1382,6 +1338,24 @@ def test_unknown_dimension_member_with_monitoring_passes():
     assert "unknown_count" in verdict.evidence
 
 
+def test_boolean_isin_minus_one_is_not_a_surrogate_key():
+    """A quoted "-1" in a boolean tidy-up (isin) is not a -1 surrogate key.
+
+    Legacy IFS/COM systems store a boolean true as -1, so
+    ``bool_value.isin("-1","1","true","yes","y")`` maps those strings to True.
+    The ``-1`` is a *string* literal inside a membership test, not a numeric
+    surrogate-key fallback, so the completeness monitor does not apply - even
+    when incidental dim/fact table *names* and a CDC ``.join(`` appear elsewhere
+    in the notebook and satisfy the fact-to-dimension gate.
+    """
+    code = ('name_map = {"r5events": "fct_events", "r5meters": "dim_meters"}\n'
+            'delta = old.join(new, keys, "left_anti").count()\n'
+            'df = df.withColumn("flag", '
+            'F.when(bool_value.isin("-1","1","true","yes","y"), F.lit(True))'
+            '.when(bool_value.isin("0","false","no","n"), F.lit(False)))\n')
+    assert nb_unknown_monitored(_nb_ctx(code)).status is Status.NA
+
+
 def test_layer_names_in_comments_do_not_create_reconciliation_scope():
     code = ('# Read from Silver before writing Gold\n'
             'df.write.mode("overwrite").saveAsTable("gold.fact_sales")\n')
@@ -1415,6 +1389,26 @@ def test_fact_write_with_duplicate_guard_has_detailed_pass_evidence():
     assert verdict.score == 3
     assert "Notebook 'nb'" in verdict.evidence
     assert "dropDuplicates" in verdict.evidence
+
+
+def test_ctas_write_is_recognised_so_the_na_reason_is_accurate():
+    """A CTAS load writes a table; a non-fact CTAS target is N/A for a *fact*-grain
+    check, but the reason must not claim the notebook 'writes no table'."""
+    code = ('spark.sql("""\n'
+            "    CREATE TABLE lh.bronze.gl_detail AS\n"
+            "    SELECT * FROM staging.gl\n"
+            '""")\n')
+    verdict = nb_grain_unique(_nb_ctx(code))
+    assert verdict.status is Status.NA
+    assert "writes no table" not in verdict.evidence
+    assert "no provable fact write target" in verdict.evidence
+
+
+def test_ctas_into_a_fact_table_without_dedup_fails():
+    code = 'spark.sql("CREATE TABLE gold.fact_sales AS SELECT * FROM staging.sales")\n'
+    verdict = nb_grain_unique(_nb_ctx(code))
+    assert verdict.score == 0
+    assert "fact_sales" in verdict.evidence
 
 
 # =============================================================================

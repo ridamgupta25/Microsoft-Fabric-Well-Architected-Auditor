@@ -21,7 +21,7 @@ from auditfast.services.audit_service import _resolve_weights
 def _result(workspace: str, score: int, weight: float = 1.0) -> CheckResult:
     return CheckResult(
         check_id=f"C-{workspace}-{score}", ref="1.1", title="t",
-        pillar=Pillar.SECURITY, status=Status.PASS if score >= MAX_SCORE else Status.FAIL,
+        pillar=Pillar.SECURITY_ACCESS, status=Status.PASS if score >= MAX_SCORE else Status.FAIL,
         score=score, workspace=workspace, layer=Layer.MIXED, weight=weight,
     )
 
