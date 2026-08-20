@@ -110,7 +110,7 @@
 "3.3.4": "Add ZORDER BY on the high-cardinality columns used in filters/joins when you OPTIMIZE, so data skipping is effective."
 "3.3.5": "Confirm V-Order is enabled for read-heavy Gold tables (it is on by default in Fabric); set it explicitly where you rely on it."
 "3.3.6": "Set Delta table properties (delta.autoOptimize.optimizeWrite / autoCompact) so writes stay compacted without a manual OPTIMIZE."
-"3.3.7": "Configure delta.logRetentionDuration and deletedFileRetentionDuration deliberately rather than relying on defaults, and monitor history growth."
+"3.3.7": "Configure delta.logRetentionDuration and delta.deletedFileRetentionDuration deliberately (via TBLPROPERTIES or ALTER TABLE SET TBLPROPERTIES) rather than relying on defaults, or schedule a VACUUM to enforce the deleted-file retention window, and monitor history growth."
 "3.4.1": "Manage Spark dependencies through a Fabric Environment instead of inline %pip/!pip installs, so libraries are shared, versioned, and reproducible."
 "3.4.2": "Pin every installed library to an explicit ==version so runs are reproducible and not broken by a floating latest release."
 "3.4.4": "Where the defaults do not fit the workload, tune Spark configuration (e.g. spark.conf.set(...)) and document why."
@@ -131,7 +131,7 @@
 # Remediation is keyed by ref, so this text has to serve both — they are both
 # load-safety advice, so it reads coherently either way.
 "3.6.4": "Make the load safe to re-run and orphan-aware: write with MERGE INTO (or TRUNCATE / DELETE-by-batch followed by INSERT) so re-running cannot duplicate rows, and detect orphan child records with an anti-join, routing unmatched keys to an error table or quarantine before loading."
-"3.6.5": "Wrap Warehouse/lakehouse load procedures in explicit transaction and TRY...CATCH handling: BEGIN TRANSACTION, perform the DML (MERGE/INSERT/CTAS), COMMIT on success, and ROLLBACK plus logged error details in CATCH. For Fabric checks, request workspace Viewer access and client-approved SQL endpoint queries so procedure/error-handling logic can be verified."
+"3.6.5": "Wrap multi-statement Warehouse/lakehouse load procedures in TRY...CATCH with transaction handling: BEGIN TRANSACTION, perform the DML (MERGE/INSERT...SELECT/CTAS), COMMIT on success, and ROLLBACK plus logged error details in CATCH. Fabric Warehouse's transaction support is limited — TRY...CATCH is supported and each single statement is atomic, but full multi-statement BEGIN/COMMIT/ROLLBACK semantics are constrained, so also keep each load step idempotent and re-runnable. A single statement (a lone MERGE, INSERT...SELECT, CTAS or TRUNCATE) is atomic and needs no wrapper. For Fabric checks, request workspace Viewer access and client-approved SQL endpoint queries so procedure/error-handling logic can be verified."
 "3.6.6": "Avoid full reloads of Warehouse targets when an incremental pattern is possible: replace unconditional INSERT/overwrite loads with MERGE INTO, CDC, or watermark-based processing so only changed rows are applied to the Gold table."
 "3.6.7": "Update and maintain statistics after significant Warehouse loads so query performance remains stable."
 "5.2.1": "Define and enforce the expected incoming schema, including column count, names, and data types, before processing records such as EAM JSON."

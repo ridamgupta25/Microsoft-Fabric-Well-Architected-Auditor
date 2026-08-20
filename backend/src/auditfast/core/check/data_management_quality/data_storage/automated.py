@@ -10,7 +10,7 @@ import json
 import re
 from datetime import datetime, timezone
 
-from auditfast.core.check._notebook import NOTEBOOK_LAYERS, executable_code
+from auditfast.core.check._notebook import NOTEBOOK_LAYERS, executable_code, strip_sql_comments
 from auditfast.core.check._pipeline import activities as pipeline_activities
 from auditfast.core.check._pipeline import script_sql
 from auditfast.core.check._recency import parse_stamp
@@ -369,6 +369,28 @@ def wh_staging_pattern(ctx: CheckContext) -> Verdict:
         "(stg_* / staging_* / stage_*) â€” a staging schema buffers loads before the final merge",
     )
 
+
+def _is_load_procedure(sql: str) -> bool:
+    """True when SQL is a genuinely multi-statement load worth a transaction.
+
+    A load needs TRY...CATCH + BEGIN/COMMIT/ROLLBACK only when it runs **more than
+    one statement**, so a failure part-way through could leave the target in a
+    partially loaded state. A **single** statement — whether a lone ``MERGE``,
+    ``INSERT ... SELECT``, ``CTAS`` / ``CREATE TABLE AS``, or ``TRUNCATE`` — is
+    atomic: it either completes or rolls itself back, with nothing to wrap. Such
+    single-statement loads are excluded from the denominator rather than failed
+    for lacking a wrapper they do not need, so the atomic-statement exemption
+    applies to every statement kind consistently. Comments are stripped first so a
+    commented-out statement neither qualifies a script nor inflates its statement
+    count.
+    """
+    body = strip_sql_comments(sql)
+    if not _WAREHOUSE_SQL_LOAD.search(body):
+        return False
+    statements = [s for s in body.split(";") if s.strip()]
+    return len(statements) > 1
+
+
 @check(
     id="WS-WH-TRYCATCH", ref="3.6.5",
     title="Warehouse/lakehouse load SQL uses TRY...CATCH with transaction handling",
@@ -383,6 +405,19 @@ def wh_try_catch_transactions(ctx: CheckContext) -> list[Verdict]:
     functions declared in the Warehouse (read from ``INFORMATION_SCHEMA.ROUTINES``,
     which is where a ``SqlServerStoredProcedure`` activity's logic actually lives)
     and the inline T-SQL a pipeline runs through a Script activity.
+
+    **Only genuinely multi-statement loads count toward the denominator.** A load
+    needs TRY...CATCH + BEGIN/COMMIT/ROLLBACK only when it runs more than one
+    statement, so a failure part-way through can leave the target partially
+    loaded. A **single** statement is atomic — it either completes or rolls itself
+    back — whether it is a lone ``MERGE``, ``INSERT ... SELECT``, ``CTAS`` or
+    ``TRUNCATE``; the atomic-statement exemption applies to every statement kind
+    consistently, so a single load is excluded rather than failed for lacking a
+    wrapper it does not need. Lumping trivial single-statement scripts in with
+    real multi-step loads produced an inconsistent "0 of 5" that failed atomic
+    statements; the honest denominator counts only the multi-statement loads, and
+    a workspace whose SQL is entirely single-statement (or Copy-only) is N/A, not
+    FAIL.
 
     **A Copy activity is out of scope, not un-judged.** It runs no SQL of its own -
     Fabric generates the load internally and the pipeline definition contains
@@ -415,13 +450,19 @@ def wh_try_catch_transactions(ctx: CheckContext) -> list[Verdict]:
     inspected: list[tuple[str, bool]] = []
     copy_loads: list[str] = []
     unread_routines: list[str] = []
+    atomic_loads: list[str] = []
 
     # Stored procedures and functions declared in the Warehouse itself.
     for routine in ctx.workspace.sql_routines:
         text = str(routine.get("definition") or "")
-        if not _WAREHOUSE_SQL_LOAD.search(text):
+        if not _WAREHOUSE_SQL_LOAD.search(strip_sql_comments(text)):
             continue
         marker = f"{routine.get('store', '')}/{routine.get('name', '')}"
+        if not _is_load_procedure(text):
+            # A single-statement load (a lone MERGE / INSERT...SELECT / CTAS /
+            # TRUNCATE) is atomic and has nothing to wrap in a transaction.
+            atomic_loads.append(marker)
+            continue
         inspected.append((
             marker,
             bool(_TRY_CATCH_SQL.search(text)) and bool(_TXN_SQL.search(text)),
@@ -440,7 +481,10 @@ def wh_try_catch_transactions(ctx: CheckContext) -> list[Verdict]:
 
                 if activity_type == "Script":
                     text = _to_text((activity.get("typeProperties") or {}).get("scripts") or [])
-                    if not _WAREHOUSE_SQL_LOAD.search(text):
+                    if not _WAREHOUSE_SQL_LOAD.search(strip_sql_comments(text)):
+                        continue
+                    if not _is_load_procedure(text):
+                        atomic_loads.append(marker)
                         continue
                     has_try_catch = bool(_TRY_CATCH_SQL.search(text))
                     has_transaction = bool(_TXN_SQL.search(text))
@@ -468,6 +512,19 @@ def wh_try_catch_transactions(ctx: CheckContext) -> list[Verdict]:
                 f"handling cannot be verified: {_named(unread_routines)}. "
                 + _SQL_PERMISSION_HINT
             )]
+        if atomic_loads:
+            copy_note = (
+                f" A further {len(copy_loads)} Copy activity/activities load without SQL."
+                if copy_loads else ""
+            )
+            return [not_applicable(
+                f"This workspace's only readable SQL loads are {len(atomic_loads)} "
+                f"single-statement (atomic) load(s) such as a lone MERGE or TRUNCATE "
+                f"({_named(atomic_loads)}); a single statement is atomic — it either "
+                f"completes or rolls itself back — so there is nothing to wrap in "
+                f"TRY...CATCH with BEGIN/COMMIT/ROLLBACK and no multi-statement load "
+                f"procedure to assess.{copy_note}"
+            )]
         if copy_loads:
             return [not_applicable(
                 f"This workspace loads through {len(copy_loads)} Copy activity/activities "
@@ -480,8 +537,8 @@ def wh_try_catch_transactions(ctx: CheckContext) -> list[Verdict]:
     compliant = [name for name, ok in inspected if ok]
     offenders = [name for name, ok in inspected if not ok]
     evidence = (
-        f"{len(compliant)} of {len(inspected)} readable SQL load(s) use TRY...CATCH "
-        "and BEGIN/COMMIT/ROLLBACK transaction handling"
+        f"{len(compliant)} of {len(inspected)} multi-statement SQL load(s) use "
+        "TRY...CATCH and BEGIN/COMMIT/ROLLBACK transaction handling"
     )
     # Name the loads that are *missing* the handling. The previous version listed
     # only the compliant ones, so a reviewer could see the size of the gap but not
@@ -499,6 +556,11 @@ def wh_try_catch_transactions(ctx: CheckContext) -> list[Verdict]:
     if unread_routines:
         evidence += (f". {len(unread_routines)} activity/activities call a stored procedure "
                      f"whose body could not be read: {_named(unread_routines)}")
+    if atomic_loads:
+        evidence += (f". {len(atomic_loads)} single-statement (atomic) load(s) "
+                     f"(e.g. a lone MERGE or TRUNCATE) were excluded from the "
+                     f"denominator — a single statement is atomic and needs no "
+                     f"transaction wrapper")
 
     verdicts: list[Verdict] = [covered(len(compliant), len(inspected), evidence)]
     # Unscored per-object rows so the report's Object column names each load,
