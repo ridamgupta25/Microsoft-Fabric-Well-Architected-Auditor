@@ -83,6 +83,7 @@ export function RunAuditPage() {
   //: Opt-in cross-workspace scoring — weight each workspace by its env level.
   const [weightByEnv, setWeightByEnv] = useState(false);
   const [chosenPillars, setChosenPillars] = useState<Record<string, boolean>>({});
+  const [externalChecksPath, setExternalChecksPath] = useState<string>("");
   const [job, setJob] = useState<AuditJob | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -194,6 +195,7 @@ export function RunAuditPage() {
           pillars: chosen,
           workspaces: specs,
           weight_by_environment: weightByEnv,
+          external_checks_csv: externalChecksPath || null,
           auth_session: source === "kb" ? undefined : session,
           source,
           snapshots: source === "kb" ? uploaded : undefined,
@@ -216,7 +218,7 @@ export function RunAuditPage() {
         setSubmitting(false);
       }
     },
-    [chosenPillars, isSignedIn, session, source, snapshots, setLastAuditId, weightByEnv],
+    [chosenPillars, isSignedIn, session, source, snapshots, setLastAuditId, weightByEnv, externalChecksPath],
   );
   const specsFor = useCallback(
     (list: Workspace[]) =>
@@ -997,6 +999,28 @@ export function RunAuditPage() {
           </span>
         </label>
       )}
+
+      <div className="card space-y-2">
+        <label htmlFor="external-checks" className="block">
+          <span className="text-sm font-medium">External checks (optional)</span>
+          <span className="text-xs text-slate-500">
+            Path to a CSV file with admin-verified checks (e.g., AdminChecks.csv). These will be merged with automated results and override any checks with the same ID.
+          </span>
+        </label>
+        <input
+          id="external-checks"
+          type="text"
+          className="input"
+          placeholder="e.g., /shared/audits/AdminChecks.csv or ./AdminChecks.csv"
+          value={externalChecksPath}
+          onChange={(event) => setExternalChecksPath(event.target.value)}
+        />
+        {externalChecksPath && (
+          <p className="text-xs text-slate-500">
+            Will load: <span className="font-mono">{externalChecksPath}</span>
+          </p>
+        )}
+      </div>
 
       <div className="flex flex-wrap items-center gap-3">
         <button

@@ -83,6 +83,12 @@ class AuditRequest(BaseModel):
                     "roll-ups. Off = today's unweighted mean. Per-workspace scores "
                     "are unchanged either way.",
     )
+    external_checks_csv: str | None = Field(
+        default=None,
+        description="Path to external checks CSV file (e.g., AdminChecks.csv). "
+                    "If provided, these checks are merged with automated results. "
+                    "External checks override automated checks with the same id.",
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -90,6 +96,7 @@ class AuditRequest(BaseModel):
                 "pillars": ["Security", "Reliability"],
                 "workspaces": [{"id": "ws-prep-01", "role": "Data Prep"}],
                 "auth_session": "3f2a9c14",
+                "external_checks_csv": "/shared/audits/AdminChecks.csv",
                 "source": "live",
             }
         }

@@ -395,7 +395,14 @@ GET /api/v1/reports/{audit_id}/download/excel
 ```
 
 `kind` is a whitelist, so a path fragment in the URL can never read an arbitrary
-file. Excel has three sheets: Scorecard, Checks, Risk Register.
+file. Excel follows the client-approved audit structure: Summary, Area Detail,
+Checklist, Findings, Risk Register, and Invent. Repeated asset verdicts are
+consolidated by control for stakeholder reporting; the deterministic asset-level
+results remain the scoring basis. `Invent` assigns each audited workspace a
+report-local sequential Workspace ID (`WS1`, `WS2`, ...); `Checklist` uses the
+same IDs as matrix columns and shows each workspace's weighted raw score on the
+engine's native 0-3 scale for every consolidated control. Percentage scores
+remain in the summary views.
 
 > **Current limitation:** report files are written to a fixed filename in the
 > output directory and overwritten by each run, so a download returns the most

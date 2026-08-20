@@ -30,7 +30,7 @@ from auditfast.core.check.data_management_quality.reporting_semantic.automated i
 from auditfast.core.check.operations_reliability.data_operations.automated import (
     medallion_architecture,
 )
-from auditfast.core.enums import Resource, Status
+from auditfast.core.enums import Layer, Resource, Status
 from auditfast.core.models import CheckContext, Item, WorkspaceContext
 
 _PASS, _PARTIAL, _FAIL = 3, 1, 0
@@ -60,6 +60,9 @@ def _rel(from_table: str, to_table: str, *, active: bool = True) -> dict:
         "from_table": from_table, "from_column": "k",
         "to_table": to_table, "to_column": "k",
         "cross_filter": "oneDirection", "is_active": active,
+        # A crawled model carries cardinality even for a defaulted many-to-one
+        # (empty string), so the check can assess the many-to-many half.
+        "from_cardinality": "", "to_cardinality": "",
     }
 
 
@@ -167,6 +170,8 @@ def test_ambiguous_paths_fail_when_a_second_active_route_exists():
     }
     outcome = relationships_have_no_ambiguous_paths(_model_ctx(models))
     assert _scored(outcome).score == _FAIL
+    # The failing model is named in the scored roll-up, not only on the detail row.
+    assert "Model(s) with a defect: m" in _scored(outcome).evidence
     # The offending pair is named on a detail row, not merely counted.
     detail = _details(outcome)[0]
     assert detail.obj == "m"
@@ -191,6 +196,59 @@ def test_ambiguous_paths_are_na_without_definitions_or_relationships():
     # One relationship cannot form a second path.
     single = _model_ctx({"m": {"relationships": [_rel("Sales", "Date")]}})
     assert _scored(relationships_have_no_ambiguous_paths(single)).status is Status.NA
+
+
+def _rel_no_cardinality(from_table: str, to_table: str, *, active: bool = True) -> dict:
+    """A relationship as an *older* snapshot recorded it — no cardinality field."""
+    return {
+        "name": f"{from_table}-{to_table}",
+        "from_table": from_table, "from_column": "k",
+        "to_table": to_table, "to_column": "k",
+        "cross_filter": "oneDirection", "is_active": active,
+    }
+
+
+def test_cardinality_is_scoped_out_when_the_snapshot_has_none():
+    """Without cardinality the check must not claim 'no direct many-to-many'."""
+    models = {"m": {"relationships": [
+        _rel_no_cardinality("Sales", "Date"), _rel_no_cardinality("Sales", "Customer"),
+    ]}}
+    verdict = _scored(relationships_have_no_ambiguous_paths(_model_ctx(models)))
+    assert verdict.score == _PASS
+    assert "no direct many-to-many relationship" not in verdict.evidence
+    assert "cardinality is not present in the parsed model" in verdict.evidence
+    assert "not assessed here" in verdict.evidence
+
+
+def test_cardinality_is_assessed_when_the_snapshot_carries_it():
+    """With cardinality present the many-to-many claim is made (and verified)."""
+    models = {"m": {"relationships": [_rel("Sales", "Date"), _rel("Sales", "Customer")]}}
+    verdict = _scored(relationships_have_no_ambiguous_paths(_model_ctx(models)))
+    assert "no direct many-to-many relationship" in verdict.evidence
+    assert "cardinality is not present" not in verdict.evidence
+
+
+def test_per_model_defect_row_carries_the_real_severity_not_informational():
+    """A named per-model FAIL must not read as 'Informational' in the report."""
+    from auditfast.core.check.registry import REGISTRY
+    from auditfast.core.engine import build_result
+    from auditfast.core.enums import Severity
+
+    models = {"m": {"relationships": [
+        _rel("Sales", "Customer"), _rel("Customer", "Geography"),
+        _rel("Sales", "Geography"),
+    ]}}
+    ctx = _model_ctx(models, layer=Layer.REPORTING)
+    outcome = relationships_have_no_ambiguous_paths(ctx)
+    detail = _details(outcome)[0]
+    assert detail.obj == "m"
+
+    spec = REGISTRY.get("R-REL-AMBIGUOUS")
+    row = build_result(spec, ctx.workspace, detail)
+    assert row.status is Status.FAIL
+    assert row.scored is False           # still does not vote in the score
+    assert row.severity is spec.severity  # but is shown at the real severity
+    assert row.severity is not Severity.INFO
 
 
 # =============================================================================

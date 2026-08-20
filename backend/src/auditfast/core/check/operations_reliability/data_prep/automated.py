@@ -28,45 +28,6 @@ from auditfast.core.models import CheckContext
 #: Timeout values Fabric/ADF apply by default — i.e. "nobody set this".
 DEFAULT_TIMEOUTS = frozenset({"7.00:00:00", "0.12:00:00", "7.00:00", ""})
 
-#: Copy-activity properties that make a bad row or unreadable file survivable
-#: instead of fatal. Any one of them means the activity was configured to keep
-#: going: skip the row, redirect it somewhere, or skip the offending file.
-FAULT_TOLERANCE_KEYS = (
-    "enableSkipIncompatibleRow",
-    "redirectIncompatibleRowSettings",
-    "skipErrorFile",
-)
-#: Where the skipped rows are recorded, so "skipped" does not mean "lost".
-COPY_LOG_KEYS = ("logSettings", "logStorageSettings")
-
-#: An activity that parks bad data rather than failing the run. Matched on the
-#: activity's own name because the destination is a dataset reference we cannot
-#: resolve — a Copy named "Write_Rejects_To_Quarantine" is the signal.
-QUARANTINE_NAME_RE = re.compile(
-    r"quarantin|reject|dead.?letter|bad.?record|error.?(?:row|record|table)|invalid",
-    re.IGNORECASE,
-)
-
-#: A notebook only meets malformed input if it reads raw files in the first place.
-FILE_READ_RE = re.compile(
-    r"spark\s*\.\s*read\b|\.\s*read\s*\.\s*(?:json|csv|text|parquet|format)\s*\(|\.\s*load\s*\(",
-    re.IGNORECASE,
-)
-#: Bad rows are kept: written aside, or isolated as a corrupt-record column.
-BAD_RECORD_KEPT_RE = re.compile(
-    r"badRecordsPath|_corrupt_record|columnNameOfCorruptRecord", re.IGNORECASE,
-)
-#: Bad rows are dropped — the run survives, but the records are gone silently.
-BAD_RECORD_DROPPED_RE = re.compile(r"DROPMALFORMED", re.IGNORECASE)
-#: The opposite of graceful handling: one bad row aborts the read.
-FAILFAST_RE = re.compile(r"FAILFAST", re.IGNORECASE)
-#: A hand-rolled quarantine: caught exception plus a write to a reject location.
-EXCEPT_RE = re.compile(r"\bexcept\b", re.IGNORECASE)
-QUARANTINE_WRITE_RE = re.compile(
-    r"quarantin|reject|dead.?letter|bad.?record|error.?(?:table|record|row)|invalid.?record",
-    re.IGNORECASE,
-)
-
 #: Activity types that ARE a notification (Teams / email / webhook / Data Activator).
 NOTIFY_TYPES = frozenset({"Teams", "Office365Outlook", "Outlook365", "SendEmail", "WebHook"})
 #: Generic call activities that only count as a notifier when their *name* says so —
@@ -247,93 +208,6 @@ def explicit_timeouts(ctx: CheckContext) -> Verdict:
         f"{len(timed) - len(custom)} of {len(timed)} activities keep Fabric's default timeout "
         f"({defaults}) — a custom timeout is not defined",
     )
-
-
-@check(
-    id="PL-POISON", ref="9.1.3",
-    title="Poison message / corrupt file handling (quarantine, not crash)",
-    pillar=Pillar.RELIABILITY, scope=Scope.PIPELINE, severity=Severity.HIGH,
-    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
-)
-def poison_message_handling(ctx: CheckContext) -> Verdict:
-    """One bad row or unreadable file is parked, not allowed to kill the run.
-
-    Judged on the Copy activities, because they are what meets untrusted source
-    data. Fabric's fault-tolerance settings are the mechanism: skip the
-    incompatible row, redirect it to a log, or skip the unreadable file. A
-    pipeline that instead routes failures to a quarantine activity counts too,
-    which is why an on-failure edge into a reject/dead-letter activity is
-    accepted as evidence.
-
-    This reads the pipeline's *configuration* — it shows the safeguard is wired
-    up, not that bad data has actually been caught.
-    """
-    copies = [a for a in walk_activities(ctx.obj) if a.get("type") == "Copy"]
-    if not copies:
-        return not_applicable("Pipeline has no Copy activity to ingest untrusted data")
-
-    def tolerant(activity: dict) -> bool:
-        props = activity.get("typeProperties") or {}
-        return any(props.get(key) for key in FAULT_TOLERANCE_KEYS)
-
-    def logged(activity: dict) -> bool:
-        props = activity.get("typeProperties") or {}
-        return any(props.get(key) for key in COPY_LOG_KEYS)
-
-    safe = [a for a in copies if tolerant(a)]
-    # A quarantine route reached on failure protects the whole pipeline, so it
-    # counts for every Copy rather than for one activity.
-    quarantine = [a for a in walk_activities(ctx.obj)
-                  if QUARANTINE_NAME_RE.search(a.get("name", ""))
-                  and any("Failed" in (dep.get("dependencyConditions") or [])
-                          for dep in (a.get("dependsOn") or []))]
-    if quarantine and not safe:
-        names = ", ".join(sorted(a.get("name", "?") for a in quarantine))
-        return covered(
-            len(copies), len(copies),
-            f"No Copy sets fault tolerance, but failures route to a quarantine "
-            f"activity: {names}",
-        )
-
-    detail = (f"{len(safe)} of {len(copies)} Copy activities skip/redirect bad rows "
-              f"or files")
-    if safe and not any(logged(a) for a in safe):
-        detail += " — none records the skipped rows, so they are dropped silently"
-    return covered(len(safe), len(copies), detail)
-
-
-@check(
-    id="NB-BADRECORDS", ref="9.1.3",
-    title="Poison message / corrupt file handling (quarantine, not crash)",
-    pillar=Pillar.RELIABILITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
-    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
-)
-def notebook_bad_records(ctx: CheckContext) -> Verdict:
-    """A notebook reading raw files keeps bad rows instead of dying or dropping them.
-
-    Graded rather than binary, because the options differ in how much they cost
-    you. ``badRecordsPath`` or a ``_corrupt_record`` column keeps the rejects for
-    inspection; ``DROPMALFORMED`` keeps the run alive but discards the records
-    with no trace; ``FAILFAST`` aborts the whole read on the first bad row.
-
-    ``PERMISSIVE`` is deliberately not credited on its own — it is Spark's
-    default, so its presence proves nothing was decided.
-    """
-    code = notebook_code(ctx.obj)
-    if not FILE_READ_RE.search(code):
-        return not_applicable("Notebook does not read raw files")
-
-    if BAD_RECORD_KEPT_RE.search(code):
-        return graded(3, "Bad records are captured (badRecordsPath / corrupt-record column)")
-    if EXCEPT_RE.search(code) and QUARANTINE_WRITE_RE.search(code):
-        return graded(3, "Read errors are caught and routed to a quarantine/reject location")
-    if BAD_RECORD_DROPPED_RE.search(code):
-        return graded(1, "Uses DROPMALFORMED — the run survives but bad records are "
-                         "discarded with no record of them")
-    if FAILFAST_RE.search(code):
-        return graded(0, "Uses FAILFAST — a single malformed record aborts the read")
-    return graded(0, "Reads raw files with no bad-record handling — one malformed "
-                     "record fails the notebook")
 
 
 @check(
