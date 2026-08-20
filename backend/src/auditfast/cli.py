@@ -52,7 +52,11 @@ def cmd_run(args) -> int:
 
     print("Running audit...")
     run = service.run_audit(
-        project, pillars=pillars, out_dir=os.path.abspath(args.out), token=token
+        project,
+        pillars=pillars,
+        out_dir=os.path.abspath(args.out),
+        token=token,
+        external_checks_csv=args.external_checks,
     )
 
     print_summary(run.project_name, run.aggregate)
@@ -215,6 +219,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--project", required=True, help="Path to the project YAML file")
     run.add_argument("--out", default="output", help="Output directory (default: output)")
     run.add_argument("--pillars", default="", help="Comma-separated pillar subset")
+    run.add_argument("--external-checks", default=None,
+                     help="Path to external checks CSV (e.g., AdminChecks.csv)")
 
     serve = sub.add_parser("serve", help="Start the REST API")
     serve.add_argument("--project", default="config/project.example.yaml",

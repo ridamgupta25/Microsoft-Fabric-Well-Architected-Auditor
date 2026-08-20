@@ -17,6 +17,7 @@ from auditfast.core.check.cost_resource_optimization.data_operations.automated i
 )
 from auditfast.core.check.data_management_quality.data_storage.automated import (
     naming_style,
+    shortcut_governance,
     warehouse_naming_is_internally_consistent,
     warehouse_schema_organization,
 )
@@ -29,7 +30,7 @@ from auditfast.core.check.data_management_quality.reporting_semantic.automated i
 from auditfast.core.check.operations_reliability.data_operations.automated import (
     medallion_architecture,
 )
-from auditfast.core.enums import Resource, Status
+from auditfast.core.enums import Layer, Resource, Status
 from auditfast.core.models import CheckContext, Item, WorkspaceContext
 
 _PASS, _PARTIAL, _FAIL = 3, 1, 0
@@ -59,6 +60,9 @@ def _rel(from_table: str, to_table: str, *, active: bool = True) -> dict:
         "from_table": from_table, "from_column": "k",
         "to_table": to_table, "to_column": "k",
         "cross_filter": "oneDirection", "is_active": active,
+        # A crawled model carries cardinality even for a defaulted many-to-one
+        # (empty string), so the check can assess the many-to-many half.
+        "from_cardinality": "", "to_cardinality": "",
     }
 
 
@@ -117,8 +121,44 @@ def test_ambiguous_paths_pass_when_the_relationship_graph_is_a_tree():
     verdict = _scored(relationships_have_no_ambiguous_paths(_model_ctx(models)))
     assert verdict.score == _PASS
     assert "1 of 1" in verdict.evidence
-    # The limit is stated, never implied away.
-    assert "cardinality is not part of the parsed model definition" in verdict.evidence
+    assert "no direct many-to-many relationship" in verdict.evidence
+
+
+def _m2m_rel(from_table: str, to_table: str, *, active: bool = True) -> dict:
+    """A relationship declared many-to-many on both ends (no bridge)."""
+    return {
+        "name": f"{from_table}-{to_table}",
+        "from_table": from_table, "from_column": "k",
+        "to_table": to_table, "to_column": "k",
+        "cross_filter": "bothDirections", "is_active": active,
+        "from_cardinality": "many", "to_cardinality": "many",
+    }
+
+
+def test_direct_many_to_many_relationship_is_flagged():
+    """A relationship declared many/many on both ends has no bridge - a defect."""
+    models = {"m": {"relationships": [_m2m_rel("Sales", "Account")]}}
+    outcome = relationships_have_no_ambiguous_paths(_model_ctx(models))
+    assert _scored(outcome).score == _FAIL
+    detail = _details(outcome)[0]
+    assert detail.obj == "m"
+    assert "direct many-to-many" in detail.evidence
+    assert "account <-> sales" in detail.evidence
+
+
+def test_standard_many_to_one_relationship_is_not_flagged_as_many_to_many():
+    """A defaulted (cardinality-omitted) relationship must not read as many-to-many."""
+    models = {"m": {"relationships": [_rel("Sales", "Date"), _rel("Sales", "Customer")]}}
+    verdict = _scored(relationships_have_no_ambiguous_paths(_model_ctx(models)))
+    assert verdict.score == _PASS
+
+
+def test_a_single_many_to_many_relationship_is_judged_not_skipped():
+    """A lone many-to-many relationship is a defect even without a second path."""
+    models = {"m": {"relationships": [_m2m_rel("A", "B")]}}
+    verdict = _scored(relationships_have_no_ambiguous_paths(_model_ctx(models)))
+    assert verdict.score == _FAIL
+    assert "0 of 1" in verdict.evidence
 
 
 def test_ambiguous_paths_fail_when_a_second_active_route_exists():
@@ -130,6 +170,8 @@ def test_ambiguous_paths_fail_when_a_second_active_route_exists():
     }
     outcome = relationships_have_no_ambiguous_paths(_model_ctx(models))
     assert _scored(outcome).score == _FAIL
+    # The failing model is named in the scored roll-up, not only on the detail row.
+    assert "Model(s) with a defect: m" in _scored(outcome).evidence
     # The offending pair is named on a detail row, not merely counted.
     detail = _details(outcome)[0]
     assert detail.obj == "m"
@@ -156,6 +198,59 @@ def test_ambiguous_paths_are_na_without_definitions_or_relationships():
     assert _scored(relationships_have_no_ambiguous_paths(single)).status is Status.NA
 
 
+def _rel_no_cardinality(from_table: str, to_table: str, *, active: bool = True) -> dict:
+    """A relationship as an *older* snapshot recorded it — no cardinality field."""
+    return {
+        "name": f"{from_table}-{to_table}",
+        "from_table": from_table, "from_column": "k",
+        "to_table": to_table, "to_column": "k",
+        "cross_filter": "oneDirection", "is_active": active,
+    }
+
+
+def test_cardinality_is_scoped_out_when_the_snapshot_has_none():
+    """Without cardinality the check must not claim 'no direct many-to-many'."""
+    models = {"m": {"relationships": [
+        _rel_no_cardinality("Sales", "Date"), _rel_no_cardinality("Sales", "Customer"),
+    ]}}
+    verdict = _scored(relationships_have_no_ambiguous_paths(_model_ctx(models)))
+    assert verdict.score == _PASS
+    assert "no direct many-to-many relationship" not in verdict.evidence
+    assert "cardinality is not present in the parsed model" in verdict.evidence
+    assert "not assessed here" in verdict.evidence
+
+
+def test_cardinality_is_assessed_when_the_snapshot_carries_it():
+    """With cardinality present the many-to-many claim is made (and verified)."""
+    models = {"m": {"relationships": [_rel("Sales", "Date"), _rel("Sales", "Customer")]}}
+    verdict = _scored(relationships_have_no_ambiguous_paths(_model_ctx(models)))
+    assert "no direct many-to-many relationship" in verdict.evidence
+    assert "cardinality is not present" not in verdict.evidence
+
+
+def test_per_model_defect_row_carries_the_real_severity_not_informational():
+    """A named per-model FAIL must not read as 'Informational' in the report."""
+    from auditfast.core.check.registry import REGISTRY
+    from auditfast.core.engine import build_result
+    from auditfast.core.enums import Severity
+
+    models = {"m": {"relationships": [
+        _rel("Sales", "Customer"), _rel("Customer", "Geography"),
+        _rel("Sales", "Geography"),
+    ]}}
+    ctx = _model_ctx(models, layer=Layer.REPORTING)
+    outcome = relationships_have_no_ambiguous_paths(ctx)
+    detail = _details(outcome)[0]
+    assert detail.obj == "m"
+
+    spec = REGISTRY.get("R-REL-AMBIGUOUS")
+    row = build_result(spec, ctx.workspace, detail)
+    assert row.status is Status.FAIL
+    assert row.scored is False           # still does not vote in the score
+    assert row.severity is spec.severity  # but is shown at the real severity
+    assert row.severity is not Severity.INFO
+
+
 # =============================================================================
 # 14.1.8 — technical keys hidden from consumers
 # =============================================================================
@@ -168,7 +263,9 @@ def test_hidden_keys_pass_when_every_key_column_is_hidden():
     verdict = _scored(key_columns_are_hidden(_model_ctx(models)))
     assert verdict.score == _PASS
     assert "1 of 1 key-shaped column(s)" in verdict.evidence
-    assert "Display folders are not part of the parsed model definition" in verdict.evidence
+    # Display folders are readable now; a snapshot without them says so rather
+    # than implying the folder half was assessed and passed.
+    assert "Display folders are not in this snapshot" in verdict.evidence
 
 
 def test_hidden_keys_fail_when_a_key_is_visible_to_report_authors():
@@ -368,6 +465,58 @@ def test_naming_style_classifies_each_convention():
     assert naming_style("FACT_ORDERS") == "UPPER_CASE"
     assert naming_style("Order Header") == "mixed"
     assert naming_style("Customer_ID") == "mixed"
+
+
+# =============================================================================
+# 4.1.3 - Shortcut governance (WS-SHORTCUT-GOVERNANCE)
+# =============================================================================
+
+def _sc(name: str, path: str, target_type: str = "OneLake") -> dict:
+    return {"name": name, "path": path, "target_type": target_type}
+
+
+def test_shortcut_governance_passes_table_shortcuts_under_tables():
+    """OneLake table shortcuts under /Tables are the recommended pattern, not a smell.
+
+    Regression for the false FAIL on MLC_Fabric_DEV: the Fabric List Shortcuts API
+    returns ``path`` as the parent folder, so distinct table shortcuts share the
+    /Tables path. They must not read as "rooted under Tables" or as duplicates of
+    one another.
+    """
+    ctx = _ctx(shortcuts={
+        "Bronze": [_sc("ifs_raw", "/Tables"), _sc("datdim", "/Tables"),
+                   _sc("MLC_Trucking", "/Files", "OneDriveSharePoint"),
+                   _sc("Fabric_Mapping_Files", "/Files", "OneDriveSharePoint")],
+        "Silver": [_sc("dss", "/Tables"), _sc("adage", "/Tables")],
+        "lz": [_sc("fin", "/Tables")],
+    })
+    verdict = shortcut_governance(ctx)
+    assert verdict.score == _PASS
+    assert "7 of 7" in verdict.evidence
+    assert "Tables path" not in verdict.evidence
+    assert "duplicate" not in verdict.evidence
+
+
+def test_shortcut_governance_still_flags_real_structural_smells():
+    """Traversal, nested Shortcuts, a missing target, and a true duplicate still fail."""
+    ctx = _ctx(shortcuts={"lh": [
+        _sc("dupe", "/Tables"), _sc("dupe", "/Tables"),   # same parent path AND name
+        _sc("escape", "/Files/../secret"),                # path traversal
+        _sc("loop", "/Files/Shortcuts/x"),                # nested Shortcuts (loop-prone)
+        _sc("blank", "/Tables", ""),                       # missing target type
+        _sc("clean", "/Tables"),
+    ]})
+    verdict = shortcut_governance(ctx)
+    assert verdict.score == _FAIL
+    evidence = verdict.evidence
+    assert "duplicate shortcut path" in evidence
+    assert "path traversal" in evidence
+    assert "nested Shortcut path" in evidence
+    assert "missing target type" in evidence
+
+
+def test_shortcut_governance_is_na_without_shortcuts():
+    assert shortcut_governance(_ctx()).status is Status.NA
 
 
 def test_warehouse_naming_passes_on_a_consistent_non_snake_convention():

@@ -28,45 +28,6 @@ from auditfast.core.models import CheckContext
 #: Timeout values Fabric/ADF apply by default — i.e. "nobody set this".
 DEFAULT_TIMEOUTS = frozenset({"7.00:00:00", "0.12:00:00", "7.00:00", ""})
 
-#: Copy-activity properties that make a bad row or unreadable file survivable
-#: instead of fatal. Any one of them means the activity was configured to keep
-#: going: skip the row, redirect it somewhere, or skip the offending file.
-FAULT_TOLERANCE_KEYS = (
-    "enableSkipIncompatibleRow",
-    "redirectIncompatibleRowSettings",
-    "skipErrorFile",
-)
-#: Where the skipped rows are recorded, so "skipped" does not mean "lost".
-COPY_LOG_KEYS = ("logSettings", "logStorageSettings")
-
-#: An activity that parks bad data rather than failing the run. Matched on the
-#: activity's own name because the destination is a dataset reference we cannot
-#: resolve — a Copy named "Write_Rejects_To_Quarantine" is the signal.
-QUARANTINE_NAME_RE = re.compile(
-    r"quarantin|reject|dead.?letter|bad.?record|error.?(?:row|record|table)|invalid",
-    re.IGNORECASE,
-)
-
-#: A notebook only meets malformed input if it reads raw files in the first place.
-FILE_READ_RE = re.compile(
-    r"spark\s*\.\s*read\b|\.\s*read\s*\.\s*(?:json|csv|text|parquet|format)\s*\(|\.\s*load\s*\(",
-    re.IGNORECASE,
-)
-#: Bad rows are kept: written aside, or isolated as a corrupt-record column.
-BAD_RECORD_KEPT_RE = re.compile(
-    r"badRecordsPath|_corrupt_record|columnNameOfCorruptRecord", re.IGNORECASE,
-)
-#: Bad rows are dropped — the run survives, but the records are gone silently.
-BAD_RECORD_DROPPED_RE = re.compile(r"DROPMALFORMED", re.IGNORECASE)
-#: The opposite of graceful handling: one bad row aborts the read.
-FAILFAST_RE = re.compile(r"FAILFAST", re.IGNORECASE)
-#: A hand-rolled quarantine: caught exception plus a write to a reject location.
-EXCEPT_RE = re.compile(r"\bexcept\b", re.IGNORECASE)
-QUARANTINE_WRITE_RE = re.compile(
-    r"quarantin|reject|dead.?letter|bad.?record|error.?(?:table|record|row)|invalid.?record",
-    re.IGNORECASE,
-)
-
 #: Activity types that ARE a notification (Teams / email / webhook / Data Activator).
 NOTIFY_TYPES = frozenset({"Teams", "Office365Outlook", "Outlook365", "SendEmail", "WebHook"})
 #: Generic call activities that only count as a notifier when their *name* says so —
@@ -75,6 +36,17 @@ NOTIFY_TYPES = frozenset({"Teams", "Office365Outlook", "Outlook365", "SendEmail"
 NOTIFY_CALL_TYPES = frozenset({"Web", "WebActivity", "AzureFunctionActivity", "Function"})
 NOTIFY_NAME_RE = re.compile(r"notif|alert|email|teams", re.IGNORECASE)
 _DATA_MOVE_TYPES = frozenset({"Copy", "Script", "TridentNotebook", "SqlServerStoredProcedure", "Lookup"})
+#: Activities that DO move or transform data, but whose failed-record handling is
+#: configured *inside the referenced artifact* — a Copy Job item, a Gen2
+#: dataflow, or a child pipeline — never in this pipeline's own JSON. A pipeline
+#: whose only mover is one of these still moves data, so it is not "no movement";
+#: but its reject route cannot be seen here, so it is N/A (never FAIL), with a
+#: reason that says so rather than the misleading "no data-movement activity".
+_OPAQUE_MOVE_TYPES = frozenset({
+    "InvokeCopyJob", "CopyJob",
+    "RefreshDataflow", "ExecuteDataFlow", "ExecuteDataflow",
+    "ExecutePipeline", "InvokePipeline",
+})
 _RECORD_ERROR = re.compile(
     r"reject|invalid|quarantine|dead[_ -]?letter|error[_ -]?output|bad[_ -]?records?|"
     r"failed[_ -]?records?|_corrupt|_rejected|_quarantine",
@@ -114,7 +86,7 @@ _RESTART_BOUNDARY = re.compile(
 
 @check(
     id="PL-RETRY", ref="2.4.1", title="All pipeline activities have appropriate retry policies configured (copy, notebook, lookup, web, ForEach)",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def retry_policy(ctx: CheckContext) -> Verdict:
@@ -127,7 +99,7 @@ def retry_policy(ctx: CheckContext) -> Verdict:
 
 @check(
     id="PL-FAILPATH", ref="2.4.3", title="On-failure paths defined for critical activities",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def failure_path(ctx: CheckContext) -> Verdict:
@@ -143,7 +115,7 @@ def failure_path(ctx: CheckContext) -> Verdict:
 
 @check(
     id="PL-NOTIFY", ref="2.4.5", title="Pipeline failure triggers notification (Data Activator, email, Teams)",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def failure_notification(ctx: CheckContext) -> Verdict:
@@ -170,7 +142,7 @@ def failure_notification(ctx: CheckContext) -> Verdict:
 @check(
     id="PL-RESTART", ref="9.1.1",
     title="Failed pipelines can be restarted from point of failure (not full re-run)",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    pillar=Pillar.RELIABILITY, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def restart_from_failure(ctx: CheckContext) -> Verdict:
@@ -209,8 +181,8 @@ def restart_from_failure(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-TIMEOUT", ref="IMPL-23", title="Pipeline activities set an explicit timeout (not Fabric's multi-day default) [PL-TIMEOUT]",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.LOW,
+    id="PL-TIMEOUT", ref="13.4.1", title="Pipeline activities set an explicit timeout (not Fabric's multi-day default) [PL-TIMEOUT]",
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def explicit_timeouts(ctx: CheckContext) -> Verdict:
@@ -239,95 +211,8 @@ def explicit_timeouts(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="PL-POISON", ref="9.1.3",
-    title="Poison message / corrupt file handling (quarantine, not crash)",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
-    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
-)
-def poison_message_handling(ctx: CheckContext) -> Verdict:
-    """One bad row or unreadable file is parked, not allowed to kill the run.
-
-    Judged on the Copy activities, because they are what meets untrusted source
-    data. Fabric's fault-tolerance settings are the mechanism: skip the
-    incompatible row, redirect it to a log, or skip the unreadable file. A
-    pipeline that instead routes failures to a quarantine activity counts too,
-    which is why an on-failure edge into a reject/dead-letter activity is
-    accepted as evidence.
-
-    This reads the pipeline's *configuration* — it shows the safeguard is wired
-    up, not that bad data has actually been caught.
-    """
-    copies = [a for a in walk_activities(ctx.obj) if a.get("type") == "Copy"]
-    if not copies:
-        return not_applicable("Pipeline has no Copy activity to ingest untrusted data")
-
-    def tolerant(activity: dict) -> bool:
-        props = activity.get("typeProperties") or {}
-        return any(props.get(key) for key in FAULT_TOLERANCE_KEYS)
-
-    def logged(activity: dict) -> bool:
-        props = activity.get("typeProperties") or {}
-        return any(props.get(key) for key in COPY_LOG_KEYS)
-
-    safe = [a for a in copies if tolerant(a)]
-    # A quarantine route reached on failure protects the whole pipeline, so it
-    # counts for every Copy rather than for one activity.
-    quarantine = [a for a in walk_activities(ctx.obj)
-                  if QUARANTINE_NAME_RE.search(a.get("name", ""))
-                  and any("Failed" in (dep.get("dependencyConditions") or [])
-                          for dep in (a.get("dependsOn") or []))]
-    if quarantine and not safe:
-        names = ", ".join(sorted(a.get("name", "?") for a in quarantine))
-        return covered(
-            len(copies), len(copies),
-            f"No Copy sets fault tolerance, but failures route to a quarantine "
-            f"activity: {names}",
-        )
-
-    detail = (f"{len(safe)} of {len(copies)} Copy activities skip/redirect bad rows "
-              f"or files")
-    if safe and not any(logged(a) for a in safe):
-        detail += " — none records the skipped rows, so they are dropped silently"
-    return covered(len(safe), len(copies), detail)
-
-
-@check(
-    id="NB-BADRECORDS", ref="9.1.3",
-    title="Poison message / corrupt file handling (quarantine, not crash)",
-    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
-    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
-)
-def notebook_bad_records(ctx: CheckContext) -> Verdict:
-    """A notebook reading raw files keeps bad rows instead of dying or dropping them.
-
-    Graded rather than binary, because the options differ in how much they cost
-    you. ``badRecordsPath`` or a ``_corrupt_record`` column keeps the rejects for
-    inspection; ``DROPMALFORMED`` keeps the run alive but discards the records
-    with no trace; ``FAILFAST`` aborts the whole read on the first bad row.
-
-    ``PERMISSIVE`` is deliberately not credited on its own — it is Spark's
-    default, so its presence proves nothing was decided.
-    """
-    code = notebook_code(ctx.obj)
-    if not FILE_READ_RE.search(code):
-        return not_applicable("Notebook does not read raw files")
-
-    if BAD_RECORD_KEPT_RE.search(code):
-        return graded(3, "Bad records are captured (badRecordsPath / corrupt-record column)")
-    if EXCEPT_RE.search(code) and QUARANTINE_WRITE_RE.search(code):
-        return graded(3, "Read errors are caught and routed to a quarantine/reject location")
-    if BAD_RECORD_DROPPED_RE.search(code):
-        return graded(1, "Uses DROPMALFORMED — the run survives but bad records are "
-                         "discarded with no record of them")
-    if FAILFAST_RE.search(code):
-        return graded(0, "Uses FAILFAST — a single malformed record aborts the read")
-    return graded(0, "Reads raw files with no bad-record handling — one malformed "
-                     "record fails the notebook")
-
-
-@check(
     id="PL-RETRY-VALUES", ref="2.4.2", title="Retry count and interval follow reasonable patterns (not infinite retries)",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def retry_values(ctx: CheckContext) -> Verdict:
@@ -497,7 +382,7 @@ def _retry_is_dynamic(activity: dict) -> bool:
 @check(
     id="PL-IDEMPOTENT", ref="2.4.6",
     title="Idempotency ensured — re-running a failed pipeline does not produce duplicates",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    pillar=Pillar.RELIABILITY, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def pipeline_idempotent(ctx: CheckContext) -> Verdict:
@@ -537,7 +422,7 @@ def pipeline_idempotent(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-IDEMPOTENT", ref="9.3.1",
     title="All pipelines and notebooks are idempotent (safe to re-run)",
-    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    pillar=Pillar.RELIABILITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def notebook_idempotent(ctx: CheckContext) -> Verdict:
@@ -603,7 +488,7 @@ def _failure_branch_targets(acts: list[dict]) -> list[str]:
 @check(
     id="PL-DEADLETTER", ref="2.4.4",
     title="Failed records captured to dead-letter / quarantine area (not silently dropped or halting good records)",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def pl_deadletter(ctx: CheckContext) -> Verdict:
@@ -632,6 +517,15 @@ def pl_deadletter(ctx: CheckContext) -> Verdict:
     acts = walk_activities(ctx.obj)
     data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
     if not data_acts:
+        opaque = sorted({a.get("type") for a in acts
+                         if (a.get("type") or "") in _OPAQUE_MOVE_TYPES})
+        if opaque:
+            return not_applicable(
+                f"Pipeline '{ctx.obj_name}' moves data only through {', '.join(opaque)}, "
+                f"whose failed-record handling is configured inside the referenced artifact "
+                f"(Copy Job / dataflow / child pipeline), not in this pipeline - it cannot be "
+                f"judged from the pipeline definition"
+            )
         return not_applicable("No data-movement activity to assess for failed records")
 
     redirecting = [
@@ -703,7 +597,7 @@ _ANY_WRITE = re.compile(
 @check(
     id="NB-DEADLETTER", ref="5.1.10",
     title="DQ quarantine pattern: failed records routed to error tables with failure reason",
-    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_deadletter(ctx: CheckContext) -> Verdict:
@@ -904,7 +798,7 @@ def _explicit_transaction(code: str) -> bool:
 @check(
     id="NB-TXN-BOUNDARY", ref="9.3.3",
     title="Transaction boundaries defined for multi-step operations (incl. Warehouse loads)",
-    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    pillar=Pillar.RELIABILITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def notebook_transaction_boundary(ctx: CheckContext) -> Verdict:
@@ -993,7 +887,7 @@ _NB_REMOTE_CALL = re.compile(
 @check(
     id="NB-RETRY-BACKOFF", ref="9.1.2",
     title="Transient failure handling: notebook retries with backoff",
-    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.RELIABILITY, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_retry_backoff(ctx: CheckContext) -> Verdict:
@@ -1093,7 +987,7 @@ def _integrity_methods(code: str) -> list[str]:
 @check(
     id="NB-POST-FAILURE-INTEGRITY", ref="9.3.4",
     title="Data integrity validated across layers after failures",
-    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.RELIABILITY, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_post_failure_integrity(ctx: CheckContext) -> Verdict:
@@ -1266,7 +1160,7 @@ def _merge_grade(text: str, subject: str) -> Verdict:
 @check(
     id="NB-MERGE-KEYED", ref="9.3.2",
     title="Merge/upsert patterns prevent duplicates on re-execution",
-    pillar=Pillar.OPERATIONS, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    pillar=Pillar.RELIABILITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def notebook_merge_keyed(ctx: CheckContext) -> Verdict:
@@ -1311,7 +1205,7 @@ def notebook_merge_keyed(ctx: CheckContext) -> Verdict:
 @check(
     id="PL-MERGE-KEYED", ref="9.3.2",
     title="Merge/upsert patterns prevent duplicates on re-execution",
-    pillar=Pillar.OPERATIONS, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    pillar=Pillar.RELIABILITY, scope=Scope.PIPELINE, severity=Severity.HIGH,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def pipeline_merge_keyed(ctx: CheckContext) -> Verdict:

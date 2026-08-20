@@ -17,7 +17,7 @@ from auditfast.core.models import GroupContext
 @group_check(
     id="XW-SECRET-SCAN", ref="11.1.8",
     title="Secret-scanning / credential-detection enabled on the source repository",
-    pillar=Pillar.SECURITY, severity=Severity.HIGH, requires=[Resource.GIT],
+    pillar=Pillar.SECURITY_ACCESS, severity=Severity.HIGH, requires=[Resource.GIT],
     required=False,
 )
 def secret_scanning_consistent(ctx: GroupContext) -> Verdict:

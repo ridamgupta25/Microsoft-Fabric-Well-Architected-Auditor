@@ -12,8 +12,8 @@ from auditfast.core.models import CheckContext
 
 
 @check(
-    id="WS-LABELS", ref="IMPL-04", title="Sensitivity labels applied across Fabric items",
-    pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    id="WS-LABELS", ref="13.2.3", title="Sensitivity labels applied across Fabric items",
+    pillar=Pillar.SECURITY_ACCESS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     requires=[Resource.ITEMS], required=True,
 )
 def sensitivity_labels(ctx: CheckContext) -> Verdict:
@@ -57,7 +57,7 @@ def sensitivity_labels(ctx: CheckContext) -> Verdict:
 
 @check(
     id="WS-RLS", ref="6.2.1", title="Row-Level Security (RLS) implemented on the Gold Warehouse and/or semantic models where required",
-    pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.CRITICAL,
+    pillar=Pillar.SECURITY_ACCESS, scope=Scope.WORKSPACE, severity=Severity.CRITICAL,
     layers=[Layer.STORAGE],
     requires=[Resource.SEMANTIC_MODEL_DEFINITIONS, Resource.ITEMS,
               Resource.WAREHOUSE_SECURITY],
@@ -195,7 +195,7 @@ def rls_on_semantic_models(ctx: CheckContext) -> list[Verdict]:
 
 @check(
     id="WS-OLS", ref="6.2.2", title="Column-Level Security / Object-Level Security applied for sensitive fields",
-    pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.CRITICAL,
+    pillar=Pillar.SECURITY_ACCESS, scope=Scope.WORKSPACE, severity=Severity.CRITICAL,
     layers=[Layer.STORAGE], requires=[Resource.SEMANTIC_MODEL_DEFINITIONS], required=True,
 )
 def ols_on_semantic_models(ctx: CheckContext) -> list[Verdict]:
@@ -253,7 +253,7 @@ _SAMPLE_LIMIT = 8
 @check(
     id="WS-DDM", ref="6.2.3",
     title="Dynamic Data Masking applied in the Warehouse for sensitive columns where appropriate",
-    pillar=Pillar.SECURITY, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    pillar=Pillar.SECURITY_ACCESS, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=TABLE_LAYERS, requires=[Resource.TABLE_SCHEMAS, Resource.TABLE_COLUMNS],
     required=True,
 )

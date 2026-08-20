@@ -16,7 +16,7 @@ def test_excel_wraps_evidence_and_recommendations(tmp_path):
         check_id="NB-TEST",
         ref="T.1",
         title="Test finding",
-        pillar=Pillar.OPERATIONS,
+        pillar=Pillar.RELIABILITY,
         status=Status.FAIL,
         score=0,
         evidence="No retry policy is configured.",
@@ -32,11 +32,7 @@ def test_excel_wraps_evidence_and_recommendations(tmp_path):
     build_excel(str(output), "Test project", aggregate([result]), [result])
 
     workbook = load_workbook(output)
-    checks = workbook["Checks"]
-    risks = workbook["Risk Register"]
-    assert checks["L2"].alignment.wrap_text is True
-    assert checks["M2"].alignment.wrap_text is True
-    assert risks["G2"].alignment.wrap_text is True
-    assert risks["H2"].alignment.wrap_text is True
-    assert checks["M2"].value == recommendation
-    assert risks["H2"].value == recommendation
+    findings = workbook["Findings"]
+    assert findings["I2"].alignment.wrap_text is True
+    assert findings["J2"].alignment.wrap_text is True
+    assert findings["J2"].value == recommendation

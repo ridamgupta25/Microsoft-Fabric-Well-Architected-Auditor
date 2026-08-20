@@ -202,7 +202,8 @@ for you to complete sign-in in a browser, then runs. There is no `--mock` /
 `--live` flag — every run is live.
 
 Reports are written to `backend/output/`:
-`audit-report.md` and `audit-report.xlsx` (Scorecard / Checks / Risk Register).
+`audit-report.md` and `audit-report.xlsx`. Both follow the stakeholder flow
+Summary → Area Detail → Checklist → Findings → Risk Register → Invent.
 
 ---
 

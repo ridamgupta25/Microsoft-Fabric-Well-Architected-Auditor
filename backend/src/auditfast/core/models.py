@@ -112,6 +112,13 @@ class WorkspaceContext:
     pipelines: dict[str, dict] = field(default_factory=dict)
     notebooks: dict[str, dict] = field(default_factory=dict)
     environments: dict[str, dict] = field(default_factory=dict)
+    #: The workspace's default Spark runtime, from
+    #: ``/workspaces/{id}/spark/settings``: ``{"runtime_version": "1.3",
+    #: "default_environment": str}``. A notebook that binds to no named
+    #: Environment inherits this, so without it the runtime check reported N/A on
+    #: the commonest configuration of all. Empty when the settings could not be
+    #: read - which the check must treat as unknown, never as out of date.
+    spark_settings: dict = field(default_factory=dict)
     tables: dict[str, dict] = field(default_factory=dict)
     shortcuts: dict[str, list] = field(default_factory=dict)
     semantic_models: dict[str, dict] = field(default_factory=dict)
@@ -128,6 +135,17 @@ class WorkspaceContext:
     #: ("defines no policy"); the warehouse being absent from the map means it could
     #: not be read, which is N/A.
     warehouse_security: dict[str, list] = field(default_factory=dict)
+    #: Per-Warehouse database options that govern automatic statistics, keyed by
+    #: store name: ``auto_create_stats`` / ``auto_update_stats`` /
+    #: ``auto_update_stats_async``. Read from ``sys.databases``.
+    #:
+    #: These are the *auditable* statistics setting. Fabric maintains statistics
+    #: itself, so no manual UPDATE STATISTICS is required - but a user can switch
+    #: the automatic behaviour off with ALTER DATABASE, and Microsoft says OFF
+    #: "can cause suboptimal query plans and degraded query performance".
+    #: ``None`` means the value could not be read, which is never the same as
+    #: "off".
+    warehouse_options: dict[str, dict] = field(default_factory=dict)
     #: Per-Warehouse SQL audit *configuration*, keyed by warehouse display name.
     #: Each value is the normalised ``settings/sqlAudit`` payload:
     #: ``{"state": str, "enabled": bool, "action_groups": [str], "retention_days": int|None}``.
@@ -158,6 +176,13 @@ class WorkspaceContext:
     #: top-level folder sample, depth/date counts, and truncation flags. Individual
     #: file names/paths are deliberately never persisted in the KB.
     lakehouse_files: dict[str, dict] = field(default_factory=dict)
+    #: Per-Lakehouse summary of the **Tables** section - the same bounded shape as
+    #: :attr:`lakehouse_files`, but for the Delta data files. A Lakehouse's tables
+    #: live under ``Tables/``, so a file-size check that read only ``Files/`` was
+    #: measuring loose landing-area files and ignoring every Parquet file the
+    #: point is actually about. Empty when the listing could not be read, which
+    #: the checks must treat as unknown rather than as an empty Lakehouse.
+    lakehouse_tables_files: dict[str, dict] = field(default_factory=dict)
     #: Per-Data-Activator (Reflex) rule summary, keyed by item display name:
     #: ``{"rules": int, "active_rules": int, "sources": int, "actions": int}``,
     #: parsed from the item's ``ReflexEntities.json`` definition. An Activator
@@ -261,16 +286,19 @@ class WorkspaceContext:
             "pipelines": self.pipelines,
             "notebooks": self.notebooks,
             "environments": self.environments,
+            "spark_settings": self.spark_settings,
             "tables": self.tables,
             "shortcuts": self.shortcuts,
             "semantic_models": self.semantic_models,
             "refresh_schedules": self.refresh_schedules,
             "warehouse_security": self.warehouse_security,
+            "warehouse_options": self.warehouse_options,
             "warehouse_audit": self.warehouse_audit,
             "run_history": self.run_history,
             "connections": self.connections,
             "reports": self.reports,
             "lakehouse_files": self.lakehouse_files,
+            "lakehouse_tables_files": self.lakehouse_tables_files,
             "activators": self.activators,
             "git_details": self.git_details,
             "sql_views": self.sql_views,
@@ -295,16 +323,19 @@ class WorkspaceContext:
             pipelines=dict(data.get("pipelines", {})),
             notebooks=dict(data.get("notebooks", {})),
             environments=dict(data.get("environments", {})),
+            spark_settings=dict(data.get("spark_settings", {})),
             tables=dict(data.get("tables", {})),
             shortcuts=dict(data.get("shortcuts", {})),
             semantic_models=dict(data.get("semantic_models", {})),
             refresh_schedules=dict(data.get("refresh_schedules", {})),
             warehouse_security=dict(data.get("warehouse_security", {})),
+            warehouse_options=dict(data.get("warehouse_options", {})),
             warehouse_audit=dict(data.get("warehouse_audit", {})),
             run_history=dict(data.get("run_history", {})),
             connections=list(data.get("connections", [])),
             reports=list(data.get("reports", [])),
             lakehouse_files=dict(data.get("lakehouse_files", {})),
+            lakehouse_tables_files=dict(data.get("lakehouse_tables_files", {})),
             activators=dict(data.get("activators", {})),
             git_details=dict(data.get("git_details", {})),
             sql_views=list(data.get("sql_views", [])),
@@ -552,6 +583,8 @@ class CheckResult:
     scope: Scope = Scope.WORKSPACE
     weight: float = 1.0
     scored: bool = True
+    #: Source of this check result: "automated" (from engine) or "external" (from CSV).
+    source: str = "automated"
 
     #: Kept as a class attribute so callers can reference ``CheckResult.MAX_SCORE``.
     MAX_SCORE = MAX_SCORE
@@ -584,6 +617,7 @@ class CheckResult:
             "scope": self.scope.value,
             "weight": self.weight,
             "scored": self.scored,
+            "source": self.source,
             # Workspace-level checks are common to every project regardless of
             # source system; the UI flags them as such.
             "common": self.scope is Scope.WORKSPACE,
@@ -618,4 +652,5 @@ class CheckResult:
             scope=Scope(data.get("scope", Scope.WORKSPACE.value)),
             weight=data.get("weight", 1.0),
             scored=data.get("scored", True),
+            source=data.get("source", "automated"),
         )

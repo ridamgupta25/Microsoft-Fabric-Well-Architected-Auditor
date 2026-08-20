@@ -18,9 +18,13 @@ import base64
 import contextlib
 import json
 import logging
+import os
+import re
+import threading
 import time
 from collections import Counter
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from typing import Any
 
@@ -70,6 +74,27 @@ _SYSTEM_PRINCIPALS: frozenset[str] = frozenset({
 })
 
 
+def _bounded_int_env(name: str, default: int, low: int, high: int) -> int:
+    """Read an int from the environment, clamped to ``[low, high]``."""
+    try:
+        return max(low, min(int(os.environ.get(name, default)), high))
+    except (TypeError, ValueError):
+        return default
+
+
+#: Per-workspace fan-out: how many item definitions are fetched at once while
+#: crawling a single workspace. Each getDefinition is a slow long-running
+#: operation, so fetching them concurrently is the crawl's biggest speed-up.
+_ITEM_FETCH_WORKERS = _bounded_int_env("AUDITFAST_MAX_PARALLEL_ITEM_FETCHES", 4, 1, 16)
+
+#: Process-wide ceiling on concurrent item-definition calls, shared across every
+#: workspace and audit, so parallel crawls together never exceed what the Fabric
+#: APIs tolerate (beyond which throttling would erase the gain).
+_DEFINITION_GATE = threading.BoundedSemaphore(
+    _bounded_int_env("AUDITFAST_MAX_INFLIGHT_ITEM_FETCHES", 32, 1, 32)
+)
+
+
 class LiveFabricProvider:
     """Reads a live Fabric tenant with a delegated, read-only OAuth2 token."""
 
@@ -82,6 +107,14 @@ class LiveFabricProvider:
 
         self._session = requests.Session()
         self._session.headers.update({"Authorization": f"Bearer {token}"})
+        # One connection pool wide enough that parallel workspace crawls share it
+        # without serialising on a too-small default (10).
+        adapter = requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
+        #: Guards the shared session's auth header and the lazily-built sub-clients
+        #: so several workspaces can be crawled concurrently on one provider.
+        self._lock = threading.Lock()
         self._timeout = timeout
         self._token_refresher = token_refresher
         #: A Power BI-audience token (``https://analysis.windows.net/powerbi/api``)
@@ -174,11 +207,36 @@ class LiveFabricProvider:
         log.info("access token expired, attempting silent refresh")
         new_token = self._token_refresher()
         if new_token:
-            self._session.headers.update({"Authorization": f"Bearer {new_token}"})
+            with self._lock:
+                self._session.headers.update({"Authorization": f"Bearer {new_token}"})
             log.info("token refreshed, resuming crawl")
             return True
         log.warning("token refresh failed, could not acquire new token")
         return False
+
+    def _fetch_items_parallel(self, items: list, worker):
+        """Run ``worker(item)`` for every item concurrently, results in input order.
+
+        Bounded by the process-wide definition gate so several workspaces (and
+        several audits) crawling at once never exceed the Fabric APIs' tolerance.
+        ``worker`` handles its own errors and returns a value; it must not raise.
+        """
+        results: list = [None] * len(items)
+        if not items:
+            return results
+        max_workers = min(_ITEM_FETCH_WORKERS, len(items))
+
+        def _run(index: int, obj):
+            with _DEFINITION_GATE:
+                return index, worker(obj)
+
+        with ThreadPoolExecutor(max_workers=max_workers,
+                                thread_name_prefix="item-fetch") as pool:
+            futures = [pool.submit(_run, i, obj) for i, obj in enumerate(items)]
+            for future in as_completed(futures):
+                index, value = future.result()
+                results[index] = value
+        return results
 
     #: getDefinition statuses worth retrying — transient throttling / 5xx.
     _RETRYABLE = frozenset({429, 500, 502, 503, 504})
@@ -323,6 +381,32 @@ class LiveFabricProvider:
             # A .py export: wrap the raw source as a single code cell.
             return {"cells": [{"cell_type": "code", "source": payload}]}, ""
         return None, failure
+
+    def _spark_settings(self, workspace_id: str) -> dict:
+        """The workspace's default Spark runtime, from the Spark settings API.
+
+        ``GET /workspaces/{id}/spark/settings`` returns
+        ``environment.runtimeVersion`` - the runtime a notebook inherits when it
+        binds to no named Environment, which is the commonest setup. Documented
+        as an ordinary delegated read (Viewer is enough), not tenant-admin.
+
+        Only the runtime and the default-environment name are kept: pool sizes
+        and session timeouts are settings no check reads, and the KB must not
+        grow with data nobody uses. A failure yields ``{}`` so the runtime check
+        falls back to its other evidence rather than raising.
+        """
+        status, body = self._get(f"/workspaces/{workspace_id}/spark/settings")
+        if status != 200 or not isinstance(body, dict):
+            log.info("workspace spark settings unavailable for %s (status %s) - "
+                     "notebooks with no bound Environment will have no runtime",
+                     workspace_id, status)
+            return {}
+        environment = body.get("environment") or {}
+        settings = {
+            "runtime_version": str(environment.get("runtimeVersion") or ""),
+            "default_environment": str(environment.get("name") or ""),
+        }
+        return settings if settings["runtime_version"] else {}
 
     def _environment_definition(self, workspace_id: str, item_id: str) -> tuple[dict | None, str]:
         """Read an Environment's Sparkcompute settings from its definition."""
@@ -800,13 +884,32 @@ class LiveFabricProvider:
                 continue
 
         def table_entry(object_id) -> dict | None:
-            """The context table an object id belongs to, if it is one we hold."""
+            """The context table an object id belongs to, if it is one we hold.
+
+            **The key must be built the way the column reader built it**, not
+            guessed at. ``SqlEndpointReader.columns`` files a Warehouse table as
+            ``<schema>.<table>`` and a Lakehouse table under its bare name, so
+            looking up the bare name alone matched nothing on a Warehouse: the
+            IDENTITY, foreign-key, key-constraint and row-count reads all
+            returned their rows and attached none of them, silently, on every
+            Warehouse ever crawled.
+
+            The store-prefixed spelling is tried last because the same reader
+            falls back to ``<store>.<table>`` when two stores hold a table of the
+            same name.
+            """
             info = objects.get(int(object_id)) if object_id is not None else None
             if not info:
                 return None
-            name = info[1]
-            return (ctx.tables.get(name)
-                    or ctx.tables.get(f"{endpoint.name}.{name}"))
+            schema, name = info[0], info[1]
+            qualified = f"{schema}.{name}" if schema else name
+            primary = qualified if endpoint.kind == "Warehouse" else name
+            for key in (primary, name, qualified,
+                        f"{endpoint.name}.{primary}", f"{endpoint.name}.{name}"):
+                entry = ctx.tables.get(key)
+                if entry is not None:
+                    return entry
+            return None
 
         for row in sets.get("row_counts", ()):
             entry = table_entry(row[0])
@@ -831,10 +934,55 @@ class LiveFabricProvider:
             if entry is not None:
                 entry["has_declared_key"] = True
 
+        # IDENTITY columns: the table *declares* which column the engine
+        # generates. A check reading this no longer has to infer "generated"
+        # from a column name. Stored per table as a list of column names, since
+        # a check needs to know which column, not merely that one exists.
+        for row in sets.get("identity_columns", ()):
+            entry = table_entry(row[0])
+            if entry is None or not row[1]:
+                continue
+            identity = entry.setdefault("identity_columns", [])
+            if row[1] not in identity:
+                identity.append(str(row[1]))
+
+        # Database-level automatic-statistics switches. Off is a real
+        # misconfiguration a user can reach and we can read - unlike NORECOMPUTE,
+        # which Fabric refuses to set at all.
+        #
+        # Keyed by the database name the row carries, not by the endpoint: one
+        # SQL endpoint exposes several databases (its own plus `master` and the
+        # dataflow staging stores), and an earlier `WHERE name = DB_NAME()`
+        # filter matched none of them, so this read silently returned nothing
+        # while `sys.stats` on the same connection worked. `master` is skipped -
+        # it is a system database nobody configures.
+        for row in sets.get("database_options", ()):
+            database = str(row[0] or "").strip()
+            if not database or database.lower() == "master":
+                continue
+            ctx.warehouse_options[database] = {
+                "auto_create_stats": bool(row[1]) if row[1] is not None else None,
+                "auto_update_stats": bool(row[2]) if row[2] is not None else None,
+                "auto_update_stats_async": bool(row[3]) if len(row) > 3 and row[3] is not None else None,
+            }
+
         for row in sets.get("stats", ()):
             entry = table_entry(row[0])
-            if entry is not None:
-                entry["statistics"] = int(entry.get("statistics", 0)) + 1
+            if entry is None:
+                continue
+            entry["statistics"] = int(entry.get("statistics", 0)) + 1
+            # `no_recompute = 1` means someone switched automatic refresh off for
+            # this statistic - the only way stale statistics survive on Fabric,
+            # and the one thing worth reporting now the engine maintains the rest.
+            if len(row) > 4 and row[4]:
+                entry["statistics_norecompute"] = int(
+                    entry.get("statistics_norecompute", 0)) + 1
+            # Newest refresh across the table's statistics, so a check can see
+            # whether automatic maintenance is actually running here.
+            if len(row) > 5 and row[5]:
+                stamp = str(row[5])
+                if stamp > str(entry.get("statistics_last_updated") or ""):
+                    entry["statistics_last_updated"] = stamp
 
         # Views and routines are workspace-level, not per table: they describe the
         # load logic, which several Warehouse checks need and none can read today.
@@ -1021,7 +1169,9 @@ class LiveFabricProvider:
         if not self._powerbi_token:
             return None
         from .powerbi import PowerBIClient
-        self._powerbi_client = PowerBIClient(self._powerbi_token, timeout=self._timeout)
+        with self._lock:
+            if self._powerbi_client is None:
+                self._powerbi_client = PowerBIClient(self._powerbi_token, timeout=self._timeout)
         return self._powerbi_client
 
     def _onelake(self):
@@ -1031,7 +1181,9 @@ class LiveFabricProvider:
         if not self._storage_token:
             return None
         from .onelake import OneLakeClient
-        self._onelake_client = OneLakeClient(self._storage_token, timeout=self._timeout)
+        with self._lock:
+            if self._onelake_client is None:
+                self._onelake_client = OneLakeClient(self._storage_token, timeout=self._timeout)
         return self._onelake_client
 
     def _semantic_model_last_refresh(self, workspace_id: str, item_id: str) -> tuple[str | None, str]:
@@ -1109,6 +1261,67 @@ class LiveFabricProvider:
             if isinstance(row, dict) and row.get("id")
         ]
         return reports, known
+
+    def _report_bindings_from_definitions(self, ctx: WorkspaceContext,
+                                          workspace_id: str) -> list[dict]:
+        """Report → semantic-model bindings from the *Fabric* item definitions.
+
+        The Power BI *Get Reports In Group* API needs a Power BI-audience token,
+        which a Fabric-only sign-in does not have - so the reuse checks reported
+        N/A on a workspace whose bindings were perfectly readable another way.
+        A Report item's ``definition.pbir`` carries ``datasetReference`` as
+        either ``byPath`` (``"../Sales.SemanticModel"``, same workspace) or
+        ``byConnection`` (``"semanticmodelid=<guid>"``), and ``getDefinition``
+        serves it on the Fabric token the crawl already holds.
+
+        Used only as a fallback: the Power BI listing is preferred because it
+        also carries the *owning workspace* of the model, which is what tells a
+        cross-workspace (central-hub) binding apart from a local one.
+        """
+        bindings: list[dict] = []
+        for item in ctx.items:
+            if item.type not in ("Report", "PaginatedReport"):
+                continue
+            parts, _failure = self._definition_parts(workspace_id, item.id)
+            dataset_id = ""
+            for part in parts:
+                if not str(part.get("path") or "").lower().endswith("definition.pbir"):
+                    continue
+                try:
+                    payload = base64.b64decode(part["payload"]).decode("utf-8")
+                    document = json.loads(payload)
+                except (KeyError, ValueError, UnicodeDecodeError):
+                    continue
+                reference = (document.get("datasetReference") or {})
+                by_connection = reference.get("byConnection") or {}
+                connection = str(by_connection.get("connectionString") or "")
+                match = re.search(r"semanticmodelid\s*=\s*([0-9a-fA-F-]{36})", connection)
+                if match:
+                    dataset_id = match.group(1)
+                    break
+                by_path = reference.get("byPath") or {}
+                path = str(by_path.get("path") or "")
+                if path:
+                    # A relative path names the model by *name*, not id; resolve it
+                    # against the item list so the checks still see a stable key.
+                    wanted = path.rsplit("/", 1)[-1].removesuffix(".SemanticModel")
+                    for candidate in ctx.items:
+                        if (candidate.type == "SemanticModel"
+                                and candidate.display_name == wanted):
+                            dataset_id = candidate.id
+                            break
+                    break
+            if dataset_id:
+                bindings.append({
+                    "id": item.id,
+                    "name": item.display_name or item.id,
+                    "dataset_id": dataset_id,
+                    # getDefinition names the model, never its owning workspace.
+                    # Left blank rather than guessed: the reuse check treats an
+                    # unknown owner as local, which is the conservative reading.
+                    "dataset_workspace_id": "",
+                })
+        return bindings
 
     def _enrich_run_history(self, ctx: WorkspaceContext, workspace_id: str) -> None:
         """Fill ``Item.last_run_utc`` from each runnable item's run/refresh history.
@@ -1228,6 +1441,8 @@ class LiveFabricProvider:
 
         # Report → semantic-model bindings (Power BI Get Reports In Group). One
         # list call, no per-report fetch: only id/name/datasetId are retained.
+        # A Fabric-native fallback runs after the item list below, for a sign-in
+        # that yielded no Power BI token.
         if Resource.REPORTS in wanted:
             ctx.reports, readable = self._workspace_reports(workspace_id)
             if not readable:
@@ -1258,6 +1473,19 @@ class LiveFabricProvider:
             log.info("fetch %s: %d items by type %s", workspace_id,
                      len(ctx.items), dict(Counter(i.type for i in ctx.items)))
 
+            # Fabric-native fallback for report bindings. definition.pbir carries
+            # the semantic-model reference on the Fabric token the crawl already
+            # holds, so a sign-in with no Power BI token no longer forces the
+            # model-reuse checks to N/A. Runs here because it needs the item list.
+            if Resource.REPORTS in wanted and not ctx.reports:
+                bindings = self._report_bindings_from_definitions(ctx, workspace_id)
+                if bindings:
+                    ctx.reports = bindings
+                    ctx.unavailable.discard(Resource.REPORTS)
+                    log.info("fetch %s: %d report binding(s) recovered from Fabric "
+                             "item definitions (no Power BI token needed)",
+                             workspace_id, len(bindings))
+
         # Per-item run/refresh recency (last_run_utc) plus the per-workspace
         # semantic-model created date. Fetched whenever a recency-needing resource
         # is selected — the KB crawl requests it for every workspace.
@@ -1284,10 +1512,11 @@ class LiveFabricProvider:
 
         if Resource.ENVIRONMENT_DEFINITIONS in wanted:
             environments = [i for i in ctx.items if i.type == "Environment"]
+            fetched = self._fetch_items_parallel(
+                environments, lambda it: self._environment_definition(workspace_id, it.id))
             attempted = read = forbidden = transient = 0
-            for item in environments:
+            for item, (definition, failure) in zip(environments, fetched, strict=True):
                 attempted += 1
-                definition, failure = self._environment_definition(workspace_id, item.id)
                 if failure == "forbidden":
                     forbidden += 1
                 elif failure == "transient":
@@ -1303,15 +1532,24 @@ class LiveFabricProvider:
             self._record_failures(ctx, Resource.ENVIRONMENT_DEFINITIONS,
                                   attempted, read, forbidden, transient)
 
+        # The workspace's *default* Spark runtime, for notebooks that bind to no
+        # named Environment. Deliberately outside the ENVIRONMENT_DEFINITIONS
+        # block above: a workspace with no Environment items still has a default
+        # runtime, and that is exactly the case this exists to answer. Keyed on
+        # the notebook resource because it is the notebook checks that read it.
+        # One call per workspace, not per item.
+        if Resource.NOTEBOOK_DEFINITIONS in wanted or Resource.ENVIRONMENT_DEFINITIONS in wanted:
+            ctx.spark_settings = self._spark_settings(workspace_id)
+
         # The expensive one — one call per pipeline. Only paid for when a
         # selected check actually reads a pipeline definition.
         if Resource.PIPELINE_DEFINITIONS in wanted:
+            pipelines = [i for i in ctx.items if i.type == "DataPipeline"]
+            fetched = self._fetch_items_parallel(
+                pipelines, lambda it: self._pipeline_definition(workspace_id, it.id))
             attempted = read = forbidden = transient = empty = 0
-            for item in ctx.items:
-                if item.type != "DataPipeline":
-                    continue
+            for item, (definition, failure) in zip(pipelines, fetched, strict=True):
                 attempted += 1
-                definition, failure = self._pipeline_definition(workspace_id, item.id)
                 if failure == "forbidden":
                     forbidden += 1
                 elif failure == "transient":
@@ -1328,29 +1566,33 @@ class LiveFabricProvider:
         # Notebook definitions: same one-call-per-item getDefinition pattern.
         if Resource.NOTEBOOK_DEFINITIONS in wanted:
             found = [i for i in ctx.items if i.type == "Notebook"]
+
+            def _notebook_bundle(it):
+                definition, failure = self._notebook_definition(workspace_id, it.id)
+                monitoring = self._notebook_monitoring(workspace_id, it.id) if definition else {}
+                return definition, failure, monitoring
+
+            fetched = self._fetch_items_parallel(found, _notebook_bundle)
             attempted = read = forbidden = transient = empty = 0
-            for item in found:
+            for item, (definition, failure, monitoring) in zip(found, fetched, strict=True):
                 attempted += 1
-                definition, failure = self._notebook_definition(workspace_id, item.id)
                 if failure == "forbidden":
                     forbidden += 1
                 elif failure == "transient":
                     transient += 1
                 elif definition:
                     read += 1
-                    if definition:
-                        binding = self._environment_binding(definition)
-                        environment = ctx.environments.get(binding)
-                        if environment:
-                            definition["_auditfast_environment"] = {
-                                "id": environment.get("id", binding),
-                                "name": environment.get("display_name", binding),
-                                "runtime_version": environment.get("runtime_version"),
-                            }
-                        monitoring = self._notebook_monitoring(workspace_id, item.id)
-                        if monitoring:
-                            definition["_auditfast_monitoring"] = monitoring
-                        ctx.notebooks[item.display_name or item.id] = definition
+                    binding = self._environment_binding(definition)
+                    environment = ctx.environments.get(binding)
+                    if environment:
+                        definition["_auditfast_environment"] = {
+                            "id": environment.get("id", binding),
+                            "name": environment.get("display_name", binding),
+                            "runtime_version": environment.get("runtime_version"),
+                        }
+                    if monitoring:
+                        definition["_auditfast_monitoring"] = monitoring
+                    ctx.notebooks[item.display_name or item.id] = definition
             self._record_failures(ctx, Resource.NOTEBOOK_DEFINITIONS,
                                   attempted, read, forbidden, transient, empty)
             log.info("fetch %s: %d notebooks found, %d definitions read",
@@ -1361,10 +1603,17 @@ class LiveFabricProvider:
         # N/A rather than failing when they are absent.
         if Resource.TABLE_SCHEMAS in wanted:
             lakehouses = [i for i in ctx.items if i.type == "Lakehouse"]
+            fetched = self._fetch_items_parallel(
+                lakehouses, lambda it: self._lakehouse_tables(workspace_id, it.id))
             attempted = read = forbidden = transient = 0
-            for item in lakehouses:
+            # ``item`` is intentionally unused: a Lakehouse table is stored under
+            # its own name, not the Lakehouse's. Two Lakehouses holding a table
+            # of the same name therefore collide here - the second wins - which
+            # the SQL column reader repairs by re-filing collisions under
+            # ``<store>.<table>``. Keeping the unpacking symmetrical with every
+            # other parallel-fetch loop is worth more than renaming this one.
+            for _item, (tables, failure) in zip(lakehouses, fetched, strict=True):
                 attempted += 1
-                tables, failure = self._lakehouse_tables(workspace_id, item.id)
                 if failure == "forbidden":
                     forbidden += 1
                 elif failure == "transient":
@@ -1409,9 +1658,11 @@ class LiveFabricProvider:
                     workspace_id, len(lakehouses),
                 )
             elif onelake is not None:
-                for item in lakehouses:
+                fetched = self._fetch_items_parallel(
+                    lakehouses,
+                    lambda it: onelake.lakehouse_files_summary(workspace_id, it.id))
+                for item, (summary, failure) in zip(lakehouses, fetched, strict=True):
                     attempted += 1
-                    summary, failure = onelake.lakehouse_files_summary(workspace_id, item.id)
                     if failure == "forbidden":
                         forbidden += 1
                     elif failure == "transient":
@@ -1422,6 +1673,14 @@ class LiveFabricProvider:
                             ctx.lakehouse_files, item.display_name or item.id, item.id
                         )
                         ctx.lakehouse_files[key] = summary
+                        # Delta table data lives under Tables/, not Files/. Summarising
+                        # only Files/ measured whatever loose files sat in the landing
+                        # area and reported "0 of 3 data files in band" for a Lakehouse
+                        # whose actual Delta data was never looked at.
+                        tables_summary, tables_failure = onelake.lakehouse_tables_summary(
+                            workspace_id, item.id)
+                        if not tables_failure:
+                            ctx.lakehouse_tables_files[key] = tables_summary
                         self._annotate_partitions(ctx, onelake, workspace_id, item)
             self._record_failures(ctx, Resource.LAKEHOUSE_FILES,
                                   attempted, read, forbidden, transient)
@@ -1434,10 +1693,11 @@ class LiveFabricProvider:
         # pull, so runtime data never enters the knowledge base.
         if Resource.WAREHOUSE_AUDIT in wanted:
             warehouses = [i for i in ctx.items if i.type == "Warehouse"]
+            fetched = self._fetch_items_parallel(
+                warehouses, lambda it: self._warehouse_audit(workspace_id, it.id))
             attempted = read = forbidden = transient = empty = 0
-            for item in warehouses:
+            for item, (settings, failure) in zip(warehouses, fetched, strict=True):
                 attempted += 1
-                settings, failure = self._warehouse_audit(workspace_id, item.id)
                 if failure == "forbidden":
                     forbidden += 1
                 elif failure == "transient":
@@ -1461,10 +1721,11 @@ class LiveFabricProvider:
         # trigger-depth check reports N/A rather than failing a present Activator.
         if Resource.ACTIVATOR_DEFINITIONS in wanted:
             reflexes = [i for i in ctx.items if i.type in ("Reflex", "Activator")]
+            fetched = self._fetch_items_parallel(
+                reflexes, lambda it: self._reflex_definition(workspace_id, it.id))
             attempted = read = forbidden = transient = empty = 0
-            for item in reflexes:
+            for item, (summary, failure) in zip(reflexes, fetched, strict=True):
                 attempted += 1
-                summary, failure = self._reflex_definition(workspace_id, item.id)
                 if failure == "forbidden":
                     forbidden += 1
                 elif failure == "transient":
@@ -1484,13 +1745,14 @@ class LiveFabricProvider:
 
         # OneLake shortcuts per lakehouse (governance/lineage: external references).
         if Resource.SHORTCUTS in wanted:
+            shortcut_lakehouses = [i for i in ctx.items if i.type == "Lakehouse"]
+            fetched = self._fetch_items_parallel(
+                shortcut_lakehouses,
+                lambda it: self._item_shortcuts(workspace_id, it.id))
             total = 0
             attempted = failed = 0
-            for item in ctx.items:
-                if item.type != "Lakehouse":
-                    continue
+            for item, (shortcuts, known) in zip(shortcut_lakehouses, fetched, strict=True):
                 attempted += 1
-                shortcuts, known = self._item_shortcuts(workspace_id, item.id)
                 if not known:
                     failed += 1
                     continue
@@ -1505,12 +1767,12 @@ class LiveFabricProvider:
 
         # Semantic-model measures + relationships, parsed from the TMSL definition.
         if Resource.SEMANTIC_MODEL_DEFINITIONS in wanted:
+            models = [i for i in ctx.items if i.type == "SemanticModel"]
+            fetched = self._fetch_items_parallel(
+                models, lambda it: self._semantic_model_definition(workspace_id, it.id))
             attempted = read = forbidden = transient = empty = 0
-            for item in ctx.items:
-                if item.type != "SemanticModel":
-                    continue
+            for item, (model, failure) in zip(models, fetched, strict=True):
                 attempted += 1
-                model, failure = self._semantic_model_definition(workspace_id, item.id)
                 if failure == "forbidden":
                     forbidden += 1
                 elif failure == "transient":
@@ -1532,15 +1794,14 @@ class LiveFabricProvider:
         # ``notifyOption``, which is how "a refresh failure alerts the owning
         # team" is actually configured. No refresh rows are read.
         if Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE in wanted:
+            schedule_models = [i for i in ctx.items if i.type == "SemanticModel"]
+            fetched = self._fetch_items_parallel(
+                schedule_models,
+                lambda it: self._semantic_model_refresh_schedule(workspace_id, it.id))
             attempted = read = forbidden = transient = 0
             schedule_reasons: dict[str, int] = {}
-            for item in ctx.items:
-                if item.type != "SemanticModel":
-                    continue
+            for item, (schedule, failure) in zip(schedule_models, fetched, strict=True):
                 attempted += 1
-                schedule, failure = self._semantic_model_refresh_schedule(
-                    workspace_id, item.id
-                )
                 if failure == "forbidden":
                     forbidden += 1
                     reason = _SCHEDULE_FORBIDDEN_REASON

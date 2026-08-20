@@ -29,10 +29,16 @@ def _nb(code: str) -> dict:
     return {"cells": [{"cell_type": "code", "source": code}]}
 
 
-def _ctx(obj, settings=None) -> CheckContext:
+def _ctx(obj, settings=None, tables=None) -> CheckContext:
     return CheckContext(
-        workspace=WorkspaceContext(id="w"), settings=settings or {}, obj_name="nb", obj=obj,
+        workspace=WorkspaceContext(id="w", tables=tables or {}),
+        settings=settings or {}, obj_name="nb", obj=obj,
     )
+
+
+def _nb_cells(*sources: str) -> dict:
+    """A notebook with one code cell per source string."""
+    return {"cells": [{"cell_type": "code", "source": s} for s in sources]}
 
 
 # -- DELTA-MERGE ---------------------------------------------------------------
@@ -103,6 +109,39 @@ def test_merge_ignores_python_commented_dml():
         "# spark.sql('DELETE FROM t')\n# spark.sql('INSERT INTO t SELECT * FROM s')"
     )))
     assert v.status is Status.NA
+
+
+def test_merge_failure_suggests_consolidating_into_merge_into():
+    v = delta_merge(_ctx(_nb(
+        "spark.sql('DELETE FROM t WHERE 1=1')\nspark.sql('INSERT INTO t SELECT * FROM s')"
+    )))
+    assert v.score == 0
+    assert "t (DELETE + INSERT)" in v.evidence
+    assert "MERGE INTO" in v.evidence
+    assert "atomically" in v.evidence
+
+
+def test_merge_scattered_dml_across_cells_is_na():
+    # An ad-hoc / scratch notebook: independent one-off statements on the same
+    # control table live in SEPARATE cells (register a row here, fix a watermark
+    # there), so they are not one logical upsert and must not be fused into a fake
+    # DELETE+INSERT+UPDATE "merge candidate".
+    v = delta_merge(_ctx(_nb_cells(
+        "spark.sql('UPDATE meta.loadlist SET watermark = current_timestamp()')",
+        "spark.sql('INSERT INTO meta.loadlist (t) VALUES (1)')",
+        "spark.sql('DELETE FROM other.hist WHERE run_id = 1')",
+    )))
+    assert v.status is Status.NA
+
+
+def test_merge_sequential_dml_within_one_cell_still_fails():
+    # The genuine anti-pattern - a delete-then-reinsert of one table written
+    # together in a single cell - is still flagged.
+    v = delta_merge(_ctx(_nb_cells(
+        "spark.sql('DELETE FROM t WHERE 1=1')\nspark.sql('INSERT INTO t SELECT * FROM s')",
+    )))
+    assert v.score == 0
+    assert "t (DELETE + INSERT)" in v.evidence
 
 
 # -- DELTA-OPTIMIZE ------------------------------------------------------------
@@ -313,34 +352,80 @@ def test_explicit_projection_passes():
 
 # -- New performance evidence checks -----------------------------------------
 
+#: A table that actually declares partition columns, as the lakehouse/Delta
+#: metadata would carry it — the source SPARK-PARTITION now discovers from.
+_PARTITIONED = {"sales": {"partitionColumns": ["load_date"]}}
+
+
 def test_partition_pruning_passes_with_filter():
-    settings = {"partition_columns": {"sales": ["load_date"]}}
     v = spark_partition_pruning(_ctx(
-        _nb("spark.sql('SELECT id FROM sales WHERE load_date = \'2026-01-01\'')"), settings,
+        _nb("spark.sql('SELECT id FROM sales WHERE load_date = \'2026-01-01\'')"),
+        tables=_PARTITIONED,
     ))
     assert v.score == 3
 
 
 def test_partition_pruning_fails_for_unfiltered_select_star():
-    settings = {"partition_columns": {"sales": ["load_date"]}}
-    v = spark_partition_pruning(_ctx(_nb("spark.sql('SELECT * FROM sales')"), settings))
+    v = spark_partition_pruning(_ctx(_nb("spark.sql('SELECT * FROM sales')"), tables=_PARTITIONED))
     assert v.score == 0
 
 
 def test_partition_pruning_is_na_without_partition_metadata():
-    v = spark_partition_pruning(_ctx(_nb("print('hello')")))
+    # No table declares partition columns, so there is nothing to assess — and the
+    # evidence must say so plainly, never naming a phantom configured table.
+    v = spark_partition_pruning(_ctx(_nb("spark.sql('SELECT * FROM sales')")))
     assert v.status is Status.NA
     assert "Notebook 'nb'" in v.evidence
-    assert "partition_columns" in v.evidence
+    assert "no lakehouse tables were read" in v.evidence
+
+
+def test_partition_pruning_na_says_the_listing_was_available_when_it_was():
+    """partitions_listed==true -> a real 'nothing is partitioned', not 'couldn't look'."""
+    tables = {"dim_date": {"partitions_listed": True},
+              "fact_sales": {"partitions_listed": True}}
+    v = spark_partition_pruning(_ctx(_nb("print('x')"), tables=tables))
+    assert v.status is Status.NA
+    assert "OneLake partition listing was available" in v.evidence
+    assert "no Delta table declares partition columns" in v.evidence
+    assert "unavailable" not in v.evidence
+
+
+def test_partition_pruning_na_says_the_listing_was_unavailable_when_unread():
+    """Tables were read but partitions were never listed -> honest 'unavailable'."""
+    tables = {"dim_date": {}, "fact_sales": {}}
+    v = spark_partition_pruning(_ctx(_nb("print('x')"), tables=tables))
+    assert v.status is Status.NA
+    assert "partition listing was unavailable" in v.evidence
+
+
+def test_partition_pruning_matches_schema_qualified_reads():
+    """A schema-qualified read (schema.table) matches the table by its bare name."""
+    tables = {"Bronze.sales_part": {"partitionColumns": ["load_date"]}}
+    ok = spark_partition_pruning(_ctx(
+        _nb("spark.sql('SELECT id FROM sales.sales_part WHERE load_date = \'2026-01-01\'')"),
+        tables=tables,
+    ))
+    assert ok.score == 3
+    bad = spark_partition_pruning(_ctx(
+        _nb("spark.sql('SELECT * FROM sales.sales_part')"), tables=tables,
+    ))
+    assert bad.score == 0
+
+
+def test_partition_pruning_ignores_a_schema_that_is_not_a_partitioned_table():
+    """A bare schema token that is not itself a partitioned table is not judged."""
+    tables = {"sales_part": {"partitionColumns": ["load_date"]}}
+    v = spark_partition_pruning(_ctx(_nb("spark.sql('SELECT * FROM sales')"), tables=tables))
+    assert v.status is Status.NA
+    assert "no SQL read of a partitioned table" in v.evidence
 
 
 def test_partition_pruning_checks_each_query_independently():
-    settings = {"partition_columns": {"sales": ["load_date"]}}
     code = """
 spark.sql('SELECT id FROM sales WHERE load_date = \'2026-01-01\'')
 spark.sql('SELECT * FROM sales')
 """
-    v = spark_partition_pruning(_ctx(_nb(code), settings))
+    v = spark_partition_pruning(_ctx(_nb(code), tables=_PARTITIONED))
     assert v.score == 0
 
 
@@ -393,7 +478,8 @@ def test_bound_environment_runtime_is_primary_evidence():
     verdict = spark_runtime(_ctx(notebook))
     assert verdict.score == 3
     assert "Validation Environment" in verdict.evidence
-    assert "Spark 3.5.0" in verdict.evidence
+    # Runtime 1.3 carries Spark 3.5.5, per the published runtime table.
+    assert "Spark 3.5.5" in verdict.evidence
 
 
 def test_bound_old_environment_runtime_fails():

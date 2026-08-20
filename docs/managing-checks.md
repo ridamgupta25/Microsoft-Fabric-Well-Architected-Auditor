@@ -159,16 +159,16 @@ flag then updates **automatically and everywhere at once**:
 - the **Catalog** page and `GET /api/v1/catalog/checks` (a *Validation* column),
 - the audit **report in the UI** (a *Validation* column + filter on the Findings
   table),
-- the downloaded **Excel** report (a colour-coded *Validation* column on the
-  `Checks` sheet + a *Validation coverage* summary on the `Scorecard`),
-- the **Markdown** report (a *Validation* column + a coverage line under
-  *Overall*).
+- the downloaded **Excel** report (a *Validation* column on the consolidated
+  `Checklist` sheet + a *Coverage and Validation* block on `Summary`),
+- the **Markdown** report (the same checklist column and executive-level
+  coverage block).
 
 ```python
 # backend/src/auditfast/core/validation.py
 VALIDATED_CHECKLIST: dict[str, str] = {
     "2.4.1":  "All pipeline activities have appropriate retry policies configured",
-    "IMPL-15": "Workspace is assigned to a Fabric capacity [WS-CAPACITY]",
+    "13.3.1": "Workspace is assigned to a Fabric capacity [WS-CAPACITY]",
     # ...add a "<ref>": "<checklist item>" line to validate a point; delete it
     #    to send the matching check(s) back to "Pending validation".
 }
