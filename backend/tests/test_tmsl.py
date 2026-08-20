@@ -41,6 +41,20 @@ def test_parse_tmsl_extracts_measures_and_relationships():
     assert rel["from_table"] == "Sales"
     assert rel["to_table"] == "Date"
     assert rel["cross_filter"] == "oneDirection"
+    # Cardinality is omitted in the fixture, so it defaults to empty (not unknown).
+    assert rel["from_cardinality"] == ""
+    assert rel["to_cardinality"] == ""
+
+
+def test_parse_tmsl_captures_explicit_relationship_cardinality():
+    doc = {"model": {"tables": [{"name": "Sales"}, {"name": "Account"}], "relationships": [
+        {"name": "m2m", "fromTable": "Sales", "fromColumn": "k",
+         "toTable": "Account", "toColumn": "k",
+         "fromCardinality": "many", "toCardinality": "many"},
+    ]}}
+    rel = parse_tmsl(doc)["relationships"][0]
+    assert rel["from_cardinality"] == "many"
+    assert rel["to_cardinality"] == "many"
 
 
 def test_parse_tmsl_captures_declared_data_categories():
@@ -114,7 +128,7 @@ def test_parse_tmsl_captures_column_declarations_but_no_row_data():
     for column in columns:
         assert set(column) == {
             "table", "name", "data_type", "source_provider_type",
-            "source_column", "is_hidden", "is_key",
+            "source_column", "is_hidden", "is_key", "display_folder",
         }
 
 

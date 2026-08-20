@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -43,7 +44,12 @@ class WorkspaceSelection(BaseModel):
 
 
 class AuditRequest(BaseModel):
-    """A request to run an audit. Always reads the live tenant."""
+    """A request to run an audit.
+
+    ``source`` chooses where the workspace data comes from: ``"live"`` crawls the
+    tenant (requires a completed sign-in), while ``"kb"`` replays saved snapshots
+    — the on-disk archive plus any uploaded ``snapshots`` — with no token.
+    """
 
     project: str | None = Field(
         default=None, description="Project YAML path. Defaults to the server's project."
@@ -58,8 +64,17 @@ class AuditRequest(BaseModel):
     )
     auth_session: str | None = Field(
         default=None,
-        description="Completed sign-in session id. Required — omitting it, or "
-                    "supplying an expired one, fails with 401.",
+        description="Completed sign-in session id. Required for source='live'; "
+                    "ignored for source='kb'.",
+    )
+    source: Literal["live", "kb"] = Field(
+        default="live",
+        description="'live' crawls the tenant; 'kb' replays saved/uploaded snapshots.",
+    )
+    snapshots: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="For source='kb': uploaded workspace snapshots to audit "
+                    "alongside (or instead of) the saved archive.",
     )
     weight_by_environment: bool = Field(
         default=False,
@@ -82,6 +97,7 @@ class AuditRequest(BaseModel):
                 "workspaces": [{"id": "ws-prep-01", "role": "Data Prep"}],
                 "auth_session": "3f2a9c14",
                 "external_checks_csv": "/shared/audits/AdminChecks.csv",
+                "source": "live",
             }
         }
     }
@@ -171,6 +187,17 @@ class WorkspaceGroup(BaseModel):
     workspaces: list[GroupMember] = Field(default_factory=list)
 
 
+class KBProvenance(BaseModel):
+    """Where a run's data came from — live crawl, cache, or saved KB replay."""
+
+    source: Literal["live", "kb"] = "live"
+    served_from_cache: bool = False
+    refreshing: bool = Field(
+        default=False,
+        description="A cached live run is being refreshed by a background crawl.",
+    )
+
+
 class AuditReport(BaseModel):
     """The full result of a completed audit."""
 
@@ -208,8 +235,10 @@ class AuditReport(BaseModel):
     files: dict[str, str] = Field(
         default_factory=dict, description="Generated report file names."
     )
-
-
+    kb: KBProvenance = Field(
+        default_factory=KBProvenance,
+        description="Provenance of the run's data (live, cache, or saved KB).",
+    )
 class QuestionnaireItem(BaseModel):
     """One interactive, self-assessed checklist point for a run."""
 
@@ -305,3 +334,16 @@ class WorkspaceOut(BaseModel):
     layer: str = ""
     items: int | None = None
     pipelines: int | None = None
+    #: Set for saved-KB workspaces: whether the archived crawl was complete, and
+    #: when it was captured. ``None`` for live/declared workspaces.
+    complete: bool | None = None
+    captured_at: str | None = None
+
+
+class KBUploadResponse(BaseModel):
+    """The result of validating one uploaded knowledge-base file."""
+
+    workspace: WorkspaceOut = Field(description="Display metadata for the picker.")
+    snapshot: dict[str, Any] = Field(
+        description="The normalized snapshot to resubmit with a source='kb' audit."
+    )

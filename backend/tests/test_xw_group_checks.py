@@ -1,6 +1,6 @@
 """Cross-workspace (group) checks ported from the local check set.
 
-Seventeen best-practice points are implemented as ``@group_check``s in the
+Eighteen best-practice points are implemented as ``@group_check``s in the
 separate ``GROUP_REGISTRY``, so they run only for a project group (>=2 members)
 and never touch a normal single-workspace audit. These tests pin that they are
 registered, run over the fixture group without error, and obey N/A-not-FAIL.
@@ -10,12 +10,17 @@ from __future__ import annotations
 import pytest
 
 from auditfast.core.check.registry import GROUP_REGISTRY, CheckRegistry
+from auditfast.core.check.data_management_quality.data_storage.group import (
+    aggregate_consistency,
+    cross_layer_reconciliation,
+)
 from auditfast.core.engine import run_audit
-from auditfast.core.enums import Layer, Scope, Status
+from auditfast.core.enums import Layer, Resource, Scope, Status
+from auditfast.core.models import GroupContext, GroupMemberContext, WorkspaceContext
 
 from .conftest import FIXTURE_SETTINGS
 
-#: The 17 checks ported from the local set, id -> ref.
+#: The 18 checks ported from the local set, id -> ref.
 PORTED = {
     "XW-MEDALLION-CONSIST": "1.1.5",
     "XW-PIPELINE-SLA": "9.4.2",
@@ -29,6 +34,7 @@ PORTED = {
     "XW-AUDIT-QUERYABLE": "10.2.5",
     "XW-CONFORMED-DIM": "4.4.9",
     "XW-AGG-CONSIST": "5.4.3",
+    "XW-LAYER-RECON": "5.4.6",
     "XW-ACCESS-AUDIT": "7.4.3",
     "XW-LINEAGE-E2E": "8.1.2",
     "XW-TECH-METADATA": "8.3.2",
@@ -46,11 +52,162 @@ _THREE_MEMBER_GROUP = [(
 )]
 
 
-def test_all_seventeen_ported_checks_are_registered():
+def test_all_eighteen_ported_checks_are_registered():
     specs = {spec.id: spec for spec in GROUP_REGISTRY}
     for check_id, ref in PORTED.items():
         assert check_id in specs, f"{check_id} not registered"
         assert specs[check_id].ref == ref
+
+
+def _aggregate_group(
+    *, measure: dict | None = None, sql: str = "",
+    unavailable: set[Resource] | None = None,
+) -> GroupContext:
+    members = []
+    for name, level in (("DEV", 1), ("PROD", 10)):
+        workspace = WorkspaceContext(
+            id=name,
+            display_name=name,
+            layer=Layer.STORAGE,
+            tables={"fact_sales": {}, "daily_sales_aggregate": {}},
+            semantic_models={
+                "Sales": {
+                    "tables": ["fact_sales", "daily_sales_aggregate"],
+                    "measures": [measure],
+                },
+            } if measure else {},
+            sql_routines=[{
+                "schema": "audit", "name": "validate_sales_rollup",
+                "type": "PROCEDURE", "definition": sql, "store": "SalesWarehouse",
+            }] if sql else [],
+            unavailable=set(unavailable or ()),
+        )
+        members.append(GroupMemberContext(workspace, level, Layer.STORAGE))
+    return GroupContext(name="Sales", members=tuple(members), settings={})
+
+
+def test_aggregate_table_names_alone_do_not_prove_reconciliation():
+    verdict = aggregate_consistency(_aggregate_group())
+    assert verdict.score != 3
+
+
+def test_semantic_model_detail_to_aggregate_variance_measure_passes():
+    measure = {
+        "name": "Detail vs Aggregate Variance",
+        "expression": "SUM(fact_sales[amount]) - SUM(daily_sales_aggregate[total_amount])",
+    }
+    verdict = aggregate_consistency(_aggregate_group(measure=measure))
+    assert verdict.score == 3
+
+
+def test_warehouse_enforced_detail_to_aggregate_reconciliation_passes():
+    sql = """
+DECLARE @detail_total decimal(18,2) = (SELECT SUM(amount) FROM fact_sales);
+DECLARE @aggregate_total decimal(18,2) = (SELECT SUM(total_amount) FROM daily_sales_aggregate);
+IF @detail_total <> @aggregate_total THROW 51000, 'Rollup mismatch', 1;
+"""
+    verdict = aggregate_consistency(_aggregate_group(sql=sql))
+    assert verdict.score == 3
+
+
+def test_warehouse_reconciliation_does_not_require_semantic_model_readability():
+    sql = """
+DECLARE @detail_total decimal(18,2) = (SELECT SUM(amount) FROM fact_sales);
+DECLARE @aggregate_total decimal(18,2) = (SELECT SUM(total_amount) FROM daily_sales_aggregate);
+IF @detail_total <> @aggregate_total THROW 51000, 'Rollup mismatch', 1;
+"""
+    verdict = aggregate_consistency(_aggregate_group(
+        sql=sql, unavailable={Resource.SEMANTIC_MODEL_DEFINITIONS},
+    ))
+    assert verdict.score == 3
+
+
+def test_semantic_reconciliation_does_not_require_warehouse_readability():
+    measure = {
+        "name": "Detail vs Aggregate Variance",
+        "expression": "SUM(fact_sales[amount]) - SUM(daily_sales_aggregate[total_amount])",
+    }
+    verdict = aggregate_consistency(_aggregate_group(
+        measure=measure, unavailable={Resource.TABLE_COLUMNS},
+    ))
+    assert verdict.score == 3
+
+
+def _layer_recon_group(
+    codes: tuple[str, ...], *, unavailable: set[int] | None = None,
+) -> GroupContext:
+    unavailable = unavailable or set()
+    members = []
+    for index, code in enumerate(codes):
+        workspace = WorkspaceContext(
+            id=f"WS-{index}",
+            display_name=f"WS-{index}",
+            layer=Layer.PREP,
+            notebooks={f"promote-{index}": {
+                "cells": [{"cell_type": "code", "source": code}],
+            }},
+            unavailable={Resource.NOTEBOOK_DEFINITIONS} if index in unavailable else set(),
+        )
+        members.append(GroupMemberContext(workspace, index + 1, Layer.PREP))
+    return GroupContext(name="Sales", members=tuple(members), settings={})
+
+
+_RECONCILED_FLOW = """
+silver = spark.read.table("silver.fact_sales")
+gold = silver.groupBy("sale_date").agg({"amount": "sum"})
+source_count = silver.count()
+target_count = gold.agg({"source_rows": "sum"}).first()[0]
+assert source_count == target_count
+gold.write.mode("overwrite").saveAsTable("gold.daily_sales")
+"""
+
+_UNCONTROLLED_FLOW = """
+silver = spark.read.table("silver.fact_sales")
+gold = silver.groupBy("sale_date").agg({"amount": "sum"})
+gold.write.mode("overwrite").saveAsTable("gold.daily_sales")
+"""
+
+
+def test_cross_layer_reconciliation_passes_without_reading_table_data():
+    verdict = cross_layer_reconciliation(
+        _layer_recon_group((_RECONCILED_FLOW, _RECONCILED_FLOW))
+    )
+    assert verdict.score == 3
+    assert "without reading client data" in verdict.evidence
+
+
+def test_cross_layer_reconciliation_fails_when_one_flow_has_no_control():
+    verdict = cross_layer_reconciliation(
+        _layer_recon_group((_RECONCILED_FLOW, _UNCONTROLLED_FLOW))
+    )
+    assert verdict.score != 3
+    assert "promote-1" in verdict.evidence
+
+
+def test_cross_layer_reconciliation_ignores_layer_names_in_comments():
+    code = """# Read Silver and write Gold\ndf.write.saveAsTable("curated.sales")"""
+    verdict = cross_layer_reconciliation(_layer_recon_group((code, code)))
+    assert verdict.status is Status.NA
+
+
+def test_cross_layer_reconciliation_is_na_with_one_readable_workspace():
+    verdict = cross_layer_reconciliation(
+        _layer_recon_group((_RECONCILED_FLOW, _RECONCILED_FLOW), unavailable={1})
+    )
+    assert verdict.status is Status.NA
+
+
+def test_cross_layer_reconciliation_ignores_the_bare_word_reconcile():
+    """A variable merely named ``reconcile_notes`` is not a reconciliation control."""
+    code = (
+        'reconcile_notes = "todo"\n'
+        'silver = spark.read.table("silver.fact_sales")\n'
+        'gold = silver.groupBy("sale_date").agg({"amount": "sum"})\n'
+        'gold.write.mode("overwrite").saveAsTable("gold.daily_sales")\n'
+    )
+    verdict = cross_layer_reconciliation(_layer_recon_group((code, code)))
+    assert verdict.score != 3
+    assert "promote-0" in verdict.evidence
 
 
 @pytest.mark.parametrize("check_id,ref", sorted(PORTED.items()))

@@ -162,6 +162,10 @@ def _table_columns(table: dict, table_name: str) -> list[dict]:
             "source_column": str(column.get("sourceColumn") or ""),
             "is_hidden": bool(column.get("isHidden", False)),
             "is_key": bool(column.get("isKey", False)),
+            # The folder a report author sees this column filed under. TMSL carries
+            # it per column; without it the "model organisation" half of ref 14.1.8
+            # was unassessable and the check said so rather than judging it.
+            "display_folder": str(column.get("displayFolder") or ""),
         })
     return out
 
@@ -230,6 +234,7 @@ def parse_tmsl(document: dict) -> dict:
                 "description": measure.get("description", "") or "",
                 "is_hidden": bool(measure.get("isHidden", False)),
                 "format_string": measure.get("formatString", "") or "",
+                "display_folder": str(measure.get("displayFolder") or ""),
             })
 
     relationships: list[dict] = []
@@ -247,6 +252,12 @@ def parse_tmsl(document: dict) -> dict:
             "to_table": to_table,
             "to_column": rel.get("toColumn", ""),
             "cross_filter": rel.get("crossFilteringBehavior", "") or "",
+            #: Declared relationship cardinality — structural metadata (never row
+            #: data). TMSL omits these for a standard many-to-one relationship, so
+            #: an empty string means "defaulted", not "unknown"; both ends set to
+            #: ``many`` is a direct many-to-many relationship (no bridge).
+            "from_cardinality": str(rel.get("fromCardinality", "") or "").strip().lower(),
+            "to_cardinality": str(rel.get("toCardinality", "") or "").strip().lower(),
             "is_active": bool(rel.get("isActive", True)),
         })
 

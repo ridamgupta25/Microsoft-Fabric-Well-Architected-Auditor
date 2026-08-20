@@ -18,8 +18,8 @@ from auditfast.core.models import CheckContext, Item
 
 
 @check(
-    id="WS-CAPACITY", ref="IMPL-15", title="Workspace is assigned to a Fabric capacity [WS-CAPACITY]",
-    pillar=Pillar.COST, scope=Scope.WORKSPACE, severity=Severity.HIGH,
+    id="WS-CAPACITY", ref="13.3.1", title="Workspace is assigned to a Fabric capacity [WS-CAPACITY]",
+    pillar=Pillar.COST_MANAGEMENT, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     requires=[Resource.WORKSPACE], required=True,
 )
 def capacity_assigned(ctx: CheckContext) -> Verdict:
@@ -47,7 +47,7 @@ def _is_stale(item: Item, *, cutoff_days: int, now: datetime) -> bool:
 
 @check(
     id="WS-ORPHAN", ref="12.3.4", title="Unused or orphaned Fabric items cleaned up (esp. Dev/QA)",
-    pillar=Pillar.COST, scope=Scope.WORKSPACE, severity=Severity.LOW,
+    pillar=Pillar.COST_MANAGEMENT, scope=Scope.WORKSPACE, severity=Severity.LOW,
     requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=False,
 )
 def no_orphaned_items(ctx: CheckContext) -> Verdict:
@@ -120,7 +120,7 @@ def _distinct_environments(environments: dict[str, dict]) -> list[dict]:
 @check(
     id="WS-SPARK-IDLE", ref="12.3.3",
     title="Spark pools not running idle (Environment compute settings tuned)",
-    pillar=Pillar.COST, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.COST_MANAGEMENT, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.ENVIRONMENT_DEFINITIONS], required=True,
 )
 def spark_pool_not_idle(ctx: CheckContext) -> Verdict:
@@ -216,7 +216,7 @@ _CAPACITY_METRICS_TYPES: frozenset[str] = frozenset({"SemanticModel", "Report", 
 @check(
     id="WS-CAPACITY-METRICS", ref="12.2.1",
     title="Fabric Capacity Metrics App deployed and monitored",
-    pillar=Pillar.COST, scope=Scope.WORKSPACE, severity=Severity.INFO,
+    pillar=Pillar.COST_MANAGEMENT, scope=Scope.WORKSPACE, severity=Severity.INFO,
     layers=(Layer.OPERATIONS,), requires=[Resource.ITEMS], required=False,
 )
 def capacity_metrics_app(ctx: CheckContext) -> Verdict:
@@ -275,7 +275,7 @@ _ACTIVATOR_TYPES: frozenset[str] = frozenset({"Reflex", "Activator"})
 @check(
     id="WS-CU-ALERTS", ref="12.2.7",
     title="CU consumption alerts configured for proactive throttling prevention",
-    pillar=Pillar.COST, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.COST_MANAGEMENT, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.OPERATIONS,), requires=[Resource.WORKSPACE, Resource.ITEMS], required=True,
 )
 def cu_consumption_alerts(ctx: CheckContext) -> Verdict:
