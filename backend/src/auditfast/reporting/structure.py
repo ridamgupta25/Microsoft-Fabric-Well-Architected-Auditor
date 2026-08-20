@@ -124,6 +124,13 @@ class ConsolidatedControl:
         return f"{min(scores)} ({average:.2f} average)"
 
     @property
+    def score_average(self) -> int | str:
+        scores = [result.score for result in self.results if result.score is not None]
+        if not scores:
+            return "N/A"
+        return round(sum(scores) / len(scores))
+
+    @property
     def validation(self) -> str:
         return validation_label(self.ref)
 
@@ -166,6 +173,24 @@ class ConsolidatedControl:
     @property
     def recommendation(self) -> str:
         return _join(result.recommendation.strip() for result in self.results)
+
+    @property
+    def rationale(self) -> str:
+        """A brief, single-line explanation — the most common evidence line."""
+        priority = [
+            result
+            for result in self.results
+            if result.status in (Status.FAIL, Status.PARTIAL)
+        ]
+        pool = priority or list(self.results)
+        evidences = [
+            (result.evidence or "").strip()
+            for result in pool
+            if (result.evidence or "").strip()
+        ]
+        if not evidences:
+            return "-"
+        return Counter(evidences).most_common(1)[0][0]
 
     @property
     def scopes(self) -> str:

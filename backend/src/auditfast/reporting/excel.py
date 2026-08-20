@@ -1,12 +1,16 @@
 """SQL-aligned stakeholder Excel report for Fabric Well-Architected audits."""
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from datetime import date
 
 from ..core.enums import Pillar, Severity, Status
 from ..core.scoring import percentage, rating
-from ..core.validation import PENDING_LABEL, VALIDATED_LABEL
+from ..core.validation import (
+    PENDING_LABEL,
+    VALIDATED_LABEL,
+)
 from .structure import (
     RISK_PROFILE,
     assessment_weight,
@@ -20,6 +24,22 @@ from .structure import (
     workspace_control_score,
     workspace_ids,
 )
+
+#: Excel forbids these characters in a sheet name and caps the name at 31 chars.
+_INVALID_SHEET_CHARS = re.compile(r"[\\/?*\[\]:]")
+
+
+def _safe_sheet_name(base: str, used: set[str]) -> str:
+    """Return a valid, unique (case-insensitive) Excel sheet name for ``base``."""
+    name = _INVALID_SHEET_CHARS.sub(" ", base).strip()[:31].strip() or "Sheet"
+    candidate = name
+    index = 2
+    while candidate.casefold() in used:
+        suffix = f" ({index})"
+        candidate = (name[: 31 - len(suffix)].strip() + suffix)
+        index += 1
+    used.add(candidate.casefold())
+    return candidate
 
 
 def _pct(pct):
@@ -182,29 +202,11 @@ def build_excel(
                 if cell.fill.fill_type is None:
                     cell.fill = banded_fill
 
-    def append_finding_row(ws, control) -> None:
-        likelihood, impact, risk_score, _ = control.risk_profile
-        ws.append(
-            [
-                control.ref,
-                control.severity.value,
-                risk_score,
-                likelihood,
-                impact,
-                control.impacted_assets,
-                control.non_impacted_assets,
-                control.not_assessed,
-                control.finding,
-                control.recommendation,
-                "Open",
-            ]
-        )
-
     # -- Summary ---------------------------------------------------------------
     ws = wb.active
     ws.title = "Summary"
     ws["A1"] = f"Fabric Audit - {project_name}"
-    ws.merge_cells("A1:E1")
+    ws.merge_cells("A1:H1")
     ws["A1"].font = title_font
     ws["A1"].fill = PatternFill("solid", fgColor=dark_blue)
     ws["A1"].alignment = Alignment(horizontal="left")
@@ -310,47 +312,6 @@ def build_excel(
         ws.cell(row=row, column=4, value=control.finding)
         ws.cell(row=row, column=5, value=control.recommendation)
 
-    # -- Checks sheet ----------------------------------------------------------
-    cs = wb.create_sheet("Checks")
-    headers = ["Workspace", "Layer role", "Object", "Check ID", "Ref", "Title",
-               "Validation", "Pillar", "Status", "Score", "Severity", "Source",
-               "Evidence", "Recommendation"]
-    cs.append(headers)
-    style_header(cs, row=1, ncols=len(headers))
-    val_col = headers.index("Validation") + 1
-    source_col = headers.index("Source") + 1
-    validated_fill = PatternFill("solid", fgColor="C6EFCE")
-    pending_fill = PatternFill("solid", fgColor="F2F2F2")
-    validated_font = Font(color="006100")
-    pending_font = Font(color="808080")
-    external_fill = PatternFill("solid", fgColor="FFF2CC")  # Light yellow for external
-    external_font = Font(color="9C6500")
-    for res in results:
-        cs.append([
-            res.workspace, res.workspace_role, res.obj, res.check_id, res.ref, res.title,
-            validation_label(res.ref),
-            res.pillar, res.status.value,
-            "" if res.score is None else res.score,
-            res.severity.value, res.source, res.evidence, res.recommendation,
-        ])
-        val_cell = cs.cell(row=cs.max_row, column=val_col)
-        if is_validated(res.ref):
-            val_cell.fill = validated_fill
-            val_cell.font = validated_font
-        else:
-            val_cell.fill = pending_fill
-            val_cell.font = pending_font
-        
-        # Highlight external checks
-        if res.source == "external":
-            src_cell = cs.cell(row=cs.max_row, column=source_col)
-            src_cell.fill = external_fill
-            src_cell.font = external_font
-    widths = [22, 16, 22, 14, 8, 34, 16, 22, 10, 7, 12, 12, 46, 52]
-    for i, w in enumerate(widths, start=1):
-        cs.column_dimensions[cs.cell(row=1, column=i).column_letter].width = w
-    cs.freeze_panes = "A2"
-
     row += 2
     style_section(ws, row, "Remediation Roadmap", 5)
     row += 1
@@ -373,7 +334,7 @@ def build_excel(
 
     # -- Area Detail -----------------------------------------------------------
     area = wb.create_sheet("Area Detail")
-    area.freeze_panes = "B2"
+    area.freeze_panes = "A2"
     row = 1
     for pillar in Pillar.scored():
         rows = pillar_controls(controls, pillar)
@@ -384,12 +345,12 @@ def build_excel(
             area,
             row,
             f"Area {pillar_number[pillar]}: {pillar.value}",
-            8,
+            9,
         )
         row += 1
         area.cell(row=row, column=1, value="Area score")
         area.cell(row=row, column=2, value=_pct(score))
-        area.cell(row=row, column=2).number_format = "0.0%"
+        area.cell(row=row, column=2).number_format = "0%"
         area.cell(row=row, column=3, value=label)
         area.cell(row=row, column=4, value="Assessment weight")
         area.cell(row=row, column=5, value=assessment_weight(results, pillar))
@@ -412,7 +373,7 @@ def build_excel(
             row += 1
             area.cell(row=row, column=1, value=category)
             area.cell(row=row, column=2, value=_pct(category_score))
-            area.cell(row=row, column=2).number_format = "0.0%"
+            area.cell(row=row, column=2).number_format = "0%"
             area.cell(row=row, column=3, value=category_label)
             area.cell(
                 row=row,
@@ -445,7 +406,7 @@ def build_excel(
                 control.ref,
                 control.title,
                 control.severity.value,
-                control.score_summary,
+                control.score_average,
                 control.assets_assessed,
                 control.validation,
                 control.impacted_evidence,
@@ -478,7 +439,7 @@ def build_excel(
                 control.ref,
                 control.finding,
                 control.severity.value,
-                control.score_summary,
+                control.score_average,
                 control.impacted_assets,
                 control.non_impacted_assets,
                 control.not_assessed,
@@ -500,11 +461,13 @@ def build_excel(
         "Ref",
         "Area",
         "Category",
-        "Check Description",
+        "Title",
         "ProducedBy",
         "Confidence",
         "Severity",
+        "Rationale",
         "Validation",
+        "Score",
         *workspace_id_by_name.values(),
     ]
     checklist.append(checklist_headers)
@@ -514,6 +477,16 @@ def build_excel(
         for workspace, workspace_id in workspace_id_by_name.items()
     }
     for control in controls:
+        workspace_scores = [
+            workspace_control_score(control, workspace)
+            for workspace in workspace_id_by_name
+        ]
+        numeric_scores = [
+            value for value in workspace_scores if isinstance(value, (int, float))
+        ]
+        overall_score = (
+            round(sum(numeric_scores) / len(numeric_scores)) if numeric_scores else ""
+        )
         checklist.append(
             [
                 control.check_id,
@@ -522,13 +495,12 @@ def build_excel(
                 control.category,
                 control.title,
                 "Rule-based",
-                "Deterministic",
+                "",
                 control.severity.value,
+                control.rationale,
                 control.validation,
-                *(
-                    workspace_control_score(control, workspace)
-                    for workspace in workspace_id_by_name
-                ),
+                overall_score,
+                *workspace_scores,
             ]
         )
         for workspace, column in workspace_columns.items():
@@ -539,8 +511,8 @@ def build_excel(
                     column=column,
                     value=value,
                 )
-                checklist.cell(row=checklist.max_row, column=column).number_format = "0.00"
-    checklist.freeze_panes = "J2"
+                checklist.cell(row=checklist.max_row, column=column).number_format = "0"
+    checklist.freeze_panes = "L2"
     last_checklist_column = checklist.cell(
         row=1,
         column=len(checklist_headers),
@@ -551,16 +523,18 @@ def build_excel(
         f"A1:{last_checklist_column}{checklist.max_row}",
     )
     checklist_widths = [
-        18,
-        10,
-        8,
-        28,
-        58,
         14,
-        16,
+        7,
+        5,
+        19,
+        30,
+        11,
         12,
-        18,
-        *(14 for _ in workspace_id_by_name),
+        9,
+        32,
+        11,
+        8,
+        *(11 for _ in workspace_id_by_name),
     ]
     for index, width in enumerate(checklist_widths, start=1):
         checklist.column_dimensions[
@@ -569,6 +543,18 @@ def build_excel(
     wrap_sheet(checklist)
 
     # -- Findings --------------------------------------------------------------
+    # Reserve a valid, unique sheet name per workspace up front for the
+    # per-workspace object-level detail sheets created after Invent.
+    audited_workspaces = sorted({result.workspace for result in results if result.workspace})
+    reserved = {name.casefold() for name in wb.sheetnames}
+    reserved.update({"findings", "risk register", "invent"})
+    workspace_sheet_names: dict[str, str] = {}
+    for workspace in audited_workspaces:
+        ws_id = workspace_id_by_name.get(workspace, workspace)
+        workspace_sheet_names[workspace] = _safe_sheet_name(
+            f"{ws_id} {workspace}", reserved
+        )
+
     finding_sheet = wb.create_sheet("Findings")
     finding_headers = [
         "Ref",
@@ -586,7 +572,22 @@ def build_excel(
     finding_sheet.append(finding_headers)
     style_header(finding_sheet, 1, len(finding_headers))
     for control in consolidated_findings:
-        append_finding_row(finding_sheet, control)
+        likelihood, impact, risk_score, _ = control.risk_profile
+        finding_sheet.append(
+            [
+                control.ref,
+                control.severity.value,
+                risk_score,
+                likelihood,
+                impact,
+                control.impacted_assets,
+                control.non_impacted_assets,
+                control.not_assessed,
+                control.finding,
+                control.recommendation,
+                "Open",
+            ]
+        )
     finding_sheet.freeze_panes = "F2"
     add_styled_table(
         finding_sheet,
@@ -603,7 +604,7 @@ def build_excel(
     # -- Risk Register ---------------------------------------------------------
     risk = wb.create_sheet("Risk Register")
     risk["A1"] = f"Risk Register - Fabric Audit - {project_name}"
-    risk.merge_cells("A1:Z1")
+    risk.merge_cells("A1:G1")
     risk["A1"].font = title_font
     risk["A1"].fill = PatternFill("solid", fgColor=dark_blue)
     risk["A2"] = "Generated"
@@ -709,7 +710,7 @@ def build_excel(
                 "",
             ]
         )
-    risk.freeze_panes = f"I{risk_header_row + 1}"
+    risk.freeze_panes = f"H{risk_header_row + 1}"
     add_styled_table(
         risk,
         "RiskRegisterTable",
@@ -717,13 +718,13 @@ def build_excel(
     )
     risk_widths = [
         12,
+        18,
+        8,
         22,
-        10,
-        28,
-        30,
+        22,
         14,
         18,
-        80,
+        60,
         20,
         40,
         40,
@@ -747,6 +748,7 @@ def build_excel(
         risk.column_dimensions[
             risk.cell(row=risk_header_row, column=index).column_letter
         ].width = width
+    risk.sheet_view.zoomScale = 100
     wrap_sheet(risk)
 
     # -- Inventory -------------------------------------------------------------
@@ -786,9 +788,84 @@ def build_excel(
         ].width = width
     wrap_sheet(inventory)
 
+    # -- Per-workspace object-level detail -------------------------------------
+    # One sheet per workspace (placed after Invent) listing every object-level
+    # check verdict for that workspace.
+    workspace_sheets = []
+    detail_headers = [
+        "Object",
+        "Scope",
+        "Area",
+        "Check ID",
+        "Ref",
+        "Title",
+        "Status",
+        "Score",
+        "Severity",
+        "Evidence",
+        "Recommendation",
+    ]
+    detail_widths = [30, 12, 8, 16, 8, 40, 10, 8, 12, 70, 80]
+    for detail_index, workspace in enumerate(audited_workspaces, start=1):
+        ws_results = [result for result in results if result.workspace == workspace]
+        detail = wb.create_sheet(workspace_sheet_names[workspace])
+        workspace_sheets.append(detail)
+        detail["A1"] = (
+            f"Object Detail - {workspace} "
+            f"({workspace_id_by_name.get(workspace, '')})"
+        )
+        detail.merge_cells("A1:K1")
+        detail["A1"].font = title_font
+        detail["A1"].fill = PatternFill("solid", fgColor=dark_blue)
+        detail["A1"].alignment = Alignment(horizontal="left")
+        detail["A2"] = f"Layer role: {ws_results[0].workspace_role or '-'}"
+        header_row = 3
+        for column, value in enumerate(detail_headers, start=1):
+            detail.cell(row=header_row, column=column, value=value)
+        style_header(detail, header_row, len(detail_headers))
+        ordered = sorted(
+            ws_results,
+            key=lambda result: (
+                result.obj or "",
+                pillar_number.get(result.pillar, 99),
+                result.ref,
+                result.check_id,
+            ),
+        )
+        for result in ordered:
+            detail.append(
+                [
+                    result.obj or "(workspace)",
+                    result.scope.value,
+                    pillar_number.get(result.pillar, ""),
+                    result.check_id,
+                    result.ref,
+                    result.title,
+                    result.status.value,
+                    "" if result.score is None else result.score,
+                    result.severity.value,
+                    result.evidence,
+                    result.recommendation,
+                ]
+            )
+        last_letter = detail.cell(
+            row=header_row, column=len(detail_headers)
+        ).column_letter
+        add_styled_table(
+            detail,
+            f"WsDetailTable{detail_index}",
+            f"A{header_row}:{last_letter}{detail.max_row}",
+        )
+        detail.freeze_panes = f"A{header_row + 1}"
+        for index, width in enumerate(detail_widths, start=1):
+            detail.column_dimensions[
+                detail.cell(row=header_row, column=index).column_letter
+            ].width = width
+        wrap_sheet(detail)
+
     # Light semantic fills make the stakeholder hierarchy visible without
     # changing any deterministic values.
-    for sheet in (ws, area, checklist, finding_sheet, risk, inventory):
+    for sheet in (ws, area, checklist, finding_sheet, risk, inventory, *workspace_sheets):
         sheet.sheet_view.showGridLines = False
     ws["A3"].fill = PatternFill("solid", fgColor=light_gray)
     ws["A4"].fill = PatternFill("solid", fgColor=light_orange)
@@ -811,18 +888,19 @@ def build_excel(
             maximum=3,
         )
 
-    for sheet in (ws, area, checklist, finding_sheet, risk, inventory):
+    for sheet in (ws, area, checklist, finding_sheet, risk, inventory, *workspace_sheets):
         add_result_formatting(sheet)
     band_unfilled_rows(ws)
     band_unfilled_rows(area)
 
+    # The Checklist keeps its explicit compact widths (not auto-fitted) so the
+    # first view reaches the Score/WS columns without shrinking the font.
     for sheet, max_width in (
         (ws, 70),
         (area, 70),
-        (checklist, 60),
         (finding_sheet, 70),
-        (risk, 70),
         (inventory, 45),
+        *((sheet, 60) for sheet in workspace_sheets),
     ):
         auto_fit_columns(sheet, max_width=max_width)
 
