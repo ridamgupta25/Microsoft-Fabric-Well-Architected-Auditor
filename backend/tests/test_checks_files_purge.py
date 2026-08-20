@@ -146,3 +146,105 @@ def test_no_notebooks_is_na():
     verdicts = ws_file_purge(workspace_ctx(
         items=_lakehouses("lh_a"), lakehouse_files={"lh_a": _files(10)}, notebooks={}))
     assert verdicts[0].status is Status.NA
+
+
+# ---------------------------------------------------------------------------
+# detection: a real purge vs incidental cleanup vs prose
+# ---------------------------------------------------------------------------
+
+def test_prose_or_a_scoring_rubric_does_not_count_as_a_purge():
+    """A rubric mentioning 'retention policy' is prose, not a purge routine."""
+    rubric = _notebook(
+        "rubric = '''\n# Scoring rubric\n"
+        "- retention policy present: 3\n- no retention policy: 0\n"
+        "- archive old files periodically: partial\n'''\nprint(rubric)"
+    )
+    verdicts = ws_file_purge(_ctx(_lakehouses("lh_a"), {"lh_a": _files(10)},
+                                  notebooks={"Setup_Section1_TenantAdmin": rubric}))
+    assert verdicts[0].score == 0
+    assert "no notebook implements a file archive or purge routine" in verdicts[0].evidence
+
+
+def test_incidental_cleanup_is_not_a_purge_routine():
+    """os.remove of a just-written file + rmtree of a temp dir is not a retention policy."""
+    incidental = _notebook(
+        "df.write.parquet(lakehouse_path)\n"
+        "os.remove(lakehouse_path)\n"
+        "shutil.rmtree(temp_dir)"
+    )
+    verdicts = ws_file_purge(_ctx(_lakehouses("lh_a"), {"lh_a": _files(10)},
+                                  notebooks={"nb_eam_sftp_read_json_copy": incidental}))
+    assert verdicts[0].score == 0
+    assert "no notebook implements a file archive or purge routine" in verdicts[0].evidence
+
+
+def test_a_files_section_delete_counts_as_a_purge():
+    """A notebookutils.fs.rm on the Files section is a deliberate purge."""
+    verdicts = ws_file_purge(_ctx(_lakehouses("lh_a"), {"lh_a": _files(10)},
+                                  notebooks={"purge": _PURGE_NOTEBOOK}))
+    assert verdicts[0].score == 3
+
+
+def test_a_local_delete_past_a_cutoff_counts_as_a_purge():
+    """os.remove filtered by an age cutoff IS a retention routine."""
+    retention = _notebook(
+        "cutoff = datetime.now() - timedelta(days=30)\n"
+        "for f in list_files('Files/landing'):\n"
+        "    if f.modification_time < cutoff:\n"
+        "        os.remove(f.path)"
+    )
+    verdicts = ws_file_purge(_ctx(_lakehouses("lh_a"), {"lh_a": _files(10)},
+                                  notebooks={"purge_old_files": retention}))
+    assert verdicts[0].score == 3
+
+
+def test_the_evidence_names_stores_with_their_file_counts():
+    """The reviewer's ask: name which lakehouse holds Files content, with counts."""
+    listings = {"Bronze_MLC_Lakehouse_TEST": _files(1030),
+                "mlc_lz_lh": _files(59), "Silver_MLC_Lakehouse_TEST": _files(0)}
+    verdicts = ws_file_purge(_ctx(
+        _lakehouses("Bronze_MLC_Lakehouse_TEST", "mlc_lz_lh", "Silver_MLC_Lakehouse_TEST"),
+        listings))
+    summary = verdicts[0]
+    assert summary.score == 0
+    assert "Bronze_MLC_Lakehouse_TEST holds 1,030 Files" in summary.evidence
+    assert "mlc_lz_lh holds 59 Files" in summary.evidence
+    # The empty one is named as not-assessed, not flagged.
+    assert "Silver_MLC_Lakehouse_TEST" in summary.evidence
+    assert set(_rows(verdicts)) == {"Bronze_MLC_Lakehouse_TEST", "mlc_lz_lh"}
+
+
+# ---------------------------------------------------------------------------
+# refinements: system staging stores and system files are not user data
+# ---------------------------------------------------------------------------
+
+def test_fabric_managed_dataflow_staging_stores_are_excluded():
+    """Dataflow staging lakehouses hold system cache, not user-orphaned data."""
+    listings = {"Bronze": _files(100),
+                "DataflowsStagingLakehouse": _files(500),
+                "StagingLakehouseForDataflows_20260311211836": _files(300)}
+    verdicts = ws_file_purge(_ctx(
+        _lakehouses("Bronze", "DataflowsStagingLakehouse",
+                    "StagingLakehouseForDataflows_20260311211836"),
+        listings))
+    summary = verdicts[0]
+    assert "Bronze holds 100 Files" in summary.evidence
+    assert "Fabric-managed Dataflow staging store(s) are excluded" in summary.evidence
+    # Only the genuine user lakehouse is flagged.
+    assert set(_rows(verdicts)) == {"Bronze"}
+
+
+def test_counts_use_data_file_count_not_total_file_count():
+    """System cache files inflate file_count; only data_file_count is user data."""
+    listings = {"Bronze": {"file_count": 40, "data_file_count": 38, "total_bytes": 4096}}
+    verdicts = ws_file_purge(_ctx(_lakehouses("Bronze"), listings))
+    assert "Bronze holds 38 Files" in verdicts[0].evidence
+    assert "holds 40 Files" not in verdicts[0].evidence
+
+
+def test_a_lakehouse_with_only_system_cache_is_not_assessed():
+    """data_file_count 0 (only FileCache/models$) -> nothing to purge -> N/A."""
+    listings = {"Bronze": {"file_count": 12, "data_file_count": 0, "total_bytes": 1024}}
+    verdicts = ws_file_purge(_ctx(_lakehouses("Bronze"), listings))
+    assert verdicts[0].status is Status.NA
+    assert "no orphaned files" in verdicts[0].evidence
