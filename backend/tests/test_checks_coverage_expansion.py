@@ -457,6 +457,22 @@ def test_orphan_check_is_na_without_a_join():
     assert nb_orphan_detect(_nb_ctx("print(1)\n")).status is Status.NA
 
 
+def test_cdc_incremental_merge_is_not_orphan_detection():
+    # A CDC / SCD2 incremental merge uses left_anti and null-on-join to isolate
+    # new and changed rows to upsert (keyed on the target's own PK), not child
+    # rows missing a parent. The FK orphan-detection check must not read that as
+    # "orphans detected but dropped" - it does not apply, so it is N/A.
+    code = (
+        'df_join = bronze.join(silver_pk_hash, keys, "left")\n'
+        'is_new = F.col("_silver_change_hash").isNull()\n'
+        'df_to_insert = df_join.filter(is_new)\n'
+        'silver_rest = silver.join(expire_pks, keys, "left_anti")\n'
+        'final = silver_rest.unionByName(df_to_insert)\n'
+        'final.write.format("delta").mode("overwrite").saveAsTable("silver.dim")\n'
+    )
+    assert nb_orphan_detect(_nb_ctx(code)).status is Status.NA
+
+
 @pytest.mark.parametrize("source", [
     'columns = ", ".join(df.columns)',
     'message = "\\n".join(lines)',
@@ -1411,6 +1427,24 @@ def test_unknown_dimension_member_with_monitoring_passes():
     verdict = nb_unknown_monitored(_nb_ctx(code))
     assert verdict.score == 3
     assert "unknown_count" in verdict.evidence
+
+
+def test_boolean_isin_minus_one_is_not_a_surrogate_key():
+    """A quoted "-1" in a boolean tidy-up (isin) is not a -1 surrogate key.
+
+    Legacy IFS/COM systems store a boolean true as -1, so
+    ``bool_value.isin("-1","1","true","yes","y")`` maps those strings to True.
+    The ``-1`` is a *string* literal inside a membership test, not a numeric
+    surrogate-key fallback, so the completeness monitor does not apply - even
+    when incidental dim/fact table *names* and a CDC ``.join(`` appear elsewhere
+    in the notebook and satisfy the fact-to-dimension gate.
+    """
+    code = ('name_map = {"r5events": "fct_events", "r5meters": "dim_meters"}\n'
+            'delta = old.join(new, keys, "left_anti").count()\n'
+            'df = df.withColumn("flag", '
+            'F.when(bool_value.isin("-1","1","true","yes","y"), F.lit(True))'
+            '.when(bool_value.isin("0","false","no","n"), F.lit(False)))\n')
+    assert nb_unknown_monitored(_nb_ctx(code)).status is Status.NA
 
 
 def test_layer_names_in_comments_do_not_create_reconciliation_scope():

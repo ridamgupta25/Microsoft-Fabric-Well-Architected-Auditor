@@ -473,6 +473,32 @@ def test_flag_domain_validation_passes():
     assert nb_flag_domain(_ctx(_nb(code))).score == _PASS
 
 
+def test_flag_domain_passes_when_a_flag_is_normalised_by_when_otherwise():
+    code = (
+        "df = spark.read.json('Files/events.json')\n"
+        "df = df.withColumn('is_active', when(col('is_active') == 'Y', True).otherwise(False))"
+    )
+    assert nb_flag_domain(_ctx(_nb(code))).score == _PASS
+
+
+def test_flag_domain_fails_on_a_boolean_type_declaration_alone():
+    """Declaring a BooleanType column sets a type; it does not restrict values."""
+    code = (
+        "df = spark.read.json('Files/events.json')\n"
+        "schema = StructType([StructField('amount', BooleanType())])"
+    )
+    assert nb_flag_domain(_ctx(_nb(code))).score == _FAIL
+
+
+def test_flag_domain_fails_on_a_generic_when_otherwise():
+    """A when/otherwise with no flag column and no flag literal is generic logic."""
+    code = (
+        "df = spark.read.csv('Files/events.csv')\n"
+        "df = df.withColumn('bucket', when(col('amount') > 100, 'big').otherwise('small'))"
+    )
+    assert nb_flag_domain(_ctx(_nb(code))).score == _FAIL
+
+
 def test_ingestion_controls_are_na_without_relevant_input_or_write():
     context = _ctx(_nb("print('no input or write')"))
     assert nb_source_metadata(context).status is Status.NA
@@ -494,27 +520,31 @@ raw.write.saveAsTable('bronze_events')
 
 
 def test_silver_quality_scores_each_aspect_separately():
-    """Two of four aspects is a partial, not a pass.
+    """Two of the three scored aspects is a partial, not a pass.
 
-    The point names cleansing, deduplication, conforming *and* type
-    standardization. An earlier version passed on any one of them and then
-    claimed all four in its evidence, which reported deduplication on notebooks
-    performing none. Scoring the ratio is what makes the evidence checkable.
+    The point scores cleansing, conforming and type standardization. Dedup is
+    detected but reported as unscored context, so it never lifts or lowers the
+    band; scoring the ratio of the three is what makes the evidence checkable.
     """
     code = """
 silver = spark.read.table('bronze_events')
-silver = silver.dropDuplicates(['event_id']).withColumn('event_date', to_date('event_date'))
+silver = (silver.dropDuplicates(['event_id'])
+          .withColumn('event_date', to_date('event_date'))
+          .withColumn('name', trim(col('name'))))
 silver.write.saveAsTable('silver_events')
 """
     verdict = nb_silver_quality(_ctx(_nb(code)))
     assert verdict.score is not None and verdict.score < _PASS
-    assert "2 of 4" in verdict.evidence
-    assert "deduplication" in verdict.evidence
-    assert "Not found: cleansing, conforming" in verdict.evidence
+    assert "2 of 3" in verdict.evidence
+    assert "Not found: conforming" in verdict.evidence
+    assert "deduplication also applied" in verdict.evidence
 
 
 def test_silver_quality_passes_when_every_aspect_is_present():
-    """All four aspects present - dedup, cast, trim (cleansing), rename (conforming)."""
+    """All three scored aspects present - cast, trim (cleansing), rename (conforming).
+
+    Dedup is also applied here, but it is reported as context, not scored.
+    """
     code = """
 silver = spark.read.table('bronze_events')
 silver = (silver.dropDuplicates(['event_id'])
@@ -525,7 +555,7 @@ silver.write.saveAsTable('silver_events')
 """
     verdict = nb_silver_quality(_ctx(_nb(code)))
     assert verdict.score == _PASS
-    assert "4 of 4" in verdict.evidence
+    assert "3 of 3" in verdict.evidence
 
 
 def test_bulk_pipeline_passes_with_parallel_copy():
@@ -600,6 +630,27 @@ def test_bulk_move_passes_with_staging_and_copy_command():
     assert verdict.score == _PASS
     assert "enableStaging=true" in verdict.evidence
     assert "allowCopyCommand=true" in verdict.evidence
+
+
+def test_bulk_move_credits_truncate_reload_and_table_lock():
+    # A TRUNCATE-then-INSERT full reload with a bulk table lock is a genuine bulk
+    # pattern (one set-based clear plus a bulk insert), the opposite of row-by-row.
+    # It must not be mislabelled "default Copy settings".
+    pipeline = _pipe({
+        "name": "Reload dim", "type": "Copy",
+        "typeProperties": {
+            "sink": {
+                "type": "FabricSqlDatabaseSink",
+                "writeBehavior": "insert",
+                "sqlWriterUseTableLock": True,
+                "preCopyScript": "TRUNCATE TABLE [raw].[dim_site]",
+            },
+        },
+    })
+    verdict = pl_bulk_move(_ctx(pipeline))
+    assert verdict.score == _PASS
+    assert "sqlWriterUseTableLock=true" in verdict.evidence
+    assert "preCopyScript truncate/reload" in verdict.evidence
 
 
 def test_bulk_move_fails_only_explicit_row_by_row_logic():
@@ -1064,6 +1115,37 @@ def test_historical_separation_full_load_name_alone_is_na(name):
         name,
         {"name": "Copy_IN_WHITM_INCROQ", "type": "Copy"},
     ))
+    assert verdict.status is Status.NA
+    assert "no historical/backfill load signal" in verdict.evidence
+
+
+def test_historical_separation_ignores_project_schema_literal_in_definition():
+    # Regression (real MLC_ADAGE data): PL_IN_WHITMPK_TBL_FullLoad was scored
+    # PARTIAL only because the historical detector matched the project's own
+    # 'ADAGE' schema name buried in a Copy sink's typeProperties - an incidental
+    # data value, not a load-intent signal - while its structurally identical
+    # twin PL_IN_WHITM_TBL_FullLoad (which names the schema via an expression)
+    # was N/A. A full-load pipeline with no historical/backfill naming must be
+    # N/A regardless of the schema / table names it writes to.
+    copy_to_adage_schema = {
+        "name": "ACT_MT_Copy_ingestBlobdataForFullLoad",
+        "type": "Copy",
+        "typeProperties": {
+            "sink": {
+                "type": "LakehouseTableSink",
+                "tableActionOption": "OverwriteSchema",
+                "datasetSettings": {
+                    "typeProperties": {
+                        "schema": {"value": "ADAGE", "type": "Expression"},
+                        "table": {"value": "IN_WHITM", "type": "Expression"},
+                    }
+                },
+            }
+        },
+    }
+    verdict = pl_historical_separation(
+        _named_pipe_ctx("PL_IN_WHITMPK_TBL_FullLoad", copy_to_adage_schema)
+    )
     assert verdict.status is Status.NA
     assert "no historical/backfill load signal" in verdict.evidence
 

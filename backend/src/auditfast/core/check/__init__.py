@@ -46,7 +46,9 @@ Option = CheckOption
 #: ("more data needed"), which is noise in the catalog and audit reports. Leaving
 #: them unloaded removes them from every surface (website, API, CLI, MCP) at once.
 #: Re-add "roadmap" here to restore them — the generated roadmap.py files remain.
-_CHECK_MODULES = {"automated", "manual", "questionnaire"}
+#: "group" carries cross-workspace (@group_check) modules, which register into
+#: the separate GROUP_REGISTRY.
+_CHECK_MODULES = {"automated", "manual", "questionnaire", "group"}
 
 
 def _discover() -> tuple[str, ...]:
