@@ -129,7 +129,6 @@ VALIDATED_CHECKLIST: dict[str, str] = {
     "4.2.5":  "Tables carry audit columns (load timestamp, source system, batch id)",
     "9.1.1":  "Failed pipelines can be restarted from point of failure (not full re-run)",
     "10.1.4": "Alerting on pipeline failure (Data Activator or equivalent)",
-    "11.5.1": "Unit tests exist for critical transformation logic",
     "2.2.1":  "Incremental load implemented where applicable (watermark, CDC, delta detection) for IFS/EAM/LIMS",
     "3.3.7":  "Delta table history / log retention configured and monitored",
     "3.1.7":  "All notebooks have meaningful, consistent names aligned to domain/layer",

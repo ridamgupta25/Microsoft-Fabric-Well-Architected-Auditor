@@ -20,6 +20,7 @@ from __future__ import annotations
 import pytest
 
 from auditfast.core.check.registry import REGISTRY
+from auditfast.core.enums import Status
 from auditfast.core.models import CheckContext, WorkspaceContext
 
 
@@ -143,3 +144,36 @@ def test_explicitly_disabled_vorder_fails():
 @pytest.mark.parametrize("check_id", ["DELTA-VORDER", "DELTA-TBLPROPS", "DELTA-RETENTION"])
 def test_delta_checks_ignore_a_notebook_that_writes_no_delta(check_id):
     assert _run(check_id, "print('hello')\n").score is None
+
+
+# -- 3.3.7 retention: pass only on a positive signal, N/A on absence ----------
+
+def test_retention_passes_on_an_explicit_property():
+    """A TBLPROPERTIES / ALTER TABLE retention property is a positive signal."""
+    code = (
+        f"{_DELTA_WRITE}"
+        "spark.sql(\"ALTER TABLE t SET TBLPROPERTIES "
+        "('delta.deletedFileRetentionDuration' = 'interval 30 days')\")"
+    )
+    assert _run("DELTA-RETENTION", code).score == 3
+
+
+def test_retention_passes_on_a_vacuum():
+    """A VACUUM actively enforces the deleted-file retention window."""
+    assert _run("DELTA-RETENTION", f"{_DELTA_WRITE}spark.sql('VACUUM t RETAIN 168 HOURS')").score == 3
+
+
+def test_retention_absence_is_na_and_names_what_it_looked_for():
+    """No retention/VACUUM signal maps to N/A — never a PASS on 'defaults apply'."""
+    v = _run("DELTA-RETENTION", _DELTA_WRITE)
+    assert v.score is None
+    assert v.status is Status.NA
+    assert "not assessable" in v.evidence
+    assert "logRetentionDuration" in v.evidence
+    assert "VACUUM" in v.evidence
+
+
+def test_retention_ignores_a_sql_commented_vacuum():
+    """A VACUUM inside a SQL comment must not count as a positive signal."""
+    code = f"{_DELTA_WRITE}spark.sql('-- VACUUM t RETAIN 168 HOURS')"
+    assert _run("DELTA-RETENTION", code).score is None

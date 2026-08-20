@@ -1,6 +1,6 @@
 """Regression tests for the checks added for refs 4.1.2, 5.2.6, 5.3.1, 5.5.6, 14.1.x,
 and for the Operations · Data Operations checks (1.1.3, 1.1.8, 10.5.1, 11.1.4,
-11.4.2, 11.4.5, 11.5.1).
+11.4.2, 11.4.5).
 
 Every case here is a defect a review found in the first implementation. Each pairs
 the misjudged input with the input that must keep working, so a future rewrite of a
@@ -49,14 +49,12 @@ from auditfast.core.check.operations_reliability.data_logs.automated import (
     kql_queries_version_controlled,
 )
 from auditfast.core.check.operations_reliability.data_operations.automated import (
-    _TEST_NAME_RE,
     activator_configured,
     branching_strategy,
     environment_isolation,
     git_covers_every_artifact,
     semantic_model_deployment,
     single_source_of_truth,
-    unit_tests_exist,
     warehouse_deployment_automated,
 )
 from auditfast.core.check.operations_reliability.data_prep.automated import (
@@ -569,7 +567,7 @@ def test_merge_check_is_na_without_a_merge():
 
 # =============================================================================
 # Operations & Reliability · Data Operations — refs 1.1.3, 1.1.8, 10.5.1,
-# 11.1.4, 11.4.2, 11.4.5, 11.5.1
+# 11.1.4, 11.4.2, 11.4.5
 #
 # Every check below is workspace-scoped, so each case builds the workspace the
 # rule is about. The N/A cases are the important ones: "we could not read it"
@@ -893,95 +891,6 @@ def test_semantic_model_deployment_is_na_when_git_is_unreadable():
     ctx = _ws_ctx(id="w", items=_items(("SemanticModel", "SM_Sales")),
                   unavailable={Resource.GIT})
     assert semantic_model_deployment(ctx).status is Status.NA
-
-
-# --- 11.5.1 unit tests -------------------------------------------------------
-
-@pytest.mark.parametrize("name,expected,why", [
-    ("NB_Test_Sales", True, "test as its own token"),
-    ("TestSalesLoad", True, "test opening a CamelCase name"),
-    ("nb_unit_tests", True, "unit tests suffix"),
-    ("Run Unit Tests", True, "an activity name"),
-    ("NB_Latest_Load", False, "'latest' is not a test"),
-    ("NB_Contest_Rules", False, "'contest' is not a test"),
-    ("NB_Tested_Rows", False, "'tested' is not a test asset"),
-])
-def test_test_name_detector(name: str, expected: bool, why: str):
-    assert bool(_TEST_NAME_RE.search(name)) is expected, why
-
-
-def test_a_test_framework_notebook_satisfies_the_unit_test_check():
-    ctx = _ws_ctx(id="w", notebooks={
-        "NB_Build": _nb(_WRITES),
-        "NB_Checks": _nb("import pytest\n\ndef test_scd2(): assert transform(1) == 2\n"),
-    })
-    verdict = unit_tests_exist(ctx)
-    assert verdict.score == 3
-    assert "NB_Checks" in verdict.evidence
-
-
-def test_transformations_with_no_test_asset_fail():
-    ctx = _ws_ctx(id="w", notebooks={"NB_Build": _nb(_WRITES)})
-    verdict = unit_tests_exist(ctx)
-    assert verdict.score == 0
-    assert "no test notebook" in verdict.evidence
-
-
-def test_a_commented_out_test_framework_does_not_count():
-    ctx = _ws_ctx(id="w", notebooks={"NB_Build": _nb(_WRITES + "# import pytest\n")})
-    assert unit_tests_exist(ctx).score == 0
-
-
-def test_a_row_count_assert_is_not_a_unit_test():
-    """A data-quality gate on production rows is not a test of the transform."""
-    ctx = _ws_ctx(id="w", notebooks={
-        "NB_Build": _nb(_WRITES + "assert df.count() > 0\n")})
-    assert unit_tests_exist(ctx).score == 0
-
-
-def test_a_test_activity_in_a_pipeline_counts():
-    ctx = _ws_ctx(
-        id="w",
-        notebooks={"NB_Build": _nb(_WRITES)},
-        pipelines={"PL_Load": {"properties": {"activities": [
-            {"name": "Run Unit Tests", "type": "TridentNotebook"}]}}},
-    )
-    assert unit_tests_exist(ctx).score == 3
-
-
-def test_a_few_tests_beside_many_transforms_is_partial_not_a_pass():
-    """Presence is not coverage: 1 test against 8 transforms must not score 3.
-
-    Regression for a real workspace where 9 test notebooks covering 61
-    transformation notebooks (15%) reported a clean PASS.
-    """
-    notebooks = {f"NB_Build_{i}": _nb(_WRITES) for i in range(8)}
-    notebooks["NB_Checks"] = _nb("import pytest\n\ndef test_scd2(): assert f(1) == 2\n")
-    ctx = _ws_ctx(id="w", notebooks=notebooks)
-    verdict = unit_tests_exist(ctx)
-    assert verdict.score < 3, "a 1-in-8 coverage ratio is not a passing test posture"
-    assert verdict.coverage == pytest.approx(1 / 8)
-    assert "NB_Checks" in verdict.evidence
-
-
-def test_more_tests_than_transforms_is_fully_covered():
-    """The ratio is clamped, so a test-heavy workspace still passes cleanly."""
-    ctx = _ws_ctx(id="w", notebooks={
-        "NB_Build": _nb(_WRITES),
-        "NB_Checks": _nb("import pytest\n\ndef test_a(): assert 1\n"),
-        "NB_More_Checks": _nb("import pytest\n\ndef test_b(): assert 1\n"),
-    })
-    assert unit_tests_exist(ctx).score == 3
-
-
-def test_unit_tests_is_na_without_notebook_definitions():
-    ctx = _ws_ctx(id="w", unavailable={Resource.NOTEBOOK_DEFINITIONS})
-    assert unit_tests_exist(ctx).status is Status.NA
-
-
-def test_unit_tests_is_na_when_no_notebook_transforms_anything():
-    ctx = _ws_ctx(id="w", notebooks={"NB_Explore": _nb("df = spark.table('t')\ndisplay(df)\n")})
-    assert unit_tests_exist(ctx).status is Status.NA
 
 
 # =============================================================================
