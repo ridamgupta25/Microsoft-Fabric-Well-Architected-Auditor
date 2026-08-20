@@ -462,8 +462,8 @@ def run_audit(
 
     # Merge external checks if provided
     if external_checks_csv:
-        from .external_checks_service import load_external_checks, ExternalCheckError
-        
+        from .external_checks_service import ExternalCheckError, load_external_checks
+
         try:
             # Strip surrounding whitespace and stray quotes (Windows "Copy as path"
             # wraps the path in double quotes, which would otherwise be taken literally).
@@ -478,13 +478,13 @@ def run_audit(
                 if candidate.exists():
                     csv_path = candidate
                 # Otherwise fall back to cwd (current working directory)
-            
+
             target_ws_ids = {ws_id for ws_id, _ in targets}
             external_results, warnings = load_external_checks(
                 csv_path,
                 target_workspaces=target_ws_ids,
             )
-            
+
             if warnings:
                 import logging
                 logger = logging.getLogger(__name__)
@@ -492,15 +492,15 @@ def run_audit(
                     f"Loaded external checks with {len(warnings)} warning(s):\n" +
                     "\n".join(f"  - {w}" for w in warnings)
                 )
-            
+
             # Merge: workspace-agnostic (external checks added regardless of workspace)
             # Simply append external checks to automated results without requiring workspace
             # match. This allows external checks from different workspaces to contribute to
             # the overall audit score. External checks keep their original workspace from CSV.
             merged_results = raw_results + external_results
-        
+
         except ExternalCheckError as e:
-            raise AuditError(f"Cannot load external checks: {e}")
+            raise AuditError(f"Cannot load external checks: {e}") from e
     else:
         merged_results = raw_results
 
