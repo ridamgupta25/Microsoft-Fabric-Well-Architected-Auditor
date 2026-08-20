@@ -812,6 +812,19 @@ _ORPHAN_DETECT = re.compile(
     r"anti.*join.*parent|parent.*anti.*join",
     re.IGNORECASE,
 )
+#: A change-data-capture / slowly-changing-dimension incremental-merge context.
+#: In such a notebook a ``left_anti`` join or a null-on-left-join is upsert
+#: machinery — it isolates NEW and CHANGED rows to insert/expire, keyed on the
+#: target's own primary key — not child rows missing a parent. Matching any of
+#: these strong, specific tokens means the anti-join is a merge step, so the
+#: fact-to-dimension FK-orphan question does not apply here (it is judged where
+#: dimensional loads run). These tokens are deliberately narrow (a bare
+#: ``active_flag`` or ``end_date`` in ordinary business data must not trip it).
+_CDC_MERGE_CONTEXT = re.compile(
+    r"\bcdc\b|change[_ ]?hash|\bis_new\b|\bis_updated\b|\bis_deleted\b|"
+    r"add_cdc_columns|cdc_columns|\bscd\b|scd[_ ]?2",
+    re.IGNORECASE,
+)
 
 # -- 5.3.6: reconciliation *across* sources, not just a row-count assertion ----
 #: Comparing one source against another. ``_COUNT_RECONCILE`` alone is not
@@ -1002,15 +1015,13 @@ _BRONZE_BATCH = re.compile(
     r"batch[_ ]?(?:id|key)",
     re.IGNORECASE,
 )
-#: The four Silver disciplines the checklist point names, kept separate so the
-#: verdict can say *which* are present. A single pattern could only answer
-#: "something was found", which reported "applies cleansing, deduplication,
-#: conforming and type standardization" on a notebook doing none of the dedup.
+#: The three Silver disciplines this check *scores*. Deduplication is detected
+#: separately (``_SILVER_DEDUP``) and reported as context but never scored:
+#: whether a given Silver source needs dedup depends on whether its business key
+#: can repeat, which this check cannot see, so penalizing its absence would be a
+#: false finding (ref 1.2.5). Kept as (name, pattern) pairs so the verdict can
+#: name *which* aspects are present rather than only "something was found".
 _SILVER_ASPECTS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("deduplication", re.compile(
-        r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.distinct\s*\(\)|dedup|"
-        r"row_number\s*\(\s*\)\s*over|qualify\b",
-        re.IGNORECASE)),
     ("type standardization", re.compile(
         r"\.cast\s*\(|to_date\s*\(|to_timestamp\s*\(|astype\s*\(|"
         r"CAST\s*\(|CONVERT\s*\(",
@@ -1023,6 +1034,11 @@ _SILVER_ASPECTS: tuple[tuple[str, re.Pattern[str]], ...] = (
         r"standardi[sz]e|conform|\.withColumnRenamed\s*\(|\balias\s*\(|mapping",
         re.IGNORECASE)),
 )
+#: Deduplication detector — reported as unscored context (see ``_SILVER_ASPECTS``).
+_SILVER_DEDUP = re.compile(
+    r"dropDuplicates\s*\(|drop_duplicates\s*\(|\.distinct\s*\(\)|dedup|"
+    r"row_number\s*\(\s*\)\s*over|qualify\b",
+    re.IGNORECASE)
 
 _EXPLICIT_ROW_BY_ROW = re.compile(
     r"row[_ -]?by[_ -]?row|record[_ -]?by[_ -]?record|per[_ -]?(?:row|record)|"
@@ -1098,11 +1114,26 @@ _TEXT_ENCODING = re.compile(
     r"decode\s*\(\s*[\"']utf[-_]?8|StringType\s*\(\)|utf[-_]?8",
     re.IGNORECASE,
 )
+#: A column name that denotes a boolean/flag field.
+_FLAG_NAME = r"(?:flag|boolean|is_[A-Za-z0-9_]+|active|enabled|valid)"
+#: The expected literals a flag is allowed to hold.
+_FLAG_LITERAL = r"(?:True|False|[\"'](?:Y|N|yes|no|true|false|0|1)[\"'])"
 _FLAG_DOMAIN = re.compile(
-    r"(?:flag|boolean|is_[A-Za-z0-9_]+|active|enabled|valid)[^\n]{0,120}?\.isin\s*\(|"
-    r"\.isin\s*\(\s*(?:True|False|[\"'](?:Y|N|true|false|0|1)[\"'])|"
+    # a flag-named column tested for membership: is_active.isin(...)
+    _FLAG_NAME + r"[^\n]{0,120}?\.isin\s*\(|"
+    # any .isin(...) whose literal set is boolean/flag values
+    r"\.isin\s*\(\s*\[?\s*" + _FLAG_LITERAL + r"|"
+    # a declared allow-list of flag / expected values
     r"(?:allowed|valid)[_ ]?(?:values|flags)|expected[_ ]?(?:values|flags)|"
-    r"BooleanType\s*\(\)|when\s*\([^\n]{0,120}?\)\.otherwise\s*\(",
+    # a when(...).otherwise(...) that normalises a flag column to expected
+    # literals - it must name a flag column AND an expected literal (either
+    # order). A bare when/otherwise is generic conditional logic and does not
+    # count; declaring a BooleanType column likewise only sets a type, it does
+    # not restrict the values, so neither is treated as flag-domain validation.
+    r"when\s*\([^\n]{0,160}?" + _FLAG_NAME + r"[^\n]{0,120}?" + _FLAG_LITERAL
+    + r"[^\n]{0,120}?\.otherwise\s*\(|"
+    r"when\s*\([^\n]{0,160}?" + _FLAG_LITERAL + r"[^\n]{0,120}?" + _FLAG_NAME
+    + r"[^\n]{0,120}?\.otherwise\s*\(",
     re.IGNORECASE,
 )
 #: A *categorical* domain restriction - 5.5.5. Deliberately distinct from
@@ -1410,6 +1441,14 @@ def nb_orphan_detect(ctx: CheckContext) -> Verdict:
     code = strip_sql_comments(executable_code(ctx.obj))
     if not (_JOIN_PATTERN.search(code) or _IMPLICIT_JOIN.search(code)):
         return not_applicable(f"Notebook '{ctx.obj_name}' does not perform joins")
+    if _CDC_MERGE_CONTEXT.search(code):
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' performs a CDC / SCD2 incremental merge — its "
+            "anti-join and null-on-join logic identify new and changed records to "
+            "insert or expire, keyed on the target's own primary key, not child rows "
+            "missing a parent. Referential-orphan detection does not apply here; it is "
+            "judged where fact-to-dimension loads run"
+        )
     if not _ORPHAN_DETECT.search(code):
         return binary(
             False,
@@ -1564,11 +1603,18 @@ _UNKNOWN_MONITORED = re.compile(
 )
 #: A real dimensional unknown-member fallback. A generic string value such as
 #: ``city = "Unknown"`` is ordinary null cleansing, not a surrogate member.
+#:
+#: The ``-1`` forms require a *numeric* -1 (a surrogate key), so each is guarded
+#: with ``(?<![\"'])`` to reject a quoted ``"-1"`` string. Legacy IFS/COM feeds
+#: store a boolean true as -1, so ``bool_value.isin("-1","1","true","yes","y")``
+#: is a flag tidy-up (scored by 5.5.7), not a surrogate-key orphan fallback -
+#: without the guard the quoted ``"-1"`` false-matched ``when(...-1`` and this
+#: completeness monitor fired on notebooks with no dimension lookup at all.
 _UNKNOWN_MEMBER_USE = re.compile(
     r"unknown[_\s]?member|inferred[_\s]?member|is_inferred|"
-    r"coalesce\s*\([^\n]{0,80}?-1|fillna\s*\([^\n]{0,60}?-1|"
-    r"\.na\.fill\s*\([^\n]{0,60}?-1|otherwise\s*\([^\n]{0,40}?-1|"
-    r"when\s*\([^\n]{0,80}?-1",
+    r"coalesce\s*\([^\n]{0,80}?(?<![\"'])-1|fillna\s*\([^\n]{0,60}?(?<![\"'])-1|"
+    r"\.na\.fill\s*\([^\n]{0,60}?(?<![\"'])-1|otherwise\s*\([^\n]{0,40}?(?<![\"'])-1|"
+    r"when\s*\([^\n]{0,80}?(?<![\"'])-1",
     re.IGNORECASE,
 )
 
@@ -1679,6 +1725,25 @@ def nb_late_arriving(ctx: CheckContext) -> Verdict:
     )
 
 
+def _describe_unknown_fallback(match_text: str) -> str:
+    """A clean, human label for a matched unknown-member fallback.
+
+    The raw regex match is a fragment cut off at the ``-1`` (e.g.
+    ``when(bool_value.isin("-1``), which reads as broken code in a report. This
+    names the *mechanism* instead — keeping the operator keyword so the evidence
+    still points at the code — rather than pasting a truncated expression.
+    """
+    text = match_text.lower()
+    if "unknown" in text and "member" in text:
+        return "a named 'unknown member'"
+    if "inferred" in text or "is_inferred" in text:
+        return "an 'inferred member'"
+    for operator in ("coalesce", "fillna", "na.fill", "otherwise", "when"):
+        if operator in text:
+            return f"a -1 surrogate-key fallback (via {operator}(...))"
+    return "an unknown/inferred member"
+
+
 @check(
     id="NB-UNKNOWN-MONITOR", ref="5.4.4",
     title="Completeness: all expected dimension members present; unknown/orphan member usage monitored",
@@ -1706,15 +1771,21 @@ def nb_unknown_monitored(ctx: CheckContext) -> Verdict:
             f"deterministic unknown/inferred-member fallback (-1 or an explicitly "
             f"named unknown/inferred member)"
         )
+    fallback = _describe_unknown_fallback(member.group(0))
     monitored = _UNKNOWN_MONITORED.search(code)
-    fallback = " ".join(member.group(0).split())
     if monitored:
         signal = " ".join(monitored.group(0).split())
-        return binary(True, f"Notebook '{ctx.obj_name}' uses unknown-member fallback "
-                      f"'{fallback}' and monitors it with '{signal}'")
-    return binary(False, f"Notebook '{ctx.obj_name}' uses unknown-member fallback "
-                  f"'{fallback}' in a fact-to-dimension lookup but never counts, "
-                  f"logs, or audits how many rows use it")
+        return binary(
+            True,
+            f"Notebook '{ctx.obj_name}' routes unmatched keys to {fallback} and "
+            f"monitors its usage (found: {signal}).",
+        )
+    return binary(
+        False,
+        f"Notebook '{ctx.obj_name}' routes unmatched keys to {fallback} in a "
+        f"fact-to-dimension lookup, but never counts, logs, or audits how many rows "
+        f"land on it — a feed that starts producing unmatched keys would look healthy.",
+    )
 
 
 @check(
@@ -2097,23 +2168,25 @@ def nb_bronze_metadata(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_silver_quality(ctx: CheckContext) -> Verdict:
-    """Silver writes apply cleansing, deduplication, conforming and type standardization.
+    """Silver writes apply cleansing, conforming and type standardization.
 
     **Only Silver notebooks are judged**, decided by what the notebook writes to
     rather than by the word "silver" appearing anywhere in it - a Gold notebook
     that *reads* a silver table was previously judged as though it produced one.
 
-    **Scored per aspect.** The point names four disciplines, and a notebook doing
-    three of them is not the same as one doing all four. An earlier version
-    matched any one pattern and then claimed all four in its evidence, which
-    reported deduplication on notebooks that performed none. The verdict now
-    names which aspects were found and which were not, and scores the ratio, so
-    the evidence can be checked against the code.
+    **Scored on three disciplines.** The verdict names which of cleansing,
+    conforming and type standardization were found and which were not, and scores
+    the ratio, so the evidence can be checked against the code.
 
-    **What it cannot determine.** That a transformation is *correct*, or that an
-    absent aspect was unnecessary - a source with a guaranteed-unique key needs
-    no dedup. The named gaps are for a reviewer to confirm, and the write target
-    is named so the reader knows which lakehouse was judged.
+    **Deduplication is reported but not scored.** Whether a Silver source needs
+    dedup depends on whether its business key can repeat - which this check cannot
+    see - so its absence is surfaced as context for a reviewer, never counted as a
+    gap. Penalizing a discipline the tool cannot establish is required would be a
+    false finding.
+
+    **What it cannot determine.** That a transformation is *correct*. The named
+    gaps are for a reviewer to confirm, and the write target is named so the
+    reader knows which lakehouse was judged.
     """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
@@ -2131,11 +2204,17 @@ def nb_silver_quality(ctx: CheckContext) -> Verdict:
 
     present = [name for name, pattern in _SILVER_ASPECTS if pattern.search(code)]
     missing = [name for name, _ in _SILVER_ASPECTS if name not in present]
+    dedup_note = (
+        "deduplication also applied (not scored)"
+        if _SILVER_DEDUP.search(code) else
+        "deduplication not detected (not scored - confirm whether this source needs it)"
+    )
     return covered(
         len(present), len(_SILVER_ASPECTS),
         f"Silver write ({how}) applies {len(present)} of {len(_SILVER_ASPECTS)} "
-        f"quality aspect(s): {', '.join(present) if present else 'none'}"
-        + (f". Not found: {', '.join(missing)}" if missing else ""),
+        f"scored quality aspect(s): {', '.join(present) if present else 'none'}"
+        + (f". Not found: {', '.join(missing)}" if missing else "")
+        + f". {dedup_note}",
     )
 
 
@@ -2146,11 +2225,16 @@ def nb_silver_quality(ctx: CheckContext) -> Verdict:
 #: built only from those is N/A for this check rather than a failure.
 _BULK_MOVE_TYPES = {"Copy", "Script", "SqlServerStoredProcedure"}
 
+#: A Copy sink ``preCopyScript`` that clears the target before a set-based load —
+#: the TRUNCATE-then-bulk-INSERT full-reload idiom. It is a genuine bulk pattern
+#: (a single set-based clear plus a bulk insert), the opposite of row-by-row.
+_BULK_PRECOPY = re.compile(r"\bTRUNCATE\b|\bDROP\s+TABLE\b|\bDELETE\s+FROM\b", re.IGNORECASE)
+
 
 @check(
     id="PL-BULK-MOVE", ref="2.6.3",
     title="Large data movements use bulk/batch patterns, not row-by-row",
-    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.HIGH,
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def pl_bulk_move(ctx: CheckContext) -> Verdict:
@@ -2195,6 +2279,11 @@ def pl_bulk_move(ctx: CheckContext) -> Verdict:
         for key in ("writeBatchSize", "batchSize"):
             if configured(sink.get(key)):
                 signals.append(f"{key}={sink[key]}")
+        if sink.get("sqlWriterUseTableLock") is True:
+            signals.append("sqlWriterUseTableLock=true")
+        pre_copy = sink.get("preCopyScript")
+        if isinstance(pre_copy, str) and _BULK_PRECOPY.search(pre_copy):
+            signals.append("preCopyScript truncate/reload")
         return signals
 
     row_by_row = [
@@ -2719,13 +2808,56 @@ def pl_full_load(ctx: CheckContext) -> Verdict:
 # -- 2.2.3 historical (Adage) load separated from ongoing incremental ----------
 _HISTORICAL = re.compile(
     r"historical|back[_ -]?fill|backfill|full[_ -]?history|one[_ -]?time[_ -]?load|"
-    r"initial[_ -]?load|adage|reload[_ -]?history",
+    r"initial[_ -]?load|reload[_ -]?history",
     re.IGNORECASE,
 )
 _ONGOING = re.compile(
     r"incremental|daily|hourly|delta[_ -]?load|watermark|cdc|ongoing|scheduled",
     re.IGNORECASE,
 )
+
+
+def _load_intent_text(pipeline_name: str, activities: list[dict]) -> str:
+    """Identifiers that carry *load intent* - the pipeline name and each
+    activity's name - joined for keyword matching.
+
+    Deliberately excludes activity ``typeProperties`` (schema / table / column
+    names, expressions, connection ids). Those are incidental data values:
+    matching a load-mode keyword against them flagged a routine full-load
+    pipeline as a "historical/backfill" load merely because it wrote to the
+    project's own ``ADAGE`` schema, and flipped the verdict between two
+    structurally identical pipelines on such a token. Intent is what the author
+    *named* the pipeline and its steps, not the data they happen to touch.
+    """
+    parts = [pipeline_name or ""]
+    parts.extend(str((a or {}).get("name") or "") for a in activities)
+    return "\n".join(parts)
+
+
+def _gate_condition_text(activity: dict) -> str:
+    """A Switch / IfCondition's *branch condition* - its name, boolean / selector
+    expression and any Switch case labels - without the nested branch bodies.
+
+    A load-mode gate is identified by what it branches *on*, not by what sits
+    inside its branches, so a container is not read as a load-mode gate just
+    because a nested activity name or value contains a load-mode word.
+    """
+    props = activity.get("typeProperties") or {}
+
+    def _expr(value: object) -> str:
+        return str(value.get("value") if isinstance(value, dict) else (value or ""))
+
+    parts = [
+        str(activity.get("name") or ""),
+        _expr(props.get("expression")),   # IfCondition predicate
+        _expr(props.get("on")),           # Switch selector
+    ]
+    parts.extend(
+        str((c or {}).get("value") or "")
+        for c in (props.get("cases") or [])
+        if isinstance(c, dict)
+    )
+    return "\n".join(parts)
 
 
 @check(
@@ -2740,14 +2872,23 @@ def pl_historical_separation(ctx: CheckContext) -> Verdict:
     Narrower than ``PL-LOADMODE`` (2.2.5), which asks whether *any* initial /
     incremental separation exists. This fires only when a historical or backfill
     load is actually present, and asks whether it is kept off the routine path.
+
+    **What counts as the signal.** Historical/backfill and ongoing/incremental
+    intent are read from load-bearing *identifiers* - the pipeline name and its
+    activity names (see :func:`_load_intent_text`) - never from the serialized
+    definition. Searching the whole JSON matched incidental data values (a
+    ``schema`` / ``table`` name in a Copy sink), so a plain full-load pipeline
+    read as "historical" merely because it wrote to the project's ``ADAGE``
+    schema, and the verdict flipped between structurally identical pipelines on
+    such a token. Intent is what the author named, not the data touched.
     """
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
-    blob = json.dumps(ctx.obj)
     acts = walk_activities(ctx.obj)
+    intent = _load_intent_text(ctx.obj_name, acts)
     historical_in_name = bool(_HISTORICAL.search(ctx.obj_name))
-    historical_in_definition = bool(_HISTORICAL.search(blob))
-    if not historical_in_definition and not historical_in_name:
+    historical_signal = bool(_HISTORICAL.search(intent))
+    if not historical_signal:
         return not_applicable(
             f"Pipeline '{ctx.obj_name}' contains no historical/backfill load signal"
         )
@@ -2760,7 +2901,8 @@ def pl_historical_separation(ctx: CheckContext) -> Verdict:
     gating_branches = [
         a for a in acts
         if (a.get("type") or "") in {"Switch", "IfCondition"}
-        and (_HISTORICAL.search(json.dumps(a)) or _LOAD_MODE.search(json.dumps(a)))
+        and (_HISTORICAL.search(_gate_condition_text(a))
+             or _LOAD_MODE.search(_gate_condition_text(a)))
     ]
     if gating_branches:
         gate = gating_branches[0]
@@ -2771,7 +2913,7 @@ def pl_historical_separation(ctx: CheckContext) -> Verdict:
             "incremental path cannot enter it without the branch condition",
         )
 
-    if _ONGOING.search(blob):
+    if _ONGOING.search(intent):
         return binary(
             False,
             f"Pipeline '{ctx.obj_name}' contains both historical/backfill and ongoing "

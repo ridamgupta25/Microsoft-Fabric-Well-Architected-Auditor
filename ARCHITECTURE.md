@@ -3,7 +3,7 @@
 > **System:** AuditFAST Core  
 > **Document type:** Enterprise solution architecture  
 > **Implementation baseline:** `auditfast` 0.4.0  
-> **Last verified:** 2026-08-03
+> **Last verified:** 2026-08-17
 
 ---
 
@@ -169,8 +169,15 @@ further restrict the run to selected Well-Architected pillars.
 The engine selects the applicable checks before execution. Each check declares
 the data it requires. The provider returns a normalized `WorkspaceContext`, the
 engine invokes checks against workspace or item objects, and each check returns a
-small verdict containing a score and evidence. The service layer then adds
+small verdict containing a score and evidence. For named project groups with at
+least two members, a second deterministic phase runs registered cross-workspace
+checks over the already-fetched member contexts. The service layer then adds
 metadata and remediation, aggregates the results, and renders the report.
+
+Grouping is additive. An ungrouped request never enters the group phase. Optional
+environment weighting is disabled by default; when enabled, a member's level
+from 1 to 10 scales its contribution to project, pillar, and layer roll-ups but
+does not change any check verdict or that workspace's own percentage.
 
 ### 3.1 Overall Architecture
 
@@ -194,8 +201,8 @@ flowchart TB
     end
 
     subgraph Domain["Deterministic domain"]
-        Registry["Check registry"]
-        Engine["Scope-driven audit engine"]
+        Registry["Per-workspace and group<br/>check registries"]
+        Engine["Scope-driven engine<br/>plus group comparison phase"]
         Scoring["Scoring and aggregation"]
         Graph["Property-graph model"]
     end
@@ -270,7 +277,11 @@ The diagram shows two deliberate boundaries:
 
 ### 4.2 In scope
 
-- project-level audits across one or more Fabric workspaces;
+- project-level audits across one or more Fabric workspaces, including named
+  cross-workspace groups and isolated workspaces in the same run;
+- deterministic group checks that compare two or more readable environments;
+- optional environment-level weighting for project roll-ups, disabled by
+  default;
 - workspace, pipeline, and notebook checks currently executed by the engine;
 - reserved support for lakehouse, semantic-model, report, and eventhouse scopes;
 - Fabric metadata, roles, Git state, item inventory, item definitions, table
@@ -427,6 +438,9 @@ carried through API schemas and reports.
 | **WorkspaceContext** | The normalized, read-only snapshot consumed by every check. |
 | **CheckSpec** | Registration-time metadata describing a check before it runs. |
 | **CheckContext** | The workspace, object, and project settings given to one check invocation. |
+| **Project group** | A named set of two or more workspace selections compared as one cross-workspace project. |
+| **Environment level** | An optional 1–10 position within a group; used as a roll-up weight only when explicitly enabled. |
+| **GroupContext** | The group name, settings, and readable member contexts ordered from lower to higher environment level. |
 | **Verdict** | A check's small answer: score, evidence, coverage, and scored/unscored state. |
 | **CheckResult** | A verdict combined with check metadata, workspace identity, severity, and remediation. |
 | **N/A** | Not assessed. The result is recorded but excluded from scoring. |
@@ -434,8 +448,9 @@ carried through API schemas and reports.
 | **Reference (`ref`)** | A stable checklist identifier and remediation lookup key. |
 | **Automated check** | A check evaluated now from provider data. |
 | **Roadmap check** | A catalogued practice that could be automated when more data is available; it is not executed today. |
-| **Interactive check** | A fixed, scored questionnaire answered by a reviewer and merged after the crawl. The mechanism exists, but none are registered at this baseline. |
+| **Interactive check** | A fixed, scored questionnaire answered by a reviewer and merged after the crawl; 40 are registered at this baseline. |
 | **Manual check** | A catalog-only practice that cannot be determined by the engine. |
+| **Group check** | A deterministic check registered separately and invoked once per project group with `Scope.GROUP` results. |
 | **Knowledge base (KB)** | A disk snapshot of normalized workspace metadata. It is not a vector database or a generative-AI knowledge base. |
 | **Digital Twin** | A separate property graph of workspace entities and relationships. It does not feed audit scores. |
 | **Discoverer** | A Digital Twin adapter that contributes authoritative graph facts from one source. |
@@ -445,10 +460,12 @@ carried through API schemas and reports.
 
 ### 7.1 Conceptual relationship
 
-A project contains workspace targets. Each workspace has a layer. Checks belong
-to a pillar and a scope, declare required resources, and return verdicts. The
-engine turns those verdicts into results. Scoring aggregates only results that
-carry a numeric score.
+A project contains workspace targets. Each workspace has a layer and may also
+belong to a named group with an environment level. Ordinary checks belong to a
+pillar and a scope, declare required resources, and return verdicts for one
+workspace. Group checks declare the member resources needed for a comparison and
+return a project-level verdict. The engine turns both into results. Scoring
+aggregates only results that carry a numeric score.
 
 ---
 
@@ -594,9 +611,9 @@ flowchart LR
 | `services/audit_runner.py` | Job lifecycle, worker-thread execution, progress, concurrency, questionnaire merge, refresh | Prevents long crawls from blocking HTTP requests |
 | `services/auth_service.py` | Entra flows, in-memory token sessions, silent refresh | Keeps Fabric tokens server-side for the browser path |
 | `services/context_store.py` | KB persistence, cache policy, background refresh, archive | Makes repeat audits responsive and preserves snapshots |
-| `core/models.py` | Provider and result contracts | Gives every adapter and check one stable data model |
-| `core/engine.py` | Generic scope dispatch and failure conversion | Runs checks without knowing individual rule logic |
-| `core/check/` | Catalog, decorators, helpers, and check functions | Holds the deterministic assessment knowledge |
+| `core/models.py` | Workspace, group, provider, and result contracts | Gives every adapter and check one stable data model |
+| `core/engine.py` | Generic scope dispatch, group comparison, and failure conversion | Runs both check kinds without knowing individual rule logic |
+| `core/check/` | Per-workspace/group registries, decorators, helpers, and check functions | Holds the deterministic assessment knowledge |
 | `core/scoring.py` | Score bands and roll-ups | Produces one consistent scorecard |
 | `clients/live.py` | Fabric REST reads and definition parsing | Isolates Fabric protocol details from the domain |
 | `clients/powerbi.py` and `clients/tmsl.py` | Power BI reads and model-fact extraction | Support semantic-model and FabricIQ use cases |
@@ -632,7 +649,7 @@ sequenceDiagram
     participant Fabric as Microsoft Fabric
     participant Core as Engine and scoring
 
-    User->>SPA: Submit project, workspaces, and pillars
+    User->>SPA: Submit project, workspaces/groups, and pillars
     SPA->>API: POST /api/v1/audit with opaque auth session
     API->>Auth: Resolve session to Fabric token
     alt session invalid
@@ -654,12 +671,17 @@ sequenceDiagram
           Fabric-->>Provider: Metadata / partial failures
           Provider-->>Service: WorkspaceContext
         end
-        Service->>Core: Run selected checks and aggregate
+        Service->>Core: Run selected per-workspace checks
         loop after each workspace
           Core-->>Service: Partial results
           Service-->>Runner: Progressive JSON report
           Runner->>Repo: Partial report visible through shared job reference
         end
+        opt groups contain two or more readable members
+          Service->>Core: Run cross-workspace group checks
+          Core-->>Service: Project-level group results
+        end
+        Service->>Core: Aggregate with optional environment weights
         Core-->>Service: Final results and scorecard
         Service-->>Runner: Final report and files
         Runner->>Repo: Mark SUCCEEDED or FAILED
@@ -706,9 +728,11 @@ its report is replaced with the refreshed result.
 
 ```mermaid
 flowchart TD
-    Request["Project YAML + request filters"] --> Targets["Resolve workspace targets,<br/>layers, and pillars"]
+  Request["Project YAML + request filters"] --> Targets["Resolve workspace targets,<br/>layers, groups, levels, and pillars"]
     Targets --> Select["Select applicable CheckSpecs<br/>and skip manual/roadmap specs"]
-    Select --> Needs["Union declared Resource needs"]
+  Targets --> GroupSelect["Select GroupCheckSpecs<br/>for named groups"]
+  Select --> Needs["Union per-workspace and applicable<br/>group Resource needs"]
+  GroupSelect --> Needs
     Needs --> Fetch["Provider.fetch(workspace, layer, resources)"]
 
     Fetch --> Access{"Workspace readable?"}
@@ -731,7 +755,11 @@ flowchart TD
     CheckNA --> Results
     Result --> Results
     WsError --> Results
-    Results --> Aggregate["Exclude unscored rows;<br/>aggregate scorecards"]
+    Results --> Groups{"Named group with at least<br/>two readable members?"}
+    Groups -- "No" --> Aggregate
+    Groups -- "Yes" --> GroupInvoke["Invoke group checks once with<br/>ordered GroupContext"]
+    GroupInvoke --> GroupResult["Project CheckResult<br/>Scope.GROUP"]
+    GroupResult --> Aggregate["Exclude unscored rows;<br/>apply optional environment weights;<br/>aggregate scorecards"]
     Aggregate --> Output["JSON + Markdown + Excel + console"]
 ```
 
@@ -739,8 +767,10 @@ flowchart TD
 
 The engine does not contain a switch statement for individual rules. It asks
 `WorkspaceContext.objects(scope)` for the objects of a scope and invokes the
-checks registered for that scope. A new check therefore changes the catalog, not
-the engine.
+checks registered for that scope. It then invokes the separate group registry
+once per eligible project group, reusing fetched member contexts and ordering
+them by environment level. A new ordinary or group check therefore changes the
+appropriate catalog, not the engine.
 
 The engine also does not decide how to obtain data. It receives an object that
 satisfies the provider contract. This is the main reason live and fixture-based
@@ -756,7 +786,8 @@ The deterministic audit consumes four inputs:
 
 1. **Project configuration** — project name, workspace identifiers, layers,
    thresholds, authentication settings, and remediation path.
-2. **Request filters** — selected pillars and optional workspace overrides.
+2. **Request filters** — selected pillars, optional workspace overrides, project
+  group names, environment levels, and the opt-in weighting flag.
 3. **Workspace snapshot** — normalized metadata and definitions from a provider
    or the KB.
 4. **Check catalog and remediation book** — versioned application content.
@@ -982,7 +1013,25 @@ a check module that is not imported does not exist at runtime. The health
 endpoint reports the registry count, duplicate ids raise immediately, and tests
 pin catalog expectations so registration failures are visible.
 
-### 15.3 Verdict types
+Cross-workspace checks use a separate `GroupCheckRegistry` and `@group_check`
+decorator because their function receives `GroupContext` rather than
+`CheckContext`. Keeping the registries separate prevents a group evaluator from
+entering the ordinary per-workspace dispatch loop.
+
+### 15.3 Cross-workspace execution
+
+The service derives a group target only when a name has at least two selected
+members. Group checks declare the resources required from every member, and
+those needs are unioned into the member crawl. The engine caches each fetched
+`WorkspaceContext`, so comparison does not repeat the normal crawl.
+
+After ordinary dispatch, readable members are sorted by environment level and
+wrapped in `GroupContext`. Each registered group check runs once and emits a
+result owned by the group name with `Scope.GROUP` and `Layer.MIXED`. If fewer
+than two members can be read, the comparison is N/A rather than FAIL. A group
+check exception is likewise isolated as N/A.
+
+### 15.4 Verdict types
 
 Five helpers cover the normal decisions:
 
@@ -998,7 +1047,7 @@ The engine combines the verdict with registered metadata, workspace identity,
 object name, severity, weight, and remediation. Passing and unscored results do
 not receive a remediation recommendation.
 
-### 15.4 Automation categories
+### 15.5 Automation categories
 
 - **Automated** checks run in the engine.
 - **Roadmap** checks remain visible in the catalog but have `manual=True`, so the
@@ -1007,11 +1056,11 @@ not receive a remediation recommendation.
   service converts reviewer answers into results and merges them idempotently.
 - **Manual** checks are catalog-only attestations.
 
-At the verified baseline, the catalog contains automated and roadmap checks but
-no registered interactive or manual checks. The questionnaire machinery remains
-available.
+At the verified baseline, the standard registry contains automated and
+interactive checks, and the separate group registry contains automated group
+checks. Skipping an interactive question remains N/A and unscored.
 
-### 15.5 Scoring
+### 15.6 Scoring
 
 Scores use a 0–3 rubric:
 
@@ -1026,13 +1075,19 @@ The weighted percentage is:
 
 $$
 	ext{percentage} =
-\frac{\sum(\text{score} \times \text{weight})}
-{\sum(3 \times \text{weight})} \times 100
+\frac{\sum(\text{score} \times \text{effective weight})}
+{\sum(3 \times \text{effective weight})} \times 100
 $$
 
-Every current check has weight 1.0. The mechanism supports other weights, but
-changing them is a scoring-policy decision and would alter historical
-comparability.
+Every check's registered base weight is currently 1.0. By default, effective
+weight equals base weight. When `weight_by_environment` is explicitly enabled,
+a per-workspace result's effective weight is its base weight multiplied by the
+workspace's environment level; missing levels use 1.0. Group results retain
+their registered base weight because they already represent the whole group.
+
+A uniform factor cancels from a workspace's own numerator and denominator, so
+environment weighting changes cross-workspace roll-ups only. With the flag off,
+or for an isolated run, the historical unweighted behavior is preserved.
 
 The aggregate includes:
 
@@ -1047,13 +1102,14 @@ Foundation rows, N/A results, informational results, access failures, and partia
 read warnings do not contribute to the denominator. `None` means not assessed;
 it is deliberately different from 0%, which means assessed and failed.
 
-### 15.6 Determinism boundary
+### 15.7 Determinism boundary
 
-For a fixed `WorkspaceContext`, project settings, registry, and remediation
-book, check invocation and score aggregation are deterministic. Live APIs and
-cache refresh decide which snapshot is supplied; they do not change the scoring
-algorithm. Report timestamps and file paths are operational metadata and are not
-part of the determinism guarantee.
+For fixed workspace contexts, group membership and levels, project settings,
+registries, weighting flag, and remediation book, check invocation and score
+aggregation are deterministic. Live APIs and cache refresh decide which snapshot
+is supplied; they do not change the scoring algorithm. Report timestamps and
+file paths are operational metadata and are not part of the determinism
+guarantee.
 
 ---
 
@@ -1299,7 +1355,8 @@ flowchart LR
 ### 19.2 Output responsibilities
 
 - **JSON** carries overall, pillar, workspace, layer, matrix, counts, results,
-  KB provenance, crawl errors, and generated filenames.
+  group membership and environment levels, weighting status, KB provenance,
+  crawl errors, and generated filenames.
 - **Markdown** emphasizes crawl completeness, scorecards, findings, N/A reasons,
   and inventory.
 - **Excel** contains a Scorecard, all Checks, and a severity-sorted Risk Register.
@@ -1312,6 +1369,9 @@ concurrently.
 ### 19.3 Progressive and final output
 
 After each workspace, the service serializes a partial JSON report for polling.
+After the workspace phase, group findings are appended and serialized under the
+group name; the SPA presents member workspace breakdowns by project group and
+labels environment-weighted reports.
 Markdown and Excel are written after the complete engine run when an output
 directory is supplied. A failed run may therefore have a useful partial JSON
 report but no final files.
@@ -1677,6 +1737,8 @@ failure.
 | ADR-010 | Keep AI and Digital Twin separate from scoring | Derived content must not affect audit trust | Some potentially useful graph context is not available to checks |
 | ADR-011 | Begin with in-memory job storage | Minimizes local deployment complexity | Not suitable for restart durability or multi-replica production |
 | ADR-012 | Isolate faults and preserve partial results | One bad item or check should not waste a long audit | Broad exception handling requires strong logging and tests |
+| ADR-013 | Keep cross-workspace checks in a separate registry and phase | Preserve existing single-workspace check contracts and results | Group checks need explicit group metadata and their own authoring path |
+| ADR-014 | Make environment weighting opt-in with identity defaults | Let production environments influence project roll-ups without silently changing historical scores | Reports must disclose weighting and callers must deliberately enable it |
 
 ### 25.2 Principal trade-offs
 
@@ -1709,7 +1771,7 @@ failure.
 | Medium | Readiness checks only settings and the registry | Storage or shared-infrastructure failure is not reflected in readiness |
 | Low | CLI and API have separate device-flow implementations | Authentication behaviour can drift |
 | Low | Frontend API types are maintained manually | Backend schema changes can create runtime mismatch |
-| Low | All scoring weights are 1.0 | Weight mechanism exists but no differentiated policy is approved |
+| Low | Registered base weights are all 1.0; environment factors are caller-selected | Cross-project comparisons require a governed convention for assigning levels |
 | Low | Several AI-oriented package folders remain placeholders | Repository structure suggests capability not yet delivered |
 | Low | Optional database settings and dependencies are declared but not wired | Configuration can imply durability that does not exist |
 
@@ -1773,7 +1835,9 @@ as an implementation reference. The authoritative backend is
 5. Generate frontend API types from OpenAPI.
 6. Remove the legacy backend tree and clearly mark or remove placeholder
   packages.
-7. Define a formal scoring-weight policy before changing any weight from 1.0.
+7. Define governance for environment-level assignment before using weighted
+  scores as an organization-wide comparison, and approve any future base-weight
+  changes separately.
 
 ### 27.6 AI governance
 
@@ -1812,6 +1876,14 @@ The engine should not change for a new rule.
 Implement `fetch` and `list_workspaces`, normalize into `WorkspaceContext`, and
 preserve unavailable-resource semantics. Once the provider satisfies the
 protocol, the existing engine, scoring, and report writers work unchanged.
+
+### 28.2a Adding a cross-workspace check
+
+Use `@group_check` when a rule must compare environments rather than inspect one
+workspace in isolation. Declare the resources needed from each member, implement
+a pure `GroupContext -> Verdict` evaluator, and return N/A when fewer than two
+readable members or required comparison data are available. Add remediation and
+focused group tests. Do not make an ordinary `CheckContext` evaluator group-aware.
 
 ### 28.3 Adding a resource or artifact type
 
@@ -1876,6 +1948,9 @@ paths ad hoc.
 - an incomplete snapshot does not satisfy a cache read.
 - a new check is not active until its module is imported and tests pass.
 - report writers consume scores; they do not create them.
+- ungrouped audits bypass group dispatch and retain the original results.
+- environment weighting remains opt-in and never changes a per-check verdict or
+  per-workspace percentage.
 
 ---
 
@@ -1883,29 +1958,31 @@ paths ad hoc.
 
 ### Appendix A — Current coverage snapshot
 
-The following figures were verified from the live registry on 2026-08-03. They
+The following figures were verified from the live registries on 2026-08-17. They
 are descriptive, not architectural constants.
 
 | Dimension | Count |
 |---|---:|
-| Total registered checks | 148 |
-| Automated | 64 |
-| Roadmap | 84 |
-| Interactive | 0 |
+| Standard registry | 265 |
+| Automated, standard registry | 225 |
+| Interactive, standard registry | 40 |
+| Roadmap | 0 |
 | Manual | 0 |
-| Workspace scope | 107 |
-| Pipeline scope | 12 |
-| Notebook scope | 29 |
+| Separate automated group registry | 18 |
+| Workspace scope, standard registry | 142 |
+| Pipeline scope, standard registry | 32 |
+| Notebook scope, standard registry | 84 |
+| Semantic-model scope, standard registry | 7 |
 
-| Pillar | Checks |
-|---|---:|
-| Data Management & Quality | 53 |
-| Operations & Reliability | 33 |
-| Performance & Capacity | 23 |
-| Security | 16 |
-| Cost & Resource Optimization | 15 |
-| Governance & Compliance | 7 |
-| Foundation, unscored | 1 |
+| Pillar | Standard | Group |
+|---|---:|---:|
+| Data Management & Quality | 129 | 2 |
+| Operations & Reliability | 68 | 11 |
+| Performance & Capacity | 34 | 0 |
+| Security | 14 | 1 |
+| Cost & Resource Optimization | 5 | 1 |
+| Governance & Compliance | 14 | 3 |
+| Foundation, unscored | 1 | 0 |
 
 Use the catalog API or CLI for the current count rather than copying these
 figures into other documents.
@@ -1922,6 +1999,7 @@ figures into other documents.
 | Audit engine | [backend/src/auditfast/core/engine.py](backend/src/auditfast/core/engine.py) |
 | Scoring | [backend/src/auditfast/core/scoring.py](backend/src/auditfast/core/scoring.py) |
 | Check registry and decorators | [backend/src/auditfast/core/check/registry.py](backend/src/auditfast/core/check/registry.py) |
+| Cross-workspace group checks | [backend/src/auditfast/core/check/operations_reliability/data_operations/group.py](backend/src/auditfast/core/check/operations_reliability/data_operations/group.py) |
 | Verdict and remediation helpers | [backend/src/auditfast/core/check/helpers.py](backend/src/auditfast/core/check/helpers.py) |
 | One audit service path | [backend/src/auditfast/services/audit_service.py](backend/src/auditfast/services/audit_service.py) |
 | Background runner | [backend/src/auditfast/services/audit_runner.py](backend/src/auditfast/services/audit_runner.py) |

@@ -66,7 +66,7 @@ def test_build_questionnaire_scopes_by_pillar_and_layer():
         "OPS-INTEGRATION-TESTS", "OPS-DATA-VALIDATION-TESTS",
         "OPS-GIT-IGNORE", "OPS-GIT-COMMIT-MSG", "OPS-GIT-PR-REVIEW",
         "OPS-GIT-MIN-REVIEWERS", "OPS-WH-SCHEMA-SCM", "OPS-DEPLOY-RULES",
-        "OPS-ENV-PARITY", "Q-CAT3-RELEASE-GOVERNANCE",
+        "OPS-ENV-PARITY",
     }
     # Every item is serialized with its question and scored options for the UI.
     for item in q:
