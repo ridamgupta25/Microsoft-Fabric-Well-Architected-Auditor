@@ -207,6 +207,20 @@ export interface Workspace {
   layer: string;
   items: number | null;
   pipelines: number | null;
+  /** Whether the saved snapshot was fully crawled. KB source only. */
+  complete?: boolean | null;
+  /** When the snapshot was captured (YYYYMMDD_HHMMSS). KB source only. */
+  captured_at?: string | null;
+}
+
+/** Where a run's data comes from: the live tenant or a saved/uploaded KB. */
+export type AuditSource = "live" | "kb";
+
+/** The echo of one validated KB upload, ready to submit with a `kb` audit. */
+export interface KBUploadResponse {
+  workspace: Workspace;
+  /** The normalized snapshot to pass back in `AuditRequest.snapshots`. */
+  snapshot: Record<string, unknown>;
 }
 
 // -- audit --------------------------------------------------------------------
@@ -249,12 +263,16 @@ export interface AuditRequest {
   project?: string | null;
   pillars: string[];
   workspaces: WorkspaceSelection[];
-  /** Completed sign-in session id. Every audit reads the live tenant. */
+  /** Completed sign-in session id. Required only for a `live` audit. */
   auth_session?: string | null;
   /** Opt-in: weight each workspace's checks by its environment level (1..10). */
   weight_by_environment?: boolean;
   /** Path to external checks CSV (e.g., AdminChecks.csv). */
   external_checks_csv?: string | null;
+  /** `live` reads the tenant; `kb` replays saved snapshots with no sign-in. */
+  source?: AuditSource;
+  /** Uploaded snapshots to audit, when `source` is `kb`. */
+  snapshots?: Record<string, unknown>[];
 }
 
 export interface AuditAccepted {
@@ -346,6 +364,15 @@ export interface AuditReport {
   weighted_by_environment?: boolean;
   errors: WorkspaceError[];
   files: Record<string, string>;
+  /** Provenance of the run's data (live crawl, cache, or saved-KB replay). */
+  kb?: KBProvenance;
+}
+
+/** Where a completed run's data came from. */
+export interface KBProvenance {
+  source: AuditSource;
+  served_from_cache: boolean;
+  refreshing: boolean;
 }
 
 export interface AuditJob {

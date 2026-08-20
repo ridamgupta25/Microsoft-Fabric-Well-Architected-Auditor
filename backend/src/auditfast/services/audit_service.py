@@ -21,12 +21,16 @@ from ..core.check.registry import REGISTRY
 from ..core.engine import READ_INCOMPLETE_CHECK_ID
 from ..core.engine import run_audit as run_engine
 from ..core.enums import Layer, Pillar
-from ..core.models import CheckResult
+from ..core.models import CheckResult, WorkspaceContext
 from ..core.scoring import aggregate
 from .project import ProjectConfig, load_project, load_remediation
 
 #: Check id used for workspaces that could not be read at all.
 ACCESS_CHECK_ID = "WS-ACCESS"
+
+#: Upper bound on snapshots accepted inline with one knowledge-base run, so an
+#: oversized request cannot exhaust memory. One snapshot per audited workspace.
+_MAX_INLINE_SNAPSHOTS = 100
 
 
 class AuditError(RuntimeError):
@@ -59,15 +63,22 @@ class AuditRun:
 def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: bool = False,
                    token_refresher=None, powerbi_token: str | None = None,
                    sql_token: str | None = None, storage_token: str | None = None,
-                   sql_token_refresher=None):
+                   sql_token_refresher=None, source: str = "live",
+                   snapshots: Sequence[dict] | None = None):
     """Create the provider for a run.
 
-    Every run reads the live tenant, but through the on-disk **knowledge base**:
-    the returned :class:`CachingProvider` serves each workspace from its cached
-    snapshot and calls Fabric only on a cache miss or once the snapshot is past
-    its TTL. ``refresh=True`` forces a fresh live crawl (rebuilding the KB).
-    Caching can be turned off entirely with ``AUDITFAST_CACHE_ENABLED=false``, in
-    which case the raw live provider is returned.
+    With ``source="live"`` (the default) every run reads the live tenant, but
+    through the on-disk **knowledge base**: the returned :class:`CachingProvider`
+    serves each workspace from its cached snapshot and calls Fabric only on a
+    cache miss or once the snapshot is past its TTL. ``refresh=True`` forces a
+    fresh live crawl (rebuilding the KB). Caching can be turned off entirely with
+    ``AUDITFAST_CACHE_ENABLED=false``, in which case the raw live provider is
+    returned.
+
+    With ``source="kb"`` the run is served entirely from saved snapshots — the
+    permanent archive plus any ``snapshots`` uploaded with the request — and no
+    token is needed, because not one Fabric call is made. A frozen snapshot makes
+    a replay the most reproducible run there is.
 
     ``powerbi_token`` is an optional Power BI-audience token used only to read
     semantic-model refresh recency; without it that one signal stays unknown.
@@ -81,9 +92,11 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
     ``storage_token`` is an optional Storage-audience token used only for OneLake
     ADLS Gen2 Files listings. Without it, file-layout checks report N/A.
     """
+    settings = get_settings()
+    if source == "kb":
+        return _build_snapshot_provider(settings, snapshots)
     if not token:
         raise AuditError("A sign-in token is required to run an audit.")
-    settings = get_settings()
     live = LiveFabricProvider(token, token_refresher=token_refresher,
                               powerbi_token=powerbi_token,
                               sql_token=sql_token if settings.sql_endpoint_enabled else None,
@@ -112,22 +125,105 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
     return provider
 
 
-def _resolve_pillars(names: Iterable[str] | None) -> list[Pillar] | None:
-    """Map pillar names from an API/CLI caller onto enum members.
+def _build_snapshot_provider(settings, snapshots: Sequence[dict] | None):
+    """A replay provider over the saved KB archive plus any uploaded snapshots."""
+    from .context_store import KBArchive, SnapshotProvider
 
-    Foundation is cross-cutting, informational context (item inventory, access
-    errors, crawl-completeness) — never scored, but always reported. It is kept
-    in every run even when the caller selects a subset of the scored pillars, so
-    the report's Workspace Inventory section is never silently empty.
+    archive = KBArchive(settings.resolve(settings.kb_archive_dir))
+    uploaded = _parse_inline_snapshots(snapshots)
+    rows = archive.index()
+    known = {row["id"] for row in rows}
+    # An uploaded workspace the archive has never seen still belongs in the run.
+    for ws_id, ctx in uploaded.items():
+        if ws_id not in known:
+            rows.append(_row_for_context(ctx))
+    return SnapshotProvider(uploaded=uploaded, archive=archive, rows=rows)
+
+
+def _parse_inline_snapshots(snapshots: Sequence[dict] | None) -> dict[str, WorkspaceContext]:
+    """Validate and index snapshots supplied inline with a KB run request."""
+    items = list(snapshots or [])
+    if len(items) > _MAX_INLINE_SNAPSHOTS:
+        raise AuditError(
+            f"Too many uploaded snapshots ({len(items)}); the limit is "
+            f"{_MAX_INLINE_SNAPSHOTS} per run."
+        )
+    contexts: dict[str, WorkspaceContext] = {}
+    for raw in items:
+        ctx = _snapshot_to_context(raw)
+        contexts[ctx.id] = ctx
+    return contexts
+
+
+def _snapshot_to_context(raw: dict) -> WorkspaceContext:
+    """Turn one uploaded/saved snapshot dict into a :class:`WorkspaceContext`.
+
+    Untrusted input: this only ever *reads* the payload into the normalized model
+    (the engine is a pure function of it, so no code can execute), but it still
+    validates the shape and rejects anything that is not a workspace so a bad
+    upload fails fast with a clear message instead of a confusing later error.
     """
+    if not isinstance(raw, dict):
+        raise AuditError("A KB snapshot must be a JSON object.")
+    # The permanent archive stores the context at the top level; the TTL cache
+    # wraps it under "context". Accept either so a file copied from either store
+    # (or a report the tool itself produced) loads without hand-editing.
+    inner = raw.get("context")
+    data = inner if isinstance(inner, dict) else raw
+    try:
+        ctx = WorkspaceContext.from_dict(data)
+    except Exception as exc:  # noqa: BLE001 - any shape error is a bad upload
+        raise AuditError(f"That file is not a valid workspace snapshot: {exc}") from exc
+    if not ctx.id:
+        raise AuditError("That snapshot is missing a workspace id.")
+    return ctx
+
+
+def _row_for_context(ctx: WorkspaceContext) -> dict:
+    """Display metadata for a snapshot the archive has not indexed."""
+    return {
+        "id": ctx.id,
+        "name": ctx.display_name or ctx.id,
+        "role": ctx.layer.value,
+        "layer": ctx.layer.value,
+        "items": len(ctx.items),
+        "pipelines": len(ctx.pipelines),
+        "complete": ctx.is_complete,
+        "captured_at": "",
+    }
+
+
+def list_kb_workspaces() -> list[dict]:
+    """Workspaces available to replay from the saved knowledge-base archive.
+
+    No token, no Fabric call — just what has already been crawled to disk. This
+    is the picker behind the "Saved KB" audit source.
+    """
+    from .context_store import KBArchive
+
+    settings = get_settings()
+    return KBArchive(settings.resolve(settings.kb_archive_dir)).index()
+
+
+def validate_snapshot(payload: dict) -> dict:
+    """Validate one uploaded KB file and echo it back normalized.
+
+    Returns ``{"workspace": <display row>, "snapshot": <normalized dict>}``. The
+    caller holds the normalized snapshot and submits it with a ``source="kb"``
+    audit; re-normalizing here means the run reads exactly what was validated.
+    """
+    ctx = _snapshot_to_context(payload)
+    return {"workspace": _row_for_context(ctx), "snapshot": ctx.to_dict()}
+
+
+def _resolve_pillars(names: Iterable[str] | None) -> list[Pillar] | None:
+    """Map pillar names from an API/CLI caller onto enum members."""
     if not names:
         return None
     wanted = {str(n).strip().lower() for n in names if str(n).strip()}
     if not wanted:
         return None
     resolved = [p for p in Pillar if p.value.lower() in wanted]
-    if Pillar.FOUNDATION not in resolved:
-        resolved.append(Pillar.FOUNDATION)
     return resolved
 
 
@@ -316,25 +412,29 @@ def run_audit(
     sql_token_refresher=None,
     weight_by_environment: bool = False,
     external_checks_csv: str | Path | None = None,
+    source: str = "live",
+    snapshots: Sequence[dict] | None = None,
 ) -> AuditRun:
     """Run an audit and, when ``out_dir`` is given, write the report files.
 
     ``on_progress``, if given, receives a partial report dict after each
     workspace — so a caller can surface results before the whole run finishes.
 
-    The run is served from the on-disk knowledge base; pass ``refresh=True`` to
-    force a fresh live crawl and rebuild the KB.
-    
+    With ``source="live"`` the run is served from the on-disk knowledge base;
+    pass ``refresh=True`` to force a fresh live crawl and rebuild the KB. With
+    ``source="kb"`` the run reads only saved snapshots — the archive plus any
+    ``snapshots`` uploaded with the request — and needs no token.
+
     ``external_checks_csv``, if given, loads additional check results from a CSV
-    file (e.g., AdminChecks.csv) and merges them with automated results. External
-    checks override automated checks with the same id. Raises AuditError if the
-    CSV is invalid.
+    file (e.g., AdminChecks.csv) and merges them with the automated results.
+    Raises AuditError if the CSV is invalid.
     """
     config = load_project(project_path)
     provider = build_provider(config, token, refresh=refresh, token_refresher=token_refresher,
                               powerbi_token=powerbi_token, sql_token=sql_token,
                               storage_token=storage_token,
-                              sql_token_refresher=sql_token_refresher)
+                              sql_token_refresher=sql_token_refresher,
+                              source=source, snapshots=snapshots)
     targets = _resolve_targets(config, workspaces)
     groups = _resolve_groups(workspaces)
     weights = _resolve_weights(workspaces, weight_by_environment)
@@ -408,7 +508,11 @@ def run_audit(
     run.groups = groups
     run.weighted_by_environment = bool(weights)
     served = bool(getattr(provider, "served_from_cache", False))
-    run.kb = {"served_from_cache": served, "refreshing": served and not refresh}
+    run.kb = {
+        "source": source,
+        "served_from_cache": served,
+        "refreshing": served and not refresh and source == "live",
+    }
     if out_dir:
         run.files = write_reports(run, out_dir)
     return run

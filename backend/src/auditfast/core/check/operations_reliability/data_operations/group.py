@@ -43,7 +43,7 @@ def _table_signatures(member: GroupMemberContext) -> dict[str, frozenset[tuple[s
     id="XW-SCHEMA-DRIFT",
     ref="11.4.3",
     title="Schema is consistent across environments (no drift)",
-    pillar=Pillar.OPERATIONS,
+    pillar=Pillar.RELIABILITY,
     severity=Severity.HIGH,
     requires=[Resource.TABLE_COLUMNS],
 )
@@ -104,7 +104,7 @@ def schema_drift(ctx: GroupContext) -> Verdict:
 @group_check(
     id="XW-MEDALLION-CONSIST", ref="1.1.5",
     title="Medallion architecture (Bronze -> Silver -> Gold) implemented consistently across environments",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM, requires=[Resource.ITEMS],
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM, requires=[Resource.ITEMS],
     required=False,
 )
 def medallion_consistent(ctx: GroupContext) -> Verdict:
@@ -127,7 +127,7 @@ def medallion_consistent(ctx: GroupContext) -> Verdict:
 @group_check(
     id="XW-PIPELINE-SLA", ref="9.4.2",
     title="Pipeline completion SLAs are monitored consistently across environments",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM,
     requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=False,
 )
 def pipeline_sla_monitored(ctx: GroupContext) -> Verdict:
@@ -150,7 +150,7 @@ def pipeline_sla_monitored(ctx: GroupContext) -> Verdict:
 @group_check(
     id="XW-SLA-ALERTS", ref="9.4.3",
     title="SLA breaches trigger alerts (Data Activator) consistently across environments",
-    pillar=Pillar.OPERATIONS, severity=Severity.HIGH,
+    pillar=Pillar.RELIABILITY, severity=Severity.HIGH,
     requires=[Resource.ACTIVATOR_DEFINITIONS], required=False,
 )
 def sla_alerts_consistent(ctx: GroupContext) -> Verdict:
@@ -173,7 +173,7 @@ def sla_alerts_consistent(ctx: GroupContext) -> Verdict:
 @group_check(
     id="XW-SLA-HISTORY", ref="9.4.4",
     title="Historical SLA compliance is tracked consistently across environments",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM,
     requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=False,
 )
 def sla_history_consistent(ctx: GroupContext) -> Verdict:
@@ -195,7 +195,7 @@ def sla_history_consistent(ctx: GroupContext) -> Verdict:
 @group_check(
     id="XW-TIER-SEP", ref="11.3.1",
     title="Each environment in the group declares a distinct Dev/QA/Prod tier",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM,
     requires=[Resource.WORKSPACE], required=False,
 )
 def tier_separation(ctx: GroupContext) -> Verdict:
@@ -217,7 +217,7 @@ def tier_separation(ctx: GroupContext) -> Verdict:
 @group_check(
     id="XW-MEDALLION-DRIFT", ref="11.4.3",
     title="Medallion tiers are present in every environment (no tier drift)",
-    pillar=Pillar.OPERATIONS, severity=Severity.HIGH, requires=[Resource.ITEMS],
+    pillar=Pillar.RELIABILITY, severity=Severity.HIGH, requires=[Resource.ITEMS],
     required=False,
 )
 def medallion_no_drift(ctx: GroupContext) -> Verdict:
@@ -271,7 +271,7 @@ def _reference_blob(ws: WorkspaceContext) -> str:
     id="XW-ENV-ISOLATION", ref="1.1.3",
     title="Environment isolation: no environment's artifacts depend on another "
           "environment's workspace (cross-env dependency)",
-    pillar=Pillar.OPERATIONS, severity=Severity.HIGH,
+    pillar=Pillar.RELIABILITY, severity=Severity.HIGH,
     requires=[
         Resource.WORKSPACE, Resource.PIPELINE_DEFINITIONS,
         Resource.NOTEBOOK_DEFINITIONS, Resource.SHORTCUTS,

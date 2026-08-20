@@ -65,7 +65,7 @@ def _has_opaque_cross_domain_ref(ws: WorkspaceContext) -> bool:
 @group_check(
     id="XW-ACCESS-AUDIT", ref="7.4.3",
     title="Data access audit trail exists (who accessed what data, when)",
-    pillar=Pillar.GOVERNANCE, severity=Severity.HIGH,
+    pillar=Pillar.DATA_GOVERNANCE, severity=Severity.HIGH,
     requires=[Resource.WAREHOUSE_AUDIT], required=False,
 )
 def access_audit_consistent(ctx: GroupContext) -> Verdict:
@@ -87,7 +87,7 @@ def access_audit_consistent(ctx: GroupContext) -> Verdict:
 @group_check(
     id="XW-LINEAGE-E2E", ref="8.1.2",
     title="End-to-end lineage visible from source system to Gold Warehouse and Power BI",
-    pillar=Pillar.GOVERNANCE, severity=Severity.MEDIUM, requires=[Resource.ITEMS],
+    pillar=Pillar.DATA_GOVERNANCE, severity=Severity.MEDIUM, requires=[Resource.ITEMS],
     required=False,
 )
 def lineage_e2e_consistent(ctx: GroupContext) -> Verdict:
@@ -112,7 +112,7 @@ def lineage_e2e_consistent(ctx: GroupContext) -> Verdict:
 @group_check(
     id="XW-TECH-METADATA", ref="8.3.2",
     title="Technical metadata (schema, lineage) automatically captured",
-    pillar=Pillar.GOVERNANCE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_GOVERNANCE, severity=Severity.MEDIUM,
     requires=[Resource.TABLE_COLUMNS, Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
 )
 def tech_metadata_consistent(ctx: GroupContext) -> Verdict:
@@ -137,7 +137,7 @@ def tech_metadata_consistent(ctx: GroupContext) -> Verdict:
     id="XW-LINEAGE-CROSSDOMAIN", ref="8.1.5",
     title="Cross-domain data dependencies documented in lineage "
           "(identifiable across every environment)",
-    pillar=Pillar.GOVERNANCE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_GOVERNANCE, severity=Severity.MEDIUM,
     requires=[
         Resource.PIPELINE_DEFINITIONS, Resource.NOTEBOOK_DEFINITIONS,
         Resource.SHORTCUTS,

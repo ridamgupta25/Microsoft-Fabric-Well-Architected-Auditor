@@ -33,7 +33,31 @@ _PII_WORD = (
     r"first_?name|last_?name|full_?name|sur_?name|given_?name|"
     r"home_?address|postal_?address|street_?address|\bpii\b)"
 )
-_PII_CONTEXT = re.compile(r"\w*" + _PII_WORD + r"\w*", re.IGNORECASE)
+#: A PII word only counts when it appears as a **column reference**, not as a
+#: substring of some longer identifier. The previous pattern wrapped every term
+#: in ``\w*…\w*``, so any word merely *containing* one matched: a notebook
+#: standardising column names could hit on ``account_number`` in a rename list
+#: and be scored 0 - "raw PII is carried through unchanged" - while handling no
+#: personal data at all.
+#:
+#: This matters more than usual because Fabric offers no alternative. Sensitivity
+#: labels are item-level only (Power BI Scanner API, tenant admin), and Purview's
+#: column classifications live in a separate catalog, so for a delegated
+#: read-only tool the column name in the code is the only available signal. It
+#: has to be read precisely.
+#:
+#: The delimiters are the ways a column is actually referenced in PySpark/SQL:
+#: quoted (``"email"``, ``'email'``), attribute (``df.email``), subscript
+#: (``df["email"]``), a ``col()``/``F.col()`` call, or a bare SQL identifier
+#: bounded by whitespace, comma, parenthesis or backtick.
+_PII_CONTEXT = re.compile(
+    r"""(?:
+          ["'`]\s*\w{0,12}""" + _PII_WORD + r"""\w{0,12}\s*["'`]   # "email_address"
+        | \.\s*""" + _PII_WORD + r"""\w{0,12}\b                     # df.email
+        | \b""" + _PII_WORD + r"""\w{0,12}\s*(?=[,)\]\s=])          # email_address,
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
 
 #: The value is replaced by something irreversible or reversible-only-with-a-key.
 #: Each alternative is a call, so a comment or a column named ``mask_flag``
@@ -77,11 +101,39 @@ def _near_pii(pattern: re.Pattern, code: str, window: int = 160) -> bool:
     return False
 
 
+def _masked_column_names(ctx: CheckContext) -> set[str]:
+    """Lower-cased names of every column the Warehouse masks (``sys.columns``).
+
+    Empty for a Lakehouse-only workspace, or where the SQL endpoint could not be
+    read - which callers must treat as "no masking evidence", never as "nothing
+    is masked".
+    """
+    masked: set[str] = set()
+    for table in (ctx.workspace.tables or {}).values():
+        if not isinstance(table, dict):
+            continue
+        for column in table.get("columns") or []:
+            if isinstance(column, dict) and column.get("is_masked"):
+                name = str(column.get("name") or "").strip().lower()
+                if name:
+                    masked.add(name)
+    return masked
+
+
+def _references_masked_column(code: str, masked: set[str]) -> bool:
+    """True when the notebook references a column the warehouse already masks."""
+    lowered = code.lower()
+    return any(re.search(rf"\b{re.escape(name)}\b", lowered) for name in masked)
+
+
 @check(
     id="NB-PII-TOKENISED", ref="5.5.4",
     title="**Sensitive data**: Masked/tokenized where required; format validation applied",
-    pillar=Pillar.SECURITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
-    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+    pillar=Pillar.DATA_QUALITY, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS,
+    requires=[Resource.NOTEBOOK_DEFINITIONS, Resource.TABLE_SCHEMAS,
+              Resource.TABLE_COLUMNS],
+    required=True,
 )
 def notebook_pii_is_tokenised(ctx: CheckContext) -> Verdict:
     """PII passing through a notebook is hashed/masked, and its format is validated.
@@ -90,29 +142,43 @@ def notebook_pii_is_tokenised(ctx: CheckContext) -> Verdict:
     not recoverable by a later fix: once raw PII has been written to the lake it
     has to be found, purged and re-loaded, and every downstream copy chased.
 
-    **Scope — the notebook half only.** ``WS-DDM`` (ref 6.2.3) covers Warehouse
-    Dynamic Data Masking from column metadata. This check never looks at table
-    metadata; it reads what the transformation code does before the value lands.
+    **Scope - the notebook half only.** ``WS-DDM`` (ref 6.2.3) covers Warehouse
+    Dynamic Data Masking from column metadata. This check reads what the
+    transformation code does before the value lands - but it now *consults* the
+    masking metadata, because a column already masked at the table level is
+    protected whatever the notebook does, and failing a notebook for not masking
+    it again would be wrong.
 
-    **What it can determine.** Whether a notebook that names PII columns
+    **The trigger demands a column reference.** An earlier version matched any
+    word merely containing a PII term, so a notebook standardising column names
+    could hit on ``account_number`` in a rename list and be scored 0 - "raw PII
+    is carried through unchanged" - while handling no personal data at all. That
+    is a confident, alarming failure about something that is not happening.
+
+    **Why the column name is the only signal.** Fabric exposes no column-level
+    PII classification a delegated read-only tool can read: sensitivity labels
+    are item-level and need the Power BI Scanner API with tenant admin, and
+    Purview's column classifications live in a separate catalog behind a separate
+    role. So this reads code, precisely, and says so.
+
+    **What it can determine.** Whether a notebook that references PII columns
     (email / phone / SSN / national id / card number / date of birth / person
-    name / address) applies a tokenisation call — ``sha2``, ``md5``, ``mask…``,
-    ``tokenize``, ``encrypt``, a ``regexp_replace`` to ``***`` — near those
-    columns, and whether it validates their format (a regex/``rlike``, a length
-    or pattern test).
+    name / address) applies a tokenisation call - ``sha2``, ``md5``, ``mask…``,
+    ``tokenize``, ``encrypt``, a ``regexp_replace`` to ``***`` - near those
+    columns, and whether it validates their format.
 
     **What it cannot.** Judge whether the *right* columns were masked, whether
     the hash is salted, or whether masking happens in a stored procedure or a
     view instead. Proximity is what links the control to the column, so a
     notebook that masks in one function and names PII in another may be judged
-    conservatively; that is a deliberate bias — over-crediting masking is the
+    conservatively; that is a deliberate bias - over-crediting masking is the
     dangerous error here.
     """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
     code = executable_code(ctx.obj)
     if not _PII_CONTEXT.search(code):
-        return not_applicable("Notebook names no personal-data column (email, phone, "
+        return not_applicable("Notebook references no personal-data column (email, phone, "
                               "national id, card number, name, address …)")
 
     tokenised = _near_pii(_TOKENISATION, code)
@@ -123,8 +189,21 @@ def notebook_pii_is_tokenised(ctx: CheckContext) -> Verdict:
     if tokenised:
         return graded(2, "Personal-data columns are hashed/masked/tokenised, but no format "
                          "validation (regex/pattern/length) is applied to them")
+
+    # A column the Warehouse already masks is protected regardless of what this
+    # notebook does. The crawl reads `is_masked` from `sys.columns`; without
+    # consulting it, a notebook reading an already-protected column would be
+    # failed for not masking it a second time.
+    masked_columns = _masked_column_names(ctx)
+    if masked_columns and _references_masked_column(code, masked_columns):
+        return graded(2, "Personal-data columns are not masked in this notebook, but the "
+                         "column(s) it references carry Dynamic Data Masking at the "
+                         "warehouse level, so the raw values are not exposed by default")
+
     if validated:
         return graded(1, "Personal-data columns are format-validated but never masked or "
-                         "tokenised — the raw values are written as they arrived")
-    return graded(0, "Personal-data columns are handled with no masking, tokenisation or "
-                     "format validation — raw PII is carried through unchanged")
+                         "tokenised - the raw values are written as they arrived")
+    return graded(1, "Personal-data columns are referenced with no masking, tokenisation "
+                     "or format validation visible in this notebook. Masking applied in a "
+                     "stored procedure, a view, or a downstream step is not readable here, "
+                     "so confirm before treating this as unprotected")

@@ -18,7 +18,7 @@ from auditfast.core.models import GroupContext
 @group_check(
     id="XW-SPARK-LOGS", ref="10.1.2",
     title="Spark application logs captured for historical analysis",
-    pillar=Pillar.OPERATIONS, severity=Severity.LOW,
+    pillar=Pillar.RELIABILITY, severity=Severity.LOW,
     requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=False,
 )
 def spark_logs_consistent(ctx: GroupContext) -> Verdict:
@@ -41,7 +41,7 @@ def spark_logs_consistent(ctx: GroupContext) -> Verdict:
 @group_check(
     id="XW-WH-LOAD-MON", ref="10.1.5",
     title="Warehouse load jobs monitored (duration, failures, row counts)",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM,
     requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=False,
 )
 def warehouse_load_monitored(ctx: GroupContext) -> Verdict:
@@ -64,7 +64,7 @@ def warehouse_load_monitored(ctx: GroupContext) -> Verdict:
 @group_check(
     id="XW-AUDIT-SCHEMA", ref="10.2.1",
     title="Audit Tables schema designed for queryability (structured, not free-text)",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM,
     requires=[Resource.TABLE_COLUMNS], required=False,
 )
 def audit_schema_consistent(ctx: GroupContext) -> Verdict:
@@ -86,7 +86,7 @@ def audit_schema_consistent(ctx: GroupContext) -> Verdict:
 @group_check(
     id="XW-AUDIT-QUERYABLE", ref="10.2.5",
     title="Audit Tables and Metadata DB are queryable by operations (not just developers)",
-    pillar=Pillar.OPERATIONS, severity=Severity.MEDIUM,
+    pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM,
     requires=[Resource.ITEMS, Resource.ROLE_ASSIGNMENTS], required=False,
 )
 def audit_queryable_consistent(ctx: GroupContext) -> Verdict:

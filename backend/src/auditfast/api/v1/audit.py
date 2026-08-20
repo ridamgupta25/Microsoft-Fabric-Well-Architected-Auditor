@@ -40,11 +40,12 @@ async def submit_audit(
 ) -> AuditAccepted:
     """Start an audit and return its id.
 
-    Requires a completed sign-in; the token is resolved here so an
-    unauthenticated request fails immediately rather than as a dead background
-    job.
+    A ``source="live"`` run requires a completed sign-in; the token is resolved
+    here so an unauthenticated request fails immediately rather than as a dead
+    background job. A ``source="kb"`` run replays saved snapshots and needs no
+    token, so sign-in is skipped entirely.
     """
-    token = resolve_token(request.auth_session)
+    token = None if request.source == "kb" else resolve_token(request.auth_session)
     project = str(settings.resolve(request.project) if request.project else settings.project_path)
 
     job = await runner.submit(
@@ -57,6 +58,8 @@ async def submit_audit(
         auth_session=request.auth_session,
         weight_by_environment=request.weight_by_environment,
         external_checks_csv=request.external_checks_csv,
+        source=request.source,
+        snapshots=request.snapshots,
     )
     return AuditAccepted(
         audit_id=job.id, status=job.status, submitted_at=job.submitted_at

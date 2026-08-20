@@ -56,20 +56,17 @@ def test_interactive_specs_are_all_interactive():
 
 def test_build_questionnaire_scopes_by_pillar_and_layer():
     q = build_questionnaire(
-        pillars=["Operations & Reliability"],
+        pillars=["DevOps & Deployment"],
         workspaces=[{"id": "w", "role": "Data Operations"}],
     )
-    assert q, "expected Operations & Reliability questionnaire items"
-    assert all(item["pillar"] == "Operations & Reliability" for item in q)
+    assert q, "expected DevOps & Deployment questionnaire items"
+    assert all(item["pillar"] == "DevOps & Deployment" for item in q)
     ids = {item["id"] for item in q}
     assert ids == {
-        "WS-DOMAIN-FOLDERS", "PL-SLA-MONITORED", "PL-SLA-ALERTS",
         "OPS-INTEGRATION-TESTS", "OPS-DATA-VALIDATION-TESTS",
         "OPS-GIT-IGNORE", "OPS-GIT-COMMIT-MSG", "OPS-GIT-PR-REVIEW",
         "OPS-GIT-MIN-REVIEWERS", "OPS-WH-SCHEMA-SCM", "OPS-DEPLOY-RULES",
-        "OPS-ENV-PARITY", "OPS-SLA-HISTORY",
-        "Q-CAT3-RELEASE-GOVERNANCE", "Q-CAT3-DR-READINESS",
-        "Q-CAT3-DATA-FRESHNESS", "Q-CAT3-INCIDENT-RESPONSE",
+        "OPS-ENV-PARITY",
     }
     # Every item is serialized with its question and scored options for the UI.
     for item in q:
@@ -80,7 +77,7 @@ def test_build_questionnaire_scopes_by_pillar_and_layer():
 
 def test_build_questionnaire_omits_unselected_pillars():
     q = build_questionnaire(
-        pillars=["Security"],
+        pillars=["Security & Access Control"],
         workspaces=[{"id": "w", "role": "Mixed"}],
     )
     assert {item["id"] for item in q} == {"Q-CAT3-ACCESS-REVIEWS"}
