@@ -329,6 +329,44 @@ def partitioned_sql_reads(
     return reads
 
 
+def discover_partitioned_tables(tables: dict[str, dict] | None) -> dict[str, list[str]]:
+    """Partitioned tables discovered from the workspace's lakehouse/Delta metadata.
+
+    Returns ``{bare_table_name: [partition_column, ...]}`` for every table whose
+    listing actually declares partition columns (``partitionColumns``, populated
+    by the OneLake partition listing). The key is the *bare* — unqualified — table
+    name, its last dotted segment, so a schema-qualified notebook read
+    (``schema.table``) matches a lakehouse-qualified metadata key
+    (``lakehouse.table``); a *schema* token is therefore never mistaken for a
+    table. Tables that declare no partition columns are omitted, so an empty
+    result means "there is no partition metadata to assess", never "every table is
+    unpartitioned".
+    """
+    discovered: dict[str, list[str]] = {}
+    for name, meta in (tables or {}).items():
+        columns = [
+            str(column).strip()
+            for column in ((meta or {}).get("partitionColumns") or [])
+            if str(column).strip()
+        ]
+        if not columns:
+            continue
+        bare = str(name).split(".")[-1].strip("`[]\" ").lower()
+        if not bare:
+            continue
+        existing = discovered.setdefault(bare, [])
+        for column in columns:
+            if column not in existing:
+                existing.append(column)
+    return discovered
+
+
+def partition_columns_for(read_table: str, partitioned: dict[str, list[str]]) -> list[str]:
+    """The declared partition columns for a SQL read's table, matched by bare name."""
+    segment = str(read_table).strip("`").lower().rsplit(".", 1)[-1]
+    return partitioned.get(segment, [])
+
+
 def monitoring(definition: dict) -> dict:
     """Provider-enriched Spark monitoring evidence for this notebook."""
     value = (definition or {}).get("_auditfast_monitoring")

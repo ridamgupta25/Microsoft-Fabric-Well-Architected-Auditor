@@ -174,21 +174,38 @@ def delta_tblprops(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def delta_retention(ctx: CheckContext) -> Verdict:
-    """Log / deleted-file retention is tuned rather than left at the default.
+    """Log / deleted-file retention is deliberately configured or actively maintained.
 
-    **What it cannot determine.** The *effective* retention. It can be set as a
-    table property, on the environment, or by a VACUUM run elsewhere - none
-    readable from a notebook definition - so no explicit configuration is N/A,
-    never a finding.
+    Passes only on a **positive** signal that retention is being managed:
+
+    * a ``delta.logRetentionDuration`` / ``delta.deletedFileRetentionDuration``
+      table property — set via ``TBLPROPERTIES(...)``, ``ALTER TABLE ... SET
+      TBLPROPERTIES(...)``, or a session ``spark.conf.set(...)``; or
+    * a ``VACUUM``, which actively enforces the deleted-file retention window.
+
+    **N/A, never a finding, on absence.** The absence of a retention line is not
+    proof of a policy: the *effective* retention can be set on the table, the
+    environment, or by a ``VACUUM`` run in another notebook, and the table
+    properties are not part of the crawl snapshot — so "no signal in this code" is
+    *unknowable*, not misconfigured. Awarding a pass for the absence of
+    configuration would claim a "configured and monitored" policy that could not
+    be seen, so absence maps to N/A. Comments (Python ``#`` and SQL ``--`` /
+    ``/* */``) are stripped first so a commented-out setting never counts.
     """
-    code = executable_code(ctx.obj)
+    code = strip_sql_comments(executable_code(ctx.obj))
     if not writes_delta(code):
         return not_applicable("Notebook does not write Delta tables")
     if _spark.RETENTION.search(code):
-        return binary(True, "Delta history/log retention explicitly configured")
+        return binary(True, "Delta log/deleted-file retention is explicitly configured "
+                      "(delta.logRetentionDuration / delta.deletedFileRetentionDuration)")
+    if _spark.VACUUM.search(code):
+        return binary(True, "Runs VACUUM, which actively enforces the Delta "
+                      "deleted-file retention window")
     return not_applicable(
-        "No explicit Delta retention config; Fabric defaults apply "
-        "(cannot verify from code)"
+        "Delta retention not assessable — no delta.logRetentionDuration / "
+        "delta.deletedFileRetentionDuration TBLPROPERTIES, ALTER TABLE SET "
+        "TBLPROPERTIES, or VACUUM found in code, and table properties were not "
+        "fetched, so Fabric defaults apply and cannot be verified from the notebook"
     )
 
 
@@ -550,35 +567,67 @@ def spark_ui_review(ctx: CheckContext) -> Verdict:
 @check(
     id="SPARK-PARTITION", ref="3.5.5", title="No full-table scans when partition pruning is possible",
     pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
-    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+    layers=NOTEBOOK_LAYERS,
+    requires=[Resource.NOTEBOOK_DEFINITIONS, Resource.TABLE_SCHEMAS, Resource.LAKEHOUSE_FILES],
+    required=True,
 )
 def spark_partition_pruning(ctx: CheckContext) -> Verdict:
-    """Every SQL read of a configured partitioned table filters a partition column."""
-    code = notebook_code(ctx.obj)
-    configured = ctx.setting("partition_columns", {})
-    if not isinstance(configured, dict) or not configured:
+    """Every SQL read of a partitioned table filters a partition column.
+
+    Partitioned tables are discovered from the workspace's lakehouse/Delta
+    metadata — the tables that actually declare partition columns — never from a
+    static, hard-coded table name. A schema-qualified read (``schema.table``) is
+    matched to a table by its bare name, so a *schema* is never mistaken for a
+    partitioned *table*.
+
+    **What it cannot determine.** Anything, when no table in the workspace exposes
+    partition metadata: the OneLake partition listing carries the only readable
+    partition keys, and Fabric's table listing has none. With no partitioned table
+    to prune against, the notebook is reported N/A — plainly, and without naming a
+    table that may not exist — rather than judged against a guess.
+    """
+    partitioned = _spark.discover_partitioned_tables(ctx.workspace.tables)
+    if not partitioned:
+        tables = ctx.workspace.tables or {}
+        listing_done = any((meta or {}).get("partitions_listed") for meta in tables.values())
+        if listing_done:
+            # The OneLake partition listing succeeded and showed nothing
+            # partitioned — a real "nothing to prune", not "we could not look".
+            return not_applicable(
+                f"Notebook '{ctx.obj_name}' was not assessed: the OneLake partition "
+                f"listing was available and no Delta table declares partition "
+                f"columns, so there is no partition-pruning requirement to check"
+            )
+        if tables:
+            return not_applicable(
+                f"Notebook '{ctx.obj_name}' was not assessed: the OneLake partition "
+                f"listing was unavailable for this workspace's tables, so their "
+                f"partition columns could not be read and partition pruning cannot "
+                f"be assessed"
+            )
         return not_applicable(
-            f"Notebook '{ctx.obj_name}' was not assessed: project setting "
-            f"'partition_columns' is empty, so the auditor cannot determine which "
-            f"table reads require partition predicates"
+            f"Notebook '{ctx.obj_name}' was not assessed: no lakehouse tables were "
+            f"read for this workspace, so there is no partitioned table to prune "
+            f"against"
         )
-    reads = _spark.partitioned_sql_reads(code, configured)
+    code = notebook_code(ctx.obj)
+    reads = _spark.partitioned_sql_reads(code, partitioned)
     if not reads:
-        tables = ", ".join(sorted(str(table) for table in configured))
         return not_applicable(
-            f"Notebook '{ctx.obj_name}' has no SQL read of the configured partitioned "
-            f"table(s): {tables}"
+            f"Notebook '{ctx.obj_name}' has no SQL read of a partitioned table "
+            f"(assessed against {len(partitioned)} partitioned table(s) discovered "
+            f"in the workspace's lakehouse metadata)"
         )
     unfiltered = sorted({table for table, filtered in reads if not filtered})
     if unfiltered:
         details = ", ".join(
-            f"{table} ({'/'.join(map(str, configured.get(table, [])))})"
+            f"{table} ({'/'.join(_spark.partition_columns_for(table, partitioned))})"
             for table in unfiltered
         )
-        return binary(False, f"Notebook '{ctx.obj_name}' reads configured partitioned "
-                      f"table(s) without a partition predicate: {details}")
-    return binary(True, f"Notebook '{ctx.obj_name}': all {len(reads)} configured "
-                  f"partitioned-table read(s) filter a configured partition column")
+        return binary(False, f"Notebook '{ctx.obj_name}' reads partitioned table(s) "
+                      f"without a partition predicate: {details}")
+    return binary(True, f"Notebook '{ctx.obj_name}': all {len(reads)} partitioned-table "
+                  f"read(s) filter a declared partition column")
 
 
 @check(

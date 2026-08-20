@@ -13,10 +13,6 @@ project:
   maximum_spark_idle_ratio: 0.3
   heavy_shuffle_bytes: 1073741824
   long_running_notebook_ms: 300000
-  # Declare known partitioned tables so pruning checks can judge each SQL read.
-  # Use either a table name or a qualified lakehouse.table name.
-  partition_columns:
-    sales: [load_date]
 
 remediation: "config/remediation.yaml"
 

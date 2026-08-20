@@ -23,7 +23,7 @@ from auditfast.core.check._dax import normalised as dax_normalised
 from auditfast.core.check._semantic import is_row_identifier
 from auditfast.core.check.helpers import Verdict, binary, covered, not_applicable, note
 from auditfast.core.check.registry import check
-from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
+from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity, Status
 from auditfast.core.models import CheckContext
 
 SEMANTIC_LAYERS = (Layer.REPORTING, Layer.STORAGE, Layer.MIXED)
@@ -504,6 +504,23 @@ def _many_to_many_pairs(model: dict[str, Any]) -> list[tuple[str, str]]:
     return sorted(pairs)
 
 
+def _cardinality_is_readable(models: dict[str, Any]) -> bool:
+    """True when the parsed relationships carry cardinality metadata to assess.
+
+    TMSL/TMDL cardinality (``fromCardinality`` / ``toCardinality``) is recorded by
+    the crawl only on snapshots taken since the extractor began capturing it; an
+    older snapshot's relationships have no cardinality key at all. Where the key
+    is absent for every relationship, direct many-to-many cannot be assessed and
+    must not be claimed either way — the check scopes it out explicitly rather
+    than asserting "no direct many-to-many" it did not verify.
+    """
+    for defn in models.values():
+        for rel in _relationships(defn):
+            if "from_cardinality" in rel or "to_cardinality" in rel:
+                return True
+    return False
+
+
 @check(
     id="R-REL-AMBIGUOUS", ref="14.1.2",
     title="Relationships correctly defined (cardinality, active/inactive) with no ambiguous filter paths",
@@ -532,26 +549,43 @@ def relationships_have_no_ambiguous_paths(ctx: CheckContext) -> list[Verdict]:
     are the fingerprint of the problem, not a defect in themselves (a
     ``USERELATIONSHIP`` role-playing dimension is a legitimate use).
 
-    **Cardinality is assessed structurally.** The parsed TMSL now carries each
-    relationship's declared ``fromCardinality`` / ``toCardinality`` (definition
-    metadata, never row data). A relationship declared ``many`` on both ends is a
-    direct many-to-many with no bridge table — the "cardinality" half of this
-    point — and is flagged as a defect alongside ambiguous paths. TMSL omits the
-    fields for an ordinary many-to-one relationship, so only an *explicit*
-    many/many is flagged; a defaulted relationship is left alone.
+    The denominator is scoped: a model is only judged when it has **two or more
+    active relationships** (or a direct many-to-many), because a model with a
+    single relationship cannot carry a second filter path. The scored evidence
+    says so, so its "N of M" is not confused with the larger count of models that
+    merely *have* relationships.
+
+    **Cardinality is assessed structurally — when the snapshot carries it.** The
+    parsed TMSL records each relationship's declared ``fromCardinality`` /
+    ``toCardinality`` (definition metadata, never row data), and a relationship
+    declared ``many`` on both ends is a direct many-to-many with no bridge table —
+    the "cardinality" half of this point — flagged alongside ambiguous paths. Two
+    limitations are stated openly rather than papered over:
+
+    * **An older snapshot has no cardinality field at all** (it was crawled before
+      the extractor captured it). When *no* relationship in the workspace carries
+      cardinality, the check does not claim "no direct many-to-many" — it says so
+      and scopes that half out, instead of asserting a clean result it never
+      verified. A re-crawl restores the assessment.
+    * TMSL omits the fields for an ordinary many-to-one relationship, so only an
+      *explicit* many/many is flagged; a many-to-many left at its defaulted
+      cardinality cannot be told apart from a many-to-one and is not flagged.
 
     **What it cannot determine.** Whether a particular inactive relationship is
     deliberate is a modelling judgement and is reported, never scored. Row-level
     cardinality (actual distinct-value counts) still needs the rows and is never
-    read.
+    read — another known limitation of reading structure alone.
 
     Distinct from ``R-BIDI-REL`` (ref 14.1.1), which judges only the *direction*
     of cross-filtering on each relationship in isolation. A model can filter in
     a single direction everywhere and still carry two active single-direction
     routes between the same tables — the defect this check finds. Workspace
     scope (not ``Scope.SEMANTIC_MODEL``) matches the sibling 14.1.x checks, so
-    the reporting workspace gets one scored roll-up plus one named detail row
-    per offending model.
+    the reporting workspace gets one scored roll-up — which names the offending
+    model(s) and their table pairs inline — plus one detail row per offending
+    model. Each detail row carries a real FAIL status (not an informational note)
+    so it surfaces under a status filter, but is left unscored so the roll-up
+    stays the single scoring contribution.
     """
     if not ctx.workspace.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
         return [not_applicable(_UNREADABLE)]
@@ -562,10 +596,14 @@ def relationships_have_no_ambiguous_paths(ctx: CheckContext) -> list[Verdict]:
     judged = clean = 0
     inactive_total = 0
     offenders: dict[str, str] = {}
+    cardinality_available = _cardinality_is_readable(models)
     for name, defn in models.items():
         adjacency, duplicates, usable = _directed_filter_graph(defn)
         inactive_total += sum(1 for r in _relationships(defn) if not _is_active(r))
-        m2m = _many_to_many_pairs(defn)
+        # Direct many-to-many can only be judged when the parsed model actually
+        # carries relationship cardinality; on a snapshot without it, skip the
+        # cardinality half rather than claim a clean result it cannot verify.
+        m2m = _many_to_many_pairs(defn) if cardinality_available else []
         # A model is judged when there is something to assess: a second filter
         # path is only *possible* with two active relationships, but a direct
         # many-to-many relationship is a defect on its own, so a model carrying
@@ -602,12 +640,33 @@ def relationships_have_no_ambiguous_paths(ctx: CheckContext) -> list[Verdict]:
         )]
 
     detail = (
-        f"{clean} of {judged} semantic model(s) have exactly one active filter path "
-        f"between any two tables and no direct many-to-many relationship; "
-        f"{inactive_total} inactive relationship(s) across the workspace"
+        f"{clean} of {judged} semantic model(s) with two or more active "
+        f"relationships have exactly one active filter path between any two tables"
+        f"{' and no direct many-to-many relationship' if cardinality_available else ''}; "
+        f"{inactive_total} inactive relationship(s) across the workspace. "
+        f"Single-relationship models cannot be ambiguous and are excluded from "
+        f"this denominator"
     )
+    if not cardinality_available:
+        detail += (". Relationship cardinality is not present in the parsed model "
+                   "definition, so direct many-to-many (no-bridge) relationships "
+                   "are not assessed here")
+    if offenders:
+        names = sorted(offenders)
+        breakdown = "; ".join(f"{name} ({offenders[name]})" for name in names[:10])
+        more = f" (+{len(names) - 10} more)" if len(names) > 10 else ""
+        detail += f". Model(s) with a defect: {breakdown}{more}"
     verdicts: list[Verdict] = [covered(clean, judged, detail)]
-    verdicts += [note(reason, obj=model_name) for model_name, reason in sorted(offenders.items())]
+    # Each offending model gets a detail row carrying a real FAIL status — not a
+    # bare INFO note — so it surfaces when the report is filtered by FAIL/PARTIAL
+    # and is not mis-routed into the informational inventory. The row is left
+    # unscored (``scored=False``) so the ``covered()`` roll-up above stays the
+    # single scoring contribution and the defect is never double-counted.
+    verdicts += [
+        Verdict(evidence=reason, score=None, scored=False,
+                status=Status.FAIL, obj=model_name)
+        for model_name, reason in sorted(offenders.items())
+    ]
     return verdicts
 
 

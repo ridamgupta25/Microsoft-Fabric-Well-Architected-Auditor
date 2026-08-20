@@ -90,7 +90,7 @@ def _offender_names(summary: dict, section: str) -> list[str]:
 @check(
     id="WS-FILE-SIZE-BANDS", ref="4.3.3",
     title="File sizes avoid the small-file problem (target 128MB-1GB per file)",
-    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.LOW,
     layers=[Layer.STORAGE], requires=[Resource.LAKEHOUSE_FILES], required=True,
 )
 def lakehouse_file_sizes_avoid_small_files(ctx: CheckContext) -> list[Verdict]:
