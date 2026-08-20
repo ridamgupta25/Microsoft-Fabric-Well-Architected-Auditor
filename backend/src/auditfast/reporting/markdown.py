@@ -193,6 +193,65 @@ def build_markdown(
         ),
     )
 
+    # External checks (from CSV) — separate section to distinguish from automated
+    external = [r for r in results if r.source == "external"]
+    if external:
+        lines.append("## External Checks (from CSV)")
+        lines.append("")
+        lines.append("These checks were loaded from an external CSV file (e.g., AdminChecks.csv) "
+                     "and are included in the overall score. They are marked here for clarity.")
+        lines.append("")
+        ext_findings = [r for r in external if r.status in (Status.FAIL, Status.PARTIAL)]
+        if ext_findings:
+            lines.append(f"### Failing / Partial ({len(ext_findings)})")
+            lines.append("")
+            lines.append("| Severity | Ref | Check | Pillar | Workspace | Status | Evidence |")
+            lines.append("|----------|-----|-------|--------|-----------|--------|----------|")
+            for r in ext_findings:
+                ev = (r.evidence or "").replace("|", "\\|")
+                lines.append(
+                    f"| {r.severity.value} | {r.ref} | {r.title} | "
+                    f"{r.pillar} | {r.workspace} | {r.status.value} | {ev} |")
+            lines.append("")
+        
+        ext_passing = [r for r in external if r.status == Status.PASS]
+        if ext_passing:
+            lines.append(f"### Passing ({len(ext_passing)})")
+            lines.append("")
+            lines.append("| Ref | Check | Pillar | Workspace |")
+            lines.append("|-----|-------|--------|-----------|")
+            for r in ext_passing:
+                lines.append(
+                    f"| {r.ref} | {r.title} | {r.pillar} | {r.workspace} |")
+            lines.append("")
+
+    # Not assessed (N/A): checks whose data could not be read. These are the
+    # "why are checks missing?" answer — grouped by reason so a permission or
+    # access gap is visible instead of the checks silently vanishing.
+    na_results = [r for r in results if r.status == Status.NA]
+    if na_results:
+        lines.append(f"## Not assessed — N/A ({len(na_results)})")
+        lines.append("")
+        lines.append("These checks could not be evaluated — usually because the data they "
+                     "read could not be fetched (most often a sign-in token that lacks the "
+                     "scope to read role assignments, Git, or item definitions via "
+                     "`getDefinition`). They are **not** failures and do not affect the score. "
+                     "Re-sign-in with full consent (Item.ReadWrite.All + Workspace.Read.All), "
+                     "then re-run to assess them.")
+        lines.append("")
+        lines.append("| Reason | Checks | Pillars affected |")
+        lines.append("|--------|-------:|------------------|")
+        groups: dict[str, list] = {}
+        for r in na_results:
+            key = (r.evidence or "Not applicable").strip()
+            group = groups.setdefault(key, [0, set()])
+            group[0] += 1
+            group[1].add(str(r.pillar))
+        for reason, (count, pillars) in sorted(groups.items(), key=lambda kv: -kv[1][0]):
+            reason_txt = reason.replace("|", "\\|")
+            lines.append(f"| {reason_txt} | {count} | {', '.join(sorted(pillars))} |")
+        lines.append("")
+
     lines += ["## Area Detail", ""]
     for pillar in Pillar.scored():
         rows = pillar_controls(controls, pillar)

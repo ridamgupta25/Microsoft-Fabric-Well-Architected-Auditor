@@ -135,6 +135,17 @@ class WorkspaceContext:
     #: ("defines no policy"); the warehouse being absent from the map means it could
     #: not be read, which is N/A.
     warehouse_security: dict[str, list] = field(default_factory=dict)
+    #: Per-Warehouse database options that govern automatic statistics, keyed by
+    #: store name: ``auto_create_stats`` / ``auto_update_stats`` /
+    #: ``auto_update_stats_async``. Read from ``sys.databases``.
+    #:
+    #: These are the *auditable* statistics setting. Fabric maintains statistics
+    #: itself, so no manual UPDATE STATISTICS is required - but a user can switch
+    #: the automatic behaviour off with ALTER DATABASE, and Microsoft says OFF
+    #: "can cause suboptimal query plans and degraded query performance".
+    #: ``None`` means the value could not be read, which is never the same as
+    #: "off".
+    warehouse_options: dict[str, dict] = field(default_factory=dict)
     #: Per-Warehouse SQL audit *configuration*, keyed by warehouse display name.
     #: Each value is the normalised ``settings/sqlAudit`` payload:
     #: ``{"state": str, "enabled": bool, "action_groups": [str], "retention_days": int|None}``.
@@ -281,6 +292,7 @@ class WorkspaceContext:
             "semantic_models": self.semantic_models,
             "refresh_schedules": self.refresh_schedules,
             "warehouse_security": self.warehouse_security,
+            "warehouse_options": self.warehouse_options,
             "warehouse_audit": self.warehouse_audit,
             "run_history": self.run_history,
             "connections": self.connections,
@@ -317,6 +329,7 @@ class WorkspaceContext:
             semantic_models=dict(data.get("semantic_models", {})),
             refresh_schedules=dict(data.get("refresh_schedules", {})),
             warehouse_security=dict(data.get("warehouse_security", {})),
+            warehouse_options=dict(data.get("warehouse_options", {})),
             warehouse_audit=dict(data.get("warehouse_audit", {})),
             run_history=dict(data.get("run_history", {})),
             connections=list(data.get("connections", [])),
@@ -350,6 +363,55 @@ class CheckContext:
     def setting(self, key: str, default: Any = None) -> Any:
         """Read a tunable from the project YAML's ``project:`` block."""
         return self.settings.get(key, default)
+
+
+@dataclass(frozen=True, slots=True)
+class GroupMemberContext:
+    """One workspace inside a project group, with the environment it represents.
+
+    ``environment_level`` is the 1..10 position the reviewer gave it (1 =
+    dev/least critical, 10 = prod/most critical), so a cross-workspace check can
+    tell *which* member is production without reading its name.
+    """
+
+    workspace: WorkspaceContext
+    environment_level: int
+    layer: Layer
+
+
+@dataclass(frozen=True, slots=True)
+class GroupContext:
+    """Everything a cross-workspace (group) check is handed.
+
+    Holds the already-fetched contexts of the group's *readable* members, sorted
+    by environment level (dev -> prod). A group check compares them and returns a
+    single :class:`~auditfast.core.check.helpers.Verdict` for the project. It must
+    still obey N/A-not-FAIL: when fewer than two members are readable there is
+    nothing to compare, and the engine reports N/A rather than a low score.
+    """
+
+    name: str
+    members: tuple[GroupMemberContext, ...]
+    settings: dict
+
+    def setting(self, key: str, default: Any = None) -> Any:
+        """Read a tunable from the project YAML's ``project:`` block."""
+        return self.settings.get(key, default)
+
+    @property
+    def workspaces(self) -> tuple[WorkspaceContext, ...]:
+        """The member workspace contexts, dev -> prod."""
+        return tuple(member.workspace for member in self.members)
+
+    @property
+    def lowest(self) -> GroupMemberContext | None:
+        """The least production-like readable member (min environment level)."""
+        return self.members[0] if self.members else None
+
+    @property
+    def highest(self) -> GroupMemberContext | None:
+        """The most production-like readable member (max environment level)."""
+        return self.members[-1] if self.members else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -457,6 +519,50 @@ class CheckSpec:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class GroupCheckSpec:
+    """Metadata for a cross-workspace (group) check.
+
+    Unlike :class:`CheckSpec` it has no ``scope`` or ``layers``: a group check is
+    not dispatched per object or per layer, but once per project group, receiving
+    a :class:`GroupContext` of the group's readable members. ``requires`` lists
+    the resources each member workspace must have fetched for the comparison.
+    """
+
+    id: str
+    ref: str
+    title: str
+    pillar: Pillar
+    fn: Callable[[GroupContext], Any]
+    severity: Severity = Severity.MEDIUM
+    requires: frozenset[Resource] = frozenset()
+    weight: float = 1.0
+    description: str = ""
+    required: bool = True
+
+    def to_dict(self) -> dict:
+        """Serializable form -- used by the catalog API and the MCP tools."""
+        return {
+            "id": self.id,
+            "ref": self.ref,
+            "title": self.title,
+            "pillar": self.pillar.value,
+            "scope": "group",
+            "severity": self.severity.value,
+            "layers": ["*"],
+            "requires": sorted(r.value for r in self.requires),
+            "weight": self.weight,
+            "required": self.required,
+            "manual": False,
+            "automation": Automation.AUTOMATED.value,
+            "interactive": False,
+            "question": self.title,
+            "options": [],
+            "description": self.description or (self.fn.__doc__ or "").strip(),
+            "validated": is_validated(self.ref),
+        }
+
+
 @dataclass(slots=True)
 class CheckResult:
     """One deterministic verdict about one implemented object."""
@@ -477,6 +583,8 @@ class CheckResult:
     scope: Scope = Scope.WORKSPACE
     weight: float = 1.0
     scored: bool = True
+    #: Source of this check result: "automated" (from engine) or "external" (from CSV).
+    source: str = "automated"
 
     #: Kept as a class attribute so callers can reference ``CheckResult.MAX_SCORE``.
     MAX_SCORE = MAX_SCORE
@@ -509,6 +617,7 @@ class CheckResult:
             "scope": self.scope.value,
             "weight": self.weight,
             "scored": self.scored,
+            "source": self.source,
             # Workspace-level checks are common to every project regardless of
             # source system; the UI flags them as such.
             "common": self.scope is Scope.WORKSPACE,
@@ -543,4 +652,5 @@ class CheckResult:
             scope=Scope(data.get("scope", Scope.WORKSPACE.value)),
             weight=data.get("weight", 1.0),
             scored=data.get("scored", True),
+            source=data.get("source", "automated"),
         )

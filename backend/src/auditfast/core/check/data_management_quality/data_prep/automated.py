@@ -32,7 +32,14 @@ from auditfast.core.check._tables import (
     is_key_column,
     name_words,
 )
-from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable
+from auditfast.core.check.helpers import (
+    Verdict,
+    binary,
+    covered,
+    graded,
+    not_applicable,
+    note,
+)
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
@@ -1565,28 +1572,13 @@ def pl_idempotent_load(ctx: CheckContext) -> Verdict:
     return not_applicable("Script activities run no INSERT/MERGE load statement")
 
 
-# -- MLC Cat-1: dimensional load quality (4.5.10, 5.4.4, 5.4.6) ---------------
+# -- MLC Cat-1: dimensional load quality (5.4.4, 5.4.6) ----------------------
 #: The notebook is doing dimensional work at all — otherwise these checks have
 #: nothing to judge and must report N/A rather than fail a Bronze ingest.
 _DIM_REF = re.compile(r"\bdim[_\s.]|\bdimension\b", re.IGNORECASE)
 _FACT_REF = re.compile(r"\bfact[_\s.]|\bfct[_\s.]", re.IGNORECASE)
 _DIM_CONTEXT = re.compile(r"\bdim[_\s.]|\bdimension\b|\bfact[_\s.]|\bfct[_\s.]", re.IGNORECASE)
 
-#: A late-arriving fact is given an inferred / unknown member instead of being
-#: dropped: a stub dimension row, or the conventional -1 surrogate key.
-#: The -1 forms all allow a nested call — ``coalesce(col("x"), lit(-1))`` is the
-#: common Spark idiom — so match "-1 appears shortly after the call", not a
-#: bracket-exact shape.
-_LATE_ARRIVING = re.compile(
-    r"inferred[_\s]?member|late[_\s]?arriv|unknown[_\s]?member|is_inferred|"
-    r"coalesce\s*\([^\n]{0,80}?-1|"
-    r"fillna\s*\([^\n]{0,60}?-1|"
-    r"\.na\.fill\s*\([^\n]{0,60}?-1|"
-    r"otherwise\s*\([^\n]{0,40}?-1|"
-    r"when\s*\([^\n]{0,80}?-1|"
-    r"['\"]unknown['\"]",
-    re.IGNORECASE,
-)
 #: Unknown/orphan member usage is counted or logged, not just silently allowed.
 _UNKNOWN_MONITORED = re.compile(
     r"unknown[_\s]?(?:count|rate|pct|percent|usage)|orphan[_\s]?(?:count|rate|pct)|"
@@ -1596,11 +1588,18 @@ _UNKNOWN_MONITORED = re.compile(
 )
 #: A real dimensional unknown-member fallback. A generic string value such as
 #: ``city = "Unknown"`` is ordinary null cleansing, not a surrogate member.
+#:
+#: The ``-1`` forms require a *numeric* -1 (a surrogate key), so each is guarded
+#: with ``(?<![\"'])`` to reject a quoted ``"-1"`` string. Legacy IFS/COM feeds
+#: store a boolean true as -1, so ``bool_value.isin("-1","1","true","yes","y")``
+#: is a flag tidy-up (scored by 5.5.7), not a surrogate-key orphan fallback -
+#: without the guard the quoted ``"-1"`` false-matched ``when(...-1`` and this
+#: completeness monitor fired on notebooks with no dimension lookup at all.
 _UNKNOWN_MEMBER_USE = re.compile(
     r"unknown[_\s]?member|inferred[_\s]?member|is_inferred|"
-    r"coalesce\s*\([^\n]{0,80}?-1|fillna\s*\([^\n]{0,60}?-1|"
-    r"\.na\.fill\s*\([^\n]{0,60}?-1|otherwise\s*\([^\n]{0,40}?-1|"
-    r"when\s*\([^\n]{0,80}?-1",
+    r"coalesce\s*\([^\n]{0,80}?(?<![\"'])-1|fillna\s*\([^\n]{0,60}?(?<![\"'])-1|"
+    r"\.na\.fill\s*\([^\n]{0,60}?(?<![\"'])-1|otherwise\s*\([^\n]{0,40}?(?<![\"'])-1|"
+    r"when\s*\([^\n]{0,80}?(?<![\"'])-1",
     re.IGNORECASE,
 )
 
@@ -1612,19 +1611,6 @@ _FACT_DIM_JOIN = re.compile(
     r"(?<![\"'])\.join\s*\(|"
     r"\b(?:left|right|full|inner|cross)?\s*join\b[^\n;]{0,200}?\bon\b",
     re.IGNORECASE | re.DOTALL,
-)
-
-#: The inferred row is later updated when the real dimension member arrives.
-#: Accept explicit lifecycle names and statically identifiable Delta/SQL merges
-#: into a dimension; a generic MERGE elsewhere is not backfill evidence.
-_INFERRED_MEMBER_BACKFILL = re.compile(
-    r"backfill[_\s]?(?:dimension|member)|"
-    r"update[_\s]?(?:inferred|unknown)[_\s]?member|"
-    r"DeltaTable\.forName\s*\([^\n]{0,160}?dim[_\s.]?[A-Za-z0-9_]*[^\n]{0,160}?\)"
-    r"[\s\S]{0,500}?\.merge\s*\([\s\S]{0,500}?whenMatchedUpdate|"
-    r"merge\s+into\s+(?:[`\[\]\w]+\.)*[`\[]?dim[_\s.]?[A-Za-z0-9_`\]]*"
-    r"[\s\S]{0,500}?when\s+matched[\s\S]{0,120}?update",
-    re.IGNORECASE,
 )
 
 _FACT_WRITE_RECEIVER = re.compile(
@@ -1643,72 +1629,6 @@ def _fact_write_evidence(code: str) -> str:
     if receiver:
         return f"write receiver '{' '.join(receiver.group(0).split())}'"
     return ""
-
-
-# NB-LATE-ARRIVING (4.5.10): flags a fact→dimension load with no unknown/inferred-member
-# fallback. Was: raw code + any ``.join(`` gate → false-FAILed metadata/DQ notebooks whose
-# only "join" was a Python ``str.join`` or whose ``dim``/``fact`` sat in a comment.
-# Updated 2026-08-12: strip comments, require a real DataFrame/SQL join (``_FACT_DIM_JOIN``),
-# and N/A a dimension-build/upsert that never references a fact (``_DIM_UPSERT`` w/o ``_FACT_REF``).
-@check(
-    id="NB-LATE-ARRIVING", ref="4.5.10",
-    title="Late-arriving dimensions and facts handled (unknown/inferred member pattern)",
-    pillar=Pillar.DATA_MODELING, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
-    layers=(*NOTEBOOK_LAYERS, Layer.STORAGE),
-    requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
-)
-def nb_late_arriving(ctx: CheckContext) -> Verdict:
-    """A fact arriving before its dimension gets an inferred member, not dropped.
-
-    Commented-out code is ignored and only a genuine fact→dimension join counts
-    (a Spark ``df.join(`` or SQL ``… JOIN … ON`` — never a Python ``str.join``),
-    so a metadata/DQ notebook whose only "join" builds a string, or whose only
-    ``dim``/``fact`` mention sits in a comment, is N/A rather than FAIL. A notebook
-    that merely *builds* a dimension (an SCD upsert) is also N/A — the fallback
-    belongs in the fact load. Without the pattern the load either discards the
-    fact (silent data loss) or fails outright; the evidence is a stub/unknown
-    member: an ``is_inferred`` flag, an explicit "unknown" member, or the
-    conventional ``-1`` surrogate key substituted when the lookup misses.
-    """
-    code = strip_sql_comments(executable_code(ctx.obj))
-    fact_write = _fact_write_evidence(code)
-    dimensional_lookup = bool(
-        _FACT_REF.search(code) and _DIM_REF.search(code) and _FACT_DIM_JOIN.search(code)
-    )
-    if not (fact_write or dimensional_lookup):
-        return not_applicable(
-            f"Notebook '{ctx.obj_name}' has no provable dimensional fact load: no "
-            f"fact-named write target/receiver or fact-to-dimension lookup. Generic "
-            f"JSON-to-Delta ingestion and audit row counts do not establish that "
-            f"late-arriving member handling applies"
-        )
-
-    fallback = _LATE_ARRIVING.search(code)
-    backfill = _INFERRED_MEMBER_BACKFILL.search(code)
-    scope = fact_write or "fact-to-dimension lookup"
-    if fallback and backfill:
-        fallback_signal = " ".join(fallback.group(0).split())
-        backfill_signal = " ".join(backfill.group(0).split())
-        return binary(
-            True,
-            f"Notebook '{ctx.obj_name}' has {scope}, routes unresolved dimension "
-            f"keys through fallback '{fallback_signal}', and backfills inferred "
-            f"members (matched '{backfill_signal}')",
-        )
-
-    missing = []
-    if not dimensional_lookup:
-        missing.append("a dimension-key lookup")
-    if not fallback:
-        missing.append("an unknown/inferred-member fallback such as surrogate key -1")
-    if not backfill:
-        missing.append("backfill of inferred members when dimension rows arrive")
-    return binary(
-        False,
-        f"Notebook '{ctx.obj_name}' has {scope} but lacks {', '.join(missing)}; "
-        f"late-arriving facts can be dropped, fail the load, or remain permanently "
-        f"assigned to an unknown member",
-    )
 
 
 def _describe_unknown_fallback(match_text: str) -> str:
@@ -1896,6 +1816,18 @@ def nb_fact_dim_ri(ctx: CheckContext) -> Verdict:
 # -- MLC Cat-1: orphaned file cleanup (4.3.4) ---------------------------------
 #: A deliberate purge / archive routine over the Files section. Distinct from
 #: VACUUM, which only reclaims Delta table files (that is DELTA-VACUUM's job).
+#: How many store names one evidence string carries - enough to act on, few
+#: enough to stay readable in a report cell.
+_MAX_NAMED_STORES = 5
+
+
+def _named_stores(names: list[str]) -> str:
+    """``"a, b, c (+4 more)"`` - a bounded list of Lakehouse/Warehouse names."""
+    shown = ", ".join(sorted(names)[:_MAX_NAMED_STORES])
+    extra = len(names) - _MAX_NAMED_STORES
+    return f"{shown} (+{extra} more)" if extra > 0 else shown
+
+
 _FILE_PURGE = re.compile(
     r"(?:mssparkutils|notebookutils)\s*\.\s*fs\s*\.\s*rm\s*\(|"
     r"\bshutil\s*\.\s*rmtree\s*\(|\bos\s*\.\s*remove\s*\(|"
@@ -1910,32 +1842,92 @@ _FILE_PURGE = re.compile(
     title="Orphaned files cleaned up periodically (archiving/purging policy)",
     pillar=Pillar.DATA_MODELING, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=(Layer.STORAGE, Layer.PREP, Layer.MIXED),
-    requires=[Resource.ITEMS, Resource.NOTEBOOK_DEFINITIONS], required=False,
+    requires=[Resource.ITEMS, Resource.NOTEBOOK_DEFINITIONS,
+              Resource.LAKEHOUSE_FILES], required=False,
 )
-def ws_file_purge(ctx: CheckContext) -> Verdict:
+def ws_file_purge(ctx: CheckContext) -> list[Verdict]:
     """Somewhere in the solution, stale Files-section data is archived or purged.
+
+    **Only Lakehouses that actually hold Files-section data are assessed.** The
+    point is about *orphaned files accumulating*; a Lakehouse whose ``Files/``
+    area is empty has nothing to accumulate, so a missing purge routine is not a
+    finding there - it is not applicable. An earlier version failed a whole
+    workspace for having no purge notebook while 8 of its 9 Lakehouses held no
+    files at all, which reported a housekeeping gap that could not exist.
+
+    The OneLake ``Files/`` listing *is* now readable (``lakehouse_files``, a
+    bounded per-Lakehouse summary), so this no longer has to assume every
+    Lakehouse holds data. Where the listing could not be read the Lakehouse is
+    reported as unassessed rather than counted either way - an unreadable area
+    is not an empty one.
 
     Scoped to the workspace rather than to each notebook: a purge routine is a
     housekeeping job that exists once, so failing every notebook that is not it
-    would be noise. Asks only whether the routine exists at all.
+    would be noise. Each Lakehouse carrying files gets its own named row so the
+    report says *which* store the gap applies to.
 
-    The Files listing itself is not readable through the Fabric REST API, so
-    this cannot confirm files were actually removed — only that a routine is
-    implemented.
+    **What it cannot determine.** Whether the routine actually runs, what it
+    targets, or whether any specific file is genuinely orphaned - it reads a
+    notebook for a purge pattern and a listing for whether files exist.
     """
-    lakehouses = [i for i in ctx.workspace.items if i.type in ("Lakehouse", "Warehouse")]
-    if not lakehouses:
-        return not_applicable("Workspace holds no lakehouse or warehouse")
+    stores = [i for i in ctx.workspace.items if i.type in ("Lakehouse", "Warehouse")]
+    if not stores:
+        return [not_applicable("Workspace holds no lakehouse or warehouse")]
     if not ctx.workspace.notebooks:
-        return not_applicable("No notebook definitions available to inspect for a "
-                              "purge routine")
-    purging = [name for name, nb in ctx.workspace.notebooks.items()
-               if _FILE_PURGE.search(notebook_code(nb))]
+        return [not_applicable("No notebook definitions available to inspect for a "
+                               "purge routine")]
+
+    listings = ctx.workspace.lakehouse_files or {}
+    with_files: list[str] = []
+    empty: list[str] = []
+    unread: list[str] = []
+    for item in stores:
+        summary = listings.get(item.display_name)
+        if not isinstance(summary, dict):
+            unread.append(item.display_name)
+        elif int(summary.get("file_count") or 0) > 0:
+            with_files.append(item.display_name)
+        else:
+            empty.append(item.display_name)
+
+    context = ""
+    if empty:
+        context += (f". {len(empty)} store(s) hold no Files-section data and are not "
+                    f"assessed ({_named_stores(empty)}) - there is nothing to purge")
+    if unread:
+        context += (f". {len(unread)} store(s) could not be listed and are not assessed "
+                    f"({_named_stores(unread)})")
+
+    purging = sorted(name for name, nb in ctx.workspace.notebooks.items()
+                     if _FILE_PURGE.search(notebook_code(nb)))
     if purging:
-        return binary(True, f"File archive/purge routine found in: {', '.join(sorted(purging))}")
-    return binary(False, f"{len(lakehouses)} lakehouse/warehouse item(s) but no notebook "
-                         f"implements a file archive or purge routine — stale Files "
-                         f"data accumulates indefinitely")
+        return [binary(
+            True,
+            f"File archive/purge routine found in: {', '.join(purging)}"
+            f"{context}",
+        )]
+
+    if not with_files:
+        return [not_applicable(
+            "No lakehouse holds Files-section data, so there are no orphaned files to "
+            f"archive or purge{context}"
+        )]
+
+    verdicts: list[Verdict] = [binary(
+        False,
+        f"{len(with_files)} lakehouse/warehouse item(s) hold Files-section data "
+        f"({_named_stores(with_files)}) but no notebook implements a file archive or "
+        f"purge routine - stale Files data accumulates indefinitely{context}",
+    )]
+    # Named, unscored rows so the report says which store the gap applies to
+    # without letting one point vote once per Lakehouse.
+    for name in with_files:
+        verdicts.append(note(
+            "Holds Files-section data with no archive or purge routine anywhere in the "
+            "workspace, so stale files here accumulate indefinitely",
+            obj=name,
+        ))
+    return verdicts
 
 
 @check(
@@ -3784,14 +3776,65 @@ def pipeline_dq_failure_halts_run(ctx: CheckContext) -> Verdict:
 #: A notebook has actually *evaluated* data quality — it holds a count of bad
 #: rows, an expectation result, or a comparison — rather than merely mentioning
 #: quality.
-_DQ_EVALUATION = re.compile(
-    r"\b(?:invalid|bad|error|reject|rejected|failed|violation|mismatch|orphan|duplicate|null)"
-    r"[_\s]?(?:count|cnt|rows?|records?|df)\b|"
-    r"^\s*assert\s+\w|\bexpect_[a-z_]+\s*\(|\bVerificationSuite\s*\(|"
-    r"\b(?:validate|validation|dq)_\w*\s*[\(=]|"
-    r"\.count\s*\(\s*\)\s*(?:==|!=|>=|<=|>|<)",
-    re.IGNORECASE | re.MULTILINE,
+#: A data-quality result was genuinely *computed*. Each alternative is a
+#: structure, not a word, because the previous version matched any identifier
+#: containing "invalid"/"error"/"duplicate" - so a notebook holding a variable
+#: called ``error_df``, or the ordinary line ``if df.count() > 0:``, was treated
+#: as evaluating data quality and then scored **0** for not halting on a check it
+#: never ran. A weak trigger followed by a hard zero is the worst shape a check
+#: can have: it reports "bad data flows downstream silently" about a notebook
+#: doing nothing wrong.
+#:
+#: The vocabulary is the documented API surface of the frameworks actually used
+#: on Spark. None of them raises on failure by itself - Great Expectations'
+#: ``run()`` returns a result, PyDeequ's ``VerificationSuite.run()`` returns a
+#: ``VerificationResult``, Soda's ``scan.execute()`` sets a status - which is
+#: precisely why "computed but not acted on" is a real and common failure.
+_DQ_FRAMEWORK = re.compile(
+    # Great Expectations
+    r"\bexpect_[a-z_]{3,}\s*\(|\bgreat_expectations\b|\bvalidation_definition\b|"
+    r"\bcheckpoint(?:_result)?\s*\.\s*run\s*\(|\.\s*success\b|"
+    # PyDeequ / Deequ
+    r"\bVerificationSuite\s*\(|\bVerificationResult\b|\bcheckResultsAsDataFrame\b|"
+    r"\bAnalysisRunner\s*\(|\bpydeequ\b|"
+    # Soda Core
+    r"\bScan\s*\(\s*\)|\bhas_check_fails\s*\(|\bassert_no_checks_fail\s*\(|"
+    r"\bsoda(?:core)?\b|"
+    # dbt / SQL test harnesses invoked from a notebook
+    r"\bdbt\s+test\b|\brun_dbt\b",
+    re.IGNORECASE,
 )
+
+#: A hand-rolled quality measure. Two shapes count, and the distinction from the
+#: previous version matters: the old pattern's suffix list included ``df``, so
+#: ``error_df = spark.read.parquet(...)`` - an ordinary dataframe - read as a
+#: data-quality evaluation. A *count* is a measurement; a dataframe is not.
+#:
+#: 1. A bad-row **count** assigned from a ``.count()`` call. The name says what
+#:    is being counted and the call says it is a count, which together is a
+#:    genuine quality measurement even before anything is done with it.
+#: 2. A bad-row count that is **compared**, wherever it came from.
+_DQ_BAD_WORD = (
+    r"(?:invalid|bad|error|reject(?:ed)?|failed|violation|mismatch|orphan|"
+    r"duplicate|dupe|null|missing|anomal\w*|dq|quality)"
+)
+_DQ_HANDROLLED = re.compile(
+    # invalid_count = df.filter(...).count()
+    rf"\b{_DQ_BAD_WORD}[_\w]{{0,20}}?(?:count|cnt)\b\s*=\s*[^\n]{{0,200}}?\.count\s*\("
+    r"|"
+    # if invalid_count > 0
+    rf"\b{_DQ_BAD_WORD}[_\w]{{0,20}}?(?:count|cnt|rows?|records?|total)\b"
+    r"[^\n]{0,80}?(?:==|!=|>=|<=|>|<)"
+    r"|"
+    # if 0 < invalid_count
+    rf"(?:==|!=|>=|<=|>|<)[^\n]{{0,40}}?\b{_DQ_BAD_WORD}"
+    r"[_\w]{0,20}?(?:count|cnt|rows?|records?|total)\b",
+    re.IGNORECASE,
+)
+
+#: An explicit assertion about the data is itself both the evaluation and the
+#: halt, so it is recognised separately.
+_DQ_ASSERTION = re.compile(r"^\s*assert\s+\w", re.MULTILINE)
 #: The notebook stops. ``raise``/``assert``/``sys.exit`` fail the notebook, and
 #: therefore the pipeline activity that ran it.
 _DQ_HARD_STOP = re.compile(
@@ -3819,38 +3862,67 @@ def notebook_dq_failure_halts_run(ctx: CheckContext) -> Verdict:
     The sibling of ``PL-DQ-GATE`` under the same ref, and a different signal:
     the pipeline check reads *wiring*, this one reads what the notebook does
     with its own result. A notebook that computes ``invalid_count`` and only
-    prints it returns success, so the orchestrator has nothing to gate on — the
+    prints it returns success, so the orchestrator has nothing to gate on - the
     pipeline can be wired perfectly and bad data still flows.
 
-    **What it can determine.** Whether a notebook that evaluates data quality
-    also raises, asserts, or exits on the result. ``raise``/``assert``/
-    ``sys.exit`` fail the run; ``notebookutils.notebook.exit`` ends it
-    *successfully* with a value, which only halts the caller if the caller looks
-    — so it scores 2, not 3.
+    **The trigger demands structure, not a word.** An earlier version matched any
+    identifier containing "error"/"invalid"/"duplicate", so a notebook holding a
+    variable named ``error_df`` - or the ordinary line ``if df.count() > 0:`` -
+    was judged to evaluate data quality and then scored 0 for not halting on it.
+    That is a confident failure about something the notebook never did. The
+    trigger now requires either a named validation framework (Great Expectations,
+    PyDeequ, Soda, dbt) or a bad-row count that is actually *compared*, and a
+    notebook matching neither is N/A.
 
-    **What it cannot.** Tell whether the stop is on the right condition, or
-    whether the caller inspects an exit value. Distinct from ``NB-DQ-RULES``
-    (5.1.2), which asks whether rules exist, and from ``NB-DEADLETTER`` (5.1.10),
-    which asks whether rejects are retained — retaining rejects and halting are
-    different controls, and a solution can want both.
+    **Why frameworks need a halt at all.** None of them raises on failure:
+    Great Expectations' ``run()`` returns a result whose ``.success`` nobody has
+    to read, PyDeequ's ``VerificationSuite.run()`` returns a ``VerificationResult``,
+    and Soda's ``scan.execute()`` only sets a status. "Computed but not acted on"
+    is the normal way this goes wrong, which is exactly what this check is for.
+
+    **What it can determine.** Whether the notebook raises, asserts, or exits on
+    the result. ``raise``/``assert``/``sys.exit`` fail the run and therefore the
+    calling pipeline activity; ``notebookutils.notebook.exit`` ends it
+    *successfully* with a value, which only halts the caller if the caller looks
+    - so it scores 2, not 3.
+
+    **What it cannot.** Tell whether the stop is on the right condition, whether
+    the caller inspects an exit value, or whether a halt in one cell relates to
+    the check in another. Distinct from ``NB-DQ-RULES`` (5.1.2), which asks
+    whether rules exist, and from ``NB-DEADLETTER`` (5.1.10), which asks whether
+    rejects are retained - retaining rejects and halting are different controls,
+    and a solution can want both.
     """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
     code = executable_code(ctx.obj)
-    if not _DQ_EVALUATION.search(code):
+
+    framework = _DQ_FRAMEWORK.search(code)
+    handrolled = _DQ_HANDROLLED.search(code)
+    assertion = _DQ_ASSERTION.search(code)
+    if not (framework or handrolled or assertion):
         return not_applicable(
-            "Notebook evaluates no data-quality result (no bad-row count, expectation, "
-            "or assertion), so there is nothing here to halt on"
+            "Notebook runs no data-quality evaluation - no validation framework "
+            "(Great Expectations, Deequ, Soda, dbt), no bad-row count that is "
+            "compared against a threshold, and no assertion - so there is no "
+            "quality result here to halt on"
         )
+
+    measured = ("a validation framework result" if framework
+                else "an assertion about the data" if assertion and not handrolled
+                else "a bad-row count")
+
     if _DQ_HARD_STOP.search(code):
-        return graded(3, "Data-quality failure raises/asserts and fails the notebook, "
-                         "so the calling pipeline cannot continue")
+        return graded(3, f"Notebook evaluates {measured} and raises/asserts on it, "
+                         f"failing the run so the calling pipeline cannot continue")
     if _DQ_SOFT_EXIT.search(code):
-        return graded(2, "Data-quality result ends the notebook through notebook.exit() — "
-                         "the run still reports success, so progression stops only if the "
-                         "caller inspects the returned value")
-    return graded(0, "Data-quality result is computed but never raised on — the notebook "
-                     "succeeds regardless, so bad data flows downstream silently")
+        return graded(2, f"Notebook evaluates {measured} and ends through "
+                         f"notebook.exit() - the run still reports success, so "
+                         f"progression stops only if the caller inspects the "
+                         f"returned value")
+    return graded(0, f"Notebook evaluates {measured} but never raises, asserts or "
+                     f"exits on it - the run succeeds regardless, so bad data flows "
+                     f"downstream silently")
 
 
 # =============================================================================

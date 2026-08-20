@@ -350,7 +350,8 @@ def test_gold_freshness_is_na_when_no_serving_item_has_a_timestamp():
     ctx = _gold_ws(Item(id="wh-1", type="Warehouse", display_name="WH_Sales"))
     verdict = gold_items_refreshed_within_sla(ctx)
     assert verdict.status is Status.NA
-    assert "readable last run/refresh timestamp" in verdict.evidence
+    assert "has a readable last-update time" in verdict.evidence
+    assert "carries no run history of its own" in verdict.evidence
 
 
 def test_gold_freshness_is_na_when_the_run_history_was_unreadable():

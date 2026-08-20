@@ -61,6 +61,8 @@ class AuditRunner:
         token: str | None = None,
         organization_id: str | None = None,
         auth_session: str | None = None,
+        weight_by_environment: bool = False,
+        external_checks_csv: str | None = None,
         source: str = "live",
         snapshots: list[dict] | None = None,
     ) -> AuditJob:
@@ -73,6 +75,8 @@ class AuditRunner:
                 "project": project_path,
                 "pillars": pillars or [],
                 "workspaces": workspaces or [],
+                "weight_by_environment": weight_by_environment,
+                "external_checks_csv": external_checks_csv,
                 "source": source,
             },
             questionnaire=questionnaire_service.build_questionnaire(pillars, workspaces),
@@ -88,6 +92,8 @@ class AuditRunner:
                 out_dir=out_dir,
                 token=token,
                 auth_session=auth_session,
+                weight_by_environment=weight_by_environment,
+                external_checks_csv=external_checks_csv,
                 source=source,
                 snapshots=snapshots,
                 parent_correlation_id=correlation_id.get(),
@@ -107,6 +113,8 @@ class AuditRunner:
         out_dir: str | None,
         token: str | None,
         auth_session: str | None = None,
+        weight_by_environment: bool = False,
+        external_checks_csv: str | None = None,
         source: str = "live",
         snapshots: list[dict] | None = None,
         parent_correlation_id: str = "-",
@@ -159,6 +167,8 @@ class AuditRunner:
                     sql_token=sql_token,
                     storage_token=storage_token,
                     sql_token_refresher=sql_token_refresher,
+                    weight_by_environment=weight_by_environment,
+                    external_checks_csv=external_checks_csv,
                     source=source,
                     snapshots=snapshots,
                 )
@@ -193,6 +203,8 @@ class AuditRunner:
                     out_dir=out_dir,
                     token=token,
                     auth_session=auth_session,
+                    weight_by_environment=weight_by_environment,
+                    external_checks_csv=external_checks_csv,
                     parent_correlation_id=parent_correlation_id,
                 )
             )
@@ -209,6 +221,8 @@ class AuditRunner:
         out_dir: str | None,
         token: str | None,
         auth_session: str | None = None,
+        weight_by_environment: bool = False,
+        external_checks_csv: str | None = None,
         parent_correlation_id: str = "-",
     ) -> None:
         """Re-crawl the tenant live, rebuild the KB, and update the report.
@@ -244,6 +258,8 @@ class AuditRunner:
                         sql_token=sql_token,
                         storage_token=storage_token,
                         sql_token_refresher=sql_token_refresher,
+                        weight_by_environment=weight_by_environment,
+                        external_checks_csv=external_checks_csv,
                     )
                 )
                 report = audit_service.to_json(run)

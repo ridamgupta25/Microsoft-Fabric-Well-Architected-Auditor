@@ -49,6 +49,13 @@ class AuditRun:
     #: Knowledge-base provenance: whether this report was served from the disk
     #: cache and whether a fresher live crawl is being (or should be) fetched.
     kb: dict = field(default_factory=dict)
+    #: Cross-workspace project groups, purely for display. Built from the
+    #: request's workspace selections; never influences targets or scoring, so an
+    #: isolated-only run leaves this empty and behaves exactly as before.
+    groups: list[dict] = field(default_factory=list)
+    #: True when the roll-up was environment-weighted (opt-in). Display only —
+    #: the per-check and per-workspace numbers are unchanged either way.
+    weighted_by_environment: bool = False
 
 
 # -- provider construction ----------------------------------------------------
@@ -210,21 +217,13 @@ def validate_snapshot(payload: dict) -> dict:
 
 
 def _resolve_pillars(names: Iterable[str] | None) -> list[Pillar] | None:
-    """Map pillar names from an API/CLI caller onto enum members.
-
-    Foundation is cross-cutting, informational context (item inventory, access
-    errors, crawl-completeness) — never scored, but always reported. It is kept
-    in every run even when the caller selects a subset of the scored pillars, so
-    the report's Workspace Inventory section is never silently empty.
-    """
+    """Map pillar names from an API/CLI caller onto enum members."""
     if not names:
         return None
     wanted = {str(n).strip().lower() for n in names if str(n).strip()}
     if not wanted:
         return None
     resolved = [p for p in Pillar if p.value.lower() in wanted]
-    if Pillar.FOUNDATION not in resolved:
-        resolved.append(Pillar.FOUNDATION)
     return resolved
 
 
@@ -251,6 +250,90 @@ def _resolve_targets(
     declared = {ws_id: layer for ws_id, layer in config.targets}
     # Preserve caller order, and default a workspace the project never declared.
     return [(ws_id, declared.get(ws_id, Layer.MIXED)) for ws_id in wanted]
+
+
+def _resolve_groups(
+    workspaces: Sequence[dict] | Sequence[str] | None,
+) -> list[dict]:
+    """Extract cross-workspace project groups from the request selections.
+
+    Display metadata only — it never changes which workspaces are audited or how
+    they score. A selection without a ``group`` is an isolated workspace and is
+    omitted, so an isolated-only run yields an empty list.
+    """
+    if not workspaces or not isinstance(workspaces[0], dict):
+        return []
+    grouped: dict[str, list[dict]] = {}
+    for entry in workspaces:  # type: ignore[union-attr]
+        name = str(entry.get("group") or "").strip()
+        if not name or not entry.get("id"):
+            continue
+        grouped.setdefault(name, []).append({
+            "id": entry["id"],
+            "name": entry.get("name") or entry["id"],
+            "role": entry.get("role") or entry.get("layer") or "Mixed",
+            "environment_level": entry.get("environment_level"),
+        })
+    return [
+        {
+            "name": name,
+            "workspaces": sorted(
+                members,
+                key=lambda member: (member.get("environment_level") or 0),
+            ),
+        }
+        for name, members in grouped.items()
+    ]
+
+
+def _resolve_weights(
+    workspaces: Sequence[dict] | Sequence[str] | None,
+    enabled: bool,
+) -> dict[str, float] | None:
+    """Map each workspace id to its environment weight (level 1..10 == weight).
+
+    Returns ``None`` when weighting is off or no levels were given, so the engine
+    runs its plain unweighted mean — identical to today. A workspace without a
+    level defaults to weight 1.0, so an isolated workspace is never up- or
+    down-weighted.
+    """
+    if not enabled or not workspaces or not isinstance(workspaces[0], dict):
+        return None
+    weights: dict[str, float] = {}
+    for entry in workspaces:  # type: ignore[union-attr]
+        ws_id = entry.get("id")
+        level = entry.get("environment_level")
+        if ws_id and isinstance(level, (int, float)) and level > 0:
+            weights[ws_id] = float(level)
+    return weights or None
+
+
+def _resolve_group_targets(
+    workspaces: Sequence[dict] | Sequence[str] | None,
+) -> list[tuple[str, tuple[tuple[str, Layer, int], ...]]]:
+    """Build the engine's group targets from the request's grouped selections.
+
+    Each is ``(group_name, ((workspace_id, layer, level), ...))``. Only groups
+    with two or more members are worth a cross-workspace comparison; a lone
+    grouped workspace yields nothing here (it is still audited individually).
+    """
+    if not workspaces or not isinstance(workspaces[0], dict):
+        return []
+    grouped: dict[str, list[tuple[str, Layer, int]]] = {}
+    for entry in workspaces:  # type: ignore[union-attr]
+        name = str(entry.get("group") or "").strip()
+        ws_id = entry.get("id")
+        if not name or not ws_id:
+            continue
+        layer = Layer.parse(entry.get("role") or entry.get("layer"))
+        level = entry.get("environment_level")
+        level = int(level) if isinstance(level, (int, float)) and level > 0 else 1
+        grouped.setdefault(name, []).append((ws_id, layer, level))
+    return [
+        (name, tuple(members))
+        for name, members in grouped.items()
+        if len(members) >= 2
+    ]
 
 
 # -- listing ------------------------------------------------------------------
@@ -327,6 +410,8 @@ def run_audit(
     sql_token: str | None = None,
     storage_token: str | None = None,
     sql_token_refresher=None,
+    weight_by_environment: bool = False,
+    external_checks_csv: str | Path | None = None,
     source: str = "live",
     snapshots: Sequence[dict] | None = None,
 ) -> AuditRun:
@@ -339,6 +424,10 @@ def run_audit(
     pass ``refresh=True`` to force a fresh live crawl and rebuild the KB. With
     ``source="kb"`` the run reads only saved snapshots — the archive plus any
     ``snapshots`` uploaded with the request — and needs no token.
+
+    ``external_checks_csv``, if given, loads additional check results from a CSV
+    file (e.g., AdminChecks.csv) and merges them with the automated results.
+    Raises AuditError if the CSV is invalid.
     """
     config = load_project(project_path)
     provider = build_provider(config, token, refresh=refresh, token_refresher=token_refresher,
@@ -347,10 +436,16 @@ def run_audit(
                               sql_token_refresher=sql_token_refresher,
                               source=source, snapshots=snapshots)
     targets = _resolve_targets(config, workspaces)
+    groups = _resolve_groups(workspaces)
+    weights = _resolve_weights(workspaces, weight_by_environment)
+    group_targets = _resolve_group_targets(workspaces)
     remediation: RemediationBook = load_remediation(config)
 
     def _progress(partial: list[CheckResult]) -> None:
-        report = to_json(_build_run(config.name, partial))
+        run = _build_run(config.name, partial)
+        run.groups = groups
+        run.weighted_by_environment = bool(weights)
+        report = to_json(run)
         report["partial"] = True
         on_progress(report)  # type: ignore[misc]
 
@@ -361,9 +456,57 @@ def run_audit(
         pillars=_resolve_pillars(pillars),
         remediation=remediation,
         on_progress=_progress if on_progress else None,
+        weights=weights,
+        groups=group_targets,
     )
 
-    run = _build_run(config.name, raw_results)
+    # Merge external checks if provided
+    if external_checks_csv:
+        from .external_checks_service import load_external_checks, ExternalCheckError
+        
+        try:
+            # Strip surrounding whitespace and stray quotes (Windows "Copy as path"
+            # wraps the path in double quotes, which would otherwise be taken literally).
+            raw_csv = str(external_checks_csv).strip().strip('"').strip("'").strip()
+
+            # Resolve CSV path: if relative, resolve it relative to project root (parent of config dir)
+            csv_path = Path(raw_csv)
+            if not csv_path.is_absolute():
+                # Try relative to project root first (parent of config.yaml directory)
+                project_root = Path(config.path).parent
+                candidate = project_root / csv_path
+                if candidate.exists():
+                    csv_path = candidate
+                # Otherwise fall back to cwd (current working directory)
+            
+            target_ws_ids = {ws_id for ws_id, _ in targets}
+            external_results, warnings = load_external_checks(
+                csv_path,
+                target_workspaces=target_ws_ids,
+            )
+            
+            if warnings:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    f"Loaded external checks with {len(warnings)} warning(s):\n" +
+                    "\n".join(f"  - {w}" for w in warnings)
+                )
+            
+            # Merge: workspace-agnostic (external checks added regardless of workspace)
+            # Simply append external checks to automated results without requiring workspace
+            # match. This allows external checks from different workspaces to contribute to
+            # the overall audit score. External checks keep their original workspace from CSV.
+            merged_results = raw_results + external_results
+        
+        except ExternalCheckError as e:
+            raise AuditError(f"Cannot load external checks: {e}")
+    else:
+        merged_results = raw_results
+
+    run = _build_run(config.name, merged_results)
+    run.groups = groups
+    run.weighted_by_environment = bool(weights)
     served = bool(getattr(provider, "served_from_cache", False))
     run.kb = {
         "source": source,
@@ -463,6 +606,8 @@ def to_json(run: AuditRun) -> dict:
         "counts": agg.get("counts", {}),
         "total_scored": agg.get("total_scored", 0),
         "results": [r.to_dict() for r in run.results],
+        "groups": run.groups,
+        "weighted_by_environment": run.weighted_by_environment,
         "kb": run.kb,
         "errors": [
             {

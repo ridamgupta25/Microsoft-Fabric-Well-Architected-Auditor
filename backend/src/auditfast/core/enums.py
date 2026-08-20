@@ -6,8 +6,9 @@ roles were re-declared in three separate places; keeping them here means adding 
 pillar or a layer is a one-line change.
 
 All enums subclass ``str`` so they serialize straight to JSON and compare equal to
-their string value — ``Pillar.SECURITY == "Security"`` is ``True``. That keeps the
-API responses and the YAML config human-readable without a conversion layer.
+their string value — ``Pillar.SECURITY_ACCESS == "Security & Access Control"`` is
+``True``. That keeps the API responses and the YAML config human-readable without a
+conversion layer.
 """
 from __future__ import annotations
 
@@ -33,13 +34,7 @@ class StrEnum(str, Enum):
 
 
 class Pillar(StrEnum):
-    """The audit pillars — aligned to the source checklist taxonomy.
-
-    Thirteen scored pillars, each owning a slice of the checklist. ``FOUNDATION``
-    is cross-cutting and internal: it holds informational results (inventory,
-    access errors) that describe the estate rather than judging it, and is never
-    scored — so it is deliberately excluded from :meth:`scored`.
-    """
+    """The audit pillars aligned to the source checklist."""
 
     ARCHITECTURE = "Architecture & Design"
     DATA_INTEGRATION = "Data Integration & Ingestion"
@@ -74,6 +69,56 @@ class Pillar(StrEnum):
             cls.COST_MANAGEMENT,
             cls.DOCUMENTATION,
         ]
+
+    @classmethod
+    def for_checklist_ref(cls, ref: str, fallback: Pillar) -> Pillar:
+        """Return the updated checklist pillar for ``ref`` when it is mapped."""
+        if ref in _UNMAPPED_CHECKLIST_REFS:
+            return fallback
+        if ref in _CHECKLIST_REF_PILLARS:
+            return _CHECKLIST_REF_PILLARS[ref]
+
+        parts = ref.split(".")
+        section = ".".join(parts[:2]) if parts and parts[0] == "14" else parts[0]
+        return _CHECKLIST_SECTION_PILLARS.get(section, fallback)
+
+
+_CHECKLIST_SECTION_PILLARS: dict[str, Pillar] = {
+    "1": Pillar.ARCHITECTURE,
+    "2": Pillar.DATA_INTEGRATION,
+    "3": Pillar.DATA_PROCESSING,
+    "4": Pillar.DATA_MODELING,
+    "5": Pillar.DATA_QUALITY,
+    "6": Pillar.SECURITY_ACCESS,
+    "7": Pillar.COMPLIANCE,
+    "8": Pillar.DATA_GOVERNANCE,
+    "9": Pillar.RELIABILITY,
+    "10": Pillar.MONITORING,
+    "11": Pillar.DEVOPS,
+    "12": Pillar.COST_MANAGEMENT,
+    "14.1": Pillar.ARCHITECTURE,
+    "14.2": Pillar.DATA_PROCESSING,
+    "14.3": Pillar.ARCHITECTURE,
+    "14.4": Pillar.SECURITY_ACCESS,
+    "14.5": Pillar.DATA_INTEGRATION,
+}
+
+_CHECKLIST_REF_PILLARS: dict[str, Pillar] = {
+    "IMPL-01": Pillar.SECURITY_ACCESS,
+    "IMPL-02": Pillar.SECURITY_ACCESS,
+    "IMPL-04": Pillar.SECURITY_ACCESS,
+    "IMPL-06": Pillar.SECURITY_ACCESS,
+    "IMPL-15": Pillar.COST_MANAGEMENT,
+    "IMPL-20": Pillar.ARCHITECTURE,
+    "IMPL-23": Pillar.DATA_INTEGRATION,
+    "IMPL-24": Pillar.ARCHITECTURE,
+    "14.5.3": Pillar.MONITORING,
+    "14.5.4": Pillar.DEVOPS,
+}
+
+# All registered refs are now mapped to the updated checklist taxonomy. Add a
+# ref here to hold it on its declared pillar when the checklist omits it.
+_UNMAPPED_CHECKLIST_REFS: set[str] = set()
 
 
 class Layer(StrEnum):
@@ -160,6 +205,11 @@ class Scope(StrEnum):
     SEMANTIC_MODEL = "semantic_model"
     REPORT = "report"
     EVENTHOUSE = "eventhouse"
+    #: A cross-workspace comparison spanning a whole project group. Not dispatched
+    #: per object like the others; a group check runs once per group over its
+    #: members' contexts. Kept last so the per-workspace dispatch order is
+    #: unchanged.
+    GROUP = "group"
 
 
 class Resource(StrEnum):
