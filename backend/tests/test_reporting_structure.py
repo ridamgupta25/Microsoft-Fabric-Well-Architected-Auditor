@@ -44,7 +44,7 @@ def _sample_results() -> list[CheckResult]:
         "check_id": "NB-ACCESS",
         "ref": "6.1.1",
         "title": "Notebook access follows least privilege",
-        "pillar": Pillar.SECURITY,
+        "pillar": Pillar.SECURITY_ACCESS,
         "severity": Severity.HIGH,
         "recommendation": "Restrict notebook access to approved identities.",
     }
@@ -81,7 +81,7 @@ def _sample_results() -> list[CheckResult]:
             check_id="NB-CACHE",
             ref="3.2.1",
             title="Notebook uses cache selectively",
-            pillar=Pillar.PERFORMANCE,
+            pillar=Pillar.DATA_PROCESSING,
             status=Status.PASS,
             score=3,
             obj="Notebook A",
@@ -118,6 +118,7 @@ def test_excel_matches_sql_report_flow_and_risk_register(tmp_path):
         "Findings",
         "Risk Register",
         "Invent",
+        "WS1 Workspace A",
     ]
     assert workbook["Checklist"].max_row == 3
     assert workbook["Findings"].max_row == 2
@@ -128,9 +129,17 @@ def test_excel_matches_sql_report_flow_and_risk_register(tmp_path):
     assert "Notebook B" in workbook["Findings"]["F2"].value
     assert "Notebook C" in workbook["Findings"]["G2"].value
     assert workbook["Summary"].freeze_panes == "A3"
-    assert workbook["Area Detail"].freeze_panes == "B2"
-    assert workbook["Checklist"].freeze_panes == "J2"
+    assert workbook["Area Detail"].freeze_panes == "A2"
+    assert workbook["Checklist"].freeze_panes == "L2"
     assert workbook["Findings"].freeze_panes == "F2"
+    assert workbook["Risk Register"].freeze_panes == "H12"
+    assert workbook["Risk Register"].sheet_view.pane.xSplit == 7
+    assert workbook["Risk Register"].sheet_view.zoomScale == 100
+    assert workbook["Risk Register"].column_dimensions["H"].width == 60
+    assert "A1:H1" in {str(cell_range) for cell_range in workbook["Summary"].merged_cells}
+    assert "A1:G1" in {
+        str(cell_range) for cell_range in workbook["Risk Register"].merged_cells
+    }
     assert workbook["Invent"].freeze_panes == "C2"
     assert set(workbook["Checklist"].tables) == {"ChecklistTable"}
     assert set(workbook["Findings"].tables) == {"FindingsTable"}
@@ -141,7 +150,7 @@ def test_excel_matches_sql_report_flow_and_risk_register(tmp_path):
     assert len(workbook["Summary"].conditional_formatting) > 0
     assert workbook["Checklist"]["A1"].font.bold
     assert workbook["Checklist"]["A1"].fill.fgColor.rgb.endswith("305496")
-    assert workbook["Checklist"]["J2"].number_format == "0.00"
+    assert workbook["Checklist"]["L2"].number_format == "0"
     assert 10 <= workbook["Checklist"].column_dimensions["A"].width <= 60
 
 
@@ -174,7 +183,7 @@ def test_workspace_ids_and_scores_match_between_inventory_and_checklist(tmp_path
             check_id="NB-CACHE",
             ref="3.2.1",
             title="Notebook uses cache selectively",
-            pillar=Pillar.PERFORMANCE,
+            pillar=Pillar.DATA_PROCESSING,
             status=Status.FAIL,
             score=0,
             obj="Notebook Z",
