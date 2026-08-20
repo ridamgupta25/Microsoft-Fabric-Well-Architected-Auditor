@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import re
 
-from auditfast.core.check._notebook import executable_code
 from auditfast.core.check._pipeline import script_sql, walk_activities
 from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable, note
 from auditfast.core.check.registry import check
@@ -815,111 +814,6 @@ def semantic_model_deployment(ctx: CheckContext) -> Verdict:
     return graded(0, f"{len(models)} semantic model(s): workspace is {version_note} and no "
                      f"pipeline refreshes a semantic model — deployment is neither "
                      f"versioned nor orchestrated")
-
-
-# =============================================================================
-# 11.5.1 — unit tests for critical transformation logic
-# =============================================================================
-
-#: The word "test" standing alone or opening a CamelCase name — ``TestSalesLoad``,
-#: ``NB_unit_test``, and ``Run Unit Tests`` match; ``Latest_Load``, ``Contest``,
-#: and ``Tested_Rows`` do not. The case-insensitivity is scoped to the word so
-#: the trailing ``[A-Z0-9]`` boundary stays case-*sensitive* — that boundary is
-#: what separates ``TestSales`` from ``Tested``.
-_TEST_NAME_RE = re.compile(
-    r"(?:^|[_\-\s.])(?i:unit[_\-\s]?)?(?i:tests?|testing)(?=$|[_\-\s.]|[A-Z0-9])"
-)
-#: A real testing framework, or a test function/class declaration. Matched
-#: against *executable* code only, so a commented-out import proves nothing.
-_TEST_FRAMEWORK_RE = re.compile(
-    r"\bimport\s+unittest\b|\bfrom\s+unittest\b|unittest\.TestCase|unittest\.main\s*\(|"
-    r"\bimport\s+pytest\b|\bfrom\s+pytest\b|@pytest\.|pytest\.main\s*\(|"
-    r"\bimport\s+nutter\b|\bfrom\s+nutter\b|"
-    r"\bfrom\s+chispa\b|\bimport\s+chispa\b|assert_df_equality|assertDataFrameEqual|"
-    r"great_expectations|\bimport\s+soda\b|\bimport\s+deequ\b|pydeequ|"
-    r"^\s*def\s+test_\w+\s*\(|^\s*class\s+Test\w*\s*\(",
-    re.IGNORECASE | re.MULTILINE,
-)
-#: The notebook actually transforms data — i.e. it has logic worth unit testing.
-_TRANSFORM_WRITE_RE = re.compile(
-    r"\.write\b|saveAsTable\s*\(|\bINSERT\s+INTO\b|\bMERGE\s+INTO\b|"
-    r"\bCREATE\s+(?:OR\s+REPLACE\s+)?TABLE\b|\.saveAsTable\b",
-    re.IGNORECASE,
-)
-
-
-@check(
-    id="WS-UNIT-TESTS", ref="11.5.1",
-    title="Unit tests exist for critical transformation logic",
-    pillar=Pillar.DEVOPS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=(Layer.OPERATIONS,),
-    requires=[Resource.NOTEBOOK_DEFINITIONS, Resource.PIPELINE_DEFINITIONS], required=True,
-)
-def unit_tests_exist(ctx: CheckContext) -> Verdict:
-    """A workspace that transforms data holds tests in proportion to that logic.
-
-    A test asset is a notebook whose *name* marks it as a test, or whose
-    executable code uses a testing framework (``unittest``, ``pytest``,
-    ``chispa``, ``nutter``, Great Expectations, Deequ) or declares a ``test_``
-    function / ``Test`` class. A pipeline activity named as a test counts too,
-    since a test notebook is usually invoked from one.
-
-    Scored as *coverage*, not presence: the point asks that critical
-    transformation logic is tested, so nine test notebooks beside sixty untested
-    transforms is a partial result. Deliberately not satisfied by a bare
-    ``assert`` in load code: asserting a row count on production data is a
-    data-quality gate, not a unit test of the transformation logic. Comments are
-    stripped first, so a commented-out ``import pytest`` proves nothing.
-    """
-    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
-        return not_applicable("Notebook definitions could not be read from Fabric")
-
-    notebooks = ctx.workspace.notebooks
-    if not notebooks:
-        return not_applicable(
-            "Workspace has no notebook definitions, so there is no transformation "
-            "logic here to unit test"
-        )
-
-    transforming: list[str] = []
-    test_notebooks: list[str] = []
-    for name, definition in notebooks.items():
-        code = executable_code(definition)
-        if _TEST_NAME_RE.search(name) or _TEST_FRAMEWORK_RE.search(code):
-            test_notebooks.append(name)
-        elif _TRANSFORM_WRITE_RE.search(code):
-            transforming.append(name)
-
-    test_activities: list[str] = []
-    if ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
-        for pipeline_name, definition in ctx.workspace.pipelines.items():
-            for activity in walk_activities(definition):
-                if _TEST_NAME_RE.search(str(activity.get("name") or "")):
-                    test_activities.append(f"{pipeline_name}/{activity.get('name')}")
-
-    if not transforming and not test_notebooks:
-        return not_applicable(
-            f"None of the {len(notebooks)} notebook(s) writes a table, so the "
-            "workspace holds no transformation logic to unit test"
-        )
-
-    if not test_notebooks and not test_activities:
-        return binary(False, f"{len(transforming)} transformation notebook(s) write tables, "
-                             f"but no test notebook, test framework, or test activity was "
-                             f"found anywhere in the workspace")
-
-    # Coverage, not mere presence. The point asks that critical transformation
-    # logic *is* tested, so a handful of test notebooks beside a large body of
-    # untested transforms is a partial result, not a pass. One test asset is
-    # credited per transformation notebook; the helper clamps the ratio, so a
-    # workspace with more tests than transforms is simply fully covered.
-    tests = len(test_notebooks) + len(test_activities)
-    found = ", ".join(sorted(test_notebooks + test_activities)[:3])
-    return covered(
-        tests, len(transforming),
-        f"{len(test_notebooks)} test notebook(s) and {len(test_activities)} test "
-        f"activity(ies) against {len(transforming)} transformation notebook(s): {found}",
-    )
 
 
 # =============================================================================
