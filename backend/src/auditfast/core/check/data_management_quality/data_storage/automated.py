@@ -293,7 +293,7 @@ def wh_load_pattern(ctx: CheckContext) -> Verdict:
 @check(
     id="NB-NO-CURSOR", ref="3.6.2",
     title="Silver-to-Gold transformations are set-based (no row-by-row cursors)",
-    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def nb_no_cursor(ctx: CheckContext) -> Verdict:
