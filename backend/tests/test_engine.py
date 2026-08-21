@@ -413,10 +413,11 @@ def test_badly_named_workspace_fails_naming(provider):
 
 
 def test_every_scoreable_check_ref_has_remediation_text():
-    """A ref missing from remediation.yaml renders an empty recommendation.
+    """Every scoreable ref must have reviewed implementation guidance.
 
-    That failure is silent — the finding still appears, just with nothing telling
-    anyone what to do about it — so it is pinned here rather than left to review.
+    The engine has a check-specific fallback so a finding is never blank, but the
+    fallback cannot carry the Fabric-specific detail expected from reviewed text.
+    Missing entries are therefore pinned here rather than left to report review.
 
     Foundation checks are excluded: they describe the estate rather than judging
     it, never fail, and so have nothing to remediate.
@@ -450,6 +451,63 @@ def test_findings_all_carry_actionable_guidance(provider):
         if r.status in (Status.FAIL, Status.PARTIAL) and not r.recommendation
     ]
     assert silent == [], f"findings with no recommendation: {silent}"
+
+
+def test_recommendation_identifies_target_gap_action_and_verification(provider):
+    """Guidance must be specific enough to act on without guessing the target."""
+    from auditfast.services.project import load_project, load_remediation
+
+    from .conftest import PROJECT_FILE
+
+    results = _run(provider, remediation=load_remediation(load_project(PROJECT_FILE)))
+    finding = next(
+        r for r in results
+        if r.check_id == "NB-IMPORTS" and r.status is Status.FAIL
+    )
+
+    assert f'notebook "{finding.obj}"' in finding.recommendation
+    assert f'workspace "{finding.workspace}"' in finding.recommendation
+    assert f"Observed gap: {finding.evidence}" in finding.recommendation
+    assert "Action:" in finding.recommendation
+    assert "wildcard import" in finding.recommendation
+    assert f"confirm {finding.check_id} is PASS" in finding.recommendation
+
+
+def test_missing_remediation_uses_check_specific_fallback(provider):
+    """A project-level remediation omission must never produce a blank finding."""
+    finding = next(
+        r for r in _run(provider)
+        if r.check_id == "NB-IMPORTS" and r.status is Status.FAIL
+    )
+
+    assert finding.recommendation
+    assert finding.title in finding.recommendation
+    assert finding.check_id in finding.recommendation
+
+
+def test_high_volume_remediation_is_specific_and_detector_aware():
+    """Weak-signal checks must tell reviewers what to verify before changing code."""
+    from auditfast.services.project import load_project, load_remediation
+
+    from .conftest import PROJECT_FILE
+
+    book = load_remediation(load_project(PROJECT_FILE))
+    required_phrases = {
+        "2.4.1": ("retryintervalinseconds", "idempotent"),
+        "3.1.1": ("takes inputs", "missing signals"),
+        "3.2.4": ("do not add a broadcast hint blindly", "spark plan"),
+        "3.3.2": ("small-file", "outside the micro-batch path"),
+        "3.3.3": ("central maintenance", "retention"),
+        "3.3.6": ("table or environment", "effective setting"),
+        "3.5.2": ("spark ui", "adaptive query execution"),
+        "5.2.5": ("source count", "target count"),
+    }
+
+    for ref, phrases in required_phrases.items():
+        guidance = book.get(ref).lower()
+        assert all(phrase in guidance for phrase in phrases), (
+            f"ref {ref} needs detector-aware remediation containing {phrases}: {guidance}"
+        )
 
 
 def test_passing_checks_carry_no_severity_or_remediation(provider):
