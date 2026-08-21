@@ -8,47 +8,25 @@ from __future__ import annotations
 import re
 
 from auditfast.core.check._notebook import executable_code, notebook_code
-from auditfast.core.check.helpers import Verdict, binary, not_applicable, note
+from auditfast.core.check.helpers import Verdict, binary, graded, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import LAYER_ITEM_TYPES, Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
 
-#: Workspace-name fragments that reveal a layer role when the workspace is not
-#: explicitly tagged. Ordered so the more specific "store"/"consumption" hints
-#: win before the broad "prep"/"ops" ones. Matched case-insensitively as
-#: substrings, so ``MLC_DATAPREP_DEV`` and ``prj-data-store-qa`` both resolve.
-_LAYER_NAME_HINTS: tuple[tuple[str, Layer], ...] = (
-    ("dataprep", Layer.PREP),
-    ("data_prep", Layer.PREP),
-    ("datastore", Layer.STORAGE),
-    ("data_store", Layer.STORAGE),
-    ("storage", Layer.STORAGE),
-    ("datalog", Layer.LOGS),
-    ("data_log", Layer.LOGS),
-    ("dataops", Layer.OPERATIONS),
-    ("data_ops", Layer.OPERATIONS),
-    ("report", Layer.REPORTING),
-    ("semantic", Layer.REPORTING),
-    ("consumption", Layer.REPORTING),
+from ._layer import effective_layer
+
+#: Layer "concern groups" for spotting a single workspace that combines several
+#: layers. ``DataPipeline`` is Prep-only (a pipeline+notebook workspace is one
+#: concern, not two) and ``SQLEndpoint`` rides with its Lakehouse/Warehouse under
+#: Store, so neither inflates the mixed-layer count.
+_CONCERN_GROUPS: tuple[tuple[str, frozenset[str]], ...] = (
+    ("Prep", frozenset({"Notebook", "DataPipeline", "Dataflow", "CopyJob"})),
+    ("Store", frozenset({"Lakehouse", "Warehouse", "SQLDatabase", "SQLEndpoint",
+                         "MirroredWarehouse"})),
+    ("Consumption", frozenset({"SemanticModel", "Report", "Dashboard",
+                              "PaginatedReport"})),
+    ("Logs", frozenset({"Eventhouse", "KQLDatabase", "KQLDashboard", "Eventstream"})),
 )
-
-
-def _effective_layer(ctx: CheckContext) -> Layer:
-    """The workspace's layer role, inferred from its name when not tagged.
-
-    A workspace explicitly tagged with a single-layer role uses that. An
-    untagged (``MIXED``) workspace whose name carries a layer hint — the common
-    ``MLC_DATAPREP_*`` / ``*_DATA_STORE_*`` naming — is resolved from the name so
-    the separation rule still applies. A truly mixed workspace stays ``MIXED``.
-    """
-    layer = ctx.workspace.layer
-    if layer is not Layer.MIXED:
-        return layer
-    name = ctx.workspace.name.lower()
-    for fragment, hinted in _LAYER_NAME_HINTS:
-        if fragment in name:
-            return hinted
-    return Layer.MIXED
 
 _INPUT_READ = re.compile(
     r"spark\.read|\.read\.(?:csv|json|text|format)|json\.loads|from_json\s*\(|"
@@ -118,7 +96,7 @@ def layer_separation(ctx: CheckContext) -> Verdict:
     """The workspace does not hold item types that belong to a different layer."""
     if not ctx.workspace.has(Resource.ITEMS):
         return not_applicable("Workspace items could not be read from Fabric")
-    layer = _effective_layer(ctx)
+    layer = effective_layer(ctx.workspace)
     expected = LAYER_ITEM_TYPES.get(layer)
     if not expected:
         # A workspace with no single-layer role permits every item type, so there
@@ -137,6 +115,41 @@ def layer_separation(ctx: CheckContext) -> Verdict:
     return binary(
         not foreign,
         f"layer '{layer.value}': foreign item types found: {sorted(foreign) or ['none']}",
+    )
+
+
+@check(
+    id="WS-LAYER-OVERLOAD", ref="1.1.1",
+    title="Separation of concerns: an untagged/mixed workspace does not combine multiple layers' item types (Data Prep / Data Store / Data Consumption / Logs)",
+    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    requires=[Resource.ITEMS], required=True,
+)
+def layer_overload(ctx: CheckContext) -> Verdict:
+    """A mixed workspace should not combine item types from multiple layers."""
+    if not ctx.workspace.has(Resource.ITEMS):
+        return not_applicable("Workspace items could not be read from Fabric")
+    # A workspace that already resolves to one layer role is judged by
+    # WS-LAYER-SEP; this rule targets the untagged, everything-in-one case.
+    if effective_layer(ctx.workspace) is not Layer.MIXED:
+        return not_applicable(
+            "Workspace resolves to a single layer role; separation is judged by "
+            "WS-LAYER-SEP"
+        )
+    present = ctx.workspace.item_types()
+    matched = [
+        f"{name} ({', '.join(sorted(hit))})"
+        for name, types in _CONCERN_GROUPS
+        if (hit := present & types)
+    ]
+    if len(matched) <= 1:
+        return binary(
+            True,
+            f"Workspace holds a single concern: {matched[0] if matched else 'no layer-specific items'}",
+        )
+    return graded(
+        1 if len(matched) == 2 else 0,
+        f"Workspace mixes {len(matched)} layers: {'; '.join(matched)}. "
+        f"Separate these into layer-specific workspaces.",
     )
 
 

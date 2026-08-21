@@ -984,6 +984,20 @@ def _integrity_methods(code: str) -> list[str]:
     return methods
 
 
+def notebook_validates_post_failure_integrity(code: str) -> bool:
+    """The boolean core of 9.3.4, shared with the cross-workspace check.
+
+    True only when a recovery path compares two layers with a real method and
+    blocks continuation on a mismatch.
+    """
+    return bool(
+        _recovery_contexts(code)
+        and _cross_layer_pair(code)
+        and _integrity_methods(code)
+        and _INTEGRITY_ENFORCEMENT.search(code)
+    )
+
+
 @check(
     id="NB-POST-FAILURE-INTEGRITY", ref="9.3.4",
     title="Data integrity validated across layers after failures",

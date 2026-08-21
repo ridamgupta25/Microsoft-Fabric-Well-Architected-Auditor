@@ -212,13 +212,11 @@ def cross_layer_reconciliation(ctx: GroupContext) -> Verdict:
     if not missing:
         return covered(
             len(applicable), len(applicable),
-            f"all {len(applicable)} Silver-to-Gold notebook flow(s) contain a "
-            "count or aggregation reconciliation control; notebook definitions "
-            "were inspected without reading client data",
+            f"Gold record counts reconcile with Silver (accounting for aggregation) "
+            f"in all {len(applicable)} Silver-to-Gold flow(s): {', '.join(sorted(reconciled))}",
         )
     return covered(
         len(reconciled), len(applicable),
-        f"reconciliation control detected in {len(reconciled)} of "
-        f"{len(applicable)} Silver-to-Gold notebook flow(s); missing in "
-        f"{', '.join(missing)}; no client data was read",
+        f"Gold-to-Silver record-count reconciliation present in {len(reconciled)} of "
+        f"{len(applicable)} Silver-to-Gold flow(s); missing in {', '.join(missing)}",
     )

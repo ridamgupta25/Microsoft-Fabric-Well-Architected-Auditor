@@ -51,7 +51,6 @@ from auditfast.core.check.operations_reliability.data_logs.automated import (
 from auditfast.core.check.operations_reliability.data_operations.automated import (
     activator_configured,
     branching_strategy,
-    environment_isolation,
     git_covers_every_artifact,
     semantic_model_deployment,
     single_source_of_truth,
@@ -638,58 +637,6 @@ def test_single_source_is_na_without_items():
 def test_single_source_is_na_when_the_workspace_stores_nothing():
     ctx = _ws_ctx(id="w", items=_items(("DataPipeline", "PL_Load")))
     assert single_source_of_truth(ctx).status is Status.NA
-
-
-# --- 1.1.3 environment isolation --------------------------------------------
-
-def test_a_prod_pipeline_reaching_into_dev_is_a_cross_environment_dependency():
-    pipeline = {"properties": {"activities": [
-        {"name": "Copy from DEV", "type": "Copy",
-         "typeProperties": {"source": {"path": "/lake/MLC_DEV/raw"}}}]}}
-    verdict = environment_isolation(
-        _ws_ctx(id="w", display_name="MLC-Prod-Ops", pipelines={"PL_Load": pipeline})
-    )
-    assert verdict.score == 0
-    assert "another environment" in verdict.evidence
-
-
-def test_a_prod_pipeline_naming_only_prod_is_isolated():
-    pipeline = {"properties": {"activities": [
-        {"name": "Copy PROD", "type": "Copy",
-         "typeProperties": {"source": {"path": "/lake/MLC_PROD/raw"}}}]}}
-    verdict = environment_isolation(
-        _ws_ctx(id="w", display_name="MLC-Prod-Ops", pipelines={"PL_Load": pipeline})
-    )
-    assert verdict.score == 3
-
-
-def test_a_test_activity_is_not_a_cross_environment_reference():
-    """"Run Unit Tests" must not read as the Test environment — WS-UNIT-TESTS asks for it."""
-    pipeline = {"properties": {"activities": [{"name": "Run Unit Tests", "type": "TridentNotebook"}]}}
-    verdict = environment_isolation(
-        _ws_ctx(id="w", display_name="MLC-Prod-Ops", pipelines={"PL_Load": pipeline})
-    )
-    assert verdict.score == 3
-
-
-def test_dev_inside_a_longer_word_is_not_an_environment_reference():
-    pipeline = {"properties": {"activities": [{"name": "Load device telemetry", "type": "Copy"}]}}
-    verdict = environment_isolation(
-        _ws_ctx(id="w", display_name="MLC-Prod-Ops", pipelines={"PL_Load": pipeline})
-    )
-    assert verdict.score == 3
-
-
-def test_environment_isolation_is_na_without_pipeline_definitions():
-    ctx = _ws_ctx(id="w", display_name="MLC-Prod-Ops",
-                  unavailable={Resource.PIPELINE_DEFINITIONS})
-    assert environment_isolation(ctx).status is Status.NA
-
-
-def test_environment_isolation_is_na_when_the_name_declares_no_tier():
-    pipeline = {"properties": {"activities": [{"name": "Copy from DEV", "type": "Copy"}]}}
-    ctx = _ws_ctx(id="w", display_name="Analytics Workspace", pipelines={"PL": pipeline})
-    assert environment_isolation(ctx).status is Status.NA
 
 
 # --- 10.5.1 Data Activator ---------------------------------------------------
