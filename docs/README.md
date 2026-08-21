@@ -20,6 +20,7 @@ always produces the same score.
 | 7 | [api.md](api.md) | Call the API from a client, a script, or a test |
 | 8 | [migration.md](migration.md) | See what changed from the Flask original, what was reused, and why |
 | 9 | [scalability.md](scalability.md) | Plan for scale, Azure deployment, and the future AI layer |
+| 10 | [advisory-ai.md](advisory-ai.md) | Understand the AI-assisted advisory report for non-deterministic checks |
 
 New to the codebase? **getting-started.md** then **architecture.md**. The rest
 assumes their vocabulary.
