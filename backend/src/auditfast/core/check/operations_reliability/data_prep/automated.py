@@ -5,6 +5,7 @@ data comes from or goes to.
 """
 from __future__ import annotations
 
+import ast
 import json
 import re
 
@@ -795,6 +796,48 @@ def _explicit_transaction(code: str) -> bool:
     return bool(_TXN_CONTEXT.search(code) or (_TXN_BEGIN.search(code) and _TXN_END.search(code)))
 
 
+def _cell_transaction_write_count(code: str) -> int:
+    """Count terminal writes on the busiest feasible path through one cell."""
+    lexical_count = len(_TXN_WRITE_OP.findall(code))
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return lexical_count
+
+    def block_count(statements: list[ast.stmt]) -> int:
+        count = 0
+        for statement in statements:
+            if isinstance(statement, ast.If):
+                count += max(block_count(statement.body), block_count(statement.orelse))
+                continue
+            if isinstance(statement, (ast.Try, ast.TryStar)):
+                handler_count = max(
+                    (block_count(handler.body) for handler in statement.handlers),
+                    default=0,
+                )
+                count += (
+                    block_count(statement.body)
+                    + max(block_count(statement.orelse), handler_count)
+                    + block_count(statement.finalbody)
+                )
+                continue
+            source = ast.get_source_segment(code, statement) or ""
+            count += len(_TXN_WRITE_OP.findall(source))
+        return count
+
+    return block_count(tree.body)
+
+
+def _transaction_write_count(definition: dict) -> int:
+    """Count writes per cell so Fabric magics do not disable Python analysis."""
+    count = 0
+    for cell in (definition or {}).get("cells") or []:
+        if cell.get("cell_type") != "code":
+            continue
+        count += _cell_transaction_write_count(executable_code({"cells": [cell]}))
+    return count
+
+
 @check(
     id="NB-TXN-BOUNDARY", ref="9.3.3",
     title="Transaction boundaries defined for multi-step operations (incl. Warehouse loads)",
@@ -815,40 +858,40 @@ def notebook_transaction_boundary(ctx: CheckContext) -> Verdict:
         return not_applicable("Notebook definitions could not be read from Fabric")
 
     code = executable_code(ctx.obj)
-    writes = _TXN_WRITE_OP.findall(code)
-    if len(writes) < 2:
+    write_count = _transaction_write_count(ctx.obj)
+    if write_count < 2:
         return not_applicable(
-            f"Notebook '{ctx.obj_name}' performs {len(writes)} terminal write "
+            f"Notebook '{ctx.obj_name}' performs {write_count} terminal write "
             f"operation(s); at least 2 are required for a multi-step transaction "
             f"boundary assessment"
         )
 
     if _explicit_transaction(code):
-        return graded(3, f"Notebook '{ctx.obj_name}' has {len(writes)} writes bounded "
+        return graded(3, f"Notebook '{ctx.obj_name}' has {write_count} writes bounded "
                          f"by an explicit transaction (BEGIN/COMMIT/ROLLBACK or a "
                          f"managed connection commit)")
     if _TXN_STAGING_SWAP.search(code):
-        return graded(3, f"Notebook '{ctx.obj_name}' has {len(writes)} writes staged "
+        return graded(3, f"Notebook '{ctx.obj_name}' has {write_count} writes staged "
                          f"and swapped in atomically, so a mid-sequence failure leaves "
                          f"the published tables untouched")
     compensation = _transaction_compensation(code)
     if compensation:
-        return graded(3, f"Notebook '{ctx.obj_name}' has {len(writes)} writes bounded "
+        return graded(3, f"Notebook '{ctx.obj_name}' has {write_count} writes bounded "
                          f"by failure compensation inside an exception handler "
                          f"(matched '{compensation}')")
 
     atomic = len(_TXN_ATOMIC_WRITE.findall(code))
-    if atomic >= len(writes):
+    if atomic >= write_count:
         return graded(
             1,
-            f"Notebook '{ctx.obj_name}': all {len(writes)} writes are individually "
+            f"Notebook '{ctx.obj_name}': all {write_count} writes are individually "
             f"atomic (merge/overwrite/replace), but the sequence is unbounded: it has "
             f"no transaction, staging swap, or exception-handler compensation; a "
             f"failure part-way leaves the target set inconsistent",
         )
     return graded(
         0,
-        f"Notebook '{ctx.obj_name}': {len(writes)} dependent writes have no explicit "
+        f"Notebook '{ctx.obj_name}': {write_count} dependent writes have no explicit "
         f"transaction, staging swap, or compensation inside an exception handler; "
         f"a failure part-way through leaves the load half-applied",
     )
