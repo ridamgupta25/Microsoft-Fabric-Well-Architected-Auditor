@@ -134,6 +134,44 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_model: str | None = Field(default=None, description="Model/deployment name to call.")
 
+    # -- custom-checks guardrail (Node 1) -------------------------------------
+    # Upper bound on a user-submitted plain-English check, enforced first in the
+    # guardrail as a denial-of-service / unbounded-consumption guard.
+    guardrail_max_prompt_chars: int = Field(
+        default=2_000,
+        description="Reject a custom-check prompt longer than this (Node 1 ValidLength).",
+    )
+
+    # -- custom-checks semantic router (Node 2) -------------------------------
+    # Meaning-based matching is model-specific, so the embedding model is pinned
+    # and the thresholds are tuned to it. All optional: with AI off the router
+    # uses only the always-on deterministic matcher.
+    embedding_model: str = Field(
+        default="BAAI/bge-small-en-v1.5",
+        description="Pinned local embedding model (FastEmbed). Changing it invalidates the index.",
+    )
+    router_reuse_threshold: float = Field(
+        default=0.45,
+        description="Stage 1 deterministic confidence at/above which a check is a duplicate.",
+    )
+    router_retrieve_threshold: float = Field(
+        default=0.70,
+        description="Stage 2 cosine floor to gather semantic candidates for the critic.",
+    )
+    router_semantic_threshold: float = Field(
+        default=0.85,
+        description="Stage 2 cosine at/above which a candidate is a duplicate when no critic runs.",
+    )
+    router_top_k: int = Field(
+        default=5, description="How many semantic candidates to retrieve for the intent critic."
+    )
+
+    # -- custom-checks KB identifier (Node 3a) --------------------------------
+    kb_identifier_min_confidence: float = Field(
+        default=0.30,
+        description="Below this the identified KB field is flagged low-confidence (best guess).",
+    )
+
     @property
     def is_production(self) -> bool:
         return self.environment.lower() in {"prod", "production"}
