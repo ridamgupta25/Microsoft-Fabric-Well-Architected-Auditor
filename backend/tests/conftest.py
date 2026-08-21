@@ -48,6 +48,15 @@ EXPECTED_OVERALL = 49.57805907172996
 EXPECTED_SCORED_CHECKS = 158
 EXPECTED_RESULT_ROWS = 369
 
+#: The service/API path excludes the advisory (non-deterministic) checks from the
+#: deterministic scorecard and routes them to a separate Advisory report. These
+#: are the engine values above minus the advisory subset.
+EXPECTED_DETERMINISTIC_OVERALL = 48.97959183673469
+EXPECTED_DETERMINISTIC_SCORED = 147
+EXPECTED_DETERMINISTIC_RESULT_ROWS = 335
+EXPECTED_ADVISORY_SCORED = 11
+EXPECTED_ADVISORY_RESULT_ROWS = 34
+
 #: A session id the auth-service patch below always resolves to a token.
 #: Anything else — including a missing session — resolves to no token, so
 #: unauthenticated-request tests keep working unchanged.
@@ -58,6 +67,18 @@ FAKE_TOKEN = "test-token"
 @pytest.fixture(scope="session")
 def project_file() -> str:
     return str(PROJECT_FILE)
+
+
+@pytest.fixture(autouse=True)
+def _ai_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force AI off for every test, so a developer's local .env never leaks in.
+
+    Tests that exercise the AI path re-patch ``is_enabled`` themselves; this only
+    sets the hermetic default.
+    """
+    from auditfast.ai import orchestrator
+
+    monkeypatch.setattr(orchestrator, "is_enabled", lambda: False)
 
 
 @pytest.fixture

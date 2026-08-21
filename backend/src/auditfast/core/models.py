@@ -17,6 +17,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from .advisory import is_advisory
 from .enums import ITEM_TYPE_SCOPE, Automation, Layer, Pillar, Resource, Scope, Severity, Status
 from .validation import is_validated
 
@@ -516,6 +517,10 @@ class CheckSpec:
             # validation. Keyed by ref; source of truth:
             # auditfast.core.validation.VALIDATED_CHECKLIST.
             "validated": is_validated(self.ref),
+            # Whether this check is routed to the advisory (non-deterministic)
+            # report instead of the deterministic scorecard. Keyed by ref;
+            # source of truth: auditfast.core.advisory.ADVISORY_CHECKLIST.
+            "advisory": is_advisory(self.ref),
         }
 
 
@@ -560,6 +565,7 @@ class GroupCheckSpec:
             "options": [],
             "description": self.description or (self.fn.__doc__ or "").strip(),
             "validated": is_validated(self.ref),
+            "advisory": is_advisory(self.ref),
         }
 
 
@@ -625,6 +631,9 @@ class CheckResult:
             # validation. Keyed by ref; source of truth:
             # auditfast.core.validation.VALIDATED_CHECKLIST.
             "validated": is_validated(self.ref),
+            # Whether this check is routed to the advisory (non-deterministic)
+            # report. Keyed by ref; source: auditfast.core.advisory.
+            "advisory": is_advisory(self.ref),
         }
 
     @classmethod

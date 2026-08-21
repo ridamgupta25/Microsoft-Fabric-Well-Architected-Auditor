@@ -16,6 +16,7 @@ from pathlib import Path
 
 from ..clients import LiveFabricProvider
 from ..config.settings import get_settings
+from ..core.advisory import is_advisory
 from ..core.check.helpers import RemediationBook
 from ..core.check.registry import REGISTRY
 from ..core.engine import READ_INCOMPLETE_CHECK_ID
@@ -45,6 +46,10 @@ class AuditRun:
     results: list[CheckResult] = field(default_factory=list)
     errors: list[CheckResult] = field(default_factory=list)
     aggregate: dict = field(default_factory=dict)
+    #: Non-deterministic (advisory) checks, kept out of the deterministic score
+    #: and routed to a separate same-format Advisory report.
+    advisory_results: list[CheckResult] = field(default_factory=list)
+    advisory_aggregate: dict = field(default_factory=dict)
     files: dict[str, str] = field(default_factory=dict)
     #: Knowledge-base provenance: whether this report was served from the disk
     #: cache and whether a fresher live crawl is being (or should be) fetched.
@@ -388,12 +393,18 @@ def _build_run(project_name: str, raw_results: list[CheckResult]) -> AuditRun:
     """
     error_ids = {ACCESS_CHECK_ID, READ_INCOMPLETE_CHECK_ID}
     errors = [r for r in raw_results if r.check_id in error_ids]
-    results = [r for r in raw_results if r.check_id not in error_ids]
+    scored = [r for r in raw_results if r.check_id not in error_ids]
+    # Advisory (non-deterministic) checks are kept out of the deterministic
+    # scorecard and the main report; they go to a separate Advisory report.
+    results = [r for r in scored if not is_advisory(r.ref)]
+    advisory_results = [r for r in scored if is_advisory(r.ref)]
     return AuditRun(
         project_name=project_name,
         results=results,
         errors=errors,
         aggregate=aggregate(results),
+        advisory_results=advisory_results,
+        advisory_aggregate=aggregate(advisory_results),
     )
 
 
@@ -449,10 +460,14 @@ def run_audit(
         report["partial"] = True
         on_progress(report)  # type: ignore[misc]
 
+    deterministic_registry, advisory_registry = _split_registries()
+
+    # Stage 1 -- the deterministic audit. This crawl is what builds the KB.
     raw_results = run_engine(
         provider,
         targets,
         config.settings,
+        registry=deterministic_registry,
         pillars=_resolve_pillars(pillars),
         remediation=remediation,
         on_progress=_progress if on_progress else None,
@@ -514,7 +529,33 @@ def run_audit(
         "refreshing": served and not refresh and source == "live",
     }
     if out_dir:
-        run.files = write_reports(run, out_dir)
+        run.files.update(write_reports(run, out_dir))
+
+    # Stage 2 -- advisory (non-deterministic) checks, evaluated *after* the audit
+    # against the knowledge base the deterministic crawl just built. The same
+    # provider serves each workspace from cache, so there is no second crawl; the
+    # results stay out of the deterministic score and go to their own report.
+    advisory_raw = run_engine(
+        provider,
+        targets,
+        config.settings,
+        registry=advisory_registry,
+        pillars=_resolve_pillars(pillars),
+        remediation=remediation,
+        weights=weights,
+    )
+    error_ids = {ACCESS_CHECK_ID, READ_INCOMPLETE_CHECK_ID}
+    advisory_results = [r for r in advisory_raw if r.check_id not in error_ids]
+    # AI re-judges the advisory checks against the knowledge base for a more
+    # accurate verdict. When AI is off (the default) this is a no-op and the
+    # deterministic verdicts are kept unchanged.
+    advisory_results = _ai_judge_advisory(
+        advisory_results, provider, targets, advisory_registry
+    )
+    run.advisory_results = advisory_results
+    run.advisory_aggregate = aggregate(advisory_results)
+    if out_dir:
+        run.files.update(write_advisory_reports(run, out_dir))
     return run
 
 
@@ -565,6 +606,50 @@ def _single_check_registry(check_id: str):
     return narrow
 
 
+def _split_registries():
+    """Split the global registry into (deterministic, advisory) catalogs.
+
+    The deterministic catalog drives Stage 1 (the scored audit + KB build); the
+    advisory catalog drives Stage 2, evaluated afterwards against that KB. Keyed
+    by ref via ``is_advisory``, so moving a check between tiers is a one-line
+    edit in ``auditfast.core.advisory``.
+    """
+    from ..core.check.registry import CheckRegistry
+
+    deterministic = CheckRegistry()
+    advisory = CheckRegistry()
+    for spec in REGISTRY.all():
+        (advisory if is_advisory(spec.ref) else deterministic).register(spec)
+    return deterministic, advisory
+
+
+def _ai_judge_advisory(results, provider, targets, advisory_registry):
+    """Re-judge advisory results with AI grounded in the KB; no-op when AI is off.
+
+    Gathers each workspace's cached knowledge-base context (no second crawl) and
+    hands it to :mod:`auditfast.ai.advisory`, which rewrites the verdicts. Any
+    failure or a disabled model leaves the deterministic verdicts untouched.
+    """
+    if not results:
+        return results
+    from ..ai import advisory as ai_advisory
+    from ..ai import orchestrator as ai_orchestrator
+
+    if not ai_orchestrator.is_enabled():
+        return results
+    contexts: dict[str, WorkspaceContext] = {}
+    for workspace_id, layer in targets:
+        specs = [s for s in advisory_registry.select(layer=layer) if not s.manual]
+        if not specs:
+            continue
+        try:
+            ctx = provider.fetch(workspace_id, layer, advisory_registry.required_resources(specs))
+        except Exception:  # noqa: BLE001 - context is best-effort, never fatal
+            continue
+        contexts[ctx.name] = ctx
+    return ai_advisory.evaluate(results, contexts)
+
+
 # -- output -------------------------------------------------------------------
 
 def write_reports(run: AuditRun, out_dir: str | Path) -> dict[str, str]:
@@ -592,6 +677,45 @@ def write_reports(run: AuditRun, out_dir: str | Path) -> dict[str, str]:
     return {"markdown": str(markdown_path), "excel": str(excel_path)}
 
 
+def write_advisory_reports(run: AuditRun, out_dir: str | Path) -> dict[str, str]:
+    """Write the advisory (non-deterministic) reports -- identical format.
+
+    Built in Stage 2, after the deterministic audit, from the advisory checks
+    evaluated against the knowledge base. Returns empty when a run produced no
+    advisory results (e.g. a pillar filter excluded them all).
+    """
+    if not run.advisory_results:
+        return {}
+    from ..reporting.excel import build_excel
+    from ..reporting.markdown import build_markdown
+
+    directory = Path(out_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    advisory_name = f"{run.project_name} - Advisory (non-deterministic)"
+    advisory_md = directory / "advisory-report.md"
+    advisory_xlsx = directory / "advisory-report.xlsx"
+    advisory_md.write_text(
+        build_markdown(
+            advisory_name,
+            run.advisory_aggregate,
+            run.advisory_results,
+            run.errors,
+        ),
+        encoding="utf-8",
+    )
+    build_excel(
+        str(advisory_xlsx),
+        advisory_name,
+        run.advisory_aggregate,
+        run.advisory_results,
+        run.errors,
+    )
+    return {
+        "advisory_markdown": str(advisory_md),
+        "advisory_excel": str(advisory_xlsx),
+    }
+
+
 def to_json(run: AuditRun) -> dict:
     """Serialize a run for an API response."""
     agg = run.aggregate
@@ -609,6 +733,13 @@ def to_json(run: AuditRun) -> dict:
         "groups": run.groups,
         "weighted_by_environment": run.weighted_by_environment,
         "kb": run.kb,
+        "advisory": {
+            "overall": run.advisory_aggregate.get("overall"),
+            "by_pillar": run.advisory_aggregate.get("by_pillar", {}),
+            "counts": run.advisory_aggregate.get("counts", {}),
+            "total_scored": run.advisory_aggregate.get("total_scored", 0),
+            "results": [r.to_dict() for r in run.advisory_results],
+        },
         "errors": [
             {
                 "workspace": r.workspace,
