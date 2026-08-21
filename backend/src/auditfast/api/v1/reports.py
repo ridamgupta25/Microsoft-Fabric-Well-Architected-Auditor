@@ -21,6 +21,11 @@ DOWNLOADS: dict[str, tuple[str, str]] = {
         "audit-report.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ),
+    "advisory-markdown": ("advisory-report.md", "text/markdown"),
+    "advisory-excel": (
+        "advisory-report.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ),
 }
 
 

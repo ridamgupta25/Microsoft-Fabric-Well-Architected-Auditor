@@ -185,6 +185,15 @@ export function ReportPage() {
             <a className="btn-secondary" href={reportDownloadUrl(auditId, "excel")}>
               Excel
             </a>
+            {(report.advisory?.results.length ?? 0) > 0 && (
+              <a
+                className="btn-secondary"
+                href={reportDownloadUrl(auditId, "advisory-excel")}
+                title="Non-deterministic checks — reviewed separately from the score"
+              >
+                Advisory (Excel)
+              </a>
+            )}
           </div>
         </div>
       </section>

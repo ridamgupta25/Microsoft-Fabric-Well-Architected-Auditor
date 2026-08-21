@@ -147,6 +147,11 @@ class CheckResultOut(BaseModel):
         description="True once the check has completed Phase 1 validation; False "
         "while it is still pending validation for the next phase.",
     )
+    advisory: bool = Field(
+        default=False,
+        description="True when the check is non-deterministic and routed to the "
+        "separate Advisory report instead of the deterministic scorecard.",
+    )
 
 
 class WorkspaceError(BaseModel):
@@ -198,6 +203,16 @@ class KBProvenance(BaseModel):
     )
 
 
+class AdvisorySection(BaseModel):
+    """The non-deterministic checks, scored and reported independently."""
+
+    overall: float | None = None
+    by_pillar: dict[str, PillarScore] = Field(default_factory=dict)
+    counts: dict[str, int] = Field(default_factory=dict)
+    total_scored: int = 0
+    results: list[CheckResultOut] = Field(default_factory=list)
+
+
 class AuditReport(BaseModel):
     """The full result of a completed audit."""
 
@@ -239,6 +254,24 @@ class AuditReport(BaseModel):
         default_factory=KBProvenance,
         description="Provenance of the run's data (live, cache, or saved KB).",
     )
+    advisory: AdvisorySection = Field(
+        default_factory=AdvisorySection,
+        description="Non-deterministic (advisory) checks: excluded from the "
+        "deterministic score above and reported separately for human / KB review.",
+    )
+
+
+class AdvisorySection(BaseModel):
+    """The non-deterministic checks, scored and reported independently."""
+
+    overall: float | None = None
+    by_pillar: dict[str, PillarScore] = Field(default_factory=dict)
+    counts: dict[str, int] = Field(default_factory=dict)
+    total_scored: int = 0
+    results: list[CheckResultOut] = Field(default_factory=list)
+
+
+AuditReport.model_rebuild()
 class QuestionnaireItem(BaseModel):
     """One interactive, self-assessed checklist point for a run."""
 

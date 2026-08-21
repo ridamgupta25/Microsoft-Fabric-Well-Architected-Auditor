@@ -366,6 +366,17 @@ export interface AuditReport {
   files: Record<string, string>;
   /** Provenance of the run's data (live crawl, cache, or saved-KB replay). */
   kb?: KBProvenance;
+  /** Non-deterministic (advisory) checks, scored and reported separately. */
+  advisory?: AdvisorySection;
+}
+
+/** The non-deterministic checks, kept out of the deterministic scorecard. */
+export interface AdvisorySection {
+  overall: number | null;
+  by_pillar: Record<string, PillarScore>;
+  counts: Record<string, number>;
+  total_scored: number;
+  results: CheckResult[];
 }
 
 /** Where a completed run's data came from. */

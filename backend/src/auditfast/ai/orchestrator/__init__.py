@@ -20,11 +20,15 @@ from ...config.settings import get_settings
 def is_enabled() -> bool:
     """True only when AI is switched on *and* a provider is configured."""
     settings = get_settings()
-    return bool(
-        settings.ai_enabled
-        and settings.azure_openai_endpoint
-        and settings.azure_openai_deployment
-    )
+    if not settings.ai_enabled:
+        return False
+    if settings.ai_provider == "openai":
+        return bool(
+            settings.openai_base_url
+            and settings.openai_model
+            and settings.openai_api_key
+        )
+    return bool(settings.azure_openai_endpoint and settings.azure_openai_deployment)
 
 
 def complete(system: str, user: str, *, max_tokens: int = 700) -> str | None:
@@ -38,14 +42,25 @@ def complete(system: str, user: str, *, max_tokens: int = 700) -> str | None:
         return None
     settings = get_settings()
     try:  # pragma: no cover - exercised only when a live model is configured
-        from openai import AzureOpenAI
+        if settings.ai_provider == "openai":
+            # Any OpenAI-compatible gateway (MAQ AI, GitHub Models, OpenAI.com, Ollama).
+            from openai import OpenAI
 
-        client = AzureOpenAI(
-            azure_endpoint=settings.azure_openai_endpoint,  # type: ignore[arg-type]
-            api_version="2024-06-01",
-        )
+            client = OpenAI(
+                base_url=settings.openai_base_url,
+                api_key=settings.openai_api_key,
+            )
+            model = settings.openai_model
+        else:
+            from openai import AzureOpenAI
+
+            client = AzureOpenAI(
+                azure_endpoint=settings.azure_openai_endpoint,  # type: ignore[arg-type]
+                api_version="2024-06-01",
+            )
+            model = settings.azure_openai_deployment
         response = client.chat.completions.create(
-            model=settings.azure_openai_deployment,  # type: ignore[arg-type]
+            model=model,  # type: ignore[arg-type]
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
