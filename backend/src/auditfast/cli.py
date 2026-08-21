@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
 from .reporting.console import print_summary
 from .services import audit_service as service
@@ -108,6 +109,67 @@ def cmd_checks(args) -> int:
             f"{row['scope']:<11}{row['severity']:<9}{row['title']}"
         )
     print(f"\n{len(rows)} check(s).")
+    return EXIT_OK
+
+
+def cmd_advisory_apply(args) -> int:
+    """Apply externally-judged verdicts to the advisory report.
+
+    The offline counterpart to the API-key path: an audit writes
+    ``advisory-bundle.jsonl``, a reviewer (or an assistant with repository
+    access) judges it into a CSV, and this folds those verdicts back in and
+    rebuilds the advisory report.
+
+    The deterministic scorecard is never touched - only advisory refs are
+    accepted, and the rebuilt file is the advisory report alone.
+    """
+    from .ai.advisory_bundle import (
+        AdvisoryVerdictError,
+        apply_verdicts,
+        bundle_ids,
+        results_from_bundle,
+    )
+
+    bundle = Path(args.bundle)
+    try:
+        results = results_from_bundle(bundle)
+        judged, summary = apply_verdicts(
+            results, {}, args.verdicts, id_by_key=bundle_ids(bundle)
+        )
+    except AdvisoryVerdictError as exc:
+        print(f"Error: {exc}")
+        return EXIT_USAGE
+
+    print(f"bundle   : {bundle}  ({len(results)} advisory finding(s))")
+    print(f"verdicts : {args.verdicts}  ({summary['verdicts_in_file']} row(s))")
+    print(f"\n  applied                  : {summary['applied']}")
+    print(f"  skipped (low confidence) : {summary['skipped_low_confidence']}")
+    print(f"  unmatched findings       : {summary['unmatched']}")
+    print(f"  ignored verdict rows     : {summary['orphaned_verdicts']}")
+    if summary["rejected_non_advisory"]:
+        print(f"  REJECTED (not advisory)  : {summary['rejected_non_advisory']}")
+
+    if summary["orphaned_verdicts"]:
+        print("\n  Verdict rows that matched no finding in this bundle, e.g.")
+        print(f"  {', '.join(summary['orphaned_ids'])}")
+        print("  Usual causes: the verdicts were judged against a different (or")
+        print("  re-crawled) bundle, the wrong --bundle was passed, or an id was")
+        print("  altered in the CSV. A verdict is never applied to a finding it")
+        print("  was not judged against.")
+
+    if args.no_report:
+        return EXIT_OK
+
+    from .core.scoring import aggregate
+    from .services.audit_service import AuditRun, write_advisory_reports
+
+    out_dir = Path(args.out)
+    run = AuditRun(project_name=args.project_name)
+    run.advisory_results = judged
+    run.advisory_aggregate = aggregate(judged)
+    files = write_advisory_reports(run, out_dir)
+    for kind, path in sorted(files.items()):
+        print(f"\nwrote {kind}: {path}")
     return EXIT_OK
 
 
@@ -251,13 +313,31 @@ def build_parser() -> argparse.ArgumentParser:
     checklist.add_argument("--no-run", action="store_true",
                            help="Only assess/dedup the points; do not evaluate them over the KB")
 
+    advisory = sub.add_parser(
+        "advisory-apply",
+        help="Apply externally-judged verdicts to the advisory report",
+    )
+    advisory.add_argument("--verdicts", required=True,
+                          help="Path to the judged CSV (finding_id,score,...)")
+    advisory.add_argument("--bundle", default="output/advisory-bundle.jsonl",
+                          help="Bundle the verdicts were judged from")
+    advisory.add_argument("--out", default="output/advisory-judged",
+                          help="Output directory for the rebuilt advisory report "
+                               "(default: output/advisory-judged, so the audit's "
+                               "own advisory-report.xlsx is not overwritten)")
+    advisory.add_argument("--project-name", default="Advisory review",
+                          help="Project name shown on the rebuilt report")
+    advisory.add_argument("--no-report", action="store_true",
+                          help="Report what would be applied; write no file")
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     handlers = {"run": cmd_run, "serve": cmd_serve, "checks": cmd_checks,
-                "twin": cmd_twin, "checklist": cmd_checklist}
+                "twin": cmd_twin, "checklist": cmd_checklist,
+                "advisory-apply": cmd_advisory_apply}
     handler = handlers.get(args.command)
     if handler is None:  # pragma: no cover - argparse enforces the choice
         build_parser().print_help()

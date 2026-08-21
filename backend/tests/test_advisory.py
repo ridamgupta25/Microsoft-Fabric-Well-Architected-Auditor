@@ -15,6 +15,10 @@ from .conftest import (
     AUTHENTICATED_SESSION,
     EXPECTED_ADVISORY_RESULT_ROWS,
     EXPECTED_ADVISORY_SCORED,
+    EXPECTED_DETERMINISTIC_RESULT_ROWS,
+    EXPECTED_DETERMINISTIC_SCORED,
+    EXPECTED_RESULT_ROWS,
+    EXPECTED_SCORED_CHECKS,
 )
 
 
@@ -41,6 +45,30 @@ def test_every_advisory_ref_is_a_registered_check():
     registered = {spec.ref for spec in REGISTRY.all()}
     missing = sorted(ADVISORY_REFS - registered)
     assert not missing, f"advisory refs with no registered check: {missing}"
+
+
+def test_the_pins_reconcile_across_the_advisory_split():
+    """deterministic + advisory must equal the total, for rows and scored checks.
+
+    The two halves are pinned separately, so a change that adds rows has to
+    update both. One that updated only the total left the deterministic pin
+    stale, and the failure surfaced in an unrelated API test with no hint of the
+    cause. Checking the arithmetic here says plainly which pin is wrong.
+    """
+    assert (
+        EXPECTED_DETERMINISTIC_RESULT_ROWS + EXPECTED_ADVISORY_RESULT_ROWS
+        == EXPECTED_RESULT_ROWS
+    ), (
+        f"{EXPECTED_DETERMINISTIC_RESULT_ROWS} deterministic + "
+        f"{EXPECTED_ADVISORY_RESULT_ROWS} advisory != {EXPECTED_RESULT_ROWS} total rows"
+    )
+    assert (
+        EXPECTED_DETERMINISTIC_SCORED + EXPECTED_ADVISORY_SCORED
+        == EXPECTED_SCORED_CHECKS
+    ), (
+        f"{EXPECTED_DETERMINISTIC_SCORED} deterministic + "
+        f"{EXPECTED_ADVISORY_SCORED} advisory != {EXPECTED_SCORED_CHECKS} scored"
+    )
 
 
 def test_advisory_and_deterministic_results_are_disjoint(client):

@@ -5,7 +5,6 @@ deployment/test posture of the operational estate.
 """
 from __future__ import annotations
 
-import json
 import re
 
 from auditfast.core.check._pipeline import script_sql, walk_activities

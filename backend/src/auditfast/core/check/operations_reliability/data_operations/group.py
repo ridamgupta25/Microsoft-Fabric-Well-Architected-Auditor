@@ -9,7 +9,6 @@ when the data needed to compare is missing.
 from __future__ import annotations
 
 import json
-
 import re
 
 from auditfast.core.check import _xw

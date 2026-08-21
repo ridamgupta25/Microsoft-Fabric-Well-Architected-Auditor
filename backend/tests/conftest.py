@@ -50,10 +50,19 @@ EXPECTED_RESULT_ROWS = 371
 
 #: The service/API path excludes the advisory (non-deterministic) checks from the
 #: deterministic scorecard and routes them to a separate Advisory report. These
-#: are the engine values above minus the advisory subset.
+#: are the engine values above minus the advisory subset, so they must reconcile:
+#:
+#:     EXPECTED_DETERMINISTIC_RESULT_ROWS + EXPECTED_ADVISORY_RESULT_ROWS
+#:         == EXPECTED_RESULT_ROWS
+#:     EXPECTED_DETERMINISTIC_SCORED + EXPECTED_ADVISORY_SCORED
+#:         == EXPECTED_SCORED_CHECKS
+#:
+#: Check that when a pin moves. A change that adds rows has to update both the
+#: total and its deterministic half; updating only one leaves the pair
+#: inconsistent and the failure surfaces in an unrelated API test.
 EXPECTED_DETERMINISTIC_OVERALL = 48.97959183673469
 EXPECTED_DETERMINISTIC_SCORED = 147
-EXPECTED_DETERMINISTIC_RESULT_ROWS = 335
+EXPECTED_DETERMINISTIC_RESULT_ROWS = 337
 EXPECTED_ADVISORY_SCORED = 11
 EXPECTED_ADVISORY_RESULT_ROWS = 34
 
