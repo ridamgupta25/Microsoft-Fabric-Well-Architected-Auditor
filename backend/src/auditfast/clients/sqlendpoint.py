@@ -609,10 +609,9 @@ _METADATA_STATEMENTS: tuple[tuple[str, str], ...] = (
     # always 0 and proves nothing. sys.dm_db_stats_properties, which would give
     # modification_counter for real staleness, is not available on Warehouse.
     ("database_options", """
-        SELECT is_auto_create_stats_on, is_auto_update_stats_on,
+        SELECT name, is_auto_create_stats_on, is_auto_update_stats_on,
                is_auto_update_stats_async_on
         FROM sys.databases
-        WHERE name = DB_NAME()
     """),
     # Database-scoped principals and role membership. Workspace role assignments
     # come from Fabric REST and frequently need a permission the sign-in lacks;

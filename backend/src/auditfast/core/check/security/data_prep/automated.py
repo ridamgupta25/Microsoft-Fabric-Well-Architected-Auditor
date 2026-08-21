@@ -22,42 +22,63 @@ from auditfast.core.check.registry import check
 from auditfast.core.enums import Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
 
-#: Column-name words that mark a value as personal data. Kept to names whose
-#: meaning is unambiguous — ``name`` alone is excluded because ``table_name``,
-#: ``file_name`` and ``column_name`` are metadata, not people.
-_PII_WORD = (
-    r"(?:email|e_mail|phone|mobile|telephone|msisdn|ssn|social_security|"
+#: Column-name words that mark a value as personal data.
+#:
+#: **Deliberately short.** This list holds only terms that name a person or a
+#: government/financial identifier and have no ordinary technical meaning, so a
+#: match is personal data wherever it appears.
+#:
+#: A wider list was tried and removed. It carried ``mobile``, ``telephone``,
+#: ``first_name`` / ``last_name`` / ``full_name``, the ``*_address`` forms and
+#: ``account_number``, gated behind a "two of these must appear" rule. Every one
+#: of them has a common innocent meaning, and on a real estate they produced
+#: nearly all of this check's false findings:
+#:
+#: * ``full_name`` matched ``source_table_full_name`` and ``dest_full_name`` -
+#:   fully-qualified *table* names. 23 notebooks about company sites, inventory
+#:   parts, GL vouchers and production tonnage were reported as carrying
+#:   personal data.
+#: * ``mobile`` matched "Mobile Brokered Stone" (a product) and "Mobile" (a
+#:   plant in Alabama).
+#: * ``account_number`` matched GL account numbers in finance notebooks.
+#:
+#: The corroboration rule reduced that but could not fix it, because two
+#: innocent terms corroborate each other just as readily as two real ones. A
+#: missed notebook is reported as N/A and can be reviewed by hand; a false FAIL
+#: on 23 notebooks teaches people to ignore the check. Precision wins here.
+_PII_UNAMBIGUOUS = (
+    r"(?:e_?mail|phone|msisdn|ssn|social_security|"
     r"national_id|nationalid|passport|driver_?licen[cs]e|tax_?id|"
-    r"credit_?card|card_?number|pan_?number|iban|account_?number|"
-    r"date_?of_?birth|birth_?date|\bdob\b|"
-    r"first_?name|last_?name|full_?name|sur_?name|given_?name|"
-    r"home_?address|postal_?address|street_?address|\bpii\b)"
+    r"credit_?card|card_?number|pan_?number|iban|"
+    r"date_?of_?birth|birth_?date|\bdob\b|\bpii\b)"
 )
-#: A PII word only counts when it appears as a **column reference**, not as a
-#: substring of some longer identifier. The previous pattern wrapped every term
-#: in ``\w*…\w*``, so any word merely *containing* one matched: a notebook
-#: standardising column names could hit on ``account_number`` in a rename list
-#: and be scored 0 - "raw PII is carried through unchanged" - while handling no
-#: personal data at all.
+
+_PII_WORD = _PII_UNAMBIGUOUS
+#: A PII word counts only when it forms a **whole column-name segment**, not
+#: when it is buried inside a longer identifier. The old pattern allowed up to
+#: 12 arbitrary characters on either side, so ``full_name`` matched
+#: ``source_table_full_name`` - a fully-qualified table name - and ``email``
+#: matched the pattern string ``.*email.*`` in a column-classification rule.
 #:
-#: This matters more than usual because Fabric offers no alternative. Sensitivity
-#: labels are item-level only (Power BI Scanner API, tenant admin), and Purview's
-#: column classifications live in a separate catalog, so for a delegated
-#: read-only tool the column name in the code is the only available signal. It
-#: has to be read precisely.
-#:
-#: The delimiters are the ways a column is actually referenced in PySpark/SQL:
-#: quoted (``"email"``, ``'email'``), attribute (``df.email``), subscript
-#: (``df["email"]``), a ``col()``/``F.col()`` call, or a bare SQL identifier
-#: bounded by whitespace, comma, parenthesis or backtick.
-_PII_CONTEXT = re.compile(
-    r"""(?:
-          ["'`]\s*\w{0,12}""" + _PII_WORD + r"""\w{0,12}\s*["'`]   # "email_address"
-        | \.\s*""" + _PII_WORD + r"""\w{0,12}\b                     # df.email
-        | \b""" + _PII_WORD + r"""\w{0,12}\s*(?=[,)\]\s=])          # email_address,
-    )""",
-    re.IGNORECASE | re.VERBOSE,
-)
+#: A qualifier is allowed on either side only when it is separated by ``_``:
+#: ``customer_email`` and ``email_address`` are column names, while
+#: ``source_table_full_name`` is not, because ``full_name`` there is the tail of
+#: a longer compound whose head (``source_table``) says what it really is.
+#: ``\w*`` after an underscore keeps genuine two-word columns without letting a
+#: term float anywhere inside an identifier.
+def _pii_context(word: str) -> re.Pattern:
+    qualified = r"(?:\w+_)?" + word + r"(?:_\w+)?"
+    return re.compile(
+        r"""(?:
+              ["'`]\s*""" + qualified + r"""\s*["'`]     # "customer_email"
+            | \.\s*""" + qualified + r"""\b              # df.customer_email
+            | \b""" + qualified + r"""\s*(?=[,)\]\s=])   # customer_email,
+        )""",
+        re.IGNORECASE | re.VERBOSE,
+    )
+
+
+_PII_CONTEXT = _pii_context(_PII_WORD)
 
 #: The value is replaced by something irreversible or reversible-only-with-a-key.
 #: Each alternative is a call, so a comment or a column named ``mask_flag``
@@ -177,9 +198,20 @@ def notebook_pii_is_tokenised(ctx: CheckContext) -> Verdict:
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
     code = executable_code(ctx.obj)
+
+    # Every term in the list is personal data on its own, so one match opens the
+    # gate. The corroboration rule that used to sit here existed only to hold
+    # back ambiguous terms (mobile, full_name, account_number); those terms are
+    # gone, so the rule has nothing left to guard.
     if not _PII_CONTEXT.search(code):
-        return not_applicable("Notebook references no personal-data column (email, phone, "
-                              "national id, card number, name, address …)")
+        return not_applicable(
+            "Notebook references no personal-data column. Only unambiguous terms "
+            "count - email, phone, ssn, passport, credit_card, date_of_birth and "
+            "the like - because terms that double as ordinary technical "
+            "vocabulary produced false findings: a fully-qualified table name "
+            "ending in full_name, a GL account_number, and a plant called Mobile "
+            "are not someone's data"
+        )
 
     tokenised = _near_pii(_TOKENISATION, code)
     validated = _near_pii(_FORMAT_VALIDATION, code)

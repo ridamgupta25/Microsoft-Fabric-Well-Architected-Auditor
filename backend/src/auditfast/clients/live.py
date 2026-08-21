@@ -884,13 +884,32 @@ class LiveFabricProvider:
                 continue
 
         def table_entry(object_id) -> dict | None:
-            """The context table an object id belongs to, if it is one we hold."""
+            """The context table an object id belongs to, if it is one we hold.
+
+            **The key must be built the way the column reader built it**, not
+            guessed at. ``SqlEndpointReader.columns`` files a Warehouse table as
+            ``<schema>.<table>`` and a Lakehouse table under its bare name, so
+            looking up the bare name alone matched nothing on a Warehouse: the
+            IDENTITY, foreign-key, key-constraint and row-count reads all
+            returned their rows and attached none of them, silently, on every
+            Warehouse ever crawled.
+
+            The store-prefixed spelling is tried last because the same reader
+            falls back to ``<store>.<table>`` when two stores hold a table of the
+            same name.
+            """
             info = objects.get(int(object_id)) if object_id is not None else None
             if not info:
                 return None
-            name = info[1]
-            return (ctx.tables.get(name)
-                    or ctx.tables.get(f"{endpoint.name}.{name}"))
+            schema, name = info[0], info[1]
+            qualified = f"{schema}.{name}" if schema else name
+            primary = qualified if endpoint.kind == "Warehouse" else name
+            for key in (primary, name, qualified,
+                        f"{endpoint.name}.{primary}", f"{endpoint.name}.{name}"):
+                entry = ctx.tables.get(key)
+                if entry is not None:
+                    return entry
+            return None
 
         for row in sets.get("row_counts", ()):
             entry = table_entry(row[0])
@@ -927,14 +946,24 @@ class LiveFabricProvider:
             if row[1] not in identity:
                 identity.append(str(row[1]))
 
-        # Database-level automatic-statistics switches, per store. Off is a real
+        # Database-level automatic-statistics switches. Off is a real
         # misconfiguration a user can reach and we can read - unlike NORECOMPUTE,
         # which Fabric refuses to set at all.
+        #
+        # Keyed by the database name the row carries, not by the endpoint: one
+        # SQL endpoint exposes several databases (its own plus `master` and the
+        # dataflow staging stores), and an earlier `WHERE name = DB_NAME()`
+        # filter matched none of them, so this read silently returned nothing
+        # while `sys.stats` on the same connection worked. `master` is skipped -
+        # it is a system database nobody configures.
         for row in sets.get("database_options", ()):
-            ctx.warehouse_options[endpoint.name] = {
-                "auto_create_stats": bool(row[0]) if row[0] is not None else None,
-                "auto_update_stats": bool(row[1]) if row[1] is not None else None,
-                "auto_update_stats_async": bool(row[2]) if len(row) > 2 and row[2] is not None else None,
+            database = str(row[0] or "").strip()
+            if not database or database.lower() == "master":
+                continue
+            ctx.warehouse_options[database] = {
+                "auto_create_stats": bool(row[1]) if row[1] is not None else None,
+                "auto_update_stats": bool(row[2]) if row[2] is not None else None,
+                "auto_update_stats_async": bool(row[3]) if len(row) > 3 and row[3] is not None else None,
             }
 
         for row in sets.get("stats", ()):
@@ -1486,7 +1515,7 @@ class LiveFabricProvider:
             fetched = self._fetch_items_parallel(
                 environments, lambda it: self._environment_definition(workspace_id, it.id))
             attempted = read = forbidden = transient = 0
-            for item, (definition, failure) in zip(environments, fetched):
+            for item, (definition, failure) in zip(environments, fetched, strict=True):
                 attempted += 1
                 if failure == "forbidden":
                     forbidden += 1
@@ -1519,7 +1548,7 @@ class LiveFabricProvider:
             fetched = self._fetch_items_parallel(
                 pipelines, lambda it: self._pipeline_definition(workspace_id, it.id))
             attempted = read = forbidden = transient = empty = 0
-            for item, (definition, failure) in zip(pipelines, fetched):
+            for item, (definition, failure) in zip(pipelines, fetched, strict=True):
                 attempted += 1
                 if failure == "forbidden":
                     forbidden += 1
@@ -1545,7 +1574,7 @@ class LiveFabricProvider:
 
             fetched = self._fetch_items_parallel(found, _notebook_bundle)
             attempted = read = forbidden = transient = empty = 0
-            for item, (definition, failure, monitoring) in zip(found, fetched):
+            for item, (definition, failure, monitoring) in zip(found, fetched, strict=True):
                 attempted += 1
                 if failure == "forbidden":
                     forbidden += 1
@@ -1577,7 +1606,13 @@ class LiveFabricProvider:
             fetched = self._fetch_items_parallel(
                 lakehouses, lambda it: self._lakehouse_tables(workspace_id, it.id))
             attempted = read = forbidden = transient = 0
-            for item, (tables, failure) in zip(lakehouses, fetched):
+            # ``item`` is intentionally unused: a Lakehouse table is stored under
+            # its own name, not the Lakehouse's. Two Lakehouses holding a table
+            # of the same name therefore collide here - the second wins - which
+            # the SQL column reader repairs by re-filing collisions under
+            # ``<store>.<table>``. Keeping the unpacking symmetrical with every
+            # other parallel-fetch loop is worth more than renaming this one.
+            for _item, (tables, failure) in zip(lakehouses, fetched, strict=True):
                 attempted += 1
                 if failure == "forbidden":
                     forbidden += 1
@@ -1626,7 +1661,7 @@ class LiveFabricProvider:
                 fetched = self._fetch_items_parallel(
                     lakehouses,
                     lambda it: onelake.lakehouse_files_summary(workspace_id, it.id))
-                for item, (summary, failure) in zip(lakehouses, fetched):
+                for item, (summary, failure) in zip(lakehouses, fetched, strict=True):
                     attempted += 1
                     if failure == "forbidden":
                         forbidden += 1
@@ -1661,7 +1696,7 @@ class LiveFabricProvider:
             fetched = self._fetch_items_parallel(
                 warehouses, lambda it: self._warehouse_audit(workspace_id, it.id))
             attempted = read = forbidden = transient = empty = 0
-            for item, (settings, failure) in zip(warehouses, fetched):
+            for item, (settings, failure) in zip(warehouses, fetched, strict=True):
                 attempted += 1
                 if failure == "forbidden":
                     forbidden += 1
@@ -1689,7 +1724,7 @@ class LiveFabricProvider:
             fetched = self._fetch_items_parallel(
                 reflexes, lambda it: self._reflex_definition(workspace_id, it.id))
             attempted = read = forbidden = transient = empty = 0
-            for item, (summary, failure) in zip(reflexes, fetched):
+            for item, (summary, failure) in zip(reflexes, fetched, strict=True):
                 attempted += 1
                 if failure == "forbidden":
                     forbidden += 1
@@ -1716,7 +1751,7 @@ class LiveFabricProvider:
                 lambda it: self._item_shortcuts(workspace_id, it.id))
             total = 0
             attempted = failed = 0
-            for item, (shortcuts, known) in zip(shortcut_lakehouses, fetched):
+            for item, (shortcuts, known) in zip(shortcut_lakehouses, fetched, strict=True):
                 attempted += 1
                 if not known:
                     failed += 1
@@ -1736,7 +1771,7 @@ class LiveFabricProvider:
             fetched = self._fetch_items_parallel(
                 models, lambda it: self._semantic_model_definition(workspace_id, it.id))
             attempted = read = forbidden = transient = empty = 0
-            for item, (model, failure) in zip(models, fetched):
+            for item, (model, failure) in zip(models, fetched, strict=True):
                 attempted += 1
                 if failure == "forbidden":
                     forbidden += 1
@@ -1765,7 +1800,7 @@ class LiveFabricProvider:
                 lambda it: self._semantic_model_refresh_schedule(workspace_id, it.id))
             attempted = read = forbidden = transient = 0
             schedule_reasons: dict[str, int] = {}
-            for item, (schedule, failure) in zip(schedule_models, fetched):
+            for item, (schedule, failure) in zip(schedule_models, fetched, strict=True):
                 attempted += 1
                 if failure == "forbidden":
                     forbidden += 1
