@@ -128,7 +128,10 @@ export async function runSingleCheck(
   return data;
 }
 
-export function reportDownloadUrl(auditId: string, kind: "markdown" | "excel"): string {
+export function reportDownloadUrl(
+  auditId: string,
+  kind: "markdown" | "excel" | "advisory-markdown" | "advisory-excel",
+): string {
   return downloadUrl(`/reports/${auditId}/download/${kind}`);
 }
 

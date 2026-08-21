@@ -13,9 +13,9 @@ from auditfast.core.check.registry import REGISTRY
 
 from .conftest import (
     AUTHENTICATED_SESSION,
-    EXPECTED_OVERALL,
-    EXPECTED_RESULT_ROWS,
-    EXPECTED_SCORED_CHECKS,
+    EXPECTED_DETERMINISTIC_OVERALL,
+    EXPECTED_DETERMINISTIC_RESULT_ROWS,
+    EXPECTED_DETERMINISTIC_SCORED,
 )
 
 
@@ -115,8 +115,9 @@ def test_audit_is_accepted_then_completes_with_the_expected_score(client):
 
     finished = _wait_for_audit(client, body["audit_id"])
     assert finished["status"] == "succeeded"
-    # The API must produce exactly the score the engine does.
-    assert finished["report"]["overall"] == EXPECTED_OVERALL
+    # The API's deterministic scorecard excludes the advisory (non-deterministic)
+    # checks, which are reported separately.
+    assert finished["report"]["overall"] == EXPECTED_DETERMINISTIC_OVERALL
 
 
 def test_report_endpoint_returns_the_full_scorecard(client):
@@ -124,9 +125,9 @@ def test_report_endpoint_returns_the_full_scorecard(client):
     _wait_for_audit(client, audit_id)
 
     report = client.get(f"/api/v1/reports/{audit_id}").json()
-    assert report["overall"] == EXPECTED_OVERALL
-    assert report["total_scored"] == EXPECTED_SCORED_CHECKS
-    assert len(report["results"]) == EXPECTED_RESULT_ROWS
+    assert report["overall"] == EXPECTED_DETERMINISTIC_OVERALL
+    assert report["total_scored"] == EXPECTED_DETERMINISTIC_SCORED
+    assert len(report["results"]) == EXPECTED_DETERMINISTIC_RESULT_ROWS
     # "Not assessed" must survive the API boundary as null rather than 0 — the
     # two mean different things to a reader. Asserted over whichever pillars
     # actually scored nothing, because naming one makes the test a hostage to

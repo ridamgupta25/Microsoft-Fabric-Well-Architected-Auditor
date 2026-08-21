@@ -119,10 +119,20 @@ class Settings(BaseSettings):
         description="Async SQLAlchemy URL. When unset, audit history is disabled.",
     )
 
-    # -- AI (not yet wired up) ------------------------------------------------
+    # -- AI (optional; off by default) ----------------------------------------
+    # Advisory checks can be re-judged by an LLM. Two providers are supported:
+    #   * ``azure``  — Azure OpenAI (endpoint + deployment; key via AZURE_OPENAI_API_KEY)
+    #   * ``openai`` — any OpenAI-compatible gateway (MAQ AI, GitHub Models,
+    #     OpenAI.com, Ollama, ...): base URL + model + key.
     ai_enabled: bool = False
+    ai_provider: str = Field(default="azure", description="azure | openai")
     azure_openai_endpoint: str | None = None
     azure_openai_deployment: str | None = None
+    openai_base_url: str | None = Field(
+        default=None, description="OpenAI-compatible gateway base URL, e.g. https://.../v1"
+    )
+    openai_api_key: str | None = None
+    openai_model: str | None = Field(default=None, description="Model/deployment name to call.")
 
     @property
     def is_production(self) -> bool:
