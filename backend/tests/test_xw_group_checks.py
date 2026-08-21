@@ -9,14 +9,17 @@ from __future__ import annotations
 
 import pytest
 
+from auditfast.core.check.data_management_quality.data_operations.group import (
+    layer_separation_consistent,
+)
 from auditfast.core.check.data_management_quality.data_storage.group import (
     aggregate_consistency,
     cross_layer_reconciliation,
 )
 from auditfast.core.check.registry import GROUP_REGISTRY, CheckRegistry
 from auditfast.core.engine import run_audit
-from auditfast.core.enums import Layer, Resource, Scope, Status
-from auditfast.core.models import GroupContext, GroupMemberContext, WorkspaceContext
+from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity, Status
+from auditfast.core.models import GroupContext, GroupMemberContext, Item, WorkspaceContext
 
 from .conftest import FIXTURE_SETTINGS
 
@@ -173,7 +176,7 @@ def test_cross_layer_reconciliation_passes_without_reading_table_data():
         _layer_recon_group((_RECONCILED_FLOW, _RECONCILED_FLOW))
     )
     assert verdict.score == 3
-    assert "without reading client data" in verdict.evidence
+    assert "Gold record counts reconcile with Silver" in verdict.evidence
 
 
 def test_cross_layer_reconciliation_fails_when_one_flow_has_no_control():
@@ -304,6 +307,62 @@ def test_layer_separation_group_check_is_na_with_a_single_readable_member(provid
     assert row.scored is False
 
 
+def _layer_group(*workspaces: WorkspaceContext) -> GroupContext:
+    members = tuple(
+        GroupMemberContext(workspace, index + 1, workspace.layer)
+        for index, workspace in enumerate(workspaces)
+    )
+    return GroupContext(name="Sales", members=members, settings={})
+
+
+def _workspace(name: str, layer: Layer, *item_types: str) -> WorkspaceContext:
+    return WorkspaceContext(
+        id=name,
+        display_name=name,
+        layer=layer,
+        items=[
+            Item(id=f"{name}-{index}", type=item_type, display_name=item_type)
+            for index, item_type in enumerate(item_types)
+        ],
+    )
+
+
+def test_layer_separation_group_requires_expected_content():
+    verdict = layer_separation_consistent(_layer_group(
+        _workspace("Prep-Dev", Layer.PREP, "Notebook"),
+        _workspace("Prep-Prod", Layer.PREP),
+    ))
+    assert verdict.coverage == 0.5
+    assert verdict.score == 1
+
+
+def test_layer_separation_group_rejects_foreign_content():
+    verdict = layer_separation_consistent(_layer_group(
+        _workspace("Prep-Dev", Layer.PREP, "Notebook"),
+        _workspace("Prep-Prod", Layer.PREP, "Notebook", "Lakehouse"),
+    ))
+    assert verdict.coverage == 0.5
+    assert verdict.score == 1
+
+
+def test_layer_separation_group_infers_an_untagged_workspace_layer():
+    verdict = layer_separation_consistent(_layer_group(
+        _workspace("Sales_DataPrep_Dev", Layer.MIXED, "Notebook"),
+        _workspace("Sales_DataPrep_Prod", Layer.MIXED, "DataPipeline"),
+    ))
+    assert verdict.coverage == 1.0
+    assert verdict.score == 3
+
+
+def test_layer_separation_group_excludes_an_unresolved_mixed_workspace():
+    verdict = layer_separation_consistent(_layer_group(
+        _workspace("Sales-Dev", Layer.MIXED, "Notebook", "Lakehouse"),
+        _workspace("Sales-Prod", Layer.PREP, "Notebook"),
+    ))
+    assert verdict.status is Status.NA
+    assert verdict.scored is False
+
+
 # -- XW-ENV-ISOLATION: the cross-workspace angle of ref 1.1.3 ------------------
 
 def test_env_isolation_group_check_is_registered_with_remediation():
@@ -314,6 +373,12 @@ def test_env_isolation_group_check_is_registered_with_remediation():
     spec = GROUP_REGISTRY.get("XW-ENV-ISOLATION")
     assert spec is not None, "XW-ENV-ISOLATION not registered"
     assert spec.ref == "1.1.3"
+    assert spec.title == (
+        "Environment isolation enforced (Dev / QA / Prod workspaces have no "
+        "shared mutable artifacts or cross-env dependencies)"
+    )
+    assert spec.pillar is Pillar.ARCHITECTURE
+    assert spec.severity is Severity.MEDIUM
     assert load_remediation(load_project(PROJECT_FILE)).get("1.1.3"), (
         "XW-ENV-ISOLATION (ref 1.1.3) has no remediation text"
     )

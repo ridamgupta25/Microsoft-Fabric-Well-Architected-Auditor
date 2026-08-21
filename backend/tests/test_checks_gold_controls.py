@@ -150,9 +150,68 @@ assert target_count == source_count, "row count mismatch"
 df.write.mode("append").saveAsTable("silver.orders")
 """
 
+_PARAMETERIZED_RECONCILIATION = """
+rows = json.loads(rows_json)
+results = []
+for row in rows:
+    source_row_cnt = row["source_row_cnt"]
+    target_row_cnt = spark.table(row["target_table"]).count()
+    row_delta = target_row_cnt - source_row_cnt
+    delta_pct = abs(row_delta) / source_row_cnt * 100
+    status = "PASS" if delta_pct <= tolerance_pct else "FAIL"
+    results.append((run_id, source_row_cnt, target_row_cnt, row_delta, delta_pct, status))
+spark.createDataFrame(results).write.mode("append").saveAsTable("dq.LoadValidationResults")
+failed_tables = spark.table("dq.LoadValidationResults").filter("status = 'FAIL'").collect()
+"""
+
+_DQ_RESULTS_WRITE_ONLY = """
+results_df.write.mode("append").saveAsTable("dq.LoadValidationResults")
+"""
+
+_DQ_RESULTS_WRITE_VIA_VARIABLE = """
+VALIDATION_TABLE = f"{layer}_MLC_Lakehouse.dq.LoadValidationResults"
+result_df.write.mode("overwrite").saveAsTable(VALIDATION_TABLE)
+"""
+
+_CAMELCASE_PARAMETERIZED_RECONCILIATION = '''
+rows = parse_json_array(rows_json)
+enriched = []
+for it in rows:
+    tgt_cnt = safe_target_count(it["bronze_schema"], it["bronze_table"])
+    enriched.append({"SourceRowCount": int(it["source_row_cnt"]), "TargetRowCount": tgt_cnt})
+result_df = (spark.createDataFrame(enriched)
+    .withColumn("RowCountDelta", col("TargetRowCount") - col("SourceRowCount"))
+    .withColumn("DeltaPct", round((col("TargetRowCount") - col("SourceRowCount")) / col("SourceRowCount") * 100, 2))
+    .withColumn("ValidationStatus",
+        when(col("RowCountDelta") == 0, lit("PASS"))
+            .otherwise(lit("FAIL"))))
+VALIDATION_TABLE = f"{layer}_MLC_Lakehouse.dq.LoadValidationResults"
+result_df.write.mode("overwrite").saveAsTable(VALIDATION_TABLE)
+'''
+
 
 def test_same_run_source_reconciliation_satisfies_5_2_5():
     assert nb_recon_count(_nb_ctx(_SAME_RUN_RECONCILIATION)).score == _PASS
+
+
+def test_parameterized_source_count_reconciliation_satisfies_5_2_5():
+    assert nb_recon_count(_nb_ctx(_PARAMETERIZED_RECONCILIATION)).score == _PASS
+
+
+def test_camelcase_parameterized_reconciliation_satisfies_5_2_5():
+    verdict = nb_recon_count(_nb_ctx(_CAMELCASE_PARAMETERIZED_RECONCILIATION))
+    assert verdict.score == _PASS
+    assert "reconciliation present" in verdict.evidence
+
+
+def test_dq_results_write_without_reconciliation_is_not_an_unvalidated_load():
+    verdict = nb_recon_count(_nb_ctx(_DQ_RESULTS_WRITE_ONLY))
+    assert verdict.status is Status.NA
+
+
+def test_dq_results_write_to_a_variable_sink_is_not_an_unvalidated_load():
+    verdict = nb_recon_count(_nb_ctx(_DQ_RESULTS_WRITE_VIA_VARIABLE))
+    assert verdict.status is Status.NA
 
 
 def test_same_run_source_reconciliation_does_not_satisfy_5_3_8():
