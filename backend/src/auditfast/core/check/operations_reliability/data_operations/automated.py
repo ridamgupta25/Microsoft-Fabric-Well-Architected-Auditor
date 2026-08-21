@@ -310,10 +310,6 @@ def single_source_of_truth(ctx: CheckContext) -> Verdict:
     )
 
 
-# =============================================================================
-# 1.1.3 — environment isolation (no cross-environment dependencies)
-# =============================================================================
-
 #: One bounded-token matcher for every environment word, so ``DEV`` inside
 #: ``DEVELOPMENT`` or ``DEVICE`` never matches.
 _TIER_TOKEN_RE = re.compile(
@@ -322,92 +318,9 @@ _TIER_TOKEN_RE = re.compile(
     re.IGNORECASE,
 )
 
-#: The same tokens minus ``TEST``/``TST``. Inside a *definition* those words are
-#: overwhelmingly benign — "Test connection", "Run unit tests", "testfile.csv" —
-#: so treating them as an environment reference would manufacture findings, and
-#: would contradict WS-UNIT-TESTS, which asks for a test step in the pipeline.
-#: A workspace's *own* tier is still read from the full map above.
-_FOREIGN_TIER_TOKENS: dict[str, str] = {
-    token: tier for token, tier in ENVIRONMENT_TIERS.items() if token not in ("TEST", "TST")
-}
-_FOREIGN_TIER_RE = re.compile(
-    r"(?<![A-Za-z0-9])(" + "|".join(sorted(_FOREIGN_TIER_TOKENS, key=len, reverse=True))
-    + r")(?![A-Za-z0-9])",
-    re.IGNORECASE,
-)
-
-
 def _tiers_in(text: str) -> set[str]:
     """Canonical environment tiers named anywhere in ``text``."""
     return {ENVIRONMENT_TIERS[m.group(1).upper()] for m in _TIER_TOKEN_RE.finditer(text)}
-
-
-def _foreign_tiers_in(text: str) -> set[str]:
-    """Unambiguous environment tiers named in a definition (excludes "test")."""
-    return {_FOREIGN_TIER_TOKENS[m.group(1).upper()]
-            for m in _FOREIGN_TIER_RE.finditer(text)}
-
-
-@check(
-    id="WS-ENV-ISOLATION", ref="1.1.3",
-    title="Environment isolation enforced (Dev / QA / Prod workspaces have no shared mutable artifacts or cross-env dependencies)",
-    pillar=Pillar.ARCHITECTURE, scope=Scope.WORKSPACE, severity=Severity.HIGH,
-    layers=(Layer.OPERATIONS,),
-    requires=[Resource.WORKSPACE, Resource.PIPELINE_DEFINITIONS], required=True,
-)
-def environment_isolation(ctx: CheckContext) -> Verdict:
-    """No pipeline in this workspace names an environment other than its own.
-
-    The workspace declares its tier in its name (Dev / QA / UAT / Prod ...). Its
-    pipelines are then read whole — activity names, paths, connection strings,
-    expressions — for a *different* tier's name. A Prod pipeline that reaches
-    into a ``_DEV`` path is a cross-environment dependency: promoting it changes
-    behaviour, and a Dev change can move Prod data.
-
-    ``test``/``tst`` are excluded from the definition scan: inside a pipeline
-    those words almost always mean "test connection" or "run the tests", not the
-    Test environment. Only names decide at all, because a workspace reference in
-    a definition is a GUID that cannot be resolved to a workspace from a
-    single-workspace crawl. A workspace whose own name declares no tier is N/A,
-    not a failure.
-    """
-    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
-        return not_applicable("Pipeline definitions could not be read from Fabric")
-
-    own_tiers = _tiers_in(ctx.workspace.name)
-    if not own_tiers:
-        return not_applicable(
-            f"Workspace name '{ctx.workspace.name}' declares no environment tier "
-            "(Dev/QA/UAT/Prod...), so a cross-environment reference cannot be identified"
-        )
-
-    pipelines = ctx.workspace.pipelines
-    if not pipelines:
-        return not_applicable(
-            "Workspace has no pipeline definitions to inspect for cross-environment references"
-        )
-
-    offenders: dict[str, set[str]] = {}
-    for name, definition in pipelines.items():
-        foreign = _foreign_tiers_in(json.dumps(definition)) - own_tiers
-        if foreign:
-            offenders[name] = foreign
-
-    own = "/".join(sorted(own_tiers))
-    if not offenders:
-        return covered(len(pipelines), len(pipelines),
-                       f"All {len(pipelines)} pipeline(s) in this {own} workspace "
-                       f"reference only {own} resources")
-
-    detail = "; ".join(
-        f"'{name}' names {'/'.join(sorted(tiers))}"
-        for name, tiers in sorted(offenders.items())[:3]
-    )
-    return covered(
-        len(pipelines) - len(offenders), len(pipelines),
-        f"{len(offenders)} of {len(pipelines)} pipeline(s) in this {own} workspace "
-        f"reference another environment: {detail}",
-    )
 
 
 # =============================================================================
@@ -1008,11 +921,11 @@ def environment_tier_is_declared(ctx: CheckContext) -> Verdict:
     workspaces in the report.
 
     **Related, and genuinely different.** ``WS-NAME`` (13.1.3) scores naming
-    style; ``WS-ENV-ISOLATION`` (1.1.3) scores whether this workspace's pipelines
-    reach into another tier; ``WS-DEPLOY`` (11.2.1) scores deployment-pipeline
-    assignment. None of them reports the tier itself, which is what the estate
-    view needs. The gated roadmap entry ``R-11-3-1`` carries the same ref and
-    records what a tenant-admin API would unlock.
+    style; ``XW-ENV-ISOLATION`` (1.1.3) compares dependencies and shared
+    connections across the project group's environments; ``WS-DEPLOY`` (11.2.1)
+    scores deployment-pipeline assignment. None of them reports the tier itself,
+    which is what the estate view needs. The gated roadmap entry ``R-11-3-1``
+    carries the same ref and records what a tenant-admin API would unlock.
     """
     name = ctx.workspace.name
     tokens = _name_tokens(name)
