@@ -14,30 +14,29 @@ from __future__ import annotations
 from auditfast.core.check import _xw
 from auditfast.core.check.helpers import Verdict
 from auditfast.core.check.registry import group_check
-from auditfast.core.enums import LAYER_ITEM_TYPES, Pillar, Resource, Severity
+from auditfast.core.enums import LAYER_ITEM_TYPES, Layer, Pillar, Resource, Severity
 from auditfast.core.models import GroupContext, WorkspaceContext
+
+from ._layer import effective_layer
 
 
 def _stays_within_layer(ws: WorkspaceContext) -> bool:
-    """True when the workspace holds no item types belonging to another layer.
-
-    A workspace with no single-layer role (mixed/untagged) permits every item
-    type, so there is no separation rule to violate and it passes vacuously —
-    mirroring the per-workspace ``WS-LAYER-SEP`` check.
-    """
-    expected = LAYER_ITEM_TYPES.get(ws.layer)
+    """True when expected items exist and no items belong to another layer."""
+    layer = effective_layer(ws)
+    expected = LAYER_ITEM_TYPES.get(layer)
     if not expected:
-        return True
+        return False
+    present = ws.item_types()
     foreign_types: set[str] = set()
     for other_layer, types in LAYER_ITEM_TYPES.items():
-        if other_layer is not ws.layer:
+        if other_layer is not layer:
             foreign_types |= types
-    return not (ws.item_types() & (foreign_types - expected))
+    return bool(present & expected) and not (present & (foreign_types - expected))
 
 
 @group_check(
     id="XW-LAYER-SEP", ref="1.1.1",
-    title="Separation of concerns maintained consistently across the estate "
+    title="Separation of concerns maintained consistently across the project group "
           "(Data Prep / Data Store / Data Consumption × Dev / QA / Prod)",
     pillar=Pillar.DATA_QUALITY, severity=Severity.MEDIUM, requires=[Resource.ITEMS],
     required=False,
@@ -53,8 +52,10 @@ def layer_separation_consistent(ctx: GroupContext) -> Verdict:
     """
     return _xw.consistency(
         ctx,
-        readable=lambda ws: ws.has(Resource.ITEMS),
+        readable=lambda ws: (
+            ws.has(Resource.ITEMS) and effective_layer(ws) is not Layer.MIXED
+        ),
         implements=_stays_within_layer,
-        practice="keeps each workspace within its layer's item types",
-        data_name="item inventories",
+        practice="contains expected items and no items from another layer",
+        data_name="item inventories with identifiable layer roles",
     )
