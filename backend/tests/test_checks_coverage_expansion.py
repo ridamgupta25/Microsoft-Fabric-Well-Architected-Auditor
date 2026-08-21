@@ -1193,6 +1193,68 @@ def test_a_single_write_notebook_has_no_boundary_to_judge():
     assert notebook_transaction_boundary(ctx).status is Status.NA
 
 
+def test_mutually_exclusive_write_modes_count_as_one_write():
+    code = '''
+if WRITE_MODE == "overwrite":
+    final_df.write.mode("overwrite").saveAsTable(target_table_name)
+elif WRITE_MODE == "append":
+    final_df.write.mode("append").saveAsTable(target_table_name)
+elif WRITE_MODE == "merge":
+    final_df.write.mode("overwrite").saveAsTable(target_table_name)
+else:
+    final_df.write.saveAsTable(target_table_name)
+'''
+    verdict = notebook_transaction_boundary(_nb_ctx(code))
+    assert verdict.status is Status.NA
+    assert "performs 1 terminal write operation" in verdict.evidence
+
+
+def test_fabric_magic_cell_does_not_disable_branch_aware_write_counting():
+    definition = {
+        "cells": [
+            {"cell_type": "code", "source": "%%configure\n{}"},
+            {"cell_type": "code", "source": '''
+if WRITE_MODE == "overwrite":
+    final_df.write.mode("overwrite").saveAsTable(target_table_name)
+elif WRITE_MODE == "append":
+    final_df.write.mode("append").saveAsTable(target_table_name)
+elif WRITE_MODE == "merge":
+    final_df.write.mode("overwrite").saveAsTable(target_table_name)
+else:
+    final_df.write.saveAsTable(target_table_name)
+'''},
+        ],
+        "metadata": {},
+    }
+    ctx = CheckContext(workspace=WorkspaceContext(id="w"), settings={},
+                       obj_name="nb", obj=definition)
+    verdict = notebook_transaction_boundary(ctx)
+    assert verdict.status is Status.NA
+    assert "performs 1 terminal write operation" in verdict.evidence
+
+
+def test_write_mode_branches_inside_try_count_as_one_write():
+    code = '''
+try:
+    if TEST_MODE:
+        print("Skipping production write")
+    else:
+        if WRITE_MODE == "overwrite":
+            final_df.write.mode("overwrite").saveAsTable(target_table_name)
+        elif WRITE_MODE == "append":
+            final_df.write.mode("append").saveAsTable(target_table_name)
+        elif WRITE_MODE == "merge":
+            final_df.write.mode("overwrite").saveAsTable(target_table_name)
+        else:
+            final_df.write.saveAsTable(target_table_name)
+except Exception as error:
+    print(error)
+'''
+    verdict = notebook_transaction_boundary(_nb_ctx(code))
+    assert verdict.status is Status.NA
+    assert "performs 1 terminal write operation" in verdict.evidence
+
+
 def test_an_explicit_tsql_transaction_bounds_the_sequence():
     code = ('cur.execute("BEGIN TRANSACTION")\n' + _TWO_WRITES + "conn.commit()\n")
     verdict = notebook_transaction_boundary(_nb_ctx(code))
