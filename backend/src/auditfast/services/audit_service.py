@@ -546,17 +546,64 @@ def run_audit(
     )
     error_ids = {ACCESS_CHECK_ID, READ_INCOMPLETE_CHECK_ID}
     advisory_results = [r for r in advisory_raw if r.check_id not in error_ids]
+    # Gathered once and shared by both judging routes: each call re-fetches every
+    # workspace and rebuilds its WorkspaceContext, and the two routes must ground
+    # a verdict in exactly the same evidence anyway.
+    contexts = (
+        _advisory_contexts(provider, targets, advisory_registry)
+        if advisory_results else {}
+    )
     # AI re-judges the advisory checks against the knowledge base for a more
     # accurate verdict. When AI is off (the default) this is a no-op and the
     # deterministic verdicts are kept unchanged.
-    advisory_results = _ai_judge_advisory(
-        advisory_results, provider, targets, advisory_registry
-    )
+    advisory_results = _ai_judge_advisory(advisory_results, contexts)
     run.advisory_results = advisory_results
     run.advisory_aggregate = aggregate(advisory_results)
     if out_dir:
         run.files.update(write_advisory_reports(run, out_dir))
+        # The offline judging bundle is written whether or not a model is
+        # configured: it is the route for reviewers who have no server-side key,
+        # and it costs one small file. It never affects this run's numbers.
+        run.files.update(_write_advisory_bundle(advisory_results, contexts, out_dir))
     return run
+
+
+def _write_advisory_bundle(results, contexts, out_dir) -> dict:
+    """Write the offline judging bundles; never fatal to an audit.
+
+    Writes the flat bundle, a themed split with a manifest, and a pre-filled
+    verdict template per theme. The split is what makes the route usable at
+    scale: one workspace produced 1,940 advisory findings, which no single
+    review session can judge well, but grouped by question they become a handful
+    of focused jobs.
+    """
+    if not results:
+        return {}
+    try:
+        from ..ai.advisory_bundle import build_bundle, write_bundle, write_themed_bundles
+
+        # Built once and shared: each record embeds up to 16 KB of evidence, so
+        # letting both writers derive their own costs a second full pass over
+        # every finding and a second copy of the same payload.
+        records = build_bundle(results, contexts)
+        files = {
+            "advisory_bundle": str(
+                write_bundle(results, contexts, Path(out_dir), records=records)
+            )
+        }
+        files.update(
+            write_themed_bundles(results, contexts, Path(out_dir), records=records)
+        )
+        return files
+    except Exception:  # noqa: BLE001 - an export must never break the audit
+        # Logged rather than swallowed: silence makes a total failure of this
+        # feature indistinguishable from "there were no advisory findings".
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "advisory: could not write the judging bundle", exc_info=True
+        )
+        return {}
 
 
 def run_check(
@@ -623,20 +670,13 @@ def _split_registries():
     return deterministic, advisory
 
 
-def _ai_judge_advisory(results, provider, targets, advisory_registry):
-    """Re-judge advisory results with AI grounded in the KB; no-op when AI is off.
+def _advisory_contexts(provider, targets, advisory_registry) -> dict:
+    """Each workspace's cached KB context, keyed by workspace name.
 
-    Gathers each workspace's cached knowledge-base context (no second crawl) and
-    hands it to :mod:`auditfast.ai.advisory`, which rewrites the verdicts. Any
-    failure or a disabled model leaves the deterministic verdicts untouched.
+    Served from the cache the deterministic stage already filled, so this costs
+    no second crawl. Shared by both judging routes - the API path and the offline
+    bundle - so they ground a verdict in exactly the same evidence.
     """
-    if not results:
-        return results
-    from ..ai import advisory as ai_advisory
-    from ..ai import orchestrator as ai_orchestrator
-
-    if not ai_orchestrator.is_enabled():
-        return results
     contexts: dict[str, WorkspaceContext] = {}
     for workspace_id, layer in targets:
         specs = [s for s in advisory_registry.select(layer=layer) if not s.manual]
@@ -647,6 +687,23 @@ def _ai_judge_advisory(results, provider, targets, advisory_registry):
         except Exception:  # noqa: BLE001 - context is best-effort, never fatal
             continue
         contexts[ctx.name] = ctx
+    return contexts
+
+
+def _ai_judge_advisory(results, contexts):
+    """Re-judge advisory results with AI grounded in the KB; no-op when AI is off.
+
+    ``contexts`` is the already-gathered per-workspace KB slice, so this costs no
+    fetch of its own. Any failure or a disabled model leaves the deterministic
+    verdicts untouched.
+    """
+    if not results:
+        return results
+    from ..ai import advisory as ai_advisory
+    from ..ai import orchestrator as ai_orchestrator
+
+    if not ai_orchestrator.is_enabled():
+        return results
     return ai_advisory.evaluate(results, contexts)
 
 

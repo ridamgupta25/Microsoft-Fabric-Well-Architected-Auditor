@@ -52,7 +52,7 @@ prompt. It is **additive** — it never registers a check and never changes a sc
 
 | Folder | Role |
 |--------|------|
-| [`agents/`](agents) | The multi-agent authoring workflow: `checklist-author` → `check-researcher` → `check-implementer` → `check-reviewer`. |
+| [`agents/`](agents) | Two workflows. **Authoring** (design time): `checklist-author` → `check-researcher` → `check-implementer` → `check-reviewer`. **Judging** (after an audit): `advisory-judge` runs end to end over the advisory bundle and produces the Advisory report. |
 | [`skills/`](skills) | `check-authoring` — the end-to-end workflow, with links to `fabric-skills/` and the MCP tools. |
 | [`prompts/`](prompts) | `add-check` — a `/add-check` command that authors one point; `run-checklist` — a `/run-checklist` command that runs a whole custom checklist. |
 | [`mcp/`](mcp) | Which MCP servers the agents use. Wired for VS Code in [`.vscode/mcp.json`](../.vscode/mcp.json) (local auditor + hosted FabricIQ). |
