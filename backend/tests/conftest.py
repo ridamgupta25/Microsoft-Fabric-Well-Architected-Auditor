@@ -70,15 +70,23 @@ def project_file() -> str:
 
 
 @pytest.fixture(autouse=True)
-def _ai_off(monkeypatch: pytest.MonkeyPatch) -> None:
+def _ai_off(monkeypatch: pytest.MonkeyPatch):
     """Force AI off for every test, so a developer's local .env never leaks in.
 
-    Tests that exercise the AI path re-patch ``is_enabled`` themselves; this only
-    sets the hermetic default.
+    Overrides the ``ai_enabled`` setting itself (the source both ``is_enabled``
+    and the endpoints read) via an env var + cache clear, and patches
+    ``is_enabled`` for good measure. Tests that exercise the AI path re-patch
+    ``is_enabled`` themselves; this only sets the hermetic default.
     """
     from auditfast.ai import orchestrator
+    from auditfast.config.settings import get_settings
 
+    monkeypatch.setenv("AUDITFAST_AI_ENABLED", "false")
+    monkeypatch.setenv("AUDITFAST_OPENAI_API_KEY", "")
+    get_settings.cache_clear()
     monkeypatch.setattr(orchestrator, "is_enabled", lambda: False)
+    yield
+    get_settings.cache_clear()
 
 
 @pytest.fixture
