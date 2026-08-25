@@ -2105,6 +2105,13 @@ def table_scd2(ctx: CheckContext) -> Verdict:
         return not_applicable(_NO_COLS)
 
     candidates = {n: _scd2_roles(t) for n, t in tabled.items()}
+    # A validity pair with no current flag is deliberately NOT an SCD2
+    # candidate: effective_date/expiration_date on a price table is when the
+    # price applied, not row versioning. See the test that pins this.
+    versioned_only = {
+        n: r for n, r in candidates.items()
+        if not r.get("flag") and r.get("start") and r.get("end")
+    }
     candidates = {n: r for n, r in candidates.items() if r.get("flag") and len(r) >= 2}
     if not candidates:
         # The columns *were* read (so this is not a permission gap) - there is
@@ -2137,6 +2144,21 @@ def table_scd2(ctx: CheckContext) -> Verdict:
             f". Non-standard column names in use ({', '.join(nonstandard[:8])}) - the "
             f"point names valid_from / valid_to / is_current, so a consumer cannot "
             f"rely on one spelling across the estate"
+        )
+    if versioned_only:
+        # Named, not scored. These carry a validity pair with no current flag,
+        # which is deliberately not counted as SCD2 - but on one estate that
+        # left 17 such tables invisible while the check reported "1 of 1 carry
+        # the full trio" and passed. A ratio built on a denominator of one
+        # should say what it excluded, so nobody reads the PASS as an estate
+        # that versions its dimensions well.
+        shown = ", ".join(sorted(versioned_only)[:5])
+        more = f" (+{len(versioned_only) - 5} more)" if len(versioned_only) > 5 else ""
+        evidence += (
+            f". Not counted: {len(versioned_only)} table(s) carry a validity "
+            f"period with no current-row flag ({shown}{more}) - a validity "
+            f"period is not necessarily row versioning, so these are excluded "
+            f"rather than failed"
         )
     return covered(len(complete), len(candidates), evidence)
 

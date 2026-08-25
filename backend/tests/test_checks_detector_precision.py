@@ -35,6 +35,7 @@ from auditfast.core.check.data_management_quality.data_prep.automated import (
     nb_source_metadata,
     nb_timeout,
     nb_utf8_encoding,
+    notebook_dq_failure_halts_run,
     parameterized,
     pl_bulk_move,
     pl_historical_separation,
@@ -214,6 +215,80 @@ def test_direct_notifier_type_still_passes():
 def test_generic_web_activity_named_alert_is_a_notifier():
     pipe = _pipe({"name": "Send_Teams_Alert", "type": "WebActivity"})
     assert failure_notification(_ctx(pipe)).score == _PASS
+
+
+def test_a_disabled_notifier_on_the_failure_path_does_not_pass():
+    """A control that cannot fire is not a control.
+
+    One real estate's only PASS for this check was a Teams activity wired to
+    three Failed edges - carrying "state": "Inactive" and no recipient. Worse,
+    "onInactiveMarkAs": "Succeeded" means the pipeline reports green on the
+    very path meant to raise the alarm.
+    """
+    pipe = _pipe(
+        {"name": "Load", "type": "Copy"},
+        {"name": "Tell someone", "type": "Teams", "state": "Inactive",
+         "onInactiveMarkAs": "Succeeded",
+         "dependsOn": [{"activity": "Load", "dependencyConditions": ["Failed"]}]},
+    )
+    verdict = pipeline_failure_alert(_ctx(pipe))
+    assert verdict.score == _FAIL
+    assert "DISABLED" in verdict.evidence
+
+
+def test_an_enabled_notifier_on_the_failure_path_still_passes():
+    pipe = _pipe(
+        {"name": "Load", "type": "Copy"},
+        {"name": "Tell someone", "type": "Teams",
+         "dependsOn": [{"activity": "Load", "dependencyConditions": ["Failed"]}]},
+    )
+    assert pipeline_failure_alert(_ctx(pipe)).score == _PASS
+
+
+def test_an_empty_pipeline_is_not_assessed_rather_than_failed():
+    """An empty pipeline has nothing to notify *about*.
+
+    Scoring 0 asserts a control is missing from something that does no work.
+    The estate this was found on had 11 empty pipelines, every one reported as
+    "No notification activity found" - a finding about nothing. The sibling
+    check ``PL-FAILURE-ALERT`` already guarded this, which is what showed the
+    omission here was an oversight rather than a decision.
+    """
+    assert failure_notification(_ctx(_pipe())).status is Status.NA
+
+
+def test_a_bare_assert_is_not_a_data_quality_evaluation():
+    """The assert trigger was a guaranteed-pass path.
+
+    ``_DQ_ASSERTION`` was byte-identical to the first alternative of
+    ``_DQ_HARD_STOP``, so any top-level assert was both the sole trigger for
+    this check and an automatic 3 - ``assert os.path.exists(path)`` scoring
+    "DQ failures halt pipeline progression".
+    """
+    nb = _nb("import os\nassert os.path.exists('/lakehouse/default')\ndf.write.save()")
+    assert notebook_dq_failure_halts_run(_ctx(nb)).status is Status.NA
+
+
+def test_an_assert_about_data_still_counts():
+    nb = _nb("assert df.filter(df.id.isNull()).count() == 0\ndf.write.save()")
+    verdict = notebook_dq_failure_halts_run(_ctx(nb))
+    assert verdict.score == _PASS
+
+
+def test_an_unreadable_notebook_is_not_reported_as_having_no_dq_check():
+    """Reading nothing and reporting 'no evaluation exists' are different claims."""
+    verdict = notebook_dq_failure_halts_run(_ctx({}))
+    assert verdict.status is Status.NA
+    assert "could not be read" in verdict.evidence
+    """An empty pipeline has nothing to notify *about*.
+
+    Scoring 0 asserts a control is missing from something that does no work.
+    The estate this was found on had 11 empty pipelines, every one reported as
+    "No notification activity found" - a finding about nothing. The sibling
+    check ``PL-FAILURE-ALERT`` already guarded this, which is what showed the
+    omission here was an oversight rather than a decision.
+    """
+    assert failure_notification(_ctx(_pipe())).status is Status.NA
 
 
 # -- NB-NO-UDF -----------------------------------------------------------------
@@ -1092,6 +1167,34 @@ def test_historical_separation_ignores_project_schema_literal_in_definition():
 
 # -- PL-DEADLETTER structural routing ----------------------------------------
 
+def test_deadletter_does_not_fail_a_pipeline_whose_load_runs_in_a_notebook():
+    """The opaque-N/A branch was unreachable whenever any mover was present.
+
+    ``_OPAQUE_MOVE_TYPES`` exists to return N/A when the load happens inside a
+    referenced artifact - but the guard was "no data-movement activity at all",
+    and TridentNotebook/Script sit in ``_DATA_MOVE_TYPES``. So one notebook kept
+    the list non-empty and disabled the branch, failing pipelines whose reject
+    handling is not in their own JSON. On one estate: 15 wrong FAILs of 39.
+    """
+    pipe = _pipe(
+        {"name": "Refresh", "type": "RefreshDataflow"},
+        {"name": "Transform", "type": "TridentNotebook"},
+    )
+    verdict = pl_deadletter(_ctx(pipe))
+    assert verdict.status is Status.NA
+    assert "cannot be judged from the pipeline definition" in verdict.evidence
+
+
+def test_deadletter_does_not_fail_a_pipeline_that_only_looks_things_up():
+    """A Lookup reads a control value for branching; it loads no rows."""
+    pipe = _pipe(
+        {"name": "Lookup1", "type": "Lookup"},
+        {"name": "If Condition1", "type": "IfCondition"},
+        {"name": "Set variable1", "type": "SetVariable"},
+    )
+    assert pl_deadletter(_ctx(pipe)).status is Status.NA
+
+
 def test_deadletter_ignores_error_words_inside_copy_column_mappings():
     pipeline = _pipe({
         "name": "Copy IFS rows",
@@ -1267,6 +1370,28 @@ def test_scd2_bare_start_end_pair_without_a_flag_is_not_scd2():
     verdict = table_scd2(_tables_ctx(prod_price=table))
     assert verdict.status is Status.NA
     assert "no table is versioned as SCD Type 2" in verdict.evidence
+
+
+def test_scd2_names_the_validity_pairs_it_excluded():
+    """A ratio built on a denominator of one must say what it left out.
+
+    Excluding validity-period tables is deliberate, but on one real estate it
+    left 17 of them invisible while the check reported "1 of 1 SCD2 table(s)
+    carry the full trio" and passed. Nothing in that sentence tells a reader
+    the population was one table.
+    """
+    complete = {"columns": [
+        {"name": "customer_key"}, {"name": "valid_from"},
+        {"name": "valid_to"}, {"name": "is_current"},
+    ]}
+    versioned = {"columns": [
+        {"name": "city_key"}, {"name": "valid_from"}, {"name": "valid_to"},
+    ]}
+    verdict = table_scd2(_tables_ctx(dim_customer=complete, dimension_city=versioned))
+
+    assert verdict.score == _PASS, "the one complete table still passes"
+    assert "Not counted: 1 table(s)" in verdict.evidence
+    assert "dimension_city" in verdict.evidence
 
 
 # -- PL-COPY-PARALLEL (lone copy → N/A) ----------------------------------------

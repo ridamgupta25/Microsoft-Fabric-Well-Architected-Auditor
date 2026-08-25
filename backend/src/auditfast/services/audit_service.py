@@ -10,6 +10,7 @@ cheap to add.
 """
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -569,41 +570,60 @@ def run_audit(
 
 
 def _write_advisory_bundle(results, contexts, out_dir) -> dict:
-    """Write the offline judging bundles; never fatal to an audit.
+    """Write the offline judging artefacts; never fatal to an audit.
 
-    Writes the flat bundle, a themed split with a manifest, and a pre-filled
-    verdict template per theme. The split is what makes the route usable at
-    scale: one workspace produced 1,940 advisory findings, which no single
-    review session can judge well, but grouped by question they become a handful
-    of focused jobs.
+    Two things go out, because the judging design is mid-transition:
+
+    * **Jobs** - one per check that has a judging guide. The reader labels every
+      object and code computes the score, which is where this is heading.
+    * **The themed bundle** - the older finding-level export, still covering the
+      refs that have no guide yet.
+
+    A check appears in exactly one of them, so nothing is judged twice and
+    nothing is lost while guides are written one at a time.
     """
     if not results:
         return {}
+    files: dict[str, str] = {}
+    try:
+        from ..ai.jobs import write_jobs
+        from ..core.judging import guide_for
+
+        by_check: dict[str, list] = {}
+        for result in results:
+            by_check.setdefault(result.check_id, []).append(result)
+
+        guided = {cid: rows for cid, rows in by_check.items() if guide_for(cid)}
+        if guided:
+            files.update(write_jobs(guided, contexts, Path(out_dir)))
+    except Exception:  # noqa: BLE001 - an export must never break the audit
+        logging.getLogger(__name__).warning(
+            "advisory: could not write the judging jobs", exc_info=True
+        )
+
     try:
         from ..ai.advisory_bundle import build_bundle, write_bundle, write_themed_bundles
+        from ..core.judging import guide_for
 
-        # Built once and shared: each record embeds up to 16 KB of evidence, so
-        # letting both writers derive their own costs a second full pass over
-        # every finding and a second copy of the same payload.
-        records = build_bundle(results, contexts)
-        files = {
-            "advisory_bundle": str(
-                write_bundle(results, contexts, Path(out_dir), records=records)
+        remaining = [r for r in results if not guide_for(r.check_id)]
+        if remaining:
+            # Built once and shared: each record embeds up to 24 KB of evidence,
+            # so letting both writers derive their own costs a second full pass
+            # over every finding and a second copy of the same payload.
+            records = build_bundle(remaining, contexts)
+            files["advisory_bundle"] = str(
+                write_bundle(remaining, contexts, Path(out_dir), records=records)
             )
-        }
-        files.update(
-            write_themed_bundles(results, contexts, Path(out_dir), records=records)
-        )
-        return files
+            files.update(
+                write_themed_bundles(remaining, contexts, Path(out_dir), records=records)
+            )
     except Exception:  # noqa: BLE001 - an export must never break the audit
         # Logged rather than swallowed: silence makes a total failure of this
         # feature indistinguishable from "there were no advisory findings".
-        import logging
-
         logging.getLogger(__name__).warning(
             "advisory: could not write the judging bundle", exc_info=True
         )
-        return {}
+    return files
 
 
 def run_check(

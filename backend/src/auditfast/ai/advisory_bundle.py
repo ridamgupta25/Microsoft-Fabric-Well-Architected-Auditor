@@ -33,7 +33,15 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..core.advisory import ADVISORY_CHECKLIST, is_advisory
+from ..core.advisory import (
+    ADVISORY_CHECKLIST,
+    SCORING_GUIDE,
+    is_advisory,
+    question_for,
+    reason_for,
+    theme_of,
+)
+from ..core.advisory import THEMES as _THEMES
 from ..core.models import CheckResult
 from ..core.scoring import status_from_score
 
@@ -54,7 +62,13 @@ BUNDLE_NAME = "advisory-bundle.jsonl"
 
 #: Per-theme bundles live here; the manifest describes them.
 BUNDLES_DIRNAME = "advisory-bundles"
-MANIFEST_NAME = "advisory-manifest.json"
+
+#: Named distinctly from the jobs manifest in :mod:`auditfast.ai.jobs`. Both
+#: stages write into the same output directory and the bundle runs second, so
+#: sharing one filename meant the bundle silently clobbered the jobs manifest -
+#: leaving 50 job files on disk that the judging agent could not discover, and
+#: a manifest describing one leftover finding as if it were the whole run.
+MANIFEST_NAME = "advisory-bundle-manifest.json"
 
 #: Columns a verdict CSV must carry. ``finding_id`` ties a verdict back to the
 #: exact bundle line, so a verdict cannot be applied to the wrong object.
@@ -63,49 +77,12 @@ REQUIRED_COLUMNS = {"finding_id", "score"}
 #: Marks a result as judged offline rather than by a rule or the API path.
 OFFLINE_SOURCE = "advisory-offline"
 
-#: Judging themes: related checks grouped so one agent session covers one kind of
-#: question. Two reasons this beats one flat file.
-#:
-#: **Session size.** A workspace produced 1,940 findings; no single session can
-#: judge that well. Split by theme, each group is a few hundred at most and the
-#: largest single check can be judged on its own.
-#:
-#: **Judgment quality.** A reviewer holding one question in mind - "does this
-#: estate reconcile its layers?" - judges more consistently than one flipping
-#: between grain, DAX style and PII masking. The grouping mirrors how the
-#: advisory refs already cluster in ``ADVISORY_CHECKLIST``.
-THEMES: dict[str, tuple[str, tuple[str, ...]]] = {
-    "referential-integrity": (
-        "Do fact foreign keys actually resolve to dimension rows?",
-        ("5.3.2", "5.4.1", "4.5.12"),
-    ),
-    "reconciliation": (
-        "Are counts and totals reconciled between source, layers and target?",
-        ("5.2.5", "5.3.6", "5.3.9", "5.4.6", "7.2.6"),
-    ),
-    "dimensional-modelling": (
-        "Is the model shaped the way a star schema should be?",
-        ("4.5.2", "4.5.4", "4.5.8", "4.5.9", "4.5.11", "4.4.9", "4.2.5"),
-    ),
-    "data-quality": (
-        "Are keys, grain and numeric precision sound at the value level?",
-        ("5.4.9", "5.5.2", "5.5.6"),
-    ),
-    "code-quality": (
-        "Is the code and DAX written the way a reviewer would want?",
-        ("14.1.4", "3.1.4"),
-    ),
-}
-
-#: ``ref -> theme name``, derived from :data:`THEMES`.
-THEME_OF_REF: dict[str, str] = {
-    ref: name for name, (_, refs) in THEMES.items() for ref in refs
-}
-
-
-def theme_of(ref: str) -> str:
-    """The judging theme a ref belongs to; ``"other"`` when it is unthemed."""
-    return THEME_OF_REF.get(ref, "other")
+#: Judging themes and the ref -> theme mapping both live in
+#: :mod:`auditfast.core.advisory`, so a ref cannot be advisory-but-unthemed.
+#: Re-exported here because callers of this module expect them.
+THEMES = _THEMES
+THEME_OF_REF: dict[str, str] = {ref: entry[0]
+                                for ref, entry in ADVISORY_CHECKLIST.items()}
 
 
 #: A verdict this uncertain is not applied: the deterministic verdict is kept.
@@ -162,7 +139,7 @@ def build_bundle(
             "ref": result.ref,
             "check_id": result.check_id,
             "title": result.title,
-            "why_advisory": ADVISORY_CHECKLIST.get(result.ref, ""),
+            "why_advisory": reason_for(result.ref),
             "rule": (spec.description or (spec.fn.__doc__ or "")).strip() if spec else "",
             "workspace": result.workspace,
             "object": result.obj,
@@ -365,7 +342,7 @@ def write_themed_bundles(
             by_ref[record["ref"]] = by_ref.get(record["ref"], 0) + 1
         jobs.append({
             "theme": theme,
-            "question": THEMES.get(theme, ("Miscellaneous advisory checks", ()))[0],
+            "question": question_for(theme),
             "bundle": str(path),
             "findings": len(items),
             "refs": dict(sorted(by_ref.items())),
@@ -380,13 +357,17 @@ def write_themed_bundles(
         # so without this the only clue is the timestamp.
         "workspaces": sorted({r["workspace"] for r in records if r.get("workspace")}),
         "total_findings": len(records),
+        # Carried in the manifest so the rubric travels with the work. A reader
+        # judging on another machine gets the same banding as the engine rather
+        # than whatever it remembers, and the guide cannot drift from the code.
+        "scoring_guide": SCORING_GUIDE,
         "jobs": sorted(jobs, key=lambda job: -job["findings"]),
     }
     manifest_path = out_dir / MANIFEST_NAME
     manifest_path.write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
     )
-    written["advisory_manifest"] = str(manifest_path)
+    written["advisory_bundle_manifest"] = str(manifest_path)
     return written
 
 

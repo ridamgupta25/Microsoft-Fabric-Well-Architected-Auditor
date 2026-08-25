@@ -91,6 +91,18 @@ def audit_tables_capture_quality_logs(ctx: CheckContext) -> Verdict:
                   "No notebook writes an audit table with row/null/exception quality metrics")
 
 
+def _is_disabled(activity: dict) -> bool:
+    """True when Fabric will skip this activity at run time.
+
+    An activity's ``state`` is ``Inactive`` when it has been switched off in
+    the designer. It still appears in the definition, still carries its
+    ``dependsOn`` edges, and still looks like a working control - but it never
+    runs. ``onInactiveMarkAs: Succeeded`` compounds it: the branch reports
+    green, so a failure path built around a disabled notifier reports success.
+    """
+    return str((activity or {}).get("state") or "").strip().lower() == "inactive"
+
+
 @check(
     id="PL-FAILURE-ALERT", ref="10.1.4",
     title="Alerting on pipeline failure (Data Activator or equivalent)",
@@ -111,14 +123,33 @@ def pipeline_failure_alert(ctx: CheckContext) -> Verdict:
     }
     notifiers = {
         a.get("name", "") for a in acts
-        if a.get("type") in _NOTIFY_TYPES
-        or (a.get("type") in _NOTIFY_CALL_TYPES and _NOTIFY_NAME.search(a.get("name", "")))
+        if not _is_disabled(a)
+        and (a.get("type") in _NOTIFY_TYPES
+             or (a.get("type") in _NOTIFY_CALL_TYPES
+                 and _NOTIFY_NAME.search(a.get("name", ""))))
     }
     linked = sorted(failure_names & notifiers)
-    return binary(bool(linked),
-                  f"Failure path is linked to notification activity: {', '.join(linked)}"
-                  if linked else
-                  "No failure-linked Data Activator, email, Teams, or webhook notification found")
+    if linked:
+        return binary(True,
+                      f"Failure path is linked to notification activity: "
+                      f"{', '.join(linked)}")
+
+    # A notifier wired to the failure edge but switched off is worse than none:
+    # it looks like the control exists, and `onInactiveMarkAs: Succeeded` makes
+    # the pipeline report green on the very path it was meant to report. One
+    # real estate's single PASS for this check was a disabled Teams activity.
+    disabled = sorted(
+        a.get("name", "") for a in acts
+        if _is_disabled(a) and a.get("name", "") in failure_names
+        and (a.get("type") in _NOTIFY_TYPES or a.get("type") in _NOTIFY_CALL_TYPES)
+    )
+    if disabled:
+        return binary(False,
+                      f"A notification activity is wired to the failure path but "
+                      f"is DISABLED, so nobody is told: {', '.join(disabled)}")
+    return binary(False,
+                  "No failure-linked Data Activator, email, Teams, or webhook "
+                  "notification found")
 
 
 # ---------------------------------------------------------------------------

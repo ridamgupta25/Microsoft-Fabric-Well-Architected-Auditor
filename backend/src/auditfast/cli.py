@@ -112,6 +112,72 @@ def cmd_checks(args) -> int:
     return EXIT_OK
 
 
+def cmd_advisory_score(args) -> int:
+    """Score judged labels into the advisory report.
+
+    The reader's half of the job is labels; this is the other half. Labels are
+    read, validated against the job that produced them, scored **in code**, and
+    written out as a report in the same format as the deterministic one.
+    """
+    from .ai.labels import LabelError, apply_labels, load_jobs, read_labels
+    from .core.scoring import aggregate
+    from .services.audit_service import AuditRun, write_advisory_reports
+
+    try:
+        jobs = load_jobs(args.jobs)
+        labels = read_labels(args.labels)
+        results, summary = apply_labels(jobs, labels, judged_by=args.judged_by)
+    except LabelError as exc:
+        print(f"Error: {exc}")
+        return EXIT_USAGE
+
+    print(f"jobs   : {args.jobs}  ({len(jobs)} check(s))")
+    print(f"labels : {args.labels}")
+    judged_checks = {e["check_id"] for e in summary["changed"] + summary["agreed"]}
+    print(f"\n  findings judged      : {summary['judged']}"
+          f"  (across {len(judged_checks)} check(s))")
+    print(f"  findings left to rules: {summary['unjudged']}"
+          f"  ({len(jobs) - len(judged_checks)} check(s) not judged yet)")
+    print(f"  objects labelled     : {summary['objects_labelled']}"
+          f"  ({summary['objects_undetermined']} undetermined)")
+    if summary["rejected_non_advisory"]:
+        print(f"  REJECTED (not advisory): {summary['rejected_non_advisory']}")
+
+    # The disagreements are the point: a reader that only ever confirms the rule
+    # has told you nothing you did not already have. Grouped by check, because
+    # an object-scoped check has a finding per notebook and printing several
+    # hundred lines buries the summary it is meant to be.
+    def _by_check(entries):
+        grouped: dict[str, list] = {}
+        for entry in entries:
+            grouped.setdefault(entry["check_id"], []).append(entry)
+        return sorted(grouped.items())
+
+    if summary["changed"]:
+        print(f"\n  changed by the reader ({len(summary['changed'])} finding(s)):")
+        for check_id, entries in _by_check(summary["changed"]):
+            ref = entries[0]["ref"]
+            moves = ", ".join(
+                sorted({f"{e['was']} -> {e['now']}" for e in entries})
+            )
+            count = f" x{len(entries)}" if len(entries) > 1 else ""
+            print(f"    {ref:<8} {check_id:<26} {moves}{count}")
+    if summary["agreed"]:
+        print(f"\n  agreed with the rule ({len(summary['agreed'])} finding(s)): "
+              + ", ".join(cid for cid, _ in _by_check(summary["agreed"])))
+
+    if args.no_report:
+        return EXIT_OK
+
+    run = AuditRun(project_name=args.project_name)
+    run.advisory_results = results
+    run.advisory_aggregate = aggregate(results)
+    files = write_advisory_reports(run, Path(args.out))
+    for kind, path in sorted(files.items()):
+        print(f"\nwrote {kind}: {path}")
+    return EXIT_OK
+
+
 def cmd_advisory_apply(args) -> int:
     """Apply externally-judged verdicts to the advisory report.
 
@@ -330,6 +396,25 @@ def build_parser() -> argparse.ArgumentParser:
     advisory.add_argument("--no-report", action="store_true",
                           help="Report what would be applied; write no file")
 
+    score = sub.add_parser(
+        "advisory-score",
+        help="Score judged labels into the advisory report",
+    )
+    score.add_argument("--jobs", default="output/jobs",
+                       help="Job file or directory the labels were judged from")
+    score.add_argument("--labels", default="output/jobs",
+                       help="Label CSV or directory of them")
+    score.add_argument("--out", default="output/advisory-judged",
+                       help="Output directory for the report "
+                            "(default: output/advisory-judged, so the audit's own "
+                            "advisory-report.xlsx is not overwritten)")
+    score.add_argument("--judged-by", default="agent",
+                       help="Recorded on every judged row (default: agent)")
+    score.add_argument("--project-name", default="Advisory review",
+                       help="Project name shown on the report")
+    score.add_argument("--no-report", action="store_true",
+                       help="Report what would change; write no file")
+
     return parser
 
 
@@ -337,7 +422,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     handlers = {"run": cmd_run, "serve": cmd_serve, "checks": cmd_checks,
                 "twin": cmd_twin, "checklist": cmd_checklist,
-                "advisory-apply": cmd_advisory_apply}
+                "advisory-apply": cmd_advisory_apply,
+                "advisory-score": cmd_advisory_score}
     handler = handlers.get(args.command)
     if handler is None:  # pragma: no cover - argparse enforces the choice
         build_parser().print_help()

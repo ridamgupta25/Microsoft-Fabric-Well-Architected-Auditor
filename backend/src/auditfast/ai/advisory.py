@@ -39,9 +39,10 @@ _SYSTEM = (
 #: Keep prompts bounded so a huge notebook or table list cannot blow the token budget.
 _MAX_EVIDENCE_CHARS = 6000
 
-#: Workspace summaries carry per-table columns and are the whole evidence for the
-#: table-modelling checks, so they get more room than a single notebook.
-_MAX_WORKSPACE_CHARS = 16000
+#: Workspace summaries carry the item list, role assignments and per-table
+#: columns, and are the whole evidence for the table-modelling, audit and
+#: monitoring checks, so they get more room than a single notebook.
+_MAX_WORKSPACE_CHARS = 24000
 
 
 def evaluate(
@@ -230,6 +231,11 @@ def _notebook_code(notebook: dict) -> str:
 _MAX_TABLES = 40
 _MAX_COLUMNS_PER_TABLE = 25
 
+#: Items and role assignments are one line each and answer questions no other
+#: section can - which item serves Gold, when it last ran, who may write here.
+_MAX_ITEMS = 60
+_MAX_ROLES = 30
+
 #: Bounds on a semantic-model summary. A relationship is one line and cheap; a
 #: measure carries a DAX expression, so it is clipped per measure as well.
 _MAX_MODEL_RELATIONSHIPS = 60
@@ -280,12 +286,48 @@ def _workspace_summary(workspace: WorkspaceContext) -> str:
     and the header says how many of how many - so a verdict can be qualified
     rather than overstated.
     """
-    from ..core.check._tables import col_names
-
     # The short sections go first. The table dump is the only unbounded part, so
     # anything after it is what a truncation silently removes - and losing the
     # semantic-model and SQL-view lists costs a check its context entirely.
     lines: list[str] = []
+
+    # Items with their run stamps. Several workspace checks ask which item is a
+    # serving store, a monitoring job or an orchestrator, and how recently it
+    # ran; without the list they can only be answered from a name vocabulary,
+    # which is the very failure that put them on the advisory list.
+    items = list(workspace.items or [])
+    if items:
+        lines.append(f"ITEMS ({len(items)}):")
+        for item in items[:_MAX_ITEMS]:
+            run = f"  last_run={item.last_run_utc}" if item.last_run_utc else ""
+            label = f" [{item.sensitivity_label}]" if item.sensitivity_label else ""
+            lines.append(f"  {item.display_name} ({item.type}){label}{run}")
+        if len(items) > _MAX_ITEMS:
+            lines.append(f"  ... and {len(items) - _MAX_ITEMS} more item(s)")
+
+    if workspace.notebooks:
+        lines.append(
+            f"NOTEBOOKS ({len(workspace.notebooks)}): "
+            + ", ".join(sorted(workspace.notebooks)[:40])
+        )
+    if workspace.pipelines:
+        lines.append(
+            f"PIPELINES ({len(workspace.pipelines)}): "
+            + ", ".join(sorted(workspace.pipelines)[:40])
+        )
+
+    # Who can write here. The metadata-access check cannot judge "only service
+    # identities write" without seeing the principals.
+    roles = list(workspace.role_assignments or [])
+    if roles:
+        lines.append(f"ROLE ASSIGNMENTS ({len(roles)}):")
+        for role in roles[:_MAX_ROLES]:
+            lines.append(
+                f"  {role.display_name} ({role.principal_type}) = {role.role}"
+            )
+        if len(roles) > _MAX_ROLES:
+            lines.append(f"  ... and {len(roles) - _MAX_ROLES} more")
+
     if workspace.semantic_models:
         lines.append("SEMANTIC MODELS: " + ", ".join(sorted(workspace.semantic_models)[:50]))
     if workspace.sql_views:
@@ -319,15 +361,29 @@ def _workspace_summary(workspace: WorkspaceContext) -> str:
                       + ", with their columns):")
         lines.append(header)
         for name in sample:
-            columns = col_names(tables.get(name) or {})
-            if columns:
-                shown = ", ".join(columns[:_MAX_COLUMNS_PER_TABLE])
-                more = (f", +{len(columns) - _MAX_COLUMNS_PER_TABLE} more"
-                        if len(columns) > _MAX_COLUMNS_PER_TABLE else "")
-                lines.append(f"  {name} ({len(columns)} cols): {shown}{more}")
-            else:
-                lines.append(f"  {name}: (columns not readable)")
+            lines.append(f"  {name}{_columns_line(tables.get(name) or {})}")
     return "\n".join(lines)
+
+
+def _columns_line(table: dict) -> str:
+    """``(n cols): a, b, c`` for one table, marking any column that is masked.
+
+    The masking flag matters on its own: the Dynamic Data Masking check asks
+    whether sensitive columns are protected, and without it the reader sees the
+    column names and has no way to tell.
+    """
+    from ..core.check._tables import columns
+
+    cols = columns(table)
+    if not cols:
+        return ": (columns not readable)"
+    shown = []
+    for col in cols[:_MAX_COLUMNS_PER_TABLE]:
+        name = str(col.get("name") or "")
+        shown.append(f"{name} [masked]" if col.get("is_masked") else name)
+    more = (f", +{len(cols) - _MAX_COLUMNS_PER_TABLE} more"
+            if len(cols) > _MAX_COLUMNS_PER_TABLE else "")
+    return f" ({len(cols)} cols): {', '.join(shown)}{more}"
 
 
 def _clip(text: str, limit: int = _MAX_EVIDENCE_CHARS) -> str:

@@ -14,7 +14,6 @@ from pathlib import Path
 import pytest
 
 from auditfast.ai.advisory_bundle import (
-    THEMES,
     AdvisoryVerdictError,
     apply_verdicts,
     build_bundle,
@@ -315,6 +314,67 @@ def test_a_table_whose_columns_could_not_be_read_says_so():
     assert "columns not readable" in _workspace_summary(workspace)
 
 
+# --- evidence the widened workspace checks depend on ------------------------
+#
+# Several refs were moved to the advisory list because their rule reads a name
+# vocabulary. A reader can only do better if the summary carries the structural
+# facts the rule was guessing at.
+
+def test_the_summary_lists_items_with_their_run_stamps():
+    """WS-GOLD-FRESHNESS and OPS-MONITOR-REFRESH have nothing to judge without."""
+    from auditfast.ai.advisory import _workspace_summary
+    from auditfast.core.models import Item, WorkspaceContext
+
+    workspace = WorkspaceContext(id="ws", display_name="WS", items=[
+        Item(id="1", type="Lakehouse", display_name="lh_analytics",
+             last_run_utc="2026-08-01T00:00:00Z"),
+    ])
+    summary = _workspace_summary(workspace)
+    assert "lh_analytics (Lakehouse)" in summary
+    assert "last_run=2026-08-01" in summary
+
+
+def test_the_summary_lists_role_assignments():
+    """WS-METADATA-WRITE asks who may write; it needs the principals."""
+    from auditfast.ai.advisory import _workspace_summary
+    from auditfast.core.models import RoleAssignment, WorkspaceContext
+
+    workspace = WorkspaceContext(id="ws", display_name="WS", role_assignments=[
+        RoleAssignment(principal_type="User", display_name="a.person", role="Admin"),
+    ])
+    summary = _workspace_summary(workspace)
+    assert "a.person (User) = Admin" in summary
+
+
+def test_a_masked_column_is_marked():
+    """WS-DDM cannot tell a protected column from an exposed one otherwise."""
+    from auditfast.ai.advisory import _workspace_summary
+    from auditfast.core.models import WorkspaceContext
+
+    workspace = WorkspaceContext(id="ws", display_name="WS", tables={
+        "dbo.customer": {"columns": [
+            {"name": "email", "is_masked": True},
+            {"name": "order_id"},
+        ]},
+    })
+    summary = _workspace_summary(workspace)
+    assert "email [masked]" in summary
+    assert "order_id," in summary or "order_id" in summary
+
+
+def test_the_summary_names_notebooks_and_pipelines():
+    """Workspace-scoped audit checks ask what runs here, not just what is stored."""
+    from auditfast.ai.advisory import _workspace_summary
+    from auditfast.core.models import WorkspaceContext
+
+    workspace = WorkspaceContext(id="ws", display_name="WS",
+                                 notebooks={"nb_load": {}},
+                                 pipelines={"pl_ingest": {}})
+    summary = _workspace_summary(workspace)
+    assert "nb_load" in summary
+    assert "pl_ingest" in summary
+
+
 # --- what a semantic-model check is given -----------------------------------
 #
 # These checks fell through to the workspace summary, so 5.4.1 - "do
@@ -382,12 +442,60 @@ def test_every_advisory_ref_belongs_to_a_theme():
     assert not unthemed, f"refs missing from THEMES: {unthemed}"
 
 
+def test_every_ref_names_a_theme_that_exists():
+    """A typo in a theme name would give a job no question to work to."""
+    from auditfast.core.advisory import ADVISORY_CHECKLIST, THEMES
+
+    unknown = sorted({entry[0] for entry in ADVISORY_CHECKLIST.values()} - set(THEMES))
+    assert not unknown, f"themes used but not defined: {unknown}"
+
+
+def test_every_theme_is_used_by_at_least_one_ref():
+    """A theme nobody references is dead weight that reads as coverage."""
+    from auditfast.core.advisory import ADVISORY_CHECKLIST, THEMES
+
+    used = {entry[0] for entry in ADVISORY_CHECKLIST.values()}
+    assert not sorted(set(THEMES) - used), f"themes with no refs: {sorted(set(THEMES) - used)}"
+
+
 def test_no_ref_is_claimed_by_two_themes():
-    seen: dict[str, str] = {}
-    for name, (_, refs) in THEMES.items():
-        for ref in refs:
-            assert ref not in seen, f"{ref} in both {seen[ref]} and {name}"
-            seen[ref] = name
+    """One ref, one theme - the structure makes this true by construction."""
+    from auditfast.core.advisory import ADVISORY_CHECKLIST
+
+    assert all(isinstance(entry, tuple) and len(entry) == 2
+               for entry in ADVISORY_CHECKLIST.values())
+
+
+def test_the_scoring_guide_states_the_engine_bands():
+    """A reader must band a ratio the same way band_from_coverage does."""
+    from auditfast.core.advisory import SCORING_GUIDE
+
+    for band in ("1.00", "0.80", "0.50"):
+        assert band in SCORING_GUIDE
+    assert "confidence=low" in SCORING_GUIDE
+
+
+def test_the_scoring_guide_addresses_the_sample():
+    """The evidence holds 40 tables of hundreds, so 'count them' is not possible.
+
+    Without this the reader either extrapolates from the sample - inventing a
+    number - or refuses to score. It must take the population count from the
+    deterministic evidence and use the sample to test the classification.
+    """
+    from auditfast.core.advisory import SCORING_GUIDE
+
+    assert "SAMPLE" in SCORING_GUIDE
+    assert "deterministic evidence" in SCORING_GUIDE
+    assert "Never state a count you did not derive" in SCORING_GUIDE
+
+
+def test_the_manifest_carries_the_scoring_guide(tmp_path):
+    """The rubric travels with the work, so it cannot drift from the code."""
+    from auditfast.core.advisory import SCORING_GUIDE
+
+    written = write_themed_bundles([_result(ref="4.5.2")], {}, tmp_path)
+    manifest = json.loads(Path(written["advisory_bundle_manifest"]).read_text(encoding="utf-8"))
+    assert manifest["scoring_guide"] == SCORING_GUIDE
 
 
 def test_themed_bundles_split_the_findings_and_write_a_manifest(tmp_path):
@@ -398,7 +506,7 @@ def test_themed_bundles_split_the_findings_and_write_a_manifest(tmp_path):
     ]
     written = write_themed_bundles(results, {}, tmp_path)
 
-    manifest = json.loads(Path(written["advisory_manifest"]).read_text(encoding="utf-8"))
+    manifest = json.loads(Path(written["advisory_bundle_manifest"]).read_text(encoding="utf-8"))
     assert manifest["total_findings"] == 3
     themes = {job["theme"]: job["findings"] for job in manifest["jobs"]}
     assert themes["dimensional-modelling"] == 2
@@ -409,7 +517,7 @@ def test_the_manifest_names_the_workspaces_it_covers(tmp_path):
     """A reviewer asked to judge 'the NOIDA audit' must be able to confirm it."""
     results = [_result(ref="4.5.2"), _result(ref="5.4.1", obj="b")]
     written = write_themed_bundles(results, {}, tmp_path)
-    manifest = json.loads(Path(written["advisory_manifest"]).read_text(encoding="utf-8"))
+    manifest = json.loads(Path(written["advisory_bundle_manifest"]).read_text(encoding="utf-8"))
     assert manifest["workspaces"] == ["WS"]
     assert manifest["generated"].endswith("Z")
 
@@ -419,7 +527,7 @@ def test_the_manifest_lists_the_biggest_job_first(tmp_path):
     results = [_result(ref="4.5.2")] + [_result(ref="5.4.1", obj=f"o{i}")
                                         for i in range(3)]
     written = write_themed_bundles(results, {}, tmp_path)
-    manifest = json.loads(Path(written["advisory_manifest"]).read_text(encoding="utf-8"))
+    manifest = json.loads(Path(written["advisory_bundle_manifest"]).read_text(encoding="utf-8"))
     assert manifest["jobs"][0]["theme"] == "referential-integrity"
 
 
@@ -531,7 +639,7 @@ def test_a_verdict_template_is_written_per_theme(tmp_path):
 def test_the_manifest_points_at_the_template_that_exists(tmp_path):
     results = [_result(ref="4.5.2")]
     written = write_themed_bundles(results, {}, tmp_path)
-    manifest = json.loads(Path(written["advisory_manifest"]).read_text(encoding="utf-8"))
+    manifest = json.loads(Path(written["advisory_bundle_manifest"]).read_text(encoding="utf-8"))
     assert Path(manifest["jobs"][0]["verdicts"]).exists()
 
 
