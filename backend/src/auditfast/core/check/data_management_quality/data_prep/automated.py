@@ -680,6 +680,20 @@ _WRITE_PATTERN = re.compile(
     r"\.saveAsTable\s*\(|\.write\b|INSERT\s+INTO|INSERT\s+OVERWRITE",
     re.IGNORECASE,
 )
+_WRITE_TARGET = re.compile(
+    r"(?:\.saveAsTable\s*\(\s*|INSERT\s+(?:INTO|OVERWRITE(?:\s+TABLE)?)\s+)"
+    r"(?:[rubf]{0,2})?[\"'`]([^\"'`]+)[\"'`]",
+    re.IGNORECASE,
+)
+_DQ_VALIDATION_TARGET = re.compile(
+    r"(?=.*(?:^|[./_])(?:dq|data[_-]?quality|audit)(?:[./_]|$))"
+    r"(?=.*(?:validation|reconcil|result|audit|quality))",
+    re.IGNORECASE,
+)
+#: A table write whose sink is a bare variable, e.g. ``saveAsTable(target_tbl)``.
+_WRITE_TARGET_VAR = re.compile(
+    r"\.(?:saveAsTable|insertInto|toTable)\s*\(\s*([A-Za-z_]\w*)\s*\)",
+)
 _COUNT_RECONCILE = re.compile(
     # A count that is actually asserted or compared against an expectation. A count
     # merely assigned, used as a column alias, or compared to 0 (an emptiness guard)
@@ -701,6 +715,28 @@ _COUNT_RECONCILE = re.compile(
     r"reconcil|\bcount_check\b|validate[^\n]*count|expect_table_row_count",
     re.IGNORECASE,
 )
+_SOURCE_COUNT_SIGNAL = re.compile(
+    r"\bsource(?:_row|_record)?_(?:count|cnt)\b|"
+    r"\b(?:count|cnt)_source(?:_row|_record)?\b",
+    re.IGNORECASE,
+)
+_TARGET_COUNT_SIGNAL = re.compile(
+    r"\btarget(?:_row|_record)?_(?:count|cnt)\b|"
+    r"\b(?:count|cnt)_target(?:_row|_record)?\b",
+    re.IGNORECASE,
+)
+_COUNT_VARIANCE_SIGNAL = re.compile(
+    r"\b(?:(?:row|record|count)_?)*(?:delta|variance)(?:_?(?:pct|percent|percentage))?\b|"
+    r"\btolerance(?:_?(?:pct|percent|percentage|count|cnt))?\b",
+    re.IGNORECASE,
+)
+_PASS_FAIL_SIGNAL = re.compile(
+    r"[\"']PASS[\"'][\s\S]{0,200}[\"']FAIL[\"']|"
+    r"[\"']FAIL[\"'][\s\S]{0,200}[\"']PASS[\"']",
+    re.IGNORECASE,
+)
+#: Splits a camelCase identifier so ``TargetRowCount`` reads as ``Target_Row_Count``.
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _RI_PATTERN = re.compile(
     r"""(?isx)
     (?:\.join\s*\(.*?["']left_anti["'])
@@ -1202,6 +1238,44 @@ _DQ_ASPECTS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
+def _reconciliation_signals_present(code: str) -> bool:
+    """Whether the notebook names a source count, a target count, a variance, and
+    a PASS/FAIL status together — the shape of a source-vs-target reconciliation.
+
+    Tolerant of a source count that arrives as a parameter (matched by name, not
+    by an inline query) and of camelCase result columns such as ``TargetRowCount``.
+    """
+    normalized = _CAMEL_BOUNDARY.sub("_", code)
+    return all(pattern.search(normalized) for pattern in (
+        _SOURCE_COUNT_SIGNAL,
+        _TARGET_COUNT_SIGNAL,
+        _COUNT_VARIANCE_SIGNAL,
+        _PASS_FAIL_SIGNAL,
+    ))
+
+
+def _writes_only_dq_results(code: str) -> bool:
+    """Whether every table write targets a DQ / validation-results table.
+
+    A variable sink (``saveAsTable(results_tbl)``) is resolved to the string
+    literal assigned to that variable, so a reconciliation-results notebook that
+    names its sink once is still recognised. An unresolved variable sink means
+    the write cannot be proven to be DQ-only, so the notebook is not classified.
+    """
+    literal_targets = _WRITE_TARGET.findall(code)
+    resolved_targets = []
+    for name in _WRITE_TARGET_VAR.findall(code):
+        assigned = re.search(
+            rf"^\s*{re.escape(name)}\s*=\s*[rubf]{{0,2}}[\"']([^\"'\n]+)[\"']",
+            code, re.MULTILINE,
+        )
+        if assigned is None:
+            return False
+        resolved_targets.append(assigned.group(1))
+    targets = literal_targets + resolved_targets
+    return bool(targets) and all(_DQ_VALIDATION_TARGET.search(t) for t in targets)
+
+
 @check(
     id="NB-RECON-COUNT", ref="5.2.5",
     title="Record count reconciliation vs. source system control counts",
@@ -1213,7 +1287,11 @@ def nb_recon_count(ctx: CheckContext) -> Verdict:
     code = executable_code(ctx.obj)
     if not _WRITE_PATTERN.search(code):
         return not_applicable("Notebook does not write data to a table")
-    ok = bool(_COUNT_RECONCILE.search(code))
+    ok = bool(_COUNT_RECONCILE.search(code)) or _reconciliation_signals_present(code)
+    if not ok and _writes_only_dq_results(code):
+        return not_applicable(
+            "Notebook writes only DQ / reconciliation results, not a data load"
+        )
     return binary(ok, "Record count reconciliation present" if ok
                   else "Writes data without record count validation")
 
