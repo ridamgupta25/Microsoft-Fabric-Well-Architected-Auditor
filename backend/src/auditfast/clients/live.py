@@ -82,6 +82,21 @@ def _bounded_int_env(name: str, default: int, low: int, high: int) -> int:
         return default
 
 
+def _retry_after_seconds(response, attempt: int, cap: float = 30.0) -> float:
+    """Seconds to wait before a retry, honoring the server's ``Retry-After``.
+
+    Falls back to exponential backoff when the header is absent, and never waits
+    longer than ``cap`` so a hostile value cannot stall the crawl.
+    """
+    header = getattr(response, "headers", {}).get("Retry-After") if response is not None else None
+    try:
+        if header is not None:
+            return min(float(header), cap)
+    except (TypeError, ValueError):
+        pass
+    return min(2.0 * (attempt + 1), cap)
+
+
 def _failure_detail(item: Item, failure: str, reason: str = "") -> dict[str, str]:
     detail = {
         "id": item.id,
@@ -292,7 +307,7 @@ class LiveFabricProvider:
                 response = self._session.post(url, timeout=self._timeout)
             except Exception as exc:
                 if attempt < 2:
-                    time.sleep(min(2.0 * (attempt + 1), 5.0))
+                    time.sleep(_retry_after_seconds(None, attempt))
                     continue
                 log.warning("item %s getDefinition transport error: %s", item_id, exc)
                 return [], "transient"
@@ -313,7 +328,7 @@ class LiveFabricProvider:
                 log.warning("item %s getDefinition -> HTTP 403 (permission denied)", item_id)
                 return [], "forbidden"
             elif status in self._RETRYABLE and attempt < 2:
-                time.sleep(min(2.0 * (attempt + 1), 5.0))
+                time.sleep(_retry_after_seconds(response, attempt))
                 continue
             else:
                 log.warning("item %s getDefinition -> HTTP %s", item_id, status)
@@ -534,6 +549,19 @@ class LiveFabricProvider:
 
         endpoints = discover_endpoints(get_json, workspace_id)
         if not endpoints:
+            # A workspace with no Lakehouse/Warehouse never had a SQL endpoint to
+            # read, so this is not a limitation to report — mark the resources N/A
+            # silently, exactly as before the SQL endpoint was wired in.
+            has_store = any(
+                (item.type or "") in ("Lakehouse", "Warehouse") for item in ctx.items
+            )
+            if not has_store:
+                for resource in (Resource.TABLE_COLUMNS, Resource.WAREHOUSE_SECURITY):
+                    if resource in wanted:
+                        ctx.unavailable.add(resource)
+                log.info("fetch %s: no Lakehouse/Warehouse — SQL endpoint reads skipped",
+                         workspace_id)
+                return
             reason = ("no provisioned SQL analytics endpoint was discovered in this "
                       "workspace (a newly created Lakehouse/Warehouse provisions one "
                       "asynchronously, and a paused capacity serves none)")
@@ -1427,9 +1455,16 @@ class LiveFabricProvider:
         wanted = set(resources)
 
         # The workspace itself is always read: it establishes both identity and
-        # access, and its status is how we detect an unreadable workspace.
+        # access, and its status is how we detect an unreadable workspace. A 429
+        # here would otherwise drop the whole workspace, so it is retried with the
+        # server's Retry-After before giving up.
         status, workspace = self._get(f"/workspaces/{workspace_id}")
         if status == 401 and self._try_refresh_token():
+            status, workspace = self._get(f"/workspaces/{workspace_id}")
+        for attempt in range(3):
+            if status != 429:
+                break
+            time.sleep(_retry_after_seconds(None, attempt))
             status, workspace = self._get(f"/workspaces/{workspace_id}")
         if status != 200 or not isinstance(workspace, dict):
             raise WorkspaceAccessError(workspace_id, status)
