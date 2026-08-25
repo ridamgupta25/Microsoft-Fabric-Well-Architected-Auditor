@@ -3,9 +3,13 @@
 How to run the backend, the tests, and the frontend under a debugger in VS Code —
 set breakpoints, step through code, and inspect variables.
 
-The configurations live in [`.vscode/launch.json`](../../.vscode/launch.json) at the
-**workspace root** (`dev/`). Open **Run and Debug** (`Ctrl+Shift+D`), pick a config
-from the dropdown, and press **F5**.
+The configurations live in [`.vscode/launch.json`](../.vscode/launch.json) in the
+repo root. Open **Run and Debug** (`Ctrl+Shift+D`), pick a config from the dropdown,
+and press **F5**.
+
+> Open the **repo folder** (`Microsoft-Fabric-Well-Architected-Auditor`) as your VS
+> Code workspace so these repo-relative paths resolve. (If you open the parent `dev`
+> folder instead, a copy at `dev/.vscode/launch.json` covers that layout.)
 
 ---
 

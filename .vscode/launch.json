@@ -1,0 +1,72 @@
+{
+  // VS Code debug configurations (repo-relative — assumes this repo folder is the
+  // workspace root). Open Run and Debug (Ctrl+Shift+D), pick a config, press F5.
+  // See docs/debugging.md.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // Backend with breakpoints. No --reload so the debugger runs the app
+      // in-process and breakpoints reliably hit (reload spawns a worker
+      // subprocess the debugger does not attach to).
+      "name": "Backend: FastAPI (debug)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["auditfast.main:app", "--host", "127.0.0.1", "--port", "8000"],
+      "cwd": "${workspaceFolder}/backend",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/backend/src"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      // Same, but with auto-reload (breakpoints in the worker may not hit).
+      "name": "Backend: FastAPI (reload, no breakpoints)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": [
+        "auditfast.main:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8000",
+        "--reload",
+        "--reload-dir",
+        "${workspaceFolder}/backend/src"
+      ],
+      "cwd": "${workspaceFolder}/backend",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      // Debug the test file you currently have open.
+      "name": "Backend: Pytest (current file)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["${file}", "-vv", "-p", "no:warnings"],
+      "cwd": "${workspaceFolder}/backend",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      // Debug the running frontend in the browser. Start the dev server first
+      // (npm run dev), then launch this to hit breakpoints in .tsx files.
+      "name": "Frontend: Edge (localhost:5173)",
+      "type": "msedge",
+      "request": "launch",
+      "url": "http://localhost:5173",
+      "webRoot": "${workspaceFolder}/frontend"
+    }
+  ],
+  "compounds": [
+    {
+      // Backend (debuggable) + frontend browser together. The Vite dev server
+      // must already be running for the Edge target to load.
+      "name": "Full stack (backend + Edge)",
+      "configurations": ["Backend: FastAPI (debug)", "Frontend: Edge (localhost:5173)"]
+    }
+  ]
+}
