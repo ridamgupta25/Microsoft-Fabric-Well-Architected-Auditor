@@ -355,10 +355,32 @@ def nb_structure(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_markdown(ctx: CheckContext) -> Verdict:
-    """At least one markdown cell documents what the notebook does."""
-    md = markdown_sources(ctx.obj)
+    """At least one markdown cell documents what the notebook does.
+
+    Three things this must not do, each found on a real estate:
+
+    * **Fail a notebook it could not read.** ``markdown_sources`` returns ``[]``
+      for a missing definition exactly as it does for a notebook with no
+      markdown, so an unreadable notebook was scored 0 with the evidence "the
+      logic is undocumented" - a claim about a notebook nobody had seen.
+    * **Fail an empty notebook.** A stub carrying only Fabric's own "Type here
+      in the cell editor" placeholder has no logic *to* document, so a finding
+      about its documentation is a finding about nothing. 28 of 132 notebooks
+      on one estate were these.
+    * **Pass a blank markdown cell.** An empty cell yields ``[""]``, and a list
+      holding an empty string is truthy, so a notebook whose only markdown cell
+      was empty scored full marks.
+    """
+    cells = (ctx.obj or {}).get("cells")
+    if not cells:
+        return not_applicable("Notebook definition could not be read from Fabric")
+
+    if not notebook_code(ctx.obj).strip():
+        return not_applicable("Notebook has no code, so there is no logic to document")
+
+    md = [source for source in markdown_sources(ctx.obj) if source.strip()]
     return binary(bool(md), f"{len(md)} markdown documentation cell(s)" if md
-                  else "No markdown cells — the logic is undocumented")
+                  else "No markdown cells - the logic is undocumented")
 
 
 @check(
@@ -4007,7 +4029,20 @@ _DQ_HANDROLLED = re.compile(
 
 #: An explicit assertion about the data is itself both the evaluation and the
 #: halt, so it is recognised separately.
-_DQ_ASSERTION = re.compile(r"^\s*assert\s+\w", re.MULTILINE)
+#: An assertion *about data*. A bare ``assert`` is not enough: it is also the
+#: first alternative of ``_DQ_HARD_STOP``, so any top-level assert would be both
+#: the sole trigger for this check and an automatic 3 - ``assert
+#: os.path.exists(path)`` scoring "DQ failures halt pipeline progression". The
+#: line must therefore reference something derived from the data.
+_DQ_ASSERTION = re.compile(
+    r"^\s*assert\s+[^\n]*?(?:"
+    r"\.\s*(?:count|isEmpty|distinct|filter|where|dropDuplicates|na)\s*\(|"
+    r"\blen\s*\(|"
+    r"\b(?:null|nulls|nan|dup|dupe|duplicate|invalid|bad|missing|orphan|"
+    r"mismatch|row|rows|record|records|count|cnt|total)\b"
+    r")",
+    re.MULTILINE | re.IGNORECASE,
+)
 #: The notebook stops. ``raise``/``assert``/``sys.exit`` fail the notebook, and
 #: therefore the pipeline activity that ran it.
 _DQ_HARD_STOP = re.compile(
@@ -4068,6 +4103,12 @@ def notebook_dq_failure_halts_run(ctx: CheckContext) -> Verdict:
     """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
+    if not (ctx.obj or {}).get("cells"):
+        # Reading nothing and reporting "no evaluation exists" are different
+        # claims. The N/A below is a finding about the notebook; this one is a
+        # finding about the crawl, and conflating them attributes an absence to
+        # a notebook nobody could see.
+        return not_applicable("This notebook's definition could not be read")
     code = executable_code(ctx.obj)
 
     framework = _DQ_FRAMEWORK.search(code)
