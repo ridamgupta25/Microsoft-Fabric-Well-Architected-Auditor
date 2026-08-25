@@ -22,6 +22,22 @@ from auditfast.core.enums import Resource
 from auditfast.core.models import WorkspaceContext
 
 
+def test_no_store_workspace_records_no_sql_limitation(monkeypatch):
+    """A workspace with no Lakehouse/Warehouse must not report a SQL-endpoint gap."""
+    import auditfast.clients.sqlendpoint as sqlmod
+    monkeypatch.setattr(sqlmod, "discover_endpoints", lambda *_a, **_k: [])
+
+    provider = LiveFabricProvider("token")
+    ctx = WorkspaceContext(id="ws")  # no items -> no Lakehouse/Warehouse
+    provider._read_sql_endpoints(
+        ctx, "ws", {Resource.TABLE_COLUMNS, Resource.WAREHOUSE_SECURITY}
+    )
+
+    assert ctx.read_failures == {}  # no limitation row
+    assert not ctx.has(Resource.TABLE_COLUMNS)  # still N/A for checks
+    assert not ctx.has(Resource.WAREHOUSE_SECURITY)
+
+
 def _gap(reason: str, endpoints: int = 3,
          wanted: set[Resource] | None = None) -> WorkspaceContext:
     ctx = WorkspaceContext(id="ws")

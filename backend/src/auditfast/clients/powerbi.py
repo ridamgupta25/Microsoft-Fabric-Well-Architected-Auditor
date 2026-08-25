@@ -26,6 +26,20 @@ from .errors import ProviderError
 log = logging.getLogger("auditfast.powerbi")
 
 
+def _retry_after_seconds(retry_after: str | None, attempt: int, cap: float = 30.0) -> float:
+    """Seconds to wait before a retry, honoring the server's ``Retry-After``.
+
+    Falls back to exponential backoff when the header is absent, and never waits
+    longer than ``cap`` so a hostile value cannot stall the crawl.
+    """
+    try:
+        if retry_after is not None:
+            return min(float(retry_after), cap)
+    except (TypeError, ValueError):
+        pass
+    return min(2.0 ** attempt, cap)
+
+
 class PowerBIError(ProviderError):
     """A Power BI REST call failed in a way the caller must surface, not swallow.
 
@@ -57,15 +71,21 @@ class PowerBIClient:
     # -- transport -------------------------------------------------------------
     def _get(self, path: str) -> tuple[int | None, Any]:
         """GET a path, returning ``(status, body)``. ``None`` status = transport failure."""
+        status, body, _retry_after = self._get_with_meta(path)
+        return status, body
+
+    def _get_with_meta(self, path: str) -> tuple[int | None, Any, str | None]:
+        """GET a path, returning ``(status, body, retry_after)`` for throttle-aware retries."""
         try:
             response = self._session.get(f"{self.BASE}{path}", timeout=self._timeout)
         except Exception as exc:  # network/DNS/TLS — treat as unknown, never as empty
             log.warning("GET %s transport error: %s", path, exc)
-            return None, None
+            return None, None, None
+        retry_after = (getattr(response, "headers", None) or {}).get("Retry-After")
         try:
-            return response.status_code, response.json()
+            return response.status_code, response.json(), retry_after
         except ValueError:
-            return response.status_code, None
+            return response.status_code, None, retry_after
 
     def _post(self, path: str, payload: dict) -> tuple[int | None, Any]:
         """POST JSON to a path, returning ``(status, body)``."""
@@ -253,7 +273,7 @@ class PowerBIClient:
         reason = "no attempt completed"
         for path in paths:
             for attempt in range(3):
-                status, body = self._get(path)
+                status, body, retry_after = self._get_with_meta(path)
                 if status == 200 and isinstance(body, dict):
                     return _refresh_schedule(body), ""
                 if status in (400, 404):
@@ -271,7 +291,7 @@ class PowerBIClient:
                     failure, reason = "transient", f"HTTP {status}"
                     break
                 if attempt < 2:
-                    time.sleep(2 ** attempt)
+                    time.sleep(_retry_after_seconds(retry_after, attempt))
         log.info("dataset %s refresh schedule unread (%s): %s",
                  dataset_id, failure, reason)
         return None, failure

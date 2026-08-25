@@ -893,3 +893,48 @@ def test_workspace_read_retries_on_401_after_refresh():
     assert ctx.display_name == "MyWS"
     assert len(refreshed) == 1
     assert len(session.get_calls) == 3  # ws(401) + ws(200) + items
+
+
+def test_definition_parts_retries_on_429_then_succeeds(monkeypatch):
+    """A throttled getDefinition (429) is retried and can then succeed."""
+    import auditfast.clients.live as live_mod
+    monkeypatch.setattr(live_mod.time, "sleep", lambda *_a, **_k: None)
+
+    provider = LiveFabricProvider("token")
+    session = _CountingFakeSession()
+    session.queue_post(_FakeResponse(429, {}))
+    import base64
+    import json
+    payload = base64.b64encode(json.dumps({"activities": []}).encode()).decode()
+    session.queue_post(_FakeResponse(200, {
+        "definition": {"parts": [{"path": "pipeline-content.json", "payload": payload}]}
+    }))
+    provider._session = session
+    provider._session.headers = {}
+
+    parts, failure = provider._definition_parts("ws-1", "item-1")
+
+    assert failure == ""
+    assert len(session.post_calls) == 2  # original + retry
+
+
+def test_workspace_read_retries_on_429_not_dropped(monkeypatch):
+    """A workspace throttled with 429 is retried instead of being skipped."""
+    import auditfast.clients.live as live_mod
+    monkeypatch.setattr(live_mod.time, "sleep", lambda *_a, **_k: None)
+
+    provider = LiveFabricProvider("token")
+    base = provider.BASE
+    session = _CountingFakeSession()
+    ws_url = f"{base}/workspaces/ws-1"
+    session.queue_get(ws_url, _FakeResponse(429, {}))
+    session.queue_get(ws_url, _FakeResponse(200, {"displayName": "MyWS"}))
+    session.queue_get(f"{base}/workspaces/ws-1/items", _FakeResponse(200, {"value": []}))
+    provider._session = session
+    provider._session.headers = {}
+
+    from auditfast.core.enums import Resource
+    ctx = provider.fetch("ws-1", resources=[Resource.ITEMS])
+
+    assert ctx.display_name == "MyWS"  # not dropped
+
