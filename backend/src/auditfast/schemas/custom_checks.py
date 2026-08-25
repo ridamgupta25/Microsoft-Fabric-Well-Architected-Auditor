@@ -7,7 +7,24 @@ token-free by construction.
 """
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from typing import Literal
+
+from pydantic import BaseModel, Field, SecretStr
+
+
+class AiConfigIn(BaseModel):
+    """A user-supplied AI key + model, used for one request only.
+
+    ``api_key`` is a :class:`SecretStr` so it is masked in logs and reprs, and it
+    is never included in any response.
+    """
+
+    provider: Literal["openai", "azure"]
+    api_key: SecretStr = Field(description="The caller's own API key. Never stored or returned.")
+    model: str = Field(default="", description="Model / deployment name.")
+    base_url: str | None = Field(default=None, description="OpenAI-compatible gateway base URL.")
+    endpoint: str | None = Field(default=None, description="Azure OpenAI endpoint.")
+    deployment: str | None = Field(default=None, description="Azure deployment name.")
 
 
 class CustomChecksRequest(BaseModel):
@@ -27,6 +44,21 @@ class CustomChecksRequest(BaseModel):
         default=None,
         description="Check ids to mark approved before rendering the report (the HITL step).",
     )
+    ai: AiConfigIn | None = Field(
+        default=None,
+        description="Optional per-request AI key/model. When omitted, AI stays off (deterministic).",
+    )
+
+
+class VerifyAiResult(BaseModel):
+    """Whether a supplied AI config can reach a model. Never echoes the key."""
+
+    ok: bool
+    message: str
+
+
+class VerifyAiRequest(BaseModel):
+    ai: AiConfigIn
 
 
 class CustomChecksResult(BaseModel):

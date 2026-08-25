@@ -16,7 +16,10 @@ Design source: ``local/Planning/Knowledge Base - Node`` (Phases 1-3).
 """
 from __future__ import annotations
 
+from functools import partial
+
 from ...config.settings import get_settings
+from ..orchestrator.ai_config import AiConfig
 from ..orchestrator.state import (
     CustomCheck,
     FetchPlan,
@@ -37,15 +40,17 @@ def identify(
     *,
     catalog: tuple[KbField, ...] = KB_FIELD_CATALOG,
     embedder=embed,
+    ai: AiConfig | None = None,
 ) -> tuple[KbField | None, float, str]:
     """The best-matching KB field for ``prompt``: ``(field, confidence, stage)``.
 
     Tries meaning (embeddings) first; falls back to keyword overlap. Returns
     ``(None, 0.0, ...)`` when nothing in the catalog overlaps at all.
     """
-    query_vec = embedder(prompt)
+    emb = partial(embed, ai=ai) if embedder is embed else embedder
+    query_vec = emb(prompt)
     if query_vec is not None:
-        best, score = _nearest_by_meaning(query_vec, catalog, embedder)
+        best, score = _nearest_by_meaning(query_vec, catalog, emb)
         if best is not None:
             return best, score, "semantic"
     return (*_nearest_by_keyword(prompt, catalog), "keyword")
@@ -84,7 +89,7 @@ def _nearest_by_keyword(
     return best, best_score
 
 
-def plan(check: CustomCheck, session) -> CustomCheck:
+def plan(check: CustomCheck, session, *, ai: AiConfig | None = None) -> CustomCheck:
     """Run Node 3a on ``check`` in place, reading ``session.shared_kb``.
 
     Only acts on a ``PENDING`` check (one Node 2 passed through as unique); a check
@@ -93,7 +98,7 @@ def plan(check: CustomCheck, session) -> CustomCheck:
     if check.lifecycle_status is not LifecycleStatus.PENDING:
         return check
 
-    field, confidence, stage = identify(check.raw_prompt)
+    field, confidence, stage = identify(check.raw_prompt, ai=ai)
     if field is None:
         return check  # nothing recognised; left PENDING, surfaced for manual review
 

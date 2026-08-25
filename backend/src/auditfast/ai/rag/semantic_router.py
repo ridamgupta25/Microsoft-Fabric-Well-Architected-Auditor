@@ -21,13 +21,14 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 
 from ...config.settings import get_settings
 from ...core.check.registry import REGISTRY, CheckRegistry
 from ...core.models import CheckSpec
 from ..matching import match_point
 from ..orchestrator import complete, is_enabled
+from ..orchestrator.ai_config import AiConfig
 from ..orchestrator.state import CustomCheck, LifecycleStatus, RoutingResult
 from .embeddings import Vector, embed
 from .vector_store import STORE, Neighbor, VectorStore
@@ -63,9 +64,11 @@ _CRITIC_SYSTEM = (
 )
 
 
-def llm_intent_critic(prompt: str, candidates: list[Neighbor]) -> IntentDecision | None:
+def llm_intent_critic(
+    prompt: str, candidates: list[Neighbor], *, ai: AiConfig | None = None
+) -> IntentDecision | None:
     """Default critic backed by the orchestrator LLM. ``None`` when AI is off."""
-    if not is_enabled() or not candidates:
+    if not is_enabled(ai) or not candidates:
         return None
     listing = "\n".join(f"- {n.id}: {n.metadata.get('title', '')}" for n in candidates)
     user = (
@@ -75,7 +78,7 @@ def llm_intent_critic(prompt: str, candidates: list[Neighbor]) -> IntentDecision
         '"reasoning": "<one sentence>"}. Set is_match true only for an exact '
         "same-direction match, and matched_id to that candidate's id."
     )
-    raw = complete(_CRITIC_SYSTEM, user, max_tokens=200)
+    raw = complete(_CRITIC_SYSTEM, user, max_tokens=200, ai=ai)
     if not raw:
         return None
     return _parse_decision(raw, {n.id for n in candidates})
@@ -112,12 +115,17 @@ class SemanticRouter:
         embedder: Embedder = embed,
         store: VectorStore | None = None,
         critic: Critic | None = llm_intent_critic,
+        ai: AiConfig | None = None,
     ) -> None:
         settings = get_settings()
         self.registry = registry
-        self.embedder = embedder
+        # Bind the per-request key into the *default* embedder/critic only; an
+        # injected fake (in tests) keeps its own (text)/(prompt, candidates) shape.
+        self.embedder = partial(embedder, ai=ai) if embedder is embed else embedder
+        self.critic = (
+            partial(critic, ai=ai) if critic is llm_intent_critic else critic
+        )
         self.store = store if store is not None else STORE
-        self.critic = critic
         self.reuse_threshold = settings.router_reuse_threshold
         self.retrieve_threshold = settings.router_retrieve_threshold
         self.semantic_threshold = settings.router_semantic_threshold
@@ -210,9 +218,10 @@ def _default_router() -> SemanticRouter:
     return SemanticRouter()
 
 
-def route(check: CustomCheck) -> CustomCheck:
-    """Convenience: route ``check`` with the process-default router."""
-    return _default_router().route(check)
+def route(check: CustomCheck, *, ai: AiConfig | None = None) -> CustomCheck:
+    """Convenience: route ``check`` with the process-default router (or ``ai``)."""
+    router = _default_router() if ai is None else SemanticRouter(ai=ai)
+    return router.route(check)
 
 
 __all__ = ["SemanticRouter", "IntentDecision", "llm_intent_critic", "route"]

@@ -138,3 +138,4 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
 #: Module-level app for ASGI servers: ``uvicorn auditfast.main:app``.
 app = create_app()
+

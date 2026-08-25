@@ -33,6 +33,99 @@ export type Severity = "Critical" | "High" | "Medium" | "Low" | "Informational";
 /** How a check's verdict is reached. */
 export type Automation = "automated" | "roadmap" | "interactive" | "manual";
 
+// -- custom checks ------------------------------------------------------------
+
+/** A per-request AI key + model. Sent only with the run; never stored server-side. */
+export interface AiConfigInput {
+  provider: "openai" | "azure";
+  api_key: string;
+  model: string;
+  base_url?: string | null;
+  endpoint?: string | null;
+  deployment?: string | null;
+}
+
+export interface CustomChecksRequest {
+  prompts: string[];
+  workspace_ids?: string[] | null;
+  approved_check_ids?: string[] | null;
+  ai?: AiConfigInput | null;
+}
+
+/** The 0-100 result a generated custom check produces when run over the KB. */
+export interface CustomCheckEvaluation {
+  status: string;
+  score: number;
+  findings: string[];
+  recommendations: string[];
+}
+
+export interface GuardrailVerdictView {
+  passed: boolean;
+  reason?: string | null;
+  matched_rule?: string | null;
+  failed_validator?: string | null;
+  layer?: string | null;
+}
+
+export interface RoutingResultView {
+  is_duplicate: boolean;
+  matched_default_id?: string | null;
+  similarity_score?: number | null;
+  stage?: string | null;
+  reasoning?: string | null;
+}
+
+export interface KbUpdateView {
+  attempt_count: number;
+  status: string;
+  apis_called: string[];
+  fields_added: string[];
+  diagnostic?: string | null;
+  root_cause?: string | null;
+  remediation?: string | null;
+  provenance: Record<string, unknown>[];
+}
+
+export interface CodeGenView {
+  attempts: number;
+  status: string;
+  stage_failed?: string | null;
+  reason?: string | null;
+}
+
+/** One row of the lifecycle ledger. Extra node detail is present but optional. */
+export interface CustomCheckRow {
+  check_id: string;
+  raw_prompt: string;
+  lifecycle_status: string;
+  feasibility?: string | null;
+  approved?: boolean | null;
+  guardrail?: GuardrailVerdictView | null;
+  routing?: RoutingResultView | null;
+  kb_update?: KbUpdateView | null;
+  code_gen?: CodeGenView | null;
+  generated_code?: string | null;
+  /** Present for generated checks: the 0-100 evaluation over the KB. */
+  evaluation?: CustomCheckEvaluation | null;
+  [key: string]: unknown;
+}
+
+export interface CustomChecksResult {
+  prompts: number;
+  workspaces: number;
+  summary: Record<string, number>;
+  ledger: CustomCheckRow[];
+  pending_review_ids: string[];
+  report_markdown: string;
+}
+
+/** Result of testing an AI key. Never echoes the key. */
+export interface VerifyAiResult {
+  ok: boolean;
+  message: string;
+}
+
 // -- health -------------------------------------------------------------------
 
 export interface Health {

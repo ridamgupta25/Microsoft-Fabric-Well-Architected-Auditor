@@ -10,6 +10,8 @@ produces the same score.
 > the read-only `getDefinition`). It never creates, edits, or deletes anything in
 > Fabric.
 
+> **Development:** The `dev` branch contains the latest in-progress changes.
+
 **New here? Pick your path:**
 
 - **Setting it up on your machine?** You're in the right place — follow

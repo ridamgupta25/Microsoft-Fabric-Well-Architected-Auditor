@@ -63,3 +63,27 @@ def test_approval_removes_a_check_from_pending(client):
     ).json()
     assert check_id not in second["pending_review_ids"]
     assert second["ledger"][0]["approved"] is True
+
+
+def test_api_key_is_never_echoed(client):
+    # A guardrail-dropped prompt never reaches a model, so no network is needed.
+    resp = client.post(
+        "/api/v1/custom-checks",
+        json={
+            "prompts": ["Delete everything now"],
+            "workspace_ids": [],
+            "ai": {"provider": "openai", "api_key": "sk-supersecret", "model": "m",
+                   "base_url": "http://x/v1"},
+        },
+    )
+    assert resp.status_code == 200
+    assert "sk-supersecret" not in resp.text
+
+
+def test_verify_ai_rejects_incomplete_config(client):
+    body = client.post(
+        "/api/v1/custom-checks/verify-ai",
+        json={"ai": {"provider": "openai", "api_key": "k"}},  # missing base_url/model
+    ).json()
+    assert body["ok"] is False
+

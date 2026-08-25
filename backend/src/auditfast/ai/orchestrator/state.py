@@ -169,6 +169,9 @@ class CustomCheck:
     feasibility: FeasibilityClass | None = None
     code_gen: CodeGenLog | None = None
     generated_code: str | None = None
+    #: Read-only REST-fetch code the AI wrote for a missing KB field (Node 3b).
+    #: Generated + safety-validated, stored as an artifact; not executed here.
+    fetch_code: str | None = None
     #: HITL decision: ``None`` = awaiting review, ``True`` = approved, ``False`` = rejected.
     approved: bool | None = None
 
@@ -185,6 +188,7 @@ class CustomCheck:
             "feasibility": self.feasibility.value if self.feasibility else None,
             "code_gen": self.code_gen.to_dict() if self.code_gen else None,
             "generated_code": self.generated_code,
+            "fetch_code": self.fetch_code,
             "approved": self.approved,
         }
 
