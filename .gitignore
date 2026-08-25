@@ -32,6 +32,9 @@ kb-cache/
 Fabric workspace kb/
 HLDS/
 
+# Custom-checks run archive — AI-generated audit code + updated KB + fetch record
+custom-checks-runs/
+
 # Local engagement configs (keep the examples).
 # NOTE: a pattern containing a slash is anchored to this file's directory, so
 # the path must be the real one — `config/*.yaml` would only match a top-level

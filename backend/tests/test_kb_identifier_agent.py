@@ -115,7 +115,7 @@ def test_plan_low_confidence_marks_fetch_plan_optional(monkeypatch):
     monkeypatch.setattr(
         kb_identifier_agent,
         "identify",
-        lambda _p: (CAT[3], 0.05, "keyword"),  # refresh_schedule field, tiny confidence
+        lambda _p, **_k: (CAT[3], 0.05, "keyword"),  # refresh_schedule field, tiny confidence
     )
     session = CustomCheckSession()
     check = plan(_check("something vague"), session)

@@ -22,6 +22,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 
 from ..custom_runtime.local_runner import (
     UnsafeCodeError,
@@ -30,6 +31,7 @@ from ..custom_runtime.local_runner import (
     validate_source,
 )
 from ..orchestrator import complete, is_enabled
+from ..orchestrator.ai_config import AiConfig
 from ..orchestrator.state import (
     CodeGenLog,
     CustomCheck,
@@ -61,7 +63,30 @@ _GEN_SYSTEM = (
     "You write a single Python class for a Microsoft Fabric audit check. The class "
     "MUST subclass BaseAuditCheck and implement evaluate(self, kb) returning a dict "
     "{'status': str, 'score': float 0-100, 'findings': list, 'recommendations': list}. "
-    "The code is READ-ONLY: it may only read the kb dict. Do NOT import os/sys/"
+    "\n\nKB SHAPE (read it exactly like this): kb is a dict keyed by WORKSPACE ID; each "
+    "value is one workspace snapshot. Always iterate workspaces with `for ws in "
+    "kb.values():` — never read item collections at the top level of kb. Inside a "
+    "workspace snapshot: 'display_name' (str), 'layer' (str), 'git_connected' (bool), "
+    "'deployment_pipeline' (bool); the collections 'notebooks', 'pipelines', "
+    "'semantic_models', 'environments', 'tables', 'refresh_schedules', 'warehouse_audit', "
+    "'activators' are DICTS keyed by item name (iterate with .items() or .values()); "
+    "'items', 'reports', 'role_assignments', 'connections', 'sql_views' are LISTS of dicts. "
+    "\n\nKEY FIELDS (use these exact names — do not guess): a report dict is "
+    "{id, name, dataset_id, dataset_workspace_id} and IS connected to a semantic model "
+    "when its 'dataset_id' is a non-empty string; read a report's name from 'name'. An "
+    "item is {id, display_name, type}. A role assignment is {principal, role} (or similar). "
+    "For notebooks/pipelines/semantic_models, use the collection KEY as the object name "
+    "(the value is a definition dict that may be empty {} when only presence is known). "
+    "A notebook/pipeline/model 'definition' value may be an empty dict when only its "
+    "presence is known. Treat a missing key as absent, and if the KB contains zero of the "
+    "relevant objects, return status 'N/A' with score 100 and a finding saying none were "
+    "found — do NOT silently pass as if all objects complied. "
+    "\n\nALWAYS populate 'findings' with concise evidence — how many items were checked "
+    "and how many passed/failed (e.g. '10 of 12 notebooks have a description'), naming "
+    "the specific failing objects; include a positive evidence line even when the check "
+    "fully passes. ALWAYS populate 'recommendations' with concrete next steps whenever "
+    "the score is below 100. "
+    "\n\nThe code is READ-ONLY: it may only read the kb dict. Do NOT import os/sys/"
     "subprocess/socket/requests, do NOT open files, do NOT use eval/exec/getattr or "
     "dunder attributes. Return only the code."
 )
@@ -78,24 +103,24 @@ def _extract_code(raw: str) -> str:
     return (match.group(1) if match else raw).strip()
 
 
-def default_generator(prompt: str, feedback: str) -> str | None:
+def default_generator(prompt: str, feedback: str, *, ai: AiConfig | None = None) -> str | None:
     """LLM-backed generator. ``None`` when AI is off."""
-    if not is_enabled():
+    if not is_enabled(ai):
         return None
     user = f"Check to implement: {prompt!r}."
     if feedback:
         user += f"\n\nYour previous attempt was rejected. Fix this and try again:\n{feedback}"
-    raw = complete(_GEN_SYSTEM, user, max_tokens=900)
+    raw = complete(_GEN_SYSTEM, user, max_tokens=900, ai=ai)
     return _extract_code(raw) if raw else None
 
 
-def default_reviewer(prompt: str, source: str) -> ReviewVerdict | None:
+def default_reviewer(prompt: str, source: str, *, ai: AiConfig | None = None) -> ReviewVerdict | None:
     """LLM-backed reviewer. ``None`` when AI is off (review is skipped)."""
-    if not is_enabled():
+    if not is_enabled(ai):
         return None
     import json
 
-    raw = complete(_REVIEW_SYSTEM, f"Intent: {prompt!r}\n\nCode:\n{source}", max_tokens=200)
+    raw = complete(_REVIEW_SYSTEM, f"Intent: {prompt!r}\n\nCode:\n{source}", max_tokens=200, ai=ai)
     if not raw:
         return None
     text = raw.strip().strip("`")
@@ -116,10 +141,39 @@ def generate(
     reviewer: Reviewer | None = default_reviewer,
     max_attempts: int = 3,
     timeout: float = 5.0,
+    ai: AiConfig | None = None,
+    code_cache: dict[str, str] | None = None,
 ) -> CustomCheck:
-    """Run Node 4 on ``check`` in place, using ``session.shared_kb`` for the smoke run."""
+    """Run Node 4 on ``check`` in place, using ``session.shared_kb`` for the smoke run.
+
+    ``code_cache`` (from cross-run memory) lets a previously-validated check reuse its
+    code instead of paying for another LLM round-trip. Reused code is **still**
+    re-validated and smoke-run, so the safety contract is unchanged.
+    """
     if check.lifecycle_status not in _ELIGIBLE:
         return check
+
+    # Memory: reuse validated code for this exact check when available.
+    if code_cache and check.check_id in code_cache:
+        cached = code_cache[check.check_id]
+        ok, _ = validate_source(cached)
+        if ok:
+            try:
+                cached_cls = load_check(cached)
+                cached_result = run_check(cached_cls, session.shared_kb, timeout=timeout)
+            except UnsafeCodeError:
+                cached_result = {"error": True}
+            if not cached_result.get("error"):
+                check.code_gen = CodeGenLog(attempts=0, status="GENERATED", reason="reused from memory")
+                check.generated_code = cached
+                check.feasibility = FeasibilityClass.FULLY_FEASIBLE
+                return check
+
+    # Bind the per-request key into the default generator/reviewer only.
+    if generator is default_generator:
+        generator = partial(default_generator, ai=ai)
+    if reviewer is default_reviewer:
+        reviewer = partial(default_reviewer, ai=ai)
 
     kb = session.shared_kb
     log = CodeGenLog()

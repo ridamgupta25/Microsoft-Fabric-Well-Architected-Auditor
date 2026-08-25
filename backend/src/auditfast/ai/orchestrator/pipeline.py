@@ -14,11 +14,18 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from ..agents import code_gen_agent, guardrails_agent, kb_identifier_agent, kb_updater_agent
+from ..agents import (
+    code_gen_agent,
+    fetch_code_gen_agent,
+    guardrails_agent,
+    kb_identifier_agent,
+    kb_updater_agent,
+)
 from ..agents.kb_updater_agent import FetchProvider
 from ..custom_runtime.local_runner import load_and_run
 from ..rag import semantic_router
 from . import kb_source
+from .ai_config import AiConfig
 from .state import CustomCheck, CustomCheckSession, LifecycleStatus
 
 Router = Callable[[CustomCheck], CustomCheck]
@@ -31,21 +38,31 @@ def run_check(
     session: CustomCheckSession,
     *,
     provider: FetchProvider | None = None,
-    router: Router = semantic_router.route,
+    router: Router | None = None,
     generator=code_gen_agent.default_generator,
     reviewer=code_gen_agent.default_reviewer,
     max_attempts: int = 3,
+    ai: AiConfig | None = None,
+    code_cache: dict[str, str] | None = None,
 ) -> CustomCheck:
     """Drive one check through Nodes 1 -> 4, stopping at its terminal status."""
     guardrails_agent.screen(check)  # Node 1
     if check.lifecycle_status is LifecycleStatus.DROPPED_GUARDRAIL:
         return check
 
-    router(check)  # Node 2
+    if router is not None:
+        router(check)  # injected router (e.g. tests) ignores ai
+    else:
+        semantic_router.route(check, ai=ai)  # Node 2
     if check.lifecycle_status is LifecycleStatus.ROUTED_DEFAULT:
         return check
 
-    kb_identifier_agent.plan(check, session)  # Node 3a
+    kb_identifier_agent.plan(check, session, ai=ai)  # Node 3a
+
+    # When data is missing, capture the read-only REST-fetch code the AI would use
+    # to enrich the KB (a stored, safety-validated artifact — not executed here).
+    if check.fetch_plan is not None:
+        fetch_code_gen_agent.generate_fetch_code(check, ai=ai)
 
     if (
         check.lifecycle_status is LifecycleStatus.PENDING
@@ -57,7 +74,8 @@ def run_check(
 
     if check.lifecycle_status in _READY_FOR_CODEGEN:
         code_gen_agent.generate(  # Node 4
-            check, session, generator=generator, reviewer=reviewer, max_attempts=max_attempts
+            check, session, generator=generator, reviewer=reviewer,
+            max_attempts=max_attempts, ai=ai, code_cache=code_cache,
         )
     return check
 
@@ -67,10 +85,12 @@ def run_batch(
     *,
     session: CustomCheckSession | None = None,
     provider: FetchProvider | None = None,
-    router: Router = semantic_router.route,
+    router: Router | None = None,
     generator=code_gen_agent.default_generator,
     reviewer=code_gen_agent.default_reviewer,
     max_attempts: int = 3,
+    ai: AiConfig | None = None,
+    code_cache: dict[str, str] | None = None,
 ) -> CustomCheckSession:
     """Run every prompt through the pipeline into one shared session."""
     session = session or CustomCheckSession()
@@ -78,7 +98,8 @@ def run_batch(
         check = session.add(prompt)
         run_check(
             check, session, provider=provider, router=router,
-            generator=generator, reviewer=reviewer, max_attempts=max_attempts,
+            generator=generator, reviewer=reviewer, max_attempts=max_attempts, ai=ai,
+            code_cache=code_cache,
         )
     return session
 
@@ -88,10 +109,12 @@ def run_custom_checks(
     contexts: object,
     *,
     seed: bool = True,
-    router: Router = semantic_router.route,
+    router: Router | None = None,
     generator=code_gen_agent.default_generator,
     reviewer=code_gen_agent.default_reviewer,
     max_attempts: int = 3,
+    ai: AiConfig | None = None,
+    code_cache: dict[str, str] | None = None,
 ) -> CustomCheckSession:
     """Run ``prompts`` against already-crawled ``contexts`` (read-only, no HTTP).
 
@@ -105,7 +128,8 @@ def run_custom_checks(
     provider = kb_source.SnapshotFetchProvider(contexts)
     return run_batch(
         prompts, session=session, provider=provider, router=router,
-        generator=generator, reviewer=reviewer, max_attempts=max_attempts,
+        generator=generator, reviewer=reviewer, max_attempts=max_attempts, ai=ai,
+        code_cache=code_cache,
     )
 
 

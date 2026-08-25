@@ -21,6 +21,8 @@ always produces the same score.
 | 8 | [migration.md](migration.md) | See what changed from the Flask original, what was reused, and why |
 | 9 | [scalability.md](scalability.md) | Plan for scale, Azure deployment, and the future AI layer |
 | 10 | [advisory-ai.md](advisory-ai.md) | Understand the AI-assisted advisory report for non-deterministic checks |
+| 11 | [debugging.md](debugging.md) | Run the backend, tests, and frontend under the VS Code debugger |
+| 12 | [custom-checks-flow.md](custom-checks-flow.md) | How the Custom Checks pipeline is implemented today, node by node, vs the intended design (and the gaps) |
 
 New to the codebase? **getting-started.md** then **architecture.md**. The rest
 assumes their vocabulary.

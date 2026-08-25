@@ -138,7 +138,7 @@ def test_below_retrieve_threshold_is_unique():
 # -- critic JSON parsing -------------------------------------------------------
 
 def test_parse_decision_accepts_valid_json_and_validates_id(monkeypatch):
-    monkeypatch.setattr(semantic_router, "is_enabled", lambda: True)
+    monkeypatch.setattr(semantic_router, "is_enabled", lambda _ai=None: True)
     monkeypatch.setattr(
         semantic_router,
         "complete",
@@ -154,7 +154,7 @@ def test_parse_decision_accepts_valid_json_and_validates_id(monkeypatch):
 
 
 def test_parse_decision_rejects_unknown_matched_id(monkeypatch):
-    monkeypatch.setattr(semantic_router, "is_enabled", lambda: True)
+    monkeypatch.setattr(semantic_router, "is_enabled", lambda _ai=None: True)
     monkeypatch.setattr(
         semantic_router,
         "complete",

@@ -16,6 +16,7 @@ from functools import lru_cache
 
 from ...config.settings import get_settings
 from ..orchestrator import is_enabled
+from ..orchestrator.ai_config import AiConfig
 
 #: A single sentence turned into coordinates for meaning.
 Vector = list[float]
@@ -34,14 +35,16 @@ def _model():  # pragma: no cover - requires the optional FastEmbed runtime
         return None
 
 
-def embed(text: str) -> Vector | None:
+def embed(text: str, *, ai: AiConfig | None = None) -> Vector | None:
     """Embed ``text``, or ``None`` when AI is off or no runtime is installed.
 
     ``None`` is the signal to fall back to keyword matching; it is never an error.
+    Embeddings run on the local FastEmbed model (no key); ``ai`` only flips the
+    on/off gate so a per-request key can enable the semantic stages.
     """
     if not text or not text.strip():
         return None
-    if not is_enabled():
+    if not is_enabled(ai):
         return None
     model = _model()
     if model is None:  # pragma: no cover - depends on the optional extra

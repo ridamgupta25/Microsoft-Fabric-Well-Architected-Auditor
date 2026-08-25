@@ -13,10 +13,31 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, status
 
-from ...schemas.custom_checks import CustomChecksRequest, CustomChecksResult
+from ...ai.orchestrator.ai_config import AiConfig
+from ...schemas.custom_checks import (
+    AiConfigIn,
+    CustomChecksRequest,
+    CustomChecksResult,
+    VerifyAiRequest,
+    VerifyAiResult,
+)
 from ...services import custom_checks_service
 
 router = APIRouter(prefix="/custom-checks", tags=["custom-checks"])
+
+
+def _to_ai_config(ai: AiConfigIn | None) -> AiConfig | None:
+    """Convert the request schema to the internal config, unwrapping the secret."""
+    if ai is None:
+        return None
+    return AiConfig(
+        provider=ai.provider,
+        api_key=ai.api_key.get_secret_value(),
+        model=ai.model,
+        base_url=ai.base_url,
+        endpoint=ai.endpoint,
+        deployment=ai.deployment,
+    )
 
 
 @router.post(
@@ -36,5 +57,18 @@ async def run(request: CustomChecksRequest) -> CustomChecksResult:
         prompts,
         workspace_ids=request.workspace_ids,
         approved_check_ids=request.approved_check_ids,
+        ai=_to_ai_config(request.ai),
     )
     return CustomChecksResult(**result)
+
+
+@router.post(
+    "/verify-ai",
+    response_model=VerifyAiResult,
+    summary="Check a supplied AI key can reach a model (never echoes the key)",
+)
+async def verify_ai(request: VerifyAiRequest) -> VerifyAiResult:
+    """Validate a user's AI key with a tiny completion; the key is never returned."""
+    result = custom_checks_service.verify_ai(_to_ai_config(request.ai))
+    return VerifyAiResult(**result)
+

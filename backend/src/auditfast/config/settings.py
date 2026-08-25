@@ -67,6 +67,31 @@ class Settings(BaseSettings):
         description="Root folder for the permanent, per-run KB archive.",
     )
 
+    # -- custom-checks run archive -------------------------------------------
+    # Each custom-checks run writes a timestamped folder with the AI-generated
+    # audit code, the updated knowledge base, and the missing-KB fetch record —
+    # mirroring the KB archive. Gitignored (holds generated code + tenant metadata).
+    custom_checks_archive_enabled: bool = Field(
+        default=True,
+        description="Write a timestamped folder per custom-checks run (generated code + updated KB + fetch record).",
+    )
+    custom_checks_archive_dir: str = Field(
+        default="custom-checks-runs",
+        description="Root folder for the per-run custom-checks archive.",
+    )
+
+    # -- custom-checks memory -------------------------------------------------
+    # Durable, cross-run memory of past custom checks: reuse validated generated
+    # code (skip a redundant LLM call) and recall prior approve/reject decisions.
+    custom_checks_memory_enabled: bool = Field(
+        default=True,
+        description="Remember generated code + decisions across custom-checks runs.",
+    )
+    custom_checks_memory_file: str = Field(
+        default="custom-checks-runs/memory.json",
+        description="Gitignored JSON file backing the custom-checks memory.",
+    )
+
     # -- SQL analytics endpoint ------------------------------------------------
     # Column schemas and Warehouse security policies are not in the Fabric REST
     # API; they are only readable over TDS (port 1433) against the SQL analytics
