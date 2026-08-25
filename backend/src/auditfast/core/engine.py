@@ -207,10 +207,17 @@ READ_INCOMPLETE_CHECK_ID = "WS-READ-INCOMPLETE"
 
 #: Human labels for the resources whose per-item reads can partially fail.
 _RESOURCE_LABEL: dict[str, str] = {
+    "activatorDefinitions": "Activator definitions",
+    "environmentDefinitions": "Environment definitions",
+    "lakehouseFiles": "Lakehouse file listings",
     "notebookDefinitions": "notebook definitions",
     "pipelineDefinitions": "pipeline definitions",
+    "semanticModelRefreshSchedule": "semantic model refresh schedules",
     "tableSchemas": "lakehouse table listings",
+    "tableColumns": "lakehouse/warehouse column schemas",
     "semanticModelDefinitions": "semantic model definitions",
+    "warehouseAudit": "Warehouse audit settings",
+    "warehouseSecurity": "Warehouse security policies",
 }
 
 
@@ -239,16 +246,52 @@ def read_incomplete_result(workspace: WorkspaceContext, resource_value: str, sta
     if reasons:
         top = sorted(reasons.items(), key=lambda kv: -kv[1])[:3]
         kinds.append("reasons: " + "; ".join(f"{r} x{c}" for r, c in top))
-    evidence = (
-        f"{failed} of {attempted} {label} could not be read — {', '.join(kinds)}. "
-        f"Re-sign-in with Item.ReadWrite.All and a workspace role that can read item "
-        f"definitions, then re-run to assess them."
-    )
+    artifacts = stat.get("artifacts") or []
+    artifact_text = ""
+    if artifacts:
+        details = []
+        for artifact in artifacts:
+            name = artifact.get("name") or artifact.get("id") or "unknown artifact"
+            artifact_id = artifact.get("id") or ""
+            failure = artifact.get("failure") or "unreadable"
+            reason = artifact.get("reason") or ""
+            identity = f"{name} ({artifact_id})" if artifact_id and artifact_id != name else name
+            details.append(f"{identity} [{failure}{f': {reason}' if reason else ''}]")
+        artifact_text = " Affected artifacts: " + "; ".join(details) + "."
+    reason_text = " ".join(str(reason).lower() for reason in reasons)
+    actions = []
+    if "pyodbc" in reason_text or "odbc driver" in reason_text:
+        actions.append(
+            "Install pyodbc and Microsoft ODBC Driver 18 for SQL Server in the backend runtime"
+        )
+    if "no provisioned sql analytics endpoint" in reason_text:
+        actions.append(
+            "Confirm the capacity is running and each Lakehouse/Warehouse SQL analytics endpoint "
+            "has finished provisioning"
+        )
+    if forbidden:
+        actions.append(
+            "Re-sign in with the required delegated scope and a workspace role that can read the artifact"
+        )
+    if transient:
+        actions.append(
+            "Run a live refresh again; if it persists, inspect HTTP 429/5xx and network logs"
+        )
+    if empty:
+        actions.append("Open the named artifact in Fabric and verify it returns a usable definition")
+    recommendation = ". ".join(actions) + ("." if actions else "Re-run the live audit.")
+    if attempted == 0 and reasons:
+        evidence = f"{label.capitalize()} unavailable — {', '.join(kinds)}."
+    else:
+        evidence = (
+            f"{failed} of {attempted} {label} could not be read — {', '.join(kinds)}. "
+            f"{artifact_text}"
+        )
     return CheckResult(
         check_id=READ_INCOMPLETE_CHECK_ID, ref="-",
         title="Incomplete crawl — data could not be read",
         pillar=Pillar.ARCHITECTURE, status=Status.NA, score=None, coverage=None,
-        evidence=evidence, recommendation="",
+        evidence=evidence, recommendation=recommendation,
         severity=Severity.HIGH, workspace=workspace.name, layer=workspace.layer,
         obj=label, scope=Scope.WORKSPACE, scored=False,
     )

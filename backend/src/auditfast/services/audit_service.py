@@ -97,7 +97,8 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
         return _build_snapshot_provider(settings, snapshots)
     if not token:
         raise AuditError("A sign-in token is required to run an audit.")
-    live = LiveFabricProvider(token, token_refresher=token_refresher,
+    live = LiveFabricProvider(token, timeout=settings.fabric_api_timeout_seconds,
+                              token_refresher=token_refresher,
                               powerbi_token=powerbi_token,
                               sql_token=sql_token if settings.sql_endpoint_enabled else None,
                               storage_token=storage_token,

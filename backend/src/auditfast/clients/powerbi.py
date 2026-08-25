@@ -18,6 +18,7 @@ Two things are easy to get wrong and are handled deliberately here:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from .errors import ProviderError
@@ -251,21 +252,26 @@ class PowerBIClient:
         failure = "transient"
         reason = "no attempt completed"
         for path in paths:
-            status, body = self._get(path)
-            if status == 200 and isinstance(body, dict):
-                return _refresh_schedule(body), ""
-            if status in (400, 404):
-                return None, ""  # no schedule configured for this model - a real answer
-            if status is None:
-                # Transport failure: DNS, reset, timeout. Retryable, and it says
-                # nothing about whether the token would have been accepted.
-                failure, reason = "transient", "transport error (DNS/reset/timeout)"
-            elif status in (401, 403):
-                failure, reason = "forbidden", f"HTTP {status}"
-            elif status == 429 or (status is not None and status >= 500):
-                failure, reason = "transient", f"HTTP {status}"
-            else:
-                failure, reason = "transient", f"HTTP {status}"
+            for attempt in range(3):
+                status, body = self._get(path)
+                if status == 200 and isinstance(body, dict):
+                    return _refresh_schedule(body), ""
+                if status in (400, 404):
+                    return None, ""  # no schedule configured for this model - a real answer
+                if status is None:
+                    # Transport failure: DNS, reset, timeout. Retryable, and it says
+                    # nothing about whether the token would have been accepted.
+                    failure, reason = "transient", "transport error (DNS/reset/timeout)"
+                elif status in (401, 403):
+                    failure, reason = "forbidden", f"HTTP {status}"
+                    break
+                elif status == 429 or (status is not None and status >= 500):
+                    failure, reason = "transient", f"HTTP {status}"
+                else:
+                    failure, reason = "transient", f"HTTP {status}"
+                    break
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
         log.info("dataset %s refresh schedule unread (%s): %s",
                  dataset_id, failure, reason)
         return None, failure
