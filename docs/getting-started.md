@@ -328,6 +328,7 @@ All optional — every setting has a working default. Prefix is `AUDITFAST_`.
 | `AUDITFAST_LOG_LEVEL` | `INFO` | Logging verbosity |
 | `AUDITFAST_LOG_JSON` | `false` | Structured JSON logs — enable when hosted |
 | `AUDITFAST_CORS_ORIGINS` | `["http://localhost:5173"]` | Origins allowed to call the API |
+| `AUDITFAST_FABRIC_API_TIMEOUT_SECONDS` | `180` | Fabric HTTP and getDefinition polling timeout |
 
 Frontend (see [`frontend/.env.example`](../frontend/.env.example)):
 
