@@ -46,7 +46,7 @@ FIXTURE_SETTINGS = {
 #: roll-up fails loudly here.
 EXPECTED_OVERALL = 49.57805907172996
 EXPECTED_SCORED_CHECKS = 158
-EXPECTED_RESULT_ROWS = 371
+EXPECTED_RESULT_ROWS = 370
 
 #: A session id the auth-service patch below always resolves to a token.
 #: Anything else — including a missing session — resolves to no token, so

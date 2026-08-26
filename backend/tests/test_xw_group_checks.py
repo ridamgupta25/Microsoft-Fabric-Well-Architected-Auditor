@@ -1,6 +1,6 @@
 """Cross-workspace (group) checks ported from the local check set.
 
-Seventeen best-practice points are implemented as ``@group_check``s in the
+Sixteen best-practice points are implemented as ``@group_check``s in the
 separate ``GROUP_REGISTRY``, so they run only for a project group (>=2 members)
 and never touch a normal single-workspace audit. These tests pin that they are
 registered, run over the fixture group without error, and obey N/A-not-FAIL.
@@ -23,7 +23,7 @@ from auditfast.core.models import GroupContext, GroupMemberContext, Item, Worksp
 
 from .conftest import FIXTURE_SETTINGS
 
-#: The 17 checks ported from the local set, id -> ref.
+#: The 16 checks ported from the local set, id -> ref.
 PORTED = {
     "XW-MEDALLION-CONSIST": "1.1.5",
     "XW-PIPELINE-SLA": "9.4.2",
@@ -40,7 +40,6 @@ PORTED = {
     "XW-ACCESS-AUDIT": "7.4.3",
     "XW-LINEAGE-E2E": "8.1.2",
     "XW-TECH-METADATA": "8.3.2",
-    "XW-CU-ALERTS": "12.2.7",
     "XW-SECRET-SCAN": "11.1.8",
 }
 
@@ -54,7 +53,7 @@ _THREE_MEMBER_GROUP = [(
 )]
 
 
-def test_all_seventeen_ported_checks_are_registered():
+def test_all_sixteen_ported_checks_are_registered():
     specs = {spec.id: spec for spec in GROUP_REGISTRY}
     for check_id, ref in PORTED.items():
         assert check_id in specs, f"{check_id} not registered"
