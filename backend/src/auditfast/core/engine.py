@@ -17,10 +17,8 @@ does not change.
 """
 from __future__ import annotations
 
-import logging
 import os
 import threading
-import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -70,77 +68,6 @@ MAX_PARALLEL_WORKSPACES = _resolve_max_parallel_workspaces()
 #: cannot multiply their per-run pools into a tenant-throttling storm: the total
 #: number of workspaces in flight across the whole process never exceeds the cap.
 _FETCH_GATE = threading.BoundedSemaphore(MAX_PARALLEL_WORKSPACES)
-
-log = logging.getLogger("auditfast.engine")
-
-
-def _resolve_workspace_batch_size() -> int:
-    """How many workspaces to crawl per batch before an adaptive cooldown.
-
-    ``0`` (the default) disables batching entirely — every workspace is crawled
-    in one wave, exactly as before. A positive value splits a large run into
-    sequential batches of that size, so a big tenant's Power BI calls do not all
-    land inside one rate-limit window.
-    """
-    raw = os.environ.get("AUDITFAST_WORKSPACE_BATCH_SIZE", "0")
-    try:
-        return max(0, int(raw))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _resolve_batch_cooldown_seconds() -> float:
-    """Seconds to pause after a batch that hit throttling, letting the Power BI
-    rate-limit window reset before the next batch. Only paid when a batch was
-    actually throttled, so a clean run never waits."""
-    raw = os.environ.get("AUDITFAST_BATCH_COOLDOWN_SECONDS", "30")
-    try:
-        return max(0.0, float(raw))
-    except (TypeError, ValueError):
-        return 30.0
-
-
-#: Batch size for large runs (0 = off) and the adaptive cooldown between batches.
-WORKSPACE_BATCH_SIZE = _resolve_workspace_batch_size()
-BATCH_COOLDOWN_SECONDS = _resolve_batch_cooldown_seconds()
-
-
-def _context_was_throttled(outcome: WorkspaceContext | Exception) -> bool:
-    """True when a crawl outcome shows Power BI/Fabric throttling (HTTP 429 etc.).
-
-    A throttled batch is the signal to cool down before the next one; a clean
-    batch is not, so the pause is adaptive rather than unconditional.
-    """
-    if isinstance(outcome, WorkspaceAccessError):
-        return outcome.status == 429
-    if isinstance(outcome, WorkspaceContext):
-        return any(
-            (stat.get("transient") or 0) > 0
-            for stat in outcome.read_failures.values()
-        )
-    return False
-
-
-def _crawl_batch(
-    provider,
-    chunk: list[tuple[int, tuple[str, Layer, float, list[CheckSpec], set[Resource]]]],
-) -> dict[int, WorkspaceContext | Exception]:
-    """Crawl one batch of planned workspaces in parallel, keyed by plan index."""
-    results: dict[int, WorkspaceContext | Exception] = {}
-    workers = min(MAX_PARALLEL_WORKSPACES, len(chunk))
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ws-fetch") as pool:
-        future_to_idx = {
-            pool.submit(_fetch_workspace, provider, wid, lyr, res): idx
-            for idx, (wid, lyr, _factor, _specs, res) in chunk
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                results[idx] = future.result()
-            except Exception as exc:  # noqa: BLE001 - reported in Phase 3
-                results[idx] = exc
-    return results
-
 
 
 def _fetch_workspace(
@@ -577,32 +504,22 @@ def run_audit(
     # network-bound and each workspace is independent, so they are fetched in
     # parallel under the process-wide cap. Evaluation (Phase 3) stays sequential
     # and in target order, so the report is byte-for-byte a serial run's — only
-    # the wall-clock shrinks. When AUDITFAST_WORKSPACE_BATCH_SIZE is set, a large
-    # run is split into sequential batches with an *adaptive* cooldown: the pause
-    # is paid only after a batch that was actually throttled, so a clean tenant
-    # never waits, but a big throttled run spaces its Power BI calls across
-    # separate rate-limit windows.
+    # the wall-clock shrinks.
     crawled: dict[int, WorkspaceContext | Exception] = {}
     if plan:
-        indexed = list(enumerate(plan))
-        if WORKSPACE_BATCH_SIZE and len(indexed) > WORKSPACE_BATCH_SIZE:
-            batches = [
-                indexed[i:i + WORKSPACE_BATCH_SIZE]
-                for i in range(0, len(indexed), WORKSPACE_BATCH_SIZE)
-            ]
-        else:
-            batches = [indexed]
-        for batch_num, batch in enumerate(batches):
-            batch_outcomes = _crawl_batch(provider, batch)
-            crawled.update(batch_outcomes)
-            is_last = batch_num == len(batches) - 1
-            if (not is_last and BATCH_COOLDOWN_SECONDS > 0
-                    and any(_context_was_throttled(o) for o in batch_outcomes.values())):
-                log.info(
-                    "workspace batch %d/%d hit throttling; cooling down %.0fs before the next batch",
-                    batch_num + 1, len(batches), BATCH_COOLDOWN_SECONDS,
-                )
-                time.sleep(BATCH_COOLDOWN_SECONDS)
+        workers = min(MAX_PARALLEL_WORKSPACES, len(plan))
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="ws-fetch") as pool:
+            future_to_idx = {
+                pool.submit(_fetch_workspace, provider, wid, lyr, res): idx
+                for idx, (wid, lyr, _factor, _specs, res) in enumerate(plan)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    crawled[idx] = future.result()
+                except Exception as exc:  # noqa: BLE001 - reported in Phase 3
+                    crawled[idx] = exc
 
     # Phase 3 — evaluate each workspace's checks, in target order. ``resources``
     # was consumed during the crawl phase and is unpacked only to keep the plan
