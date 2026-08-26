@@ -330,6 +330,8 @@ All optional — every setting has a working default. Prefix is `AUDITFAST_`.
 | `AUDITFAST_CORS_ORIGINS` | `["http://localhost:5173"]` | Origins allowed to call the API |
 | `AUDITFAST_FABRIC_API_TIMEOUT_SECONDS` | `180` | Fabric HTTP and getDefinition polling timeout |
 | `AUDITFAST_MAX_INFLIGHT_POWERBI_READS` | `3` | Max concurrent Power BI Datasets-API reads; lower reduces throttling |
+| `AUDITFAST_WORKSPACE_BATCH_SIZE` | `0` | Crawl large runs in batches of N workspaces (0 = off) |
+| `AUDITFAST_BATCH_COOLDOWN_SECONDS` | `30` | Pause after a throttled batch to reset the rate-limit window |
 
 Frontend (see [`frontend/.env.example`](../frontend/.env.example)):
 

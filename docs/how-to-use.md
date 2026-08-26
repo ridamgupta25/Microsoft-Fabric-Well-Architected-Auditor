@@ -547,6 +547,8 @@ set them as real environment variables before `serve`.
 | `AUDITFAST_CORS_ORIGINS` | `["http://localhost:5173"]` | Origins allowed to call the API |
 | `AUDITFAST_FABRIC_API_TIMEOUT_SECONDS` | `180` | Fabric HTTP and getDefinition polling timeout |
 | `AUDITFAST_MAX_INFLIGHT_POWERBI_READS` | `3` | Max concurrent Power BI Datasets-API reads (refresh schedules); lower reduces throttling |
+| `AUDITFAST_WORKSPACE_BATCH_SIZE` | `0` | Crawl large runs in batches of N workspaces (0 = off); reduces Power BI throttling |
+| `AUDITFAST_BATCH_COOLDOWN_SECONDS` | `30` | Pause after a *throttled* batch to let the rate-limit window reset |
 | `AUDITFAST_CACHE_ENABLED` | `true` | Turn the knowledge-base cache on/off |
 | `AUDITFAST_CACHE_TTL_SECONDS` | `86400` | How long a cached snapshot stays fresh |
 
