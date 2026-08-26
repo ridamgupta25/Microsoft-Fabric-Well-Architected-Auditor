@@ -119,11 +119,11 @@ export function ReportPage() {
         <section className="rounded-md border border-orange-200 bg-orange-50 p-4 dark:border-orange-900 dark:bg-orange-950">
           <h2 className="flex items-center gap-2 text-base font-semibold text-orange-900 dark:text-orange-300">
             <span aria-hidden="true">⚠</span>
-            Workspaces Requiring Additional Access ({report.errors.length})
+            Audit Read Limitations ({report.errors.length})
           </h2>
           <p className="mt-1 text-xs text-orange-700 dark:text-orange-400">
-            These were skipped and are excluded from the scores below. Grant at least Viewer
-            access, then re-run the audit.
+            These resources or artifacts could not be assessed and are excluded from the scores below.
+            Review the recorded cause and remediation, then run a live audit again.
           </p>
           <div className="mt-3 scroll-x">
             <table className="table-base">
@@ -136,8 +136,8 @@ export function ReportPage() {
                 </tr>
               </thead>
               <tbody>
-                {report.errors.map((item) => (
-                  <tr key={item.workspace}>
+                {report.errors.map((item, index) => (
+                  <tr key={`${item.workspace}-${index}`}>
                     <td className="font-medium">{item.workspace}</td>
                     <td>
                       <span className="badge bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200">
@@ -146,7 +146,7 @@ export function ReportPage() {
                     </td>
                     <td className="min-w-[16rem]">{item.message}</td>
                     <td className="min-w-[16rem] text-orange-800 dark:text-orange-300">
-                      {item.recommendation || "Ask an admin for access, then re-run."}
+                      {item.recommendation || "Review the recorded cause, then run a live audit again."}
                     </td>
                   </tr>
                 ))}

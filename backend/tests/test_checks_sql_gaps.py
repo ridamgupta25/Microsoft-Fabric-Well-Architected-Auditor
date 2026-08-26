@@ -17,8 +17,25 @@ these pin the two places the reason must now appear:
 from __future__ import annotations
 
 from auditfast.clients.live import LiveFabricProvider
+from auditfast.core.engine import read_incomplete_result
 from auditfast.core.enums import Resource
 from auditfast.core.models import WorkspaceContext
+
+
+def test_no_store_workspace_records_no_sql_limitation(monkeypatch):
+    """A workspace with no Lakehouse/Warehouse must not report a SQL-endpoint gap."""
+    import auditfast.clients.sqlendpoint as sqlmod
+    monkeypatch.setattr(sqlmod, "discover_endpoints", lambda *_a, **_k: [])
+
+    provider = LiveFabricProvider("token")
+    ctx = WorkspaceContext(id="ws")  # no items -> no Lakehouse/Warehouse
+    provider._read_sql_endpoints(
+        ctx, "ws", {Resource.TABLE_COLUMNS, Resource.WAREHOUSE_SECURITY}
+    )
+
+    assert ctx.read_failures == {}  # no limitation row
+    assert not ctx.has(Resource.TABLE_COLUMNS)  # still N/A for checks
+    assert not ctx.has(Resource.WAREHOUSE_SECURITY)
 
 
 def _gap(reason: str, endpoints: int = 3,
@@ -67,3 +84,17 @@ def test_no_provisioned_endpoint_is_recorded_with_its_own_reason():
     assert any("provisioned" in r for r in reasons)
     # Zero endpoints must still record a count, or the histogram reads as empty.
     assert sum(reasons.values()) >= 1
+
+
+def test_no_endpoint_report_does_not_say_zero_of_zero_failed():
+    ctx = _gap("no provisioned SQL analytics endpoint was discovered", endpoints=0)
+
+    warning = read_incomplete_result(
+        ctx,
+        Resource.TABLE_COLUMNS.value,
+        ctx.read_failures[Resource.TABLE_COLUMNS.value],
+    )
+
+    assert warning.evidence.startswith("Lakehouse/warehouse column schemas unavailable")
+    assert "0 of 0" not in warning.evidence
+    assert "capacity is running" in warning.recommendation

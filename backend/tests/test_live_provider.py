@@ -1,7 +1,32 @@
 """Tests for the live provider's transport helpers (offline, with a fake session)."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from auditfast.clients.live import LiveFabricProvider
+from auditfast.services import audit_service
+
+
+def test_build_provider_uses_configured_fabric_timeout(monkeypatch):
+    captured = {}
+
+    class FakeLiveProvider:
+        def __init__(self, token, **kwargs):
+            captured.update(token=token, **kwargs)
+
+    settings = SimpleNamespace(
+        fabric_api_timeout_seconds=240,
+        sql_endpoint_enabled=False,
+        cache_enabled=False,
+        kb_archive_enabled=False,
+    )
+    monkeypatch.setattr(audit_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(audit_service, "LiveFabricProvider", FakeLiveProvider)
+
+    provider = audit_service.build_provider(None, token="token")
+
+    assert isinstance(provider, FakeLiveProvider)
+    assert captured["timeout"] == 240
 
 
 class _FakeResponse:
@@ -24,6 +49,17 @@ class _FakeSession:
     def get(self, url, timeout=None):
         self.calls.append(url)
         return self.by_url[url]
+
+
+class _SequenceGetSession:
+    def __init__(self, responses: list[_FakeResponse]):
+        self.responses = list(responses)
+        self.calls: list[str] = []
+        self.headers: dict = {}
+
+    def get(self, url, timeout=None):
+        self.calls.append(url)
+        return self.responses.pop(0)
 
 
 def _provider_with(session: _FakeSession) -> LiveFabricProvider:
@@ -572,6 +608,25 @@ def test_powerbi_refresh_schedule_401_is_forbidden_not_no_schedule():
     assert client.dataset_refresh_schedule("d1", group_id="ws") == (None, "forbidden")
 
 
+def test_powerbi_refresh_schedule_retries_throttling(monkeypatch):
+    from auditfast.clients import powerbi
+
+    client = powerbi.PowerBIClient("pbi")
+    session = _SequenceGetSession([
+        _FakeResponse(429, {}),
+        _FakeResponse(503, {}),
+        _FakeResponse(200, {"enabled": True, "notifyOption": "MailOnFailure"}),
+    ])
+    client._session = session
+    monkeypatch.setattr(powerbi.time, "sleep", lambda _seconds: None)
+
+    schedule, failure = client.dataset_refresh_schedule("d1", group_id="ws")
+
+    assert failure == ""
+    assert schedule["notifies_on_failure"] is True
+    assert len(session.calls) == 3
+
+
 def test_fetch_reads_refresh_schedules_and_round_trips_them():
     provider = LiveFabricProvider("token")
     base = provider.BASE
@@ -643,6 +698,33 @@ def test_fetch_model_with_no_schedule_is_read_not_unavailable():
 
     assert ctx.refresh_schedules == {}
     assert Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE not in ctx.unavailable
+
+
+def test_fetch_refresh_schedule_failure_records_model_identity():
+    provider = LiveFabricProvider("token")
+    base = provider.BASE
+    items = {"value": [{"id": "sm-1", "type": "SemanticModel", "displayName": "Sales"}]}
+    provider._session = _FakeSession({
+        f"{base}/workspaces/ws-1": _FakeResponse(200, {"displayName": "Reporting"}),
+        f"{base}/workspaces/ws-1/items": _FakeResponse(200, items),
+    })
+    provider._powerbi_client = _FakeRefreshSchedulePowerBI({"sm-1": (None, "forbidden")})
+
+    from auditfast.core.enums import Resource
+
+    ctx = provider.fetch(
+        "ws-1",
+        resources=[Resource.ITEMS, Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE],
+    )
+
+    artifacts = ctx.read_failures[Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE.value]["artifacts"]
+    assert artifacts == [{
+        "id": "sm-1",
+        "name": "Sales",
+        "failure": "forbidden",
+        "reason": "Power BI rejected the token (HTTP 401/403) - the sign-in lacks "
+                  "Dataset.Read.All, or the tenant setting for it is off",
+    }]
 
 
 def test_fetch_sets_created_date_even_when_refresh_history_empty():
@@ -811,3 +893,48 @@ def test_workspace_read_retries_on_401_after_refresh():
     assert ctx.display_name == "MyWS"
     assert len(refreshed) == 1
     assert len(session.get_calls) == 3  # ws(401) + ws(200) + items
+
+
+def test_definition_parts_retries_on_429_then_succeeds(monkeypatch):
+    """A throttled getDefinition (429) is retried and can then succeed."""
+    import auditfast.clients.live as live_mod
+    monkeypatch.setattr(live_mod.time, "sleep", lambda *_a, **_k: None)
+
+    provider = LiveFabricProvider("token")
+    session = _CountingFakeSession()
+    session.queue_post(_FakeResponse(429, {}))
+    import base64
+    import json
+    payload = base64.b64encode(json.dumps({"activities": []}).encode()).decode()
+    session.queue_post(_FakeResponse(200, {
+        "definition": {"parts": [{"path": "pipeline-content.json", "payload": payload}]}
+    }))
+    provider._session = session
+    provider._session.headers = {}
+
+    parts, failure = provider._definition_parts("ws-1", "item-1")
+
+    assert failure == ""
+    assert len(session.post_calls) == 2  # original + retry
+
+
+def test_workspace_read_retries_on_429_not_dropped(monkeypatch):
+    """A workspace throttled with 429 is retried instead of being skipped."""
+    import auditfast.clients.live as live_mod
+    monkeypatch.setattr(live_mod.time, "sleep", lambda *_a, **_k: None)
+
+    provider = LiveFabricProvider("token")
+    base = provider.BASE
+    session = _CountingFakeSession()
+    ws_url = f"{base}/workspaces/ws-1"
+    session.queue_get(ws_url, _FakeResponse(429, {}))
+    session.queue_get(ws_url, _FakeResponse(200, {"displayName": "MyWS"}))
+    session.queue_get(f"{base}/workspaces/ws-1/items", _FakeResponse(200, {"value": []}))
+    provider._session = session
+    provider._session.headers = {}
+
+    from auditfast.core.enums import Resource
+    ctx = provider.fetch("ws-1", resources=[Resource.ITEMS])
+
+    assert ctx.display_name == "MyWS"  # not dropped
+

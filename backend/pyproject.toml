@@ -18,6 +18,7 @@ dependencies = [
     # Fabric access + auth
     "msal>=1.28",
     "requests>=2.31",
+    "pyodbc>=5.1",
     # Domain / reporting
     "openpyxl>=3.1",
     "PyYAML>=6.0",

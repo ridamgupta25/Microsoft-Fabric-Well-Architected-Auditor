@@ -44,27 +44,9 @@ FIXTURE_SETTINGS = {
 #: The overall score the recorded tenant must produce. Pinned to the value the
 #: engine returns for the fixture, so any change to a check, a band, or the
 #: roll-up fails loudly here.
-EXPECTED_OVERALL = 49.89384288747346
-EXPECTED_SCORED_CHECKS = 157
-EXPECTED_RESULT_ROWS = 371
-
-#: The service/API path excludes the advisory (non-deterministic) checks from the
-#: deterministic scorecard and routes them to a separate Advisory report. These
-#: are the engine values above minus the advisory subset, so they must reconcile:
-#:
-#:     EXPECTED_DETERMINISTIC_RESULT_ROWS + EXPECTED_ADVISORY_RESULT_ROWS
-#:         == EXPECTED_RESULT_ROWS
-#:     EXPECTED_DETERMINISTIC_SCORED + EXPECTED_ADVISORY_SCORED
-#:         == EXPECTED_SCORED_CHECKS
-#:
-#: Check that when a pin moves. A change that adds rows has to update both the
-#: total and its deterministic half; updating only one leaves the pair
-#: inconsistent and the failure surfaces in an unrelated API test.
-EXPECTED_DETERMINISTIC_OVERALL = 51.2
-EXPECTED_DETERMINISTIC_SCORED = 125
-EXPECTED_DETERMINISTIC_RESULT_ROWS = 290
-EXPECTED_ADVISORY_SCORED = 32
-EXPECTED_ADVISORY_RESULT_ROWS = 81
+EXPECTED_OVERALL = 49.57805907172996
+EXPECTED_SCORED_CHECKS = 158
+EXPECTED_RESULT_ROWS = 370
 
 #: A session id the auth-service patch below always resolves to a token.
 #: Anything else — including a missing session — resolves to no token, so

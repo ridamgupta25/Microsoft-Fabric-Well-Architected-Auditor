@@ -82,6 +82,32 @@ def _bounded_int_env(name: str, default: int, low: int, high: int) -> int:
         return default
 
 
+def _retry_after_seconds(response, attempt: int, cap: float = 30.0) -> float:
+    """Seconds to wait before a retry, honoring the server's ``Retry-After``.
+
+    Falls back to exponential backoff when the header is absent, and never waits
+    longer than ``cap`` so a hostile value cannot stall the crawl.
+    """
+    header = getattr(response, "headers", {}).get("Retry-After") if response is not None else None
+    try:
+        if header is not None:
+            return min(float(header), cap)
+    except (TypeError, ValueError):
+        pass
+    return min(2.0 * (attempt + 1), cap)
+
+
+def _failure_detail(item: Item, failure: str, reason: str = "") -> dict[str, str]:
+    detail = {
+        "id": item.id,
+        "name": item.display_name or item.id,
+        "failure": failure,
+    }
+    if reason:
+        detail["reason"] = reason
+    return detail
+
+
 #: Per-workspace fan-out: how many item definitions are fetched at once while
 #: crawling a single workspace. Each getDefinition is a slow long-running
 #: operation, so fetching them concurrently is the crawl's biggest speed-up.
@@ -281,7 +307,7 @@ class LiveFabricProvider:
                 response = self._session.post(url, timeout=self._timeout)
             except Exception as exc:
                 if attempt < 2:
-                    time.sleep(min(2.0 * (attempt + 1), 5.0))
+                    time.sleep(_retry_after_seconds(None, attempt))
                     continue
                 log.warning("item %s getDefinition transport error: %s", item_id, exc)
                 return [], "transient"
@@ -302,7 +328,7 @@ class LiveFabricProvider:
                 log.warning("item %s getDefinition -> HTTP 403 (permission denied)", item_id)
                 return [], "forbidden"
             elif status in self._RETRYABLE and attempt < 2:
-                time.sleep(min(2.0 * (attempt + 1), 5.0))
+                time.sleep(_retry_after_seconds(response, attempt))
                 continue
             else:
                 log.warning("item %s getDefinition -> HTTP %s", item_id, status)
@@ -523,6 +549,19 @@ class LiveFabricProvider:
 
         endpoints = discover_endpoints(get_json, workspace_id)
         if not endpoints:
+            # A workspace with no Lakehouse/Warehouse never had a SQL endpoint to
+            # read, so this is not a limitation to report — mark the resources N/A
+            # silently, exactly as before the SQL endpoint was wired in.
+            has_store = any(
+                (item.type or "") in ("Lakehouse", "Warehouse") for item in ctx.items
+            )
+            if not has_store:
+                for resource in (Resource.TABLE_COLUMNS, Resource.WAREHOUSE_SECURITY):
+                    if resource in wanted:
+                        ctx.unavailable.add(resource)
+                log.info("fetch %s: no Lakehouse/Warehouse — SQL endpoint reads skipped",
+                         workspace_id)
+                return
             reason = ("no provisioned SQL analytics endpoint was discovered in this "
                       "workspace (a newly created Lakehouse/Warehouse provisions one "
                       "asynchronously, and a paused capacity serves none)")
@@ -730,8 +769,9 @@ class LiveFabricProvider:
         provider = body.get("gitProviderDetails") or {}
         sync = body.get("gitSyncDetails") or {}
         state = body.get("gitConnectionState") or ""
+        connected = state != "NotConnected" if state else bool(provider)
         return {
-            "connected": state != "NotConnected" if state else bool(provider),
+            "connected": connected,
             "state": state,
             "provider": provider.get("gitProviderType", ""),
             # Azure DevOps reports organizationName; GitHub reports ownerName.
@@ -742,6 +782,42 @@ class LiveFabricProvider:
             "directory": provider.get("directoryName", ""),
             "head": sync.get("head"),
             "last_sync_time": sync.get("lastSyncTime"),
+            "secret_scanning": LiveFabricProvider._secret_scanning_status(
+                provider.get("gitProviderType", ""), connected
+            ),
+        }
+
+    @staticmethod
+    def _secret_scanning_status(provider_type: str, connected: bool) -> dict:
+        """Record what is known about the repo's secret-scanning posture.
+
+        Secret scanning / push protection is a *Git-provider* control (GitHub
+        Advanced Security, Azure DevOps push protection) that the Fabric
+        ``git/connection`` API does not expose, and reading it needs a
+        repo-security token the auditor is not granted. So the honest, read-only
+        answer is ``enabled: None`` (unknown, not verified) with the reason, which
+        lets a check report the environment as *unverified* rather than assume a
+        pass or a fail. The shape stays stable so a future provider integration
+        can fill ``enabled`` in without a schema change.
+        """
+        if not connected:
+            return {
+                "provider": provider_type,
+                "verified": False,
+                "enabled": None,
+                "push_protection": None,
+                "reason": "workspace is not connected to source control",
+            }
+        return {
+            "provider": provider_type,
+            "verified": False,
+            "enabled": None,
+            "push_protection": None,
+            "reason": (
+                "secret scanning / push protection is a Git-provider security "
+                "control not exposed by the Fabric git/connection API and needs a "
+                "repo-security token to read; not verifiable read-only"
+            ),
         }
 
     @staticmethod
@@ -819,7 +895,8 @@ class LiveFabricProvider:
     @staticmethod
     def _record_failures(ctx: WorkspaceContext, resource: Resource,
                          attempted: int, read: int, forbidden: int, transient: int,
-                         empty: int = 0, reasons: dict[str, int] | None = None) -> None:
+                         empty: int = 0, reasons: dict[str, int] | None = None,
+                         artifacts: list[dict[str, str]] | None = None) -> None:
         """Record a one-per-item read outcome on the context.
 
         When some items of a type could not be read, store the counts so the gap
@@ -849,6 +926,8 @@ class LiveFabricProvider:
                 stat["reasons"] = dict(
                     sorted(reasons.items(), key=lambda kv: -kv[1])
                 )
+            if artifacts:
+                stat["artifacts"] = [dict(artifact) for artifact in artifacts]
             ctx.read_failures[resource.value] = stat
             if read == 0:
                 ctx.unavailable.add(resource)
@@ -1413,9 +1492,16 @@ class LiveFabricProvider:
         wanted = set(resources)
 
         # The workspace itself is always read: it establishes both identity and
-        # access, and its status is how we detect an unreadable workspace.
+        # access, and its status is how we detect an unreadable workspace. A 429
+        # here would otherwise drop the whole workspace, so it is retried with the
+        # server's Retry-After before giving up.
         status, workspace = self._get(f"/workspaces/{workspace_id}")
         if status == 401 and self._try_refresh_token():
+            status, workspace = self._get(f"/workspaces/{workspace_id}")
+        for attempt in range(3):
+            if status != 429:
+                break
+            time.sleep(_retry_after_seconds(None, attempt))
             status, workspace = self._get(f"/workspaces/{workspace_id}")
         if status != 200 or not isinstance(workspace, dict):
             raise WorkspaceAccessError(workspace_id, status)
@@ -1515,12 +1601,15 @@ class LiveFabricProvider:
             fetched = self._fetch_items_parallel(
                 environments, lambda it: self._environment_definition(workspace_id, it.id))
             attempted = read = forbidden = transient = 0
+            failed_artifacts = []
             for item, (definition, failure) in zip(environments, fetched, strict=True):
                 attempted += 1
                 if failure == "forbidden":
                     forbidden += 1
+                    failed_artifacts.append(_failure_detail(item, failure, "HTTP 401/403"))
                 elif failure == "transient":
                     transient += 1
+                    failed_artifacts.append(_failure_detail(item, failure))
                 else:
                     read += 1
                     if definition:
@@ -1530,7 +1619,8 @@ class LiveFabricProvider:
                         ctx.environments[item.id] = record
                         ctx.environments[item.display_name] = record
             self._record_failures(ctx, Resource.ENVIRONMENT_DEFINITIONS,
-                                  attempted, read, forbidden, transient)
+                                  attempted, read, forbidden, transient,
+                                  artifacts=failed_artifacts)
 
         # The workspace's *default* Spark runtime, for notebooks that bind to no
         # named Environment. Deliberately outside the ENVIRONMENT_DEFINITIONS
@@ -1548,20 +1638,25 @@ class LiveFabricProvider:
             fetched = self._fetch_items_parallel(
                 pipelines, lambda it: self._pipeline_definition(workspace_id, it.id))
             attempted = read = forbidden = transient = empty = 0
+            failed_artifacts = []
             for item, (definition, failure) in zip(pipelines, fetched, strict=True):
                 attempted += 1
                 if failure == "forbidden":
                     forbidden += 1
+                    failed_artifacts.append(_failure_detail(item, failure, "HTTP 401/403"))
                 elif failure == "transient":
                     transient += 1
+                    failed_artifacts.append(_failure_detail(item, failure))
                 elif definition:
                     read += 1
                     key = self._unique_key(ctx.pipelines, item.display_name or item.id, item.id)
                     ctx.pipelines[key] = definition
                 else:
                     empty += 1
+                    failed_artifacts.append(_failure_detail(item, "empty"))
             self._record_failures(ctx, Resource.PIPELINE_DEFINITIONS,
-                                  attempted, read, forbidden, transient, empty)
+                                  attempted, read, forbidden, transient, empty,
+                                  artifacts=failed_artifacts)
 
         # Notebook definitions: same one-call-per-item getDefinition pattern.
         if Resource.NOTEBOOK_DEFINITIONS in wanted:
@@ -1574,12 +1669,15 @@ class LiveFabricProvider:
 
             fetched = self._fetch_items_parallel(found, _notebook_bundle)
             attempted = read = forbidden = transient = empty = 0
+            failed_artifacts = []
             for item, (definition, failure, monitoring) in zip(found, fetched, strict=True):
                 attempted += 1
                 if failure == "forbidden":
                     forbidden += 1
+                    failed_artifacts.append(_failure_detail(item, failure, "HTTP 401/403"))
                 elif failure == "transient":
                     transient += 1
+                    failed_artifacts.append(_failure_detail(item, failure))
                 elif definition:
                     read += 1
                     binding = self._environment_binding(definition)
@@ -1594,7 +1692,8 @@ class LiveFabricProvider:
                         definition["_auditfast_monitoring"] = monitoring
                     ctx.notebooks[item.display_name or item.id] = definition
             self._record_failures(ctx, Resource.NOTEBOOK_DEFINITIONS,
-                                  attempted, read, forbidden, transient, empty)
+                                  attempted, read, forbidden, transient, empty,
+                                  artifacts=failed_artifacts)
             log.info("fetch %s: %d notebooks found, %d definitions read",
                      workspace_id, len(found), len(ctx.notebooks))
 
@@ -1606,6 +1705,7 @@ class LiveFabricProvider:
             fetched = self._fetch_items_parallel(
                 lakehouses, lambda it: self._lakehouse_tables(workspace_id, it.id))
             attempted = read = forbidden = transient = 0
+            failed_artifacts = []
             # ``item`` is intentionally unused: a Lakehouse table is stored under
             # its own name, not the Lakehouse's. Two Lakehouses holding a table
             # of the same name therefore collide here - the second wins - which
@@ -1616,8 +1716,10 @@ class LiveFabricProvider:
                 attempted += 1
                 if failure == "forbidden":
                     forbidden += 1
+                    failed_artifacts.append(_failure_detail(_item, failure, "HTTP 401/403"))
                 elif failure == "transient":
                     transient += 1
+                    failed_artifacts.append(_failure_detail(_item, failure))
                 else:
                     read += 1
                     for tbl in tables:
@@ -1629,7 +1731,8 @@ class LiveFabricProvider:
                                 "columns": [],
                             }
             self._record_failures(ctx, Resource.TABLE_SCHEMAS,
-                                  attempted, read, forbidden, transient)
+                                  attempted, read, forbidden, transient,
+                                  artifacts=failed_artifacts)
             log.info("fetch %s: %d lakehouses, %d tables read",
                      workspace_id, len(lakehouses), len(ctx.tables))
 
@@ -1647,6 +1750,7 @@ class LiveFabricProvider:
         if Resource.LAKEHOUSE_FILES in wanted:
             lakehouses = [i for i in ctx.items if i.type == "Lakehouse"]
             attempted = read = forbidden = transient = 0
+            failed_artifacts = []
             onelake = self._onelake()
             if lakehouses and onelake is None:
                 ctx.unavailable.add(Resource.LAKEHOUSE_FILES)
@@ -1665,8 +1769,10 @@ class LiveFabricProvider:
                     attempted += 1
                     if failure == "forbidden":
                         forbidden += 1
+                        failed_artifacts.append(_failure_detail(item, failure, "HTTP 401/403"))
                     elif failure == "transient":
                         transient += 1
+                        failed_artifacts.append(_failure_detail(item, failure))
                     else:
                         read += 1
                         key = self._unique_key(
@@ -1683,7 +1789,8 @@ class LiveFabricProvider:
                             ctx.lakehouse_tables_files[key] = tables_summary
                         self._annotate_partitions(ctx, onelake, workspace_id, item)
             self._record_failures(ctx, Resource.LAKEHOUSE_FILES,
-                                  attempted, read, forbidden, transient)
+                                  attempted, read, forbidden, transient,
+                                  artifacts=failed_artifacts)
             log.info("fetch %s: lakehouse Files summaries read for %d of %d lakehouse(s)",
                      workspace_id, read, len(lakehouses))
 
@@ -1696,14 +1803,18 @@ class LiveFabricProvider:
             fetched = self._fetch_items_parallel(
                 warehouses, lambda it: self._warehouse_audit(workspace_id, it.id))
             attempted = read = forbidden = transient = empty = 0
+            failed_artifacts = []
             for item, (settings, failure) in zip(warehouses, fetched, strict=True):
                 attempted += 1
                 if failure == "forbidden":
                     forbidden += 1
+                    failed_artifacts.append(_failure_detail(item, failure, "HTTP 401/403"))
                 elif failure == "transient":
                     transient += 1
+                    failed_artifacts.append(_failure_detail(item, failure))
                 elif settings is None:
                     empty += 1
+                    failed_artifacts.append(_failure_detail(item, "empty"))
                 else:
                     read += 1
                     key = self._unique_key(
@@ -1711,7 +1822,8 @@ class LiveFabricProvider:
                     )
                     ctx.warehouse_audit[key] = settings
             self._record_failures(ctx, Resource.WAREHOUSE_AUDIT,
-                                  attempted, read, forbidden, transient, empty)
+                                  attempted, read, forbidden, transient, empty,
+                                  artifacts=failed_artifacts)
             log.info("fetch %s: sql audit settings read for %d of %d warehouse(s)",
                      workspace_id, read, attempted)
 
@@ -1724,12 +1836,15 @@ class LiveFabricProvider:
             fetched = self._fetch_items_parallel(
                 reflexes, lambda it: self._reflex_definition(workspace_id, it.id))
             attempted = read = forbidden = transient = empty = 0
+            failed_artifacts = []
             for item, (summary, failure) in zip(reflexes, fetched, strict=True):
                 attempted += 1
                 if failure == "forbidden":
                     forbidden += 1
+                    failed_artifacts.append(_failure_detail(item, failure, "HTTP 401/403"))
                 elif failure == "transient":
                     transient += 1
+                    failed_artifacts.append(_failure_detail(item, failure))
                 elif summary is not None:
                     read += 1
                     key = self._unique_key(
@@ -1738,8 +1853,10 @@ class LiveFabricProvider:
                     ctx.activators[key] = summary
                 else:
                     empty += 1
+                    failed_artifacts.append(_failure_detail(item, "empty"))
             self._record_failures(ctx, Resource.ACTIVATOR_DEFINITIONS,
-                                  attempted, read, forbidden, transient, empty)
+                                  attempted, read, forbidden, transient, empty,
+                                  artifacts=failed_artifacts)
             log.info("fetch %s: activator definitions read for %d of %d reflex item(s)",
                      workspace_id, read, attempted)
 
@@ -1771,12 +1888,15 @@ class LiveFabricProvider:
             fetched = self._fetch_items_parallel(
                 models, lambda it: self._semantic_model_definition(workspace_id, it.id))
             attempted = read = forbidden = transient = empty = 0
+            failed_artifacts = []
             for item, (model, failure) in zip(models, fetched, strict=True):
                 attempted += 1
                 if failure == "forbidden":
                     forbidden += 1
+                    failed_artifacts.append(_failure_detail(item, failure, "HTTP 401/403"))
                 elif failure == "transient":
                     transient += 1
+                    failed_artifacts.append(_failure_detail(item, failure))
                 elif model:
                     read += 1
                     key = self._unique_key(
@@ -1785,8 +1905,10 @@ class LiveFabricProvider:
                     ctx.semantic_models[key] = model
                 else:
                     empty += 1
+                    failed_artifacts.append(_failure_detail(item, "empty"))
             self._record_failures(ctx, Resource.SEMANTIC_MODEL_DEFINITIONS,
-                                  attempted, read, forbidden, transient, empty)
+                                  attempted, read, forbidden, transient, empty,
+                                  artifacts=failed_artifacts)
             log.info("fetch %s: %d semantic models parsed", workspace_id, len(ctx.semantic_models))
 
         # Semantic-model refresh *schedule configuration* — one Power BI Datasets
@@ -1800,6 +1922,7 @@ class LiveFabricProvider:
                 lambda it: self._semantic_model_refresh_schedule(workspace_id, it.id))
             attempted = read = forbidden = transient = 0
             schedule_reasons: dict[str, int] = {}
+            failed_artifacts = []
             for item, (schedule, failure) in zip(schedule_models, fetched, strict=True):
                 attempted += 1
                 if failure == "forbidden":
@@ -1818,10 +1941,12 @@ class LiveFabricProvider:
                         )
                         ctx.refresh_schedules[key] = schedule
                     continue
+                failed_artifacts.append(_failure_detail(item, failure, reason))
                 schedule_reasons[reason] = schedule_reasons.get(reason, 0) + 1
             self._record_failures(ctx, Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE,
                                   attempted, read, forbidden, transient,
-                                  reasons=schedule_reasons)
+                                  reasons=schedule_reasons,
+                                  artifacts=failed_artifacts)
             log.info("fetch %s: refresh schedule read for %d of %d semantic model(s) "
                      "(%d forbidden, %d transient)",
                      workspace_id, read, attempted, forbidden, transient)
