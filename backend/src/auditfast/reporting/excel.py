@@ -5,6 +5,7 @@ import re
 from collections import defaultdict
 from datetime import date
 
+from ..core.engine import READ_INCOMPLETE_CHECK_ID
 from ..core.enums import Pillar, Severity, Status
 from ..core.scoring import percentage, rating
 from ..core.validation import (
@@ -760,11 +761,17 @@ def build_excel(
         "Objects Assessed",
         "Asset-Level Results",
         "Consolidated Controls",
+        "Read Limitations",
     ]
     inventory.append(inventory_headers)
     style_header(inventory, 1, len(inventory_headers))
     for workspace in sorted({result.workspace for result in results if result.workspace}):
         workspace_results = [result for result in results if result.workspace == workspace]
+        read_limitations = [
+            result.evidence
+            for result in workspace_results
+            if result.check_id == READ_INCOMPLETE_CHECK_ID
+        ]
         inventory.append(
             [
                 workspace_id_by_name[workspace],
@@ -773,15 +780,16 @@ def build_excel(
                 len({result.obj for result in workspace_results if result.obj}),
                 len(workspace_results),
                 len({(result.check_id, result.ref) for result in workspace_results}),
+                "\n".join(read_limitations),
             ]
         )
     inventory.freeze_panes = "C2"
     add_styled_table(
         inventory,
         "InventoryTable",
-        f"A1:F{inventory.max_row}",
+        f"A1:G{inventory.max_row}",
     )
-    inventory_widths = [14, 42, 22, 20, 22, 24]
+    inventory_widths = [14, 42, 22, 20, 22, 24, 65]
     for index, width in enumerate(inventory_widths, start=1):
         inventory.column_dimensions[
             inventory.cell(row=1, column=index).column_letter
