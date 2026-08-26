@@ -24,7 +24,6 @@ _CHECKS: list[tuple[str, str, str, tuple[str, ...], bool, str]] = [
     ("R-12-2-4", "12.2.4", "Capacity bursting/throttling incidents tracked — frequent throttling indicates undersizing", (Layer.OPERATIONS,), True, "CAPACITY_METRICS"),
     ("R-12-2-5", "12.2.5", "Workloads distributed to avoid peak-hour contention", (Layer.OPERATIONS,), True, "CAPACITY_METRICS"),
     ("R-12-2-6", "12.2.6", "Background vs interactive CU consumption analyzed", (Layer.OPERATIONS,), True, "CAPACITY_METRICS"),
-    ("R-12-2-7", "12.2.7", "CU consumption alerts configured for proactive throttling prevention", (Layer.OPERATIONS,), True, "CAPACITY_METRICS"),
     ("R-12-3-1", "12.3.1", "ADLS Gen2 access tier appropriate (Hot vs Cool) for Pre-Bronze/Bronze", (Layer.OPERATIONS,), True, "CAPACITY_METRICS"),
     ("R-12-3-2", "12.3.2", "Lifecycle policies on ADLS for old files (move to Cool/Archive)", (Layer.OPERATIONS,), True, "CAPACITY_METRICS"),
     ("R-12-3-3", "12.3.3", "Spark pool not running idle (Environment settings tuned)", (Layer.OPERATIONS,), True, "CAPACITY_METRICS"),

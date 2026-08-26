@@ -231,7 +231,7 @@ def sla_alerts_consistent(ctx: GroupContext) -> Verdict:
     activity. State matters: a ``MailOnFailure`` schedule that is *disabled* is
     configured-but-inactive, so it is reported as PARTIAL, not a pass. Any
     activator rule is classified as SLA-relevant here (failure / lateness), which
-    keeps this check distinct from 12.2.7 (capacity CU alerting) so one rule is
+    keeps this check distinct from capacity CU-consumption alerting so one rule is
     not double-counted. N/A when fewer than two environments can be compared.
     """
     active: list[str] = []
