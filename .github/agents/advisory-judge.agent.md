@@ -29,7 +29,15 @@ PHASE 4. Everything else you decide and proceed.
 # PHASE 0 - FIND THE WORK
 # ═══════════════════════════════════════════════════════════════════
 
-Read `backend/output/advisory-manifest.json`. It lists one job per check:
+Every audit writes its own timestamped directory, so the work is under
+`backend/output/<workspace-or-project>_<timestamp>/`. Take the most recent one:
+
+```powershell
+cd backend
+Get-ChildItem output -Directory | Sort-Object Name -Descending | Select-Object -First 1
+```
+
+Read `<run>/advisory-manifest.json` inside it. It lists one job per check:
 
 ```json
 {"check_id": "TB-STARSCHEMA",
@@ -38,9 +46,14 @@ Read `backend/output/advisory-manifest.json`. It lists one job per check:
  "theme": "dimensional-modelling",
  "objects": 18,
  "chunks": 1,
- "job": "backend/output/jobs/TB-STARSCHEMA.json",
- "labels_file": "backend/output/jobs/TB-STARSCHEMA-labels.csv"}
+ "job": "C:\\...\\output\\NOIDA_20260826_143012\\jobs\\TB-STARSCHEMA.json",
+ "labels_file": "C:\\...\\output\\NOIDA_20260826_143012\\jobs\\TB-STARSCHEMA-labels.csv"}
 ```
+
+`job` and `labels_file` are **full paths** - use them as given rather than
+rebuilding them from a folder name. If you find a bare `backend/output/jobs/`
+with no timestamp above it, that is from before per-run directories and is not
+what a current audit wrote.
 
 Everything is keyed by **`check_id`**, not `ref`. Seven advisory refs carry two
 checks each - `5.1.9` is both a pipeline check and a notebook one - so a ref does
@@ -123,9 +136,12 @@ Check first - this writes nothing:
 
 ```powershell
 cd backend
-..\.venv\Scripts\python.exe -m auditfast advisory-score `
-    --jobs output\jobs --labels output\jobs --no-report
+..\.venv\Scripts\python.exe -m auditfast advisory-score --no-report
 ```
+
+`advisory-score` resolves the most recent run on its own, so there is no path to
+pass. Add `--run output\<dir>` only to score an older one, or `--workspace NAME`
+to pick the newest run of one workspace.
 
 Read the counts:
 
@@ -143,8 +159,7 @@ against a different export. Re-export and judge again rather than editing ids.
 Then write the report:
 
 ```powershell
-..\.venv\Scripts\python.exe -m auditfast advisory-score `
-    --jobs output\jobs --labels output\jobs
+..\.venv\Scripts\python.exe -m auditfast advisory-score
 ```
 
 # ═══════════════════════════════════════════════════════════════════
