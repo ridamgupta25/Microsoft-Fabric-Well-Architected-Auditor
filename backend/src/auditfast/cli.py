@@ -63,6 +63,10 @@ def cmd_run(args) -> int:
     print_summary(run.project_name, run.aggregate)
     for error in run.errors:
         print(f"  ! {error.workspace}: {error.evidence}", file=sys.stderr)
+    # Each run writes its own timestamped directory, so say which one - it is
+    # what `advisory-score --run` takes, and what a later comparison needs.
+    if run.out_dir:
+        print(f"Run dir: {run.out_dir}")
     print(f"Report : {run.files.get('markdown')}")
     print(f"Excel  : {run.files.get('excel')}")
     return EXIT_OK

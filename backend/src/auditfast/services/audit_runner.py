@@ -357,6 +357,11 @@ class AuditRunner:
                 report["audit_id"] = job.id
                 report = self._merge_answers(job, report)
                 job.report = report
+                # The refresh is a second crawl, so it wrote a second run
+                # directory. Point the job at it: leaving `out_dir` on the
+                # cache-served run would serve downloads and advisory judging
+                # files that no longer match the report above.
+                job.out_dir = run.out_dir or job.out_dir
                 await self._repository.update(job)
                 logger.info(
                     "audit knowledge base refreshed",

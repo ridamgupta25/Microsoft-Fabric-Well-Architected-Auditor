@@ -30,14 +30,12 @@ from pathlib import Path
 from typing import Any
 
 from ..ai.advisory import label_job
+from ..ai.jobs import JOBS_DIRNAME
 from ..ai.labels import LabelError, apply_labels, load_jobs, read_labels
 from ..ai.orchestrator import Credentials
 from ..core.scoring import aggregate
 
 logger = logging.getLogger(__name__)
-
-#: Where the audit leaves its jobs, relative to the output directory.
-JOBS_DIRNAME = "jobs"
 
 #: Kept separate from ``advisory-report.*`` so a judged run never overwrites the
 #: audit's own advisory report - a reader needs both to see what judging changed.
