@@ -120,6 +120,14 @@ _DEFINITION_GATE = threading.BoundedSemaphore(
     _bounded_int_env("AUDITFAST_MAX_INFLIGHT_ITEM_FETCHES", 32, 1, 32)
 )
 
+#: Dedicated, much tighter ceiling on concurrent Power BI Datasets-API calls
+#: (refresh schedules). That endpoint throttles far harder than the Fabric
+#: surface, so it is paced separately — a steady trickle instead of the 32-wide
+#: Fabric burst — which stops the 429s without slowing the Fabric crawl.
+_POWERBI_GATE = threading.BoundedSemaphore(
+    _bounded_int_env("AUDITFAST_MAX_INFLIGHT_POWERBI_READS", 3, 1, 8)
+)
+
 
 class LiveFabricProvider:
     """Reads a live Fabric tenant with a delegated, read-only OAuth2 token."""
@@ -1264,7 +1272,8 @@ class LiveFabricProvider:
         if pbi is None:
             return None, "forbidden"
         try:
-            return pbi.dataset_refresh_schedule(item_id, group_id=workspace_id)
+            with _POWERBI_GATE:
+                return pbi.dataset_refresh_schedule(item_id, group_id=workspace_id)
         except Exception as exc:
             log.warning("semantic model %s refresh schedule error: %s", item_id, exc)
             return None, "transient"

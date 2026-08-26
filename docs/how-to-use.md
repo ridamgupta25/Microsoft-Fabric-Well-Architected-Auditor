@@ -546,6 +546,7 @@ set them as real environment variables before `serve`.
 | `AUDITFAST_LOG_JSON` | `false` | Structured JSON logs — enable when hosted |
 | `AUDITFAST_CORS_ORIGINS` | `["http://localhost:5173"]` | Origins allowed to call the API |
 | `AUDITFAST_FABRIC_API_TIMEOUT_SECONDS` | `180` | Fabric HTTP and getDefinition polling timeout |
+| `AUDITFAST_MAX_INFLIGHT_POWERBI_READS` | `3` | Max concurrent Power BI Datasets-API reads (refresh schedules); lower reduces throttling |
 | `AUDITFAST_CACHE_ENABLED` | `true` | Turn the knowledge-base cache on/off |
 | `AUDITFAST_CACHE_TTL_SECONDS` | `86400` | How long a cached snapshot stays fresh |
 

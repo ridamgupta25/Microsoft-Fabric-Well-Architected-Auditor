@@ -272,7 +272,7 @@ class PowerBIClient:
         failure = "transient"
         reason = "no attempt completed"
         for path in paths:
-            for attempt in range(3):
+            for attempt in range(5):
                 status, body, retry_after = self._get_with_meta(path)
                 if status == 200 and isinstance(body, dict):
                     return _refresh_schedule(body), ""
@@ -290,7 +290,7 @@ class PowerBIClient:
                 else:
                     failure, reason = "transient", f"HTTP {status}"
                     break
-                if attempt < 2:
+                if attempt < 4:
                     time.sleep(_retry_after_seconds(retry_after, attempt))
         log.info("dataset %s refresh schedule unread (%s): %s",
                  dataset_id, failure, reason)

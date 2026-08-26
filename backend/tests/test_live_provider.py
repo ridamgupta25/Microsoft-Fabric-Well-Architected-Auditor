@@ -677,6 +677,33 @@ def test_fetch_refresh_schedule_without_powerbi_token_is_unavailable_not_silent(
     assert Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE in ctx.unavailable
 
 
+def test_refresh_schedule_read_goes_through_the_powerbi_gate(monkeypatch):
+    """Power BI refresh-schedule reads must acquire the dedicated rate gate."""
+    import auditfast.clients.live as live_mod
+
+    acquired = []
+
+    class _TrackingGate:
+        def __enter__(self):
+            acquired.append(True)
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    monkeypatch.setattr(live_mod, "_POWERBI_GATE", _TrackingGate())
+
+    provider = LiveFabricProvider("token")
+    provider._powerbi_client = _FakeRefreshSchedulePowerBI({
+        "sm-1": ({"enabled": True, "notifies_on_failure": True}, ""),
+    })
+
+    schedule, failure = provider._semantic_model_refresh_schedule("ws-1", "sm-1")
+
+    assert failure == ""
+    assert acquired == [True]  # the gate was entered exactly once
+
+
 def test_fetch_model_with_no_schedule_is_read_not_unavailable():
     """A model that genuinely has no schedule read cleanly - the resource stays available."""
     provider = LiveFabricProvider("token")
