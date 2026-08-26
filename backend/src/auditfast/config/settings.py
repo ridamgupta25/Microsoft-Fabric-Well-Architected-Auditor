@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     # -- audit defaults -------------------------------------------------------
     default_project: str = "config/project.example.yaml"
     output_dir: str = "output"
+    fabric_api_timeout_seconds: int = Field(
+        default=180,
+        ge=1,
+        description="HTTP request and getDefinition polling timeout for Fabric APIs.",
+    )
 
     # -- knowledge-base cache -------------------------------------------------
     # Audits are served from an on-disk snapshot of each workspace (the KB) so a
