@@ -730,8 +730,9 @@ class LiveFabricProvider:
         provider = body.get("gitProviderDetails") or {}
         sync = body.get("gitSyncDetails") or {}
         state = body.get("gitConnectionState") or ""
+        connected = state != "NotConnected" if state else bool(provider)
         return {
-            "connected": state != "NotConnected" if state else bool(provider),
+            "connected": connected,
             "state": state,
             "provider": provider.get("gitProviderType", ""),
             # Azure DevOps reports organizationName; GitHub reports ownerName.
@@ -742,6 +743,42 @@ class LiveFabricProvider:
             "directory": provider.get("directoryName", ""),
             "head": sync.get("head"),
             "last_sync_time": sync.get("lastSyncTime"),
+            "secret_scanning": LiveFabricProvider._secret_scanning_status(
+                provider.get("gitProviderType", ""), connected
+            ),
+        }
+
+    @staticmethod
+    def _secret_scanning_status(provider_type: str, connected: bool) -> dict:
+        """Record what is known about the repo's secret-scanning posture.
+
+        Secret scanning / push protection is a *Git-provider* control (GitHub
+        Advanced Security, Azure DevOps push protection) that the Fabric
+        ``git/connection`` API does not expose, and reading it needs a
+        repo-security token the auditor is not granted. So the honest, read-only
+        answer is ``enabled: None`` (unknown, not verified) with the reason, which
+        lets a check report the environment as *unverified* rather than assume a
+        pass or a fail. The shape stays stable so a future provider integration
+        can fill ``enabled`` in without a schema change.
+        """
+        if not connected:
+            return {
+                "provider": provider_type,
+                "verified": False,
+                "enabled": None,
+                "push_protection": None,
+                "reason": "workspace is not connected to source control",
+            }
+        return {
+            "provider": provider_type,
+            "verified": False,
+            "enabled": None,
+            "push_protection": None,
+            "reason": (
+                "secret scanning / push protection is a Git-provider security "
+                "control not exposed by the Fabric git/connection API and needs a "
+                "repo-security token to read; not verifiable read-only"
+            ),
         }
 
     @staticmethod

@@ -11,7 +11,7 @@ import re
 
 from auditfast.core.check import _xw
 from auditfast.core.check._notebook import executable_code
-from auditfast.core.check.helpers import Verdict
+from auditfast.core.check.helpers import Verdict, covered, not_applicable
 from auditfast.core.check.operations_reliability.data_prep.automated import (
     notebook_validates_post_failure_integrity,
 )
@@ -36,6 +36,13 @@ _PL_INTEGRITY = re.compile(
 )
 
 
+#: A notebook recovery/replay/backfill path (before the integrity re-check).
+_NB_RECOVERY = re.compile(
+    r"recover\w*|re-?run|backfill|replay|reprocess\w*|(?:^|\W)resume(?:\W|$)|repair",
+    re.IGNORECASE,
+)
+
+
 def _pipeline_validates_post_failure_integrity(definition_json: str) -> bool:
     """True when a pipeline runs a count/reconciliation check on a failure path."""
     return bool(
@@ -44,17 +51,31 @@ def _pipeline_validates_post_failure_integrity(definition_json: str) -> bool:
     )
 
 
-def _validates_post_failure_integrity(ws: WorkspaceContext) -> bool:
-    """True when any notebook or pipeline validates post-failure layer integrity."""
-    if any(
-        notebook_validates_post_failure_integrity(executable_code(defn))
-        for defn in (ws.notebooks or {}).values()
-    ):
-        return True
-    return any(
-        _pipeline_validates_post_failure_integrity(json.dumps(defn))
-        for defn in (ws.pipelines or {}).values()
-    )
+def _post_failure_paths(ws: WorkspaceContext) -> tuple[list[str], list[str]]:
+    """Return ``(recovery_paths, validated_paths)`` inspected in a workspace.
+
+    ``recovery_paths`` are the notebooks/pipelines that run on a recovery,
+    replay or backfill path; ``validated_paths`` are the subset that also
+    re-validate cross-layer integrity there (a source-vs-target row/key count
+    comparison that fails loudly on a mismatch). Naming both lets the evidence
+    say exactly what was inspected and why it did or did not pass.
+    """
+    recovery: list[str] = []
+    validated: list[str] = []
+    for name, definition in (ws.notebooks or {}).items():
+        code = executable_code(definition)
+        if notebook_validates_post_failure_integrity(code):
+            recovery.append(name)
+            validated.append(name)
+        elif _NB_RECOVERY.search(code):
+            recovery.append(name)
+    for name, definition in (ws.pipelines or {}).items():
+        blob = json.dumps(definition)
+        if _PL_RECOVERY.search(blob):
+            recovery.append(name)
+            if _PL_INTEGRITY.search(blob):
+                validated.append(name)
+    return recovery, validated
 
 
 @group_check(
@@ -67,19 +88,49 @@ def _validates_post_failure_integrity(ws: WorkspaceContext) -> bool:
 def post_failure_integrity_consistent(ctx: GroupContext) -> Verdict:
     """Every environment re-checks cross-layer integrity on a recovery path.
 
-    The per-workspace ``NB-POST-FAILURE-INTEGRITY`` (9.3.4) judges one notebook;
-    this compares across the group over both notebooks and pipelines, so a
-    recovery-time integrity check present in Prod but missing from Dev/UAT is
-    surfaced as drift. N/A when fewer than two members' notebook or pipeline
-    definitions could be read.
+    For each environment its notebooks and pipelines are scanned for a recovery /
+    replay / backfill path that re-validates cross-layer row/key counts (a
+    source-vs-target count comparison referencing the run audit's
+    ``source_count`` / ``target_count``) and fails loudly on a mismatch. The
+    verdict is the coverage of environments that do so, and the evidence names
+    the paths inspected in each — the validated ones, or the recovery paths that
+    were found but do not re-validate. N/A when fewer than two members' notebook
+    or pipeline definitions could be read.
     """
-    return _xw.consistency(
-        ctx,
-        readable=lambda ws: (
-            ws.has(Resource.NOTEBOOK_DEFINITIONS)
-            or ws.has(Resource.PIPELINE_DEFINITIONS)
-        ),
-        implements=_validates_post_failure_integrity,
-        practice="validates cross-layer integrity on a recovery/replay path",
-        data_name="notebook or pipeline definitions",
+    present: list[str] = []
+    absent: list[str] = []
+    for member in ctx.members:
+        ws = member.workspace
+        if not (ws.has(Resource.NOTEBOOK_DEFINITIONS)
+                or ws.has(Resource.PIPELINE_DEFINITIONS)):
+            continue
+        label = _xw.env_label(member)
+        recovery, validated = _post_failure_paths(ws)
+        if validated:
+            present.append(f"{label} [{', '.join(validated[:3])}]")
+        elif recovery:
+            absent.append(
+                f"{label} (recovery path(s) {', '.join(recovery[:3])} do not "
+                "re-validate cross-layer counts)"
+            )
+        else:
+            absent.append(f"{label} (no recovery/replay/backfill path found)")
+
+    total = len(present) + len(absent)
+    if total < 2:
+        return not_applicable(
+            "fewer than two environments had readable notebook or pipeline "
+            "definitions to compare"
+        )
+    if not absent:
+        return covered(
+            total, total,
+            f"every environment re-validates cross-layer integrity on a recovery "
+            f"path: {'; '.join(present)}",
+        )
+    passing = f"validated in {'; '.join(present)}. " if present else ""
+    return covered(
+        len(present), total,
+        f"cross-layer integrity is re-validated on a recovery path in "
+        f"{len(present)} of {total} environment(s); {passing}not in {'; '.join(absent)}",
     )

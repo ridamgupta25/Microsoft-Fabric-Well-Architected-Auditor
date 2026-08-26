@@ -268,3 +268,131 @@ def has_enabled_warehouse_audit(ws: WorkspaceContext) -> bool:
 def has_columns_captured(ws: WorkspaceContext) -> bool:
     """True when at least one table has column definitions captured."""
     return any(_columns(table) for table in ws.tables.values())
+
+
+# -- capture-completeness signal ----------------------------------------------
+
+def has_recoverable_read_failures(ws: WorkspaceContext) -> bool:
+    """True when the crawl hit a *recoverable* (forbidden/throttled) read failure.
+
+    A workspace's :attr:`WorkspaceContext.is_complete` is also false when a core
+    list (role assignments) simply needs a higher role — which says nothing about
+    whether its data-plane inventory (semantic models, reports, definitions) was
+    captured. This narrower signal is true only when a per-item definition/table
+    read was *blocked* (401/403) or *throttled* (429/5xx), i.e. the crawl was
+    genuinely degraded and its object inventory may be short of the real estate.
+    A group check must not read a missing object as "absent" for such a member —
+    it is "not fetched", which is N/A, not FAIL.
+    """
+    return any(
+        stat.get("forbidden") or stat.get("transient")
+        for stat in ws.read_failures.values()
+    )
+
+
+# -- strict, type-resolved run history ----------------------------------------
+
+def has_typed_run_history(ws: WorkspaceContext, types: Iterable[str]) -> bool:
+    """True when an item *whose type is in* ``types`` has recorded run history.
+
+    Unlike :func:`has_run_history` this never falls back to "any run history at
+    all" — a workspace whose only recorded runs are Notebook runs is *not*
+    counted as having DataPipeline history. Resolving each ``run_history`` key to
+    its item type is what stops a notebook-only environment being miscounted as
+    pipeline-monitored.
+    """
+    wanted = set(types)
+    id_to_type = {item.id: item.type for item in ws.items}
+    for item_id, stamps in ws.run_history.items():
+        if not stamps:
+            continue
+        if id_to_type.get(item_id) in wanted:
+            return True
+    return False
+
+
+def pipeline_item_count(ws: WorkspaceContext) -> int:
+    """How many DataPipeline items the workspace inventory holds."""
+    items = sum(1 for item in ws.items if item.type == "DataPipeline")
+    # Pipelines are also fetched by definition into ``pipelines``; use whichever
+    # is larger so a workspace with pipeline definitions but no typed item rows
+    # (older fixtures) is still counted as having pipelines.
+    return max(items, len(ws.pipelines))
+
+
+# -- queryable audit-table schema (no acting-user requirement) -----------------
+
+#: Column-name synonyms for the four groups that make an ETL/run audit table
+#: *queryable* — deliberately without an acting-user column, which belongs to a
+#: data-access audit, not an operational run log.
+AUDIT_QUERYABLE_GROUPS: dict[str, frozenset[str]] = {
+    "event_time": frozenset({
+        "timestamp", "event_timestamp", "eventtime", "event_time", "created_at",
+        "createdon", "modified_at", "modifiedon", "start_time", "end_time",
+        "start_time_utc", "end_time_utc", "run_time", "log_time", "load_date",
+        "load_timestamp", "execution_timestamp",
+    }),
+    "operation": frozenset({
+        "operation", "operation_type", "action", "action_type", "pipeline_name",
+        "activity_name", "notebook_name", "item_name", "stage", "task_name",
+        "job_name", "process_name", "event", "event_type", "source_name",
+        "target_name",
+    }),
+    "status": frozenset({"status", "state", "severity", "result", "outcome"}),
+}
+
+#: Identifier columns — any of these, or any column whose name ends in ``id``.
+_AUDIT_ID_NAMES: frozenset[str] = frozenset({
+    "id", "log_id", "run_id", "pipeline_run_id", "log_details_id", "batch_id",
+    "load_id", "execution_id", "correlation_id", "job_id", "task_id",
+})
+
+
+def _has_identifier_column(cols: set[str]) -> bool:
+    return bool(cols & _AUDIT_ID_NAMES) or any(c.endswith("id") for c in cols)
+
+
+def has_queryable_audit_table(ws: WorkspaceContext) -> bool:
+    """True when an audit-named table has a structured, queryable schema.
+
+    "Queryable" means typed columns for *when* (an event timestamp), *what*
+    (the pipeline/activity/notebook or an operation/action), *the outcome*
+    (status/severity/state), and *an identifier* — i.e. structured, not
+    free-text. An acting-user column is **not** required: these are ETL run audit
+    tables (audit_master / audit_detail / pipeline_run_log), not data-access
+    audits, and requiring a user column wrongly failed every one of them.
+    """
+    for name, table in ws.tables.items():
+        if not (_tokens(name) & AUDIT_NAME_HINTS):
+            continue
+        cols = _columns(table)
+        if not cols:
+            continue
+        if all(cols & group for group in AUDIT_QUERYABLE_GROUPS.values()) and \
+                _has_identifier_column(cols):
+            return True
+    return False
+
+
+#: Name tokens that mark a table as a technical-metadata registry/catalog.
+METADATA_TABLE_HINTS: frozenset[str] = frozenset(
+    {"audit", "log", "metadata", "meta", "registry", "catalog", "lineage",
+     "dictionary", "loadlist", "control"}
+)
+
+
+def has_metadata_registry(ws: WorkspaceContext) -> bool:
+    """True when a table captures technical metadata outside a semantic model.
+
+    Metadata can be captured *in* a semantic model or in *separate* metadata
+    files/tables (a metadata registry, ``*_metadata`` / ``audit_*`` / a load-list
+    control table). This recognises the second form so a workspace that keeps its
+    lineage/schema metadata in tables is credited even without a semantic model.
+    """
+    for name in ws.tables:
+        low = str(name).lower()
+        bare = low.split(".")[-1]
+        if (_tokens(name) & METADATA_TABLE_HINTS) or "_metadata" in low or \
+                "metadata_" in low or bare.endswith("_meta"):
+            return True
+    return False

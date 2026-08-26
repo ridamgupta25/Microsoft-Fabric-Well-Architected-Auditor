@@ -9,12 +9,11 @@ when the data needed to compare is missing.
 from __future__ import annotations
 
 import json
-
 import re
 
 from auditfast.core.check import _xw
 from auditfast.core.check._notebook import executable_code
-from auditfast.core.check.helpers import Verdict, covered, not_applicable
+from auditfast.core.check.helpers import Verdict, covered, graded, not_applicable
 from auditfast.core.check.registry import group_check
 from auditfast.core.enums import Pillar, Resource, Severity
 from auditfast.core.models import GroupContext, GroupMemberContext, WorkspaceContext
@@ -44,7 +43,7 @@ def _table_signatures(member: GroupMemberContext) -> dict[str, frozenset[tuple[s
 
 @group_check(
     id="XW-SCHEMA-DRIFT",
-    ref="11.4.3",
+    ref="11.4.3b",
     title="Schema is consistent across environments (no drift)",
     pillar=Pillar.RELIABILITY,
     severity=Severity.HIGH,
@@ -131,45 +130,164 @@ def medallion_consistent(ctx: GroupContext) -> Verdict:
     id="XW-PIPELINE-SLA", ref="9.4.2",
     title="Pipeline completion SLAs are monitored consistently across environments",
     pillar=Pillar.RELIABILITY, severity=Severity.MEDIUM,
-    requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=False,
+    requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY,
+              Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE], required=False,
 )
 def pipeline_sla_monitored(ctx: GroupContext) -> Verdict:
-    """Pipelines carry run history (are monitored) in every environment.
+    """Pipeline completion SLAs are set and monitored in every environment.
 
-    Run history is the readable evidence that a pipeline's completion is being
-    tracked. An environment whose pipelines have no recorded runs is not being
-    monitored to the same standard as its peers. N/A when fewer than two members'
-    run history could be read.
+    Monitoring is judged only from *DataPipeline* run history: each ``run_history``
+    key is resolved to its item type, so a notebook-only environment (run history
+    for Notebooks but no pipeline) is not miscounted as pipeline-monitored. An
+    environment with **no pipelines** is N/A for this check (nothing to monitor),
+    not a failure; an environment that *has* pipelines but no pipeline run history
+    is a real gap. The SLA dimension — a scheduled cadence and failure
+    notification — is read from the refresh/trigger schedules: when they are all
+    disabled, cadence and notification are reported as switched off. N/A when
+    fewer than two environments have pipelines to compare.
     """
-    return _xw.consistency(
-        ctx,
-        readable=lambda ws: ws.has(Resource.ITEM_RUN_HISTORY) and ws.has(Resource.ITEMS),
-        implements=lambda ws: _xw.has_run_history(ws, {"DataPipeline"}),
-        practice="monitors pipeline completion (run history present)",
-        data_name="pipeline run history",
+    monitored: list[str] = []
+    gaps: list[str] = []
+    no_pipelines: list[str] = []
+    schedules_present = schedules_all_disabled = False
+    for member in ctx.members:
+        ws = member.workspace
+        if not (ws.has(Resource.ITEMS) and ws.has(Resource.ITEM_RUN_HISTORY)):
+            continue
+        label = _xw.env_label(member)
+        if _xw.pipeline_item_count(ws) == 0:
+            no_pipelines.append(label)
+            continue
+        if _xw.has_typed_run_history(ws, {"DataPipeline"}):
+            monitored.append(label)
+        else:
+            gaps.append(label)
+        if ws.refresh_schedules:
+            schedules_present = True
+            if all(not s.get("enabled") for s in ws.refresh_schedules.values()):
+                schedules_all_disabled = True
+
+    judged = len(monitored) + len(gaps)
+    if judged < 2:
+        extra = f" ({', '.join(no_pipelines)} have no pipelines)" if no_pipelines else ""
+        return not_applicable(
+            "fewer than two environments in this group have pipelines whose "
+            f"completion SLAs could be monitored{extra}"
+        )
+    if schedules_present and schedules_all_disabled:
+        sla_note = (" SLA caveat: the refresh/trigger schedules present are all "
+                    "disabled, so scheduled cadence and failure notification are "
+                    "switched off (not monitored).")
+    elif not schedules_present:
+        sla_note = (" SLA caveat: no scheduled trigger was found, so completion "
+                    "cadence is not enforced.")
+    else:
+        sla_note = ""
+    na_note = f" {', '.join(no_pipelines)} have no pipelines (N/A)." if no_pipelines else ""
+    if not gaps:
+        return covered(
+            judged, judged,
+            f"pipeline completion is monitored (DataPipeline run history present) in "
+            f"all {judged} environment(s) with pipelines: {', '.join(monitored)}."
+            f"{sla_note}{na_note}",
+        )
+    return covered(
+        len(monitored), judged,
+        f"pipeline completion is monitored in {len(monitored)} of {judged} "
+        f"environment(s) with pipelines ({', '.join(monitored) or 'none'}); no "
+        f"DataPipeline run history in {', '.join(gaps)}.{sla_note}{na_note}",
     )
+
+
+#: A pipeline activity type that can raise a failure alert (email / Teams / web).
+_FAILURE_ALERT_TYPE = re.compile(
+    r'"type"\s*:\s*"(?:Office365Outlook|Teams|WebActivity|WebHook|Web)"',
+    re.IGNORECASE,
+)
+
+
+def _has_pipeline_failure_alert(ws: WorkspaceContext) -> bool:
+    """True when a pipeline runs an email/Teams/web activity on a failure path."""
+    for definition in (ws.pipelines or {}).values():
+        blob = json.dumps(definition)
+        if '"Failed"' in blob and _FAILURE_ALERT_TYPE.search(blob):
+            return True
+    return False
 
 
 @group_check(
     id="XW-SLA-ALERTS", ref="9.4.3",
     title="SLA breaches trigger alerts (Data Activator) consistently across environments",
     pillar=Pillar.RELIABILITY, severity=Severity.HIGH,
-    requires=[Resource.ACTIVATOR_DEFINITIONS], required=False,
+    requires=[Resource.ACTIVATOR_DEFINITIONS, Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE,
+              Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def sla_alerts_consistent(ctx: GroupContext) -> Verdict:
-    """A Data Activator with rules exists in every environment, not just one.
+    """SLA-breach alerting exists on *some* surface in every environment.
 
-    Alerting configured only in Prod leaves Dev/UAT breaches silent. An
-    environment "implements" alerting when it holds at least one Activator with a
-    configured rule. N/A when fewer than two members' Activator definitions could
-    be read.
+    Alerting is not only a Data Activator. Three surfaces are inspected: a Data
+    Activator rule; a refresh schedule whose ``notify_option`` sends mail on
+    failure; and a pipeline failure path that runs an email / Teams / web
+    activity. State matters: a ``MailOnFailure`` schedule that is *disabled* is
+    configured-but-inactive, so it is reported as PARTIAL, not a pass. Any
+    activator rule is classified as SLA-relevant here (failure / lateness), which
+    keeps this check distinct from 12.2.7 (capacity CU alerting) so one rule is
+    not double-counted. N/A when fewer than two environments can be compared.
     """
-    return _xw.consistency(
-        ctx,
-        readable=lambda ws: ws.has(Resource.ACTIVATOR_DEFINITIONS),
-        implements=_xw.has_active_activator,
-        practice="has a Data Activator rule for SLA breaches",
-        data_name="Data Activator definitions",
+    active: list[str] = []
+    inactive: list[str] = []
+    none_of: list[str] = []
+    for member in ctx.members:
+        ws = member.workspace
+        label = _xw.env_label(member)
+        activator = _xw.has_active_activator(ws)
+        mail_active = any(
+            s.get("enabled") and "mail" in str(s.get("notify_option", "")).lower()
+            for s in ws.refresh_schedules.values()
+        )
+        mail_configured = any(
+            "mail" in str(s.get("notify_option", "")).lower() or s.get("notifies_on_failure")
+            for s in ws.refresh_schedules.values()
+        )
+        pipeline_alert = _has_pipeline_failure_alert(ws)
+        if activator or mail_active or pipeline_alert:
+            active.append(label)
+        elif mail_configured:
+            inactive.append(label)
+        else:
+            none_of.append(label)
+
+    total = len(active) + len(inactive) + len(none_of)
+    if total < 2:
+        return not_applicable(
+            "fewer than two environments in this group could be compared for SLA "
+            "alerting"
+        )
+    none_note = f"; no alerting surface in {', '.join(none_of)}" if none_of else ""
+    if active and not inactive and not none_of:
+        return covered(total, total,
+                       f"SLA-breach alerting is active in all {total} environment(s): "
+                       f"{', '.join(active)}")
+    if active:
+        return covered(
+            len(active), total,
+            f"SLA-breach alerting is active in {len(active)} of {total} "
+            f"environment(s) ({', '.join(active)}); "
+            f"configured-but-disabled in {', '.join(inactive) or 'none'}{none_note}",
+        )
+    if inactive:
+        return graded(
+            1,
+            f"no active SLA-breach alerting: Data Activator absent, but a "
+            f"failure-notification (MailOnFailure) is configured yet disabled in "
+            f"{', '.join(inactive)}{none_note}. Enable the failure notification or "
+            "add a Data Activator rule so breaches reach an owner.",
+        )
+    return covered(
+        0, total,
+        f"no SLA-breach alerting on any surface (Data Activator, failure "
+        f"notification, or pipeline failure activity) in {total} environment(s): "
+        f"{', '.join(none_of)}",
     )
 
 
@@ -218,7 +336,7 @@ def tier_separation(ctx: GroupContext) -> Verdict:
 
 
 @group_check(
-    id="XW-MEDALLION-DRIFT", ref="11.4.3",
+    id="XW-MEDALLION-DRIFT", ref="11.4.3a",
     title="Medallion tiers are present in every environment (no tier drift)",
     pillar=Pillar.RELIABILITY, severity=Severity.HIGH, requires=[Resource.ITEMS],
     required=False,
