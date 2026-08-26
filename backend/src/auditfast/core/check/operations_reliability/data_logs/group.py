@@ -8,11 +8,16 @@ two members can be read.
 """
 from __future__ import annotations
 
+import json
+
 from auditfast.core.check import _xw
+from auditfast.core.check._notebook import executable_code
 from auditfast.core.check.helpers import Verdict, covered, graded, not_applicable
 from auditfast.core.check.registry import group_check
 from auditfast.core.enums import Pillar, Resource, Severity
 from auditfast.core.models import GroupContext, WorkspaceContext
+
+from .automated import _LOAD_ACTION, _WAREHOUSE_TARGET
 
 
 @group_check(
@@ -50,14 +55,15 @@ def spark_logs_consistent(ctx: GroupContext) -> Verdict:
     )
 
 
-def _has_rowcount_audit_table(ws: WorkspaceContext) -> tuple[bool, str]:
-    """True when a table records per-load source vs target row counts.
+def _rowcount_audit_tables(ws: WorkspaceContext) -> list[str]:
+    """Names of tables that record per-load source vs target row counts.
 
     The row-count dimension of load monitoring is captured when an audit table
     carries both a source-row-count and a target-row-count column (e.g.
     ``audit_detail.source_count`` / ``target_count``), so a load that succeeds
     while moving zero rows is still caught.
     """
+    found: list[str] = []
     for name, table in ws.tables.items():
         cols = {
             str(col.get("name", "")).lower()
@@ -67,8 +73,51 @@ def _has_rowcount_audit_table(ws: WorkspaceContext) -> tuple[bool, str]:
         has_source = any("source" in c and "count" in c for c in cols) or "source_count" in cols
         has_target = any("target" in c and "count" in c for c in cols) or "target_count" in cols
         if has_source and has_target:
-            return True, str(name).split(".")[-1]
-    return False, ""
+            found.append(str(name).split(".")[-1])
+    return sorted(set(found))
+
+
+def _warehouse_load_jobs(ws: WorkspaceContext) -> dict[str, str]:
+    """``name -> definition text`` for every job that loads a Warehouse.
+
+    A job qualifies when its definition both names a Warehouse target and performs
+    a load action (Copy/INSERT/MERGE/write). Mirrors the per-workspace
+    ``OPS-WH-LOAD-MONITORED`` detector.
+    """
+    found: dict[str, str] = {}
+    for name, definition in (ws.pipelines or {}).items():
+        text = json.dumps(definition)
+        if _WAREHOUSE_TARGET.search(text) and _LOAD_ACTION.search(text):
+            found[name] = text
+    for name, definition in (ws.notebooks or {}).items():
+        code = executable_code(definition)
+        if _WAREHOUSE_TARGET.search(code) and _LOAD_ACTION.search(code):
+            found[name] = code
+    return found
+
+
+def _load_job_breakdown(ws: WorkspaceContext) -> str:
+    """Name every Warehouse-load job in the workspace, split by run-history presence."""
+    loaders = _warehouse_load_jobs(ws)
+    if not loaders:
+        return "no Warehouse-load job identified in the definitions"
+    ran = {item.display_name or item.id for item in ws.items if item.last_run_utc}
+    with_history = sorted(name for name in loaders if name in ran)
+    without_history = sorted(name for name in loaders if name not in ran)
+    parts = [f"{len(with_history)} of {len(loaders)} load job(s) with run history"]
+    if without_history:
+        parts.append(f"no run history: {_names(without_history)}")
+    if with_history:
+        parts.append(f"with run history: {_names(with_history)}")
+    return "; ".join(parts)
+
+
+def _names(names: list[str], cap: int = 5) -> str:
+    """A comma-joined, capped list of names with a ``+N more`` suffix."""
+    shown = ", ".join(names[:cap])
+    if len(names) > cap:
+        shown += f" (+{len(names) - cap} more)"
+    return shown
 
 
 @group_check(
@@ -91,20 +140,22 @@ def warehouse_load_monitored(ctx: GroupContext) -> Verdict:
     applicable: list[str] = []
     rowcount_envs: list[str] = []
     runhistory_envs: list[str] = []
-    rowcount_table = ""
+    rowcount_tables: set[str] = set()
+    job_details: list[str] = []
     for member in ctx.members:
         ws = member.workspace
         if not (ws.has(Resource.ITEMS) and _xw.has_item_type(ws, _xw.DATA_STORE_TYPES)):
             continue
         label = _xw.env_label(member)
         applicable.append(label)
-        has_rows, table = _has_rowcount_audit_table(ws)
-        if has_rows:
+        tables = _rowcount_audit_tables(ws)
+        if tables:
             rowcount_envs.append(label)
-            rowcount_table = rowcount_table or table
+            rowcount_tables.update(tables)
         if ws.has(Resource.ITEM_RUN_HISTORY) and \
                 _xw.has_typed_run_history(ws, {"DataPipeline", "Notebook"}):
             runhistory_envs.append(label)
+        job_details.append(f"{label}: {_load_job_breakdown(ws)}")
 
     if len(applicable) < 2:
         return not_applicable(
@@ -114,12 +165,14 @@ def warehouse_load_monitored(ctx: GroupContext) -> Verdict:
 
     total = len(applicable)
     rows_n, runs_n = len(rowcount_envs), len(runhistory_envs)
-    table_hint = f" ({rowcount_table}.source_count/target_count)" if rowcount_table else ""
+    table_hint = (f" (via {', '.join(sorted(rowcount_tables)[:3])})"
+                  if rowcount_tables else "")
     evidence = (
         f"Row-count monitoring{table_hint} present in {rows_n} of {total} "
         f"environment(s) ({', '.join(rowcount_envs) or 'none'}); load-job run "
         f"history (duration/failure) present in {runs_n} of {total} "
-        f"({', '.join(runhistory_envs) or 'none'})."
+        f"({', '.join(runhistory_envs) or 'none'}). "
+        + " | ".join(job_details)
     )
     # Composite of two independent axes, each worth up to full marks per env.
     score01 = (rows_n + runs_n) / (2 * total)

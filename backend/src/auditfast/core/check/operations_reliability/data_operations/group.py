@@ -19,6 +19,23 @@ from auditfast.core.enums import Pillar, Resource, Severity
 from auditfast.core.models import GroupContext, GroupMemberContext, WorkspaceContext
 
 
+def _names(names: list[str], cap: int = 5) -> str:
+    """A comma-joined, capped list of names with a ``+N more`` suffix."""
+    shown = ", ".join(names[:cap])
+    if len(names) > cap:
+        shown += f" (+{len(names) - cap} more)"
+    return shown
+
+
+def _pipelines_without_run_history(ws: WorkspaceContext) -> list[str]:
+    """Names of DataPipeline items that have no recorded run history."""
+    return sorted(
+        item.display_name or item.id
+        for item in ws.items
+        if item.type == "DataPipeline" and not ws.run_history.get(item.id)
+    )
+
+
 def _table_signatures(member: GroupMemberContext) -> dict[str, frozenset[tuple[str, str]]] | None:
     """A member's ``{table -> {(column, type)}}`` signature, or None if unreadable.
 
@@ -161,7 +178,8 @@ def pipeline_sla_monitored(ctx: GroupContext) -> Verdict:
         if _xw.has_typed_run_history(ws, {"DataPipeline"}):
             monitored.append(label)
         else:
-            gaps.append(label)
+            missing = _pipelines_without_run_history(ws)
+            gaps.append(f"{label} (no run history: {_names(missing)})" if missing else label)
         if ws.refresh_schedules:
             schedules_present = True
             if all(not s.get("enabled") for s in ws.refresh_schedules.values()):
