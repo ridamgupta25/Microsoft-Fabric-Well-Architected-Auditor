@@ -16,7 +16,7 @@ from auditfast.core.check._lineage import (
     notebook_texts,
     pipeline_texts,
 )
-from auditfast.core.check.helpers import Verdict
+from auditfast.core.check.helpers import Verdict, covered, not_applicable
 from auditfast.core.check.registry import group_check
 from auditfast.core.enums import Pillar, Resource, Severity
 from auditfast.core.models import GroupContext, WorkspaceContext
@@ -62,6 +62,34 @@ def _has_opaque_cross_domain_ref(ws: WorkspaceContext) -> bool:
     return False
 
 
+def _reporting_stage_present(ws: WorkspaceContext) -> bool:
+    """True when the workspace holds a reporting stage (semantic model / report).
+
+    Reads the *reporting* end of the lineage chain from any of the readable
+    surfaces: a reporting-type item in the inventory, a captured semantic-model
+    definition, or a captured report binding.
+    """
+    return (
+        _xw.has_item_type(ws, _xw.REPORTING_TYPES)
+        or bool(ws.semantic_models)
+        or bool(ws.reports)
+    )
+
+
+def _captures_technical_metadata(ws: WorkspaceContext) -> bool:
+    """True when technical metadata is captured in a model *or* in files/tables.
+
+    Either form counts: table schema (column/type definitions), a semantic model,
+    or a separate metadata registry (``*_metadata`` / ``audit_*`` / load-list
+    control table).
+    """
+    return (
+        _xw.has_columns_captured(ws)
+        or bool(ws.semantic_models)
+        or _xw.has_metadata_registry(ws)
+    )
+
+
 @group_check(
     id="XW-ACCESS-AUDIT", ref="7.4.3",
     title="Data access audit trail exists (who accessed what data, when)",
@@ -91,21 +119,59 @@ def access_audit_consistent(ctx: GroupContext) -> Verdict:
     required=False,
 )
 def lineage_e2e_consistent(ctx: GroupContext) -> Verdict:
-    """Each environment holds the full source -> store -> reporting chain.
+    """Each fully-captured environment holds the source -> store -> report chain.
 
-    An environment "implements" an end-to-end chain when its inventory contains a
-    source item (pipeline / notebook / dataflow), a data store, and a reporting
-    item (semantic model / report). N/A when fewer than two members' items could
-    be read.
+    Judged from the *item inventory* only — a source item (pipeline / notebook /
+    dataflow), a data store (Lakehouse / Warehouse), and a reporting item
+    (semantic model / report), the chain the Fabric REST surface can attest. It
+    makes no Purview / lineage-graph-completeness claim, which the REST surface
+    cannot retrieve.
+
+    An environment whose reporting inventory was **not fully captured** — no
+    semantic model or report *and* the crawl hit recoverable read failures — is
+    excluded as *not fetched* (N/A for that member), never counted as a missing
+    stage: "we could not read it" is not "it is absent". N/A when fewer than two
+    fully-captured environments remain to compare.
     """
-    return _xw.consistency(
-        ctx,
-        readable=lambda ws: ws.has(Resource.ITEMS),
-        implements=lambda ws: _xw.has_item_type(ws, _xw.SOURCE_TYPES)
-        and _xw.has_item_type(ws, _xw.DATA_STORE_TYPES)
-        and _xw.has_item_type(ws, _xw.REPORTING_TYPES),
-        practice="expresses a source -> store -> report lineage chain",
-        data_name="item inventories",
+    present: list[str] = []
+    absent: list[str] = []
+    excluded: list[str] = []
+    for member in ctx.members:
+        ws = member.workspace
+        if not ws.has(Resource.ITEMS):
+            continue
+        label = _xw.env_label(member)
+        has_source = _xw.has_item_type(ws, _xw.SOURCE_TYPES)
+        has_store = _xw.has_item_type(ws, _xw.DATA_STORE_TYPES)
+        has_report = _reporting_stage_present(ws)
+        if has_source and has_store and has_report:
+            present.append(label)
+        elif not has_report and _xw.has_recoverable_read_failures(ws):
+            excluded.append(label)
+        else:
+            absent.append(label)
+
+    judged = len(present) + len(absent)
+    excl_note = (
+        f"; {', '.join(excluded)} excluded (reporting inventory not fully captured "
+        "— transient read failures during the crawl)" if excluded else ""
+    )
+    if judged < 2:
+        return not_applicable(
+            "fewer than two environments had a fully-captured item inventory to "
+            f"compare the source -> store -> report chain{excl_note or ''}"
+        )
+    if not absent:
+        return covered(
+            judged, judged,
+            f"the source -> store -> report item chain is present in all {judged} "
+            f"fully-captured environment(s): {', '.join(present)}{excl_note}",
+        )
+    return covered(
+        len(present), judged,
+        f"the source -> store -> report item chain is present in {len(present)} of "
+        f"{judged} fully-captured environment(s); incomplete in "
+        f"{', '.join(absent)}{excl_note}",
     )
 
 
@@ -116,20 +182,55 @@ def lineage_e2e_consistent(ctx: GroupContext) -> Verdict:
     requires=[Resource.TABLE_COLUMNS, Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
 )
 def tech_metadata_consistent(ctx: GroupContext) -> Verdict:
-    """Every environment captures table schema *and* semantic-model metadata.
+    """Every environment captures technical metadata — in a model *or* in files.
 
-    An environment "implements" technical metadata capture when it has column
-    definitions for at least one table and at least one semantic model. N/A when
-    fewer than two members had both table columns and semantic-model definitions
-    readable.
+    Technical metadata counts when captured in **either** form: (a) table *schema*
+    metadata — column/type definitions read for at least one table; (b) a
+    *semantic model*; or (c) a separate metadata registry — a ``*_metadata`` /
+    ``audit_*`` / load-list control table. Schema and semantic metadata are scored
+    together but not conflated: an environment with readable table schema is
+    credited even when its semantic model was not fetched.
+
+    An environment that captures none of these *and* whose crawl hit recoverable
+    read failures is excluded as *not fetched* (N/A), never failed. N/A when fewer
+    than two fully-captured environments remain.
     """
-    return _xw.consistency(
-        ctx,
-        readable=lambda ws: ws.has(Resource.TABLE_COLUMNS)
-        and ws.has(Resource.SEMANTIC_MODEL_DEFINITIONS),
-        implements=lambda ws: _xw.has_columns_captured(ws) and bool(ws.semantic_models),
-        practice="captures table schema and semantic-model metadata",
-        data_name="schema and semantic-model metadata",
+    present: list[str] = []
+    absent: list[str] = []
+    excluded: list[str] = []
+    for member in ctx.members:
+        ws = member.workspace
+        if not (ws.has(Resource.TABLE_COLUMNS) or ws.has(Resource.SEMANTIC_MODEL_DEFINITIONS)):
+            continue
+        label = _xw.env_label(member)
+        if _captures_technical_metadata(ws):
+            present.append(label)
+        elif _xw.has_recoverable_read_failures(ws):
+            excluded.append(label)
+        else:
+            absent.append(label)
+
+    judged = len(present) + len(absent)
+    excl_note = (
+        f"; {', '.join(excluded)} excluded (metadata not fully captured — "
+        "transient read failures)" if excluded else ""
+    )
+    if judged < 2:
+        return not_applicable(
+            "fewer than two environments had readable schema or semantic-model "
+            f"metadata to compare{excl_note or ''}"
+        )
+    if not absent:
+        return covered(
+            judged, judged,
+            f"technical metadata (table schema and/or semantic model / metadata "
+            f"registry) is captured in all {judged} environment(s): "
+            f"{', '.join(present)}{excl_note}",
+        )
+    return covered(
+        len(present), judged,
+        f"technical metadata is captured in {len(present)} of {judged} "
+        f"environment(s); missing in {', '.join(absent)}{excl_note}",
     )
 
 

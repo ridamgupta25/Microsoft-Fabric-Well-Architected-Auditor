@@ -7,11 +7,11 @@ two members can be read.
 """
 from __future__ import annotations
 
+import json
 import re
 
 from auditfast.core.check import _xw
 from auditfast.core.check._notebook import executable_code, layer_words_in, strip_sql_comments
-from auditfast.core.check.data_management_quality.data_prep.automated import _WRITE_PATTERN
 from auditfast.core.check.helpers import Verdict, covered, not_applicable
 from auditfast.core.check.registry import group_check
 from auditfast.core.enums import Pillar, Resource, Severity
@@ -39,29 +39,6 @@ _RECONCILIATION_NAME = re.compile(
 )
 _SQL_MISMATCH = re.compile(r"\b(?:if|where|having)\b[^;]*(?:<>|!=)", re.IGNORECASE)
 _SQL_STOP = re.compile(r"\b(?:throw|raiserror)\b", re.IGNORECASE)
-
-
-@group_check(
-    id="XW-CONFORMED-DIM", ref="4.4.9",
-    title="Cross-domain conformed dimensions shared (not duplicated per domain) in the Warehouse",
-    pillar=Pillar.DATA_QUALITY, severity=Severity.MEDIUM, requires=[Resource.TABLE_COLUMNS],
-    required=False,
-)
-def conformed_dimensions(ctx: GroupContext) -> Verdict:
-    """Every environment carries the group-wide set of conformed dimensions.
-
-    The reference is the union of dimension table names across the group; an
-    environment missing a dimension its peers have signals a duplicated or
-    per-environment dimension rather than a shared conformed one. N/A when fewer
-    than two members' table columns could be read, or no dimensions are found.
-    """
-    return _xw.superset_consistency(
-        ctx,
-        readable=lambda ws: ws.has(Resource.TABLE_COLUMNS),
-        signature=_xw.dimension_table_names,
-        practice="carries every conformed dimension the group declares",
-        data_name="dimension tables",
-    )
 
 
 def _names_have_detail_and_aggregate(names) -> bool:
@@ -160,18 +137,106 @@ def aggregate_consistency(ctx: GroupContext) -> Verdict:
     )
 
 
+#: A *data* write (not a DDL CREATE) and its target: what the flow produces.
+_DATA_WRITE_TARGET = re.compile(
+    r"""(?:\.saveAsTable\s*\(\s*|\.insertInto\s*\(\s*"""
+    r"""|INSERT\s+(?:INTO|OVERWRITE(?:\s+TABLE)?)\s+)"""
+    r"""(?:[rubf]{0,2})?["'`]?([\w.\[\]/-]+)""",
+    re.IGNORECASE,
+)
+#: Target-name tokens that place a write in the Gold serving tier or a Warehouse.
+_GOLD_TARGET_TOKENS = frozenset(
+    {"gold", "serving", "serve", "presentation", "mart", "datamart",
+     "aggregate", "aggregated", "consumption", "warehouse", "edw"}
+)
+#: Target-name tokens that mark a write as landing in a metadata/log registry,
+#: not a data table — the tell of a DDL/metadata-bootstrap notebook.
+_METADATA_TARGET = re.compile(
+    r"\b(?:meta|metadata|loadlist|field_standards?|registry|catalog|_ddl"
+    r"|log|audit|control|sequence_counter|validation|dictionary|lineage)\b",
+    re.IGNORECASE,
+)
+#: A pipeline whose sink or target names the Gold serving tier / a Warehouse.
+_PL_GOLD_SINK = re.compile(
+    r"DataWarehouseSink|DataWarehouse\b|\bWarehouse\b|\bgold\b|\bmart\b|\bEDW\b",
+    re.IGNORECASE,
+)
+_PL_SILVER_SOURCE = re.compile(r"\bsilver\b", re.IGNORECASE)
+_PL_NAME_SILVER_TO_GOLD = re.compile(r"silver.{0,20}gold", re.IGNORECASE)
+#: A pipeline record-count reconciliation control (compare source vs target).
+_PL_RECON_CONTROL = re.compile(
+    r"source[_ ]?count|target[_ ]?count|record[_ ]?count|reconcil"
+    r"|count[_ ]?check|control[_ ]?total",
+    re.IGNORECASE,
+)
+
+
+def _write_targets(code: str) -> list[str]:
+    return [m.group(1) for m in _DATA_WRITE_TARGET.finditer(code)]
+
+
+def _writes_gold_data(code: str) -> bool:
+    """True when the code writes *data* to a Gold-tier / Warehouse target.
+
+    A DDL ``CREATE TABLE`` is not a data write, and a target named for a metadata
+    registry is not a gold data table, so neither counts here.
+    """
+    for target in _write_targets(code):
+        tokens = {t.lower() for t in re.split(r"[^A-Za-z0-9]+", target) if t}
+        if tokens & _GOLD_TARGET_TOKENS:
+            return True
+    return False
+
+
+def _is_metadata_only_notebook(code: str) -> bool:
+    """True when the notebook only defines/loads metadata, not data.
+
+    A DDL/metadata-bootstrap notebook (``nb_metadata_ddl_script``) creates schemas
+    and a metadata/log/registry table and seeds it; it moves no Silver data to a
+    Gold target, so it must not be mistaken for a Silver-to-Gold flow. It is
+    metadata-only when it has no data write at all, or every data write targets a
+    metadata/log/registry table.
+    """
+    targets = _write_targets(code)
+    if not targets:
+        return True
+    return all(_METADATA_TARGET.search(target) for target in targets)
+
+
+def _pipeline_is_silver_to_gold(name: str, definition: dict) -> bool:
+    """True when a pipeline moves Silver data into a Gold-tier / Warehouse target."""
+    if _PL_NAME_SILVER_TO_GOLD.search(name):
+        return True
+    blob = json.dumps(definition)
+    return bool(_PL_SILVER_SOURCE.search(blob) and _PL_GOLD_SINK.search(blob))
+
+
 def _silver_to_gold_flows(ws) -> tuple[list[str], list[str]]:
-    """Return applicable and reconciled Silver-to-Gold notebook names."""
+    """Return applicable and reconciled Silver-to-Gold flow names (nb + pipeline).
+
+    A notebook flow reads Silver and writes *data* to a Gold-tier target, and is
+    not a DDL/metadata notebook. A pipeline flow moves Silver into a Warehouse /
+    Gold sink (e.g. the ``Silver To Gold`` pipeline). Each flow is then checked
+    for a record-count reconciliation control.
+    """
     applicable: list[str] = []
     reconciled: list[str] = []
     for name, definition in ws.notebooks.items():
         code = strip_sql_comments(executable_code(definition))
-        if not ({"silver", "gold"} <= layer_words_in(code)):
+        if "silver" not in layer_words_in(code):
             continue
-        if not _WRITE_PATTERN.search(code):
+        if _is_metadata_only_notebook(code):
+            continue
+        if not _writes_gold_data(code):
             continue
         applicable.append(name)
         if _RECON_CONTROL.search(code):
+            reconciled.append(name)
+    for name, definition in ws.pipelines.items():
+        if not _pipeline_is_silver_to_gold(name, definition):
+            continue
+        applicable.append(name)
+        if _PL_RECON_CONTROL.search(json.dumps(definition)):
             reconciled.append(name)
     return applicable, reconciled
 
@@ -180,13 +245,16 @@ def _silver_to_gold_flows(ws) -> tuple[list[str], list[str]]:
     id="XW-LAYER-RECON", ref="5.4.6",
     title="Cross-layer reconciliation: Gold record counts reconcile with Silver (accounting for aggregation)",
     pillar=Pillar.DATA_QUALITY, severity=Severity.HIGH,
-    requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
+    requires=[Resource.NOTEBOOK_DEFINITIONS, Resource.PIPELINE_DEFINITIONS], required=False,
 )
 def cross_layer_reconciliation(ctx: GroupContext) -> Verdict:
     """Detect reconciliation controls across a group's Silver-to-Gold flows.
 
-    This is metadata-only: it inspects notebook definitions already present in
-    each workspace snapshot and never queries table rows or business values.
+    Silver-to-Gold flows are the notebooks that read Silver and write data to a
+    Gold-tier target (DDL/metadata notebooks are excluded) and the pipelines that
+    move Silver into a Warehouse / Gold sink. This is metadata-only: it inspects
+    the definitions already in each snapshot and never queries table rows or
+    business values.
     """
     readable = [member for member in ctx.members
                 if member.workspace.has(Resource.NOTEBOOK_DEFINITIONS)]
@@ -205,7 +273,8 @@ def cross_layer_reconciliation(ctx: GroupContext) -> Verdict:
 
     if not applicable:
         return not_applicable(
-            "no executable Silver-to-Gold notebook writes were found across the group"
+            "no Silver-to-Gold data flow (notebook write to a Gold-tier target, or "
+            "a Silver-to-Warehouse pipeline) was found across the group"
         )
 
     missing = sorted(set(applicable) - set(reconciled))
