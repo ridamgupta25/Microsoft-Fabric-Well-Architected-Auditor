@@ -1,14 +1,18 @@
 """AI-assisted re-evaluation of the advisory (non-deterministic) checks.
 
-Grounded in the knowledge base: for each advisory check the deterministic engine
-already produced, an LLM re-judges the point using the relevant workspace data
-(notebook code, table/schema inventory, semantic-model list, SQL views/routines)
-and returns a fresh score + evidence + recommendation. The AI *understands intent*
-where the deterministic regex could only pattern-match, which is exactly why these
-checks were flagged low-confidence.
+Grounded in the knowledge base and, wherever a judging guide exists, routed
+through **the same machinery the offline agent uses**: the model is shown the
+guide and the evidence and asked to LABEL each object, and
+:mod:`.classify` turns those labels into a score. The model never returns a
+score, so it cannot invent a number, and the keyed path and the agent path
+cannot disagree about arithmetic - only about labels.
+
+Checks that have no guide yet fall back to the older per-finding path, where the
+model is asked for a score directly. That path is less constrained; it exists so
+a check without a guide still reaches the report rather than being stranded.
 
 Strictly optional and best-effort. When AI is disabled (the default) or anything
-fails — model outage, bad JSON, missing data — the deterministic verdict is kept
+fails - model outage, bad JSON, missing data - the deterministic verdict is kept
 unchanged. The AI never touches the deterministic scorecard: it only rewrites the
 verdicts that land in the separate Advisory report.
 """
@@ -20,6 +24,7 @@ from dataclasses import replace
 
 from ..core.check.registry import REGISTRY
 from ..core.enums import Scope
+from ..core.judging import guide_for
 from ..core.models import CheckResult, WorkspaceContext
 from ..core.scoring import status_from_score
 from . import orchestrator
@@ -45,6 +50,28 @@ _MAX_EVIDENCE_CHARS = 6000
 _MAX_WORKSPACE_CHARS = 24000
 
 
+#: Reply contract for the guide-driven path: the model returns LABELS, never a
+#: score. Scoring stays in :mod:`.classify`, which is what keeps the keyed and
+#: the agent paths arithmetically identical.
+_LABEL_SYSTEM = (
+    "You are a Microsoft Fabric Well-Architected reviewer. You will be given one "
+    "check, the labels it allows, and a list of objects with their evidence. "
+    "Label EVERY object from its own evidence. "
+    'Reply with ONLY a JSON array: [{"object": "<id exactly as given>", '
+    '"label": "<one of the allowed labels>", "reason": "<short clause citing the '
+    'evidence>", "confidence": "high"|"medium"|"low"}]. '
+    "Do not return a score - scoring is not your job. "
+    "Never use a label outside the allowed list. "
+    "Use the undetermined label only when the evidence could not be read; "
+    '"I am unsure" is not undetermined. '
+    "A label that contradicts the evidence shown for that object is the worst "
+    "error you can make."
+)
+
+#: One reply line per object is short, but a chunk can hold many objects.
+_LABEL_MAX_TOKENS = 4000
+
+
 def evaluate(
     results: list[CheckResult],
     workspaces: dict[str, WorkspaceContext],
@@ -52,8 +79,144 @@ def evaluate(
     """Return advisory results re-judged by AI, or unchanged when AI is off."""
     if not orchestrator.is_enabled() or not results:
         return results
+
+    guided = [r for r in results if guide_for(r.check_id) is not None]
+    plain = [r for r in results if guide_for(r.check_id) is None]
+
+    judged, unbuilt = _judge_with_guides(guided, workspaces) if guided else ([], [])
+
+    # Anything without a guide, and anything whose job could not be built (no
+    # workspace slice, or the evidence builder found nothing), still gets a look
+    # via the older per-finding path rather than being left unjudged.
     cache: dict[tuple, CheckResult] = {}
-    return [_judged(result, workspaces.get(result.workspace), cache) for result in results]
+    fallback = [_judged(r, workspaces.get(r.workspace), cache) for r in plain + unbuilt]
+    return judged + fallback
+
+
+def _judge_with_guides(
+    results: list[CheckResult],
+    workspaces: dict[str, WorkspaceContext],
+) -> tuple[list[CheckResult], list[CheckResult]]:
+    """``(judged, unbuilt)`` - label each object, then let ``classify`` score it.
+
+    ``unbuilt`` is whatever could not be turned into a job, for the caller to
+    put through the fallback path. A model that returns nothing usable is NOT
+    unbuilt: ``apply_labels`` keeps the deterministic verdict for those
+    findings, which is the honest outcome rather than a second guess.
+    """
+    from .jobs import build_job
+    from .labels import apply_labels
+
+    by_check: dict[str, list[CheckResult]] = {}
+    for result in results:
+        by_check.setdefault(result.check_id, []).append(result)
+
+    jobs: dict[str, dict] = {}
+    labels: dict[str, dict[str, dict]] = {}
+    unbuilt: list[CheckResult] = []
+
+    for check_id, rows in sorted(by_check.items()):
+        workspace = workspaces.get(rows[0].workspace)
+        job = build_job(check_id, rows, workspace) if workspace else None
+        if job is None:
+            unbuilt.extend(rows)
+            continue
+        jobs[check_id] = job
+        given = label_job(job)
+        if given:
+            labels[check_id] = given
+
+    if not jobs:
+        return [], results
+
+    try:
+        judged, _summary = apply_labels(jobs, labels, judged_by="ai")
+    except Exception:  # noqa: BLE001 - advisory path must never raise
+        return [], results
+    return judged, unbuilt
+
+
+def label_job(job: dict, *, credentials=None) -> dict[str, dict]:
+    """``{object_id: {label, reason, confidence}}`` for one job, chunk by chunk.
+
+    An unparseable or missing reply for a chunk simply leaves those objects
+    unlabelled, and ``apply_labels`` keeps their deterministic verdict.
+
+    ``credentials`` routes the call to a caller-supplied key instead of the
+    configured provider, which is how a signed-in user judges with their own
+    model without that key being stored anywhere.
+    """
+    allowed = set(job.get("labels") or ()) | {job.get("undetermined_label", "undetermined")}
+    out: dict[str, dict] = {}
+
+    for chunk in job.get("chunks", []):
+        objects = chunk.get("objects") or []
+        if not objects:
+            continue
+        lines = [
+            f"--- OBJECT: {obj.get('id', '')}\n"
+            f"the rule concluded: {obj.get('rule_says') or '(no per-object verdict)'}\n"
+            f"{obj.get('facts', '')}"
+            for obj in objects
+        ]
+        user = (
+            f"CHECK: {job.get('title', '')}\n"
+            f"QUESTION: {job.get('question', '')}\n\n"
+            f"HOW TO LABEL:\n{job.get('instruction', '')}\n\n"
+            f"ALLOWED LABELS: {', '.join(sorted(allowed))}\n\n"
+            f"Label all {len(objects)} object(s) below.\n\n"
+            + "\n\n".join(lines)
+        )
+        for obj_id, entry in _parse_labels(
+            orchestrator.complete(
+                _LABEL_SYSTEM, user,
+                max_tokens=_LABEL_MAX_TOKENS,
+                credentials=credentials,
+            )
+        ).items():
+            if entry["label"] in allowed:
+                out[obj_id] = entry
+
+    return out
+
+
+def _parse_labels(raw: str | None) -> dict[str, dict]:
+    """Parse the JSON array of labels, tolerating fenced or chatty replies."""
+    if not raw:
+        return {}
+    text = raw.strip()
+    fenced = re.search(r"```(?:json)?\s*(.+?)\s*```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
+    if not text.startswith("["):
+        start = text.find("[")
+        end = text.rfind("]")
+        if start == -1 or end <= start:
+            return {}
+        text = text[start : end + 1]
+    try:
+        rows = json.loads(text)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(rows, list):
+        return {}
+
+    out: dict[str, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        # NOT stripped: a Fabric item may genuinely be named with a trailing
+        # space, and the job carries the real name.
+        obj = row.get("object")
+        label = row.get("label")
+        if not isinstance(obj, str) or not isinstance(label, str) or not label.strip():
+            continue
+        out[obj] = {
+            "label": label.strip(),
+            "reason": str(row.get("reason") or "").strip(),
+            "confidence": str(row.get("confidence") or "").strip(),
+        }
+    return out
 
 
 def _judged(

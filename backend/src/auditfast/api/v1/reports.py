@@ -13,19 +13,18 @@ from ..deps import OrganizationDep, RunnerDep, SettingsDep
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 
-#: Download kind -> (filename, media type). A whitelist, so a path fragment in
-#: the URL can never be used to read an arbitrary file off the server.
+#: Download kind -> (path relative to the run directory, media type). A
+#: whitelist, so a path fragment in the URL can never be used to read an
+#: arbitrary file off the server.
+_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 DOWNLOADS: dict[str, tuple[str, str]] = {
     "markdown": ("audit-report.md", "text/markdown"),
-    "excel": (
-        "audit-report.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ),
+    "excel": ("audit-report.xlsx", _XLSX),
     "advisory-markdown": ("advisory-report.md", "text/markdown"),
-    "advisory-excel": (
-        "advisory-report.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ),
+    "advisory-excel": ("advisory-report.xlsx", _XLSX),
+    # Written by advisory judging, which runs after the audit on request.
+    "advisory-judged-markdown": ("advisory-judged/advisory-report.md", "text/markdown"),
+    "advisory-judged-excel": ("advisory-judged/advisory-report.xlsx", _XLSX),
 }
 
 
@@ -79,20 +78,41 @@ async def get_report(
 async def download_report(
     audit_id: str,
     kind: Annotated[str, PathParam(description="markdown | excel")],
+    runner: RunnerDep,
+    organization_id: OrganizationDep,
     settings: SettingsDep,
 ) -> FileResponse:
-    """Download the Markdown or Excel rendering of a report."""
+    """Download the Markdown or Excel rendering of a report.
+
+    Resolved against **this audit's** own output directory. Each run writes its
+    own timestamped folder, so a fixed path would hand back whichever audit
+    finished most recently - which was already wrong when two ran, and is a
+    plain 404 now.
+    """
     entry = DOWNLOADS.get(kind)
     if entry is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Unknown report kind {kind!r}. Expected one of: {', '.join(DOWNLOADS)}.",
         )
-    filename, media_type = entry
-    path = Path(settings.output_path) / filename
+    relative, media_type = entry
+
+    job = await runner.get(audit_id, organization_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No audit found with id {audit_id!r}.",
+        )
+    # Fall back to the output root only for a job recorded before per-run
+    # directories existed.
+    base = Path(job.out_dir) if job.out_dir else Path(settings.output_path)
+    path = base / relative
     if not path.exists():
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="No report file has been generated yet. Run an audit first.",
+            detail=(
+                f"No {kind} file for audit {audit_id!r}. "
+                "Advisory files appear only after advisory judging has run."
+            ),
         )
-    return FileResponse(path, media_type=media_type, filename=filename)
+    return FileResponse(path, media_type=media_type, filename=path.name)

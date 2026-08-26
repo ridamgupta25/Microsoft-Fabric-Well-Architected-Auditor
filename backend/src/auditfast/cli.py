@@ -122,17 +122,35 @@ def cmd_advisory_score(args) -> int:
     from .ai.labels import LabelError, apply_labels, load_jobs, read_labels
     from .core.scoring import aggregate
     from .services.audit_service import AuditRun, write_advisory_reports
+    from .services.run_output import latest_run_dir
+
+    # Every audit writes its own timestamped directory, so "score the run I just
+    # did" has to mean the newest one rather than a fixed path that the next
+    # audit would have replaced.
+    run_dir = Path(args.run) if args.run else latest_run_dir(args.output, args.workspace)
+    if run_dir is None:
+        scope = f" for {args.workspace!r}" if args.workspace else ""
+        print(f"Error: no audit run found under {args.output}{scope}. Run an audit first.")
+        return EXIT_USAGE
+    if not run_dir.is_dir():
+        print(f"Error: {run_dir} is not a directory.")
+        return EXIT_USAGE
+
+    jobs_path = args.jobs or str(run_dir / "jobs")
+    labels_path = args.labels or str(run_dir / "jobs")
+    out_path = args.out or str(run_dir / "advisory-judged")
 
     try:
-        jobs = load_jobs(args.jobs)
-        labels = read_labels(args.labels)
+        jobs = load_jobs(jobs_path)
+        labels = read_labels(labels_path)
         results, summary = apply_labels(jobs, labels, judged_by=args.judged_by)
     except LabelError as exc:
         print(f"Error: {exc}")
         return EXIT_USAGE
 
-    print(f"jobs   : {args.jobs}  ({len(jobs)} check(s))")
-    print(f"labels : {args.labels}")
+    print(f"run    : {run_dir}")
+    print(f"jobs   : {jobs_path}  ({len(jobs)} check(s))")
+    print(f"labels : {labels_path}")
     judged_checks = {e["check_id"] for e in summary["changed"] + summary["agreed"]}
     print(f"\n  findings judged      : {summary['judged']}"
           f"  (across {len(judged_checks)} check(s))")
@@ -172,7 +190,7 @@ def cmd_advisory_score(args) -> int:
     run = AuditRun(project_name=args.project_name)
     run.advisory_results = results
     run.advisory_aggregate = aggregate(results)
-    files = write_advisory_reports(run, Path(args.out))
+    files = write_advisory_reports(run, Path(out_path))
     for kind, path in sorted(files.items()):
         print(f"\nwrote {kind}: {path}")
     return EXIT_OK
@@ -400,13 +418,22 @@ def build_parser() -> argparse.ArgumentParser:
         "advisory-score",
         help="Score judged labels into the advisory report",
     )
-    score.add_argument("--jobs", default="output/jobs",
-                       help="Job file or directory the labels were judged from")
-    score.add_argument("--labels", default="output/jobs",
-                       help="Label CSV or directory of them")
-    score.add_argument("--out", default="output/advisory-judged",
-                       help="Output directory for the report "
-                            "(default: output/advisory-judged, so the audit's own "
+    score.add_argument("--run", default=None,
+                       help="Run directory to score, e.g. output/NOIDA_20260826_143012. "
+                            "Defaults to the most recent run under --output")
+    score.add_argument("--workspace", default=None,
+                       help="Narrow --run's search to one workspace or project name")
+    score.add_argument("--output", default="output",
+                       help="Root the runs live under (default: output)")
+    score.add_argument("--jobs", default=None,
+                       help="Job file or directory the labels were judged from "
+                            "(default: the resolved run's jobs/)")
+    score.add_argument("--labels", default=None,
+                       help="Label CSV or directory of them "
+                            "(default: the resolved run's jobs/)")
+    score.add_argument("--out", default=None,
+                       help="Output directory for the report (default: the resolved "
+                            "run's advisory-judged/, so the audit's own "
                             "advisory-report.xlsx is not overwritten)")
     score.add_argument("--judged-by", default="agent",
                        help="Recorded on every judged row (default: agent)")

@@ -392,15 +392,35 @@ def test_monitor_refresh_uses_every_item_in_a_data_logs_workspace():
     assert verdict.score == 3
 
 
-def test_monitor_refresh_uses_every_item_in_a_mixed_workspace():
-    """A Mixed workspace plays the Data Logs role, so it falls back the same way.
+def test_monitor_refresh_does_not_guess_from_every_item_in_a_mixed_workspace():
+    """A Mixed workspace gets no fallback, because most of it is not monitoring.
 
-    Previously a Mixed workspace with no monitoring-named item returned N/A even
-    though run history was read - the Logs-only fallback excluded Mixed.
+    A Data Logs workspace exists to hold logs, so measuring everything in it is a
+    fair reading. A Mixed workspace plays that role among several others, so the
+    same fallback measured ordinary ETL - student notebooks, ingestion pipelines -
+    and reported their cadence as the monitoring cadence. On one estate that
+    produced a PASS at "every 0.2h" while the actual monitoring Eventhouses had
+    never run at all.
+
+    An earlier revision fell back here to avoid a false N/A when a Mixed
+    workspace really did have monitoring under an unmatched name. That trade is
+    the wrong way round: a false N/A says "we could not tell", which is true,
+    whereas a false PASS says the estate is observable when nobody looked.
     """
     verdict = monitoring_refresh_cadence(_ctx(
         layer=Layer.MIXED,
         items=[Item(id="p1", type="DataPipeline", display_name="PL_Nightly")],
+        run_history={"p1": _hourly()},
+    ))
+    assert verdict.status is Status.NA
+    assert "Mixed" in verdict.evidence
+
+
+def test_monitor_refresh_still_reads_a_named_monitoring_item_in_a_mixed_workspace():
+    """Dropping the fallback must not stop Mixed being judged when it can be."""
+    verdict = monitoring_refresh_cadence(_ctx(
+        layer=Layer.MIXED,
+        items=[Item(id="p1", type="DataPipeline", display_name="PL_Monitoring_Refresh")],
         run_history={"p1": _hourly()},
     ))
     assert verdict.score == 3
@@ -415,4 +435,4 @@ def test_monitor_refresh_is_na_on_a_non_logs_non_mixed_workspace_without_named_i
         run_history={"p1": _hourly()},
     ))
     assert verdict.status is Status.NA
-    assert "not tagged Data Logs or Mixed" in verdict.evidence
+    assert "not tagged Data Logs" in verdict.evidence

@@ -7,6 +7,8 @@
  */
 import { apiClient, downloadUrl } from "./apiClient";
 import type {
+  AdvisoryRun,
+  AdvisoryRunRequest,
   AuditAccepted,
   AuditAnswersRequest,
   AuditJob,
@@ -130,9 +132,61 @@ export async function runSingleCheck(
 
 export function reportDownloadUrl(
   auditId: string,
-  kind: "markdown" | "excel" | "advisory-markdown" | "advisory-excel",
+  kind:
+    | "markdown"
+    | "excel"
+    | "advisory-markdown"
+    | "advisory-excel"
+    | "advisory-judged-markdown"
+    | "advisory-judged-excel",
 ): string {
   return downloadUrl(`/reports/${auditId}/download/${kind}`);
+}
+
+/**
+ * Start advisory judging for a finished audit.
+ *
+ * Deliberately separate from the audit: it costs tokens against a key the
+ * reviewer supplies, so it is something they choose after seeing the
+ * deterministic report. The key is sent for this run and never stored.
+ */
+export async function runAdvisory(
+  auditId: string,
+  request: AdvisoryRunRequest,
+): Promise<AdvisoryRun> {
+  const { data } = await apiClient.post<AdvisoryRun>(
+    `/audit/${auditId}/advisory`,
+    request,
+  );
+  return data;
+}
+
+export async function getAdvisory(auditId: string): Promise<AdvisoryRun> {
+  const { data } = await apiClient.get<AdvisoryRun>(`/audit/${auditId}/advisory`);
+  return data;
+}
+
+/**
+ * Poll advisory judging until it finishes.
+ *
+ * Slower interval than the audit poll: judging makes one model call per chunk
+ * across fifty checks, so it is minutes of work and a tight loop would only add
+ * request noise.
+ */
+export async function pollAdvisory(
+  auditId: string,
+  onProgress?: (run: AdvisoryRun) => void,
+  signal?: AbortSignal,
+  intervalMs = 3000,
+): Promise<AdvisoryRun> {
+  for (;;) {
+    if (signal?.aborted) throw new DOMException("Polling aborted", "AbortError");
+
+    const run = await getAdvisory(auditId);
+    onProgress?.(run);
+    if (run.advisory_status && TERMINAL_STATUSES.has(run.advisory_status)) return run;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
 }
 
 const TERMINAL_STATUSES = new Set(["succeeded", "failed"]);

@@ -446,17 +446,16 @@ GUIDES: dict[str, JudgingGuide] = {
             "                              same thing.\n"
             "\n"
             "The rule reads load-mode intent from the pipeline's NAME\n"
-            "(full_load|incr*load|incremental|initial_load) and from PARAMETER\n"
-            "names (load_type|load_mode|is_initial|full_load|incremental), so\n"
-            "'PL_incremental_copy' passes on its name alone and a properly\n"
-            "parameterised pipeline whose parameter is called 'run_type' fails.\n"
+            "(full_load|incr*load|incremental|initial_load), from PARAMETER\n"
+            "names (load_type|load_mode|is_initial|full_load|incremental), from\n"
+            "an If/Switch branch that mentions the mode, and from an activity\n"
+            "EXPRESSION that selects it - a ForEach whose Copy source SQL reads\n"
+            "@if(equals(item().load_type,'full'), ...) from a control table.\n"
             "\n"
-            "It does NOT look inside activity expressions. A ForEach that drives\n"
-            "the mode from a control-table column - Copy source SQL reading\n"
-            "@if(equals(item().load_type,'full'), ...), or a watermark Script\n"
-            "that runs only for incremental rows - separates the modes properly\n"
-            "and the rule still calls it FAIL. Read the expressions, not just\n"
-            "the parameters and the branches."
+            "So 'PL_incremental_copy' passes on its name alone, and a properly\n"
+            "parameterised pipeline whose parameter is called 'run_type' still\n"
+            "fails - 'run_type' is not in the vocabulary. Read the parameters,\n"
+            "the branches and the expressions."
         ),
     ),
     "PL-DQ-GATE": JudgingGuide(
@@ -567,6 +566,21 @@ GUIDES: dict[str, JudgingGuide] = {
             "counts as explaining the logic even though there is no markdown\n"
             "cell - the question is whether the notebook is explained, not which\n"
             "cell type was used.\n"
+            "\n"
+            "Comments are held to the SAME bar as markdown, so apply one test:\n"
+            "does the comment say something the code does not already say?\n"
+            "\n"
+            "  '# out-of-order update; should be dropped for SCD Type 1' explains\n"
+            "  - it gives a reason the code cannot state. It counts.\n"
+            "\n"
+            "  '# Create Spark session' above SparkSession.builder.getOrCreate(),\n"
+            "  or '# Save as Lakehouse table' above saveAsTable(...), restates the\n"
+            "  next line. A notebook carrying only restatements is\n"
+            "  'present_but_uninformative', NOT 'explains_the_logic'.\n"
+            "\n"
+            "Judge the whole notebook, not the first cell: one substantive\n"
+            "comment block buried in the middle is enough to explain it, and a\n"
+            "run that reads only the opening lines will under-rate it.\n"
             "\n"
             "The rule counts non-empty markdown cells and passes on one, so a\n"
             "single cell containing the notebook's own file name passes, and a\n"
@@ -1413,8 +1427,9 @@ GUIDES: dict[str, JudgingGuide] = {
         ref="10.4.2",
         shape="best",
         labels=("monitoring_hourly_or_better", "monitoring_several_times_a_day",
-                "monitoring_daily_or_slower"),
-        bands=(3, 1, 0),
+                "monitoring_daily_or_slower", "not_monitoring_data"),
+        bands=(3, 1, 0, 0),
+        out_of_scope=("not_monitoring_data",),
         evidence="workspace-items",
         classify=(
             "Decide which of these items carry MONITORING DATA - telemetry,\n"
@@ -1422,8 +1437,9 @@ GUIDES: dict[str, JudgingGuide] = {
             "know the estate is healthy - and then read off how often each one\n"
             "actually refreshes.\n"
             "\n"
-            "Each record states 'median gap between runs = N h', computed from\n"
-            "the observed run history. You do not calculate it - read it.\n"
+            "Each record states 'median gap between runs = N h' when two or more\n"
+            "runs were recorded. Many items carry only a single timestamp, or\n"
+            "none; read what is there rather than assuming a gap is stated.\n"
             "\n"
             "  monitoring_hourly_or_better    - monitoring data, gap about 1 hour\n"
             "                                   or less.\n"
@@ -1432,19 +1448,25 @@ GUIDES: dict[str, JudgingGuide] = {
             "  monitoring_daily_or_slower     - monitoring data, gap of a day or\n"
             "                                   more, so a problem can go unseen\n"
             "                                   for a working day.\n"
+            "  not_monitoring_data            - an ETL notebook, an ingestion\n"
+            "                                   pipeline, a report, a warehouse:\n"
+            "                                   the practice does not apply. MOST\n"
+            "                                   items in a workspace are this, and\n"
+            "                                   it is a judgment, not a gap.\n"
             "\n"
-            "Use 'undetermined' for every item that is NOT monitoring data, and\n"
-            "for monitoring data whose cadence could not be measured. Most items\n"
-            "in a workspace are not monitoring data.\n"
+            "Use 'undetermined' only for something that IS monitoring data but\n"
+            "whose cadence could not be measured - a monitoring Eventhouse with\n"
+            "no run recorded. Do not use it for an item that simply is not\n"
+            "monitoring; say so with 'not_monitoring_data'.\n"
             "\n"
             "The strongest label wins: one properly refreshed monitoring item\n"
             "means the estate is observable.\n"
             "\n"
             "The rule selects items by name words - monitor, telemetry, audit,\n"
-            "log - so a config table called 'monitor_config' is measured as if\n"
-            "it were monitoring data, and in a Data Logs workspace with no\n"
-            "matching name it falls back to measuring EVERY item. Judge what the\n"
-            "item is for."
+            "log - so a config table called 'monitor_config' is measured as if it\n"
+            "were monitoring data. In a Data Logs workspace with no matching name\n"
+            "it falls back to measuring EVERY item; a Mixed workspace gets no\n"
+            "such fallback and reports N/A instead. Judge what the item is for."
         ),
     ),
     "WS-METADATA-WRITE": JudgingGuide(
