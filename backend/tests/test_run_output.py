@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from auditfast.services.run_output import (
     latest_run_dir,
     new_run_dir,
+    prune_empty_runs,
     run_dirs,
     run_label,
     slugify,
@@ -102,3 +103,81 @@ def test_names_that_would_break_a_path_are_made_safe(tmp_path):
 
 def test_an_empty_name_still_produces_a_directory(tmp_path):
     assert new_run_dir(tmp_path, "", now=_at(1)).exists()
+
+
+# -- clearing up after a run that never got going ------------------------------
+
+def test_an_empty_run_directory_is_pruned(tmp_path):
+    """A failed audit leaves an empty folder, which reads as "found nothing"."""
+    failed = new_run_dir(tmp_path, "NOIDA", now=_at(1))
+
+    removed = prune_empty_runs(tmp_path)
+
+    assert removed == [failed]
+    assert not failed.exists()
+
+
+def test_a_run_that_wrote_anything_is_left_alone(tmp_path):
+    kept = new_run_dir(tmp_path, "NOIDA", now=_at(1))
+    (kept / "audit-report.md").write_text("real", encoding="utf-8")
+
+    assert prune_empty_runs(tmp_path) == []
+    assert (kept / "audit-report.md").exists()
+
+
+def test_pruning_ignores_folders_that_are_not_runs(tmp_path):
+    """Only timestamped run directories are ours to delete."""
+    (tmp_path / "kb-cache").mkdir()
+
+    prune_empty_runs(tmp_path)
+
+    assert (tmp_path / "kb-cache").exists()
+
+
+# -- a refresh re-crawls the SAME run --------------------------------------
+
+def test_the_kb_refresh_reuses_the_original_run_directory(tmp_path, monkeypatch):
+    """The refresh replaces an audit's report, so it must replace its files.
+
+    Given a fresh directory it would create a newer, EMPTY one while the live
+    crawl ran, and the newest folder is what both a person and `latest_run_dir`
+    reach for - so a report would be downloaded, or scored, from a run that had
+    written nothing yet. That is exactly what a reviewer hit: a successful audit
+    whose newest output folder was empty.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    from auditfast.database.models import AuditJob
+    from auditfast.database.repositories.memory import InMemoryAuditJobRepository
+    from auditfast.services import audit_runner as runner_module
+    from auditfast.services.audit_runner import AuditRunner
+
+    original = new_run_dir(tmp_path, "NOIDA", now=_at(1))
+    (original / "audit-report.md").write_text("first", encoding="utf-8")
+
+    captured: dict = {}
+
+    def _fake_run_audit(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(out_dir=kwargs.get("run_dir"))
+
+    monkeypatch.setattr(runner_module.audit_service, "run_audit", _fake_run_audit)
+    monkeypatch.setattr(runner_module.audit_service, "to_json", lambda _run: {"overall": 1.0})
+
+    repository = InMemoryAuditJobRepository()
+    job = AuditJob(id="job1", out_dir=str(original))
+
+    async def _exercise():
+        await repository.add(job)
+        await AuditRunner(repository)._refresh_in_background(
+            job, project_path="p", pillars=None, workspaces=None,
+            out_dir=str(tmp_path), token=None,
+        )
+
+    asyncio.run(_exercise())
+
+    assert captured.get("run_dir") == str(original), (
+        "the refresh must re-crawl into the job's own directory"
+    )
+    assert run_dirs(tmp_path) == [original], "a refresh must not add a directory"
