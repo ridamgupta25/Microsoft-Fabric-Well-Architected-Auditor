@@ -11,7 +11,20 @@ from auditfast.core.check import _xw
 from auditfast.core.check.helpers import Verdict, covered, graded, not_applicable
 from auditfast.core.check.registry import group_check
 from auditfast.core.enums import Pillar, Resource, Severity
-from auditfast.core.models import GroupContext
+from auditfast.core.models import GroupContext, WorkspaceContext
+
+
+def _git_repo_summary(ws: WorkspaceContext) -> str:
+    """A human ``provider org/repo@branch`` string from the workspace Git details."""
+    details = ws.git_details or {}
+    provider = str(details.get("provider") or "").strip() or "Git"
+    org = str(details.get("organization") or "").strip()
+    repo = str(details.get("repository") or "").strip()
+    branch = str(details.get("branch") or "").strip()
+    location = "/".join(part for part in (org, repo) if part) or "repository name unavailable"
+    if branch:
+        location = f"{location}@{branch}"
+    return f"{provider} {location}"
 
 
 @group_check(
@@ -57,14 +70,16 @@ def secret_scanning_consistent(ctx: GroupContext) -> Verdict:
         if not ws.git_connected:
             not_connected.append(label)
             continue
+        # Name the repository so the reviewer knows exactly where to act.
+        repo_label = f"{label} ({_git_repo_summary(ws)})"
         scan = ws.git_details.get("secret_scanning") or {}
         state = scan.get("enabled")
         if state is True:
-            enabled.append(label)
+            enabled.append(repo_label)
         elif state is False:
-            disabled.append(label)
+            disabled.append(repo_label)
         else:  # connected, but the provider security status was not verified
-            unverified.append(label)
+            unverified.append(repo_label)
 
     parts: list[str] = []
     if enabled:
