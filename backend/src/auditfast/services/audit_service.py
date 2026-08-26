@@ -431,6 +431,7 @@ def run_audit(
     external_checks_csv: str | Path | None = None,
     source: str = "live",
     snapshots: Sequence[dict] | None = None,
+    run_dir: str | Path | None = None,
 ) -> AuditRun:
     """Run an audit and, when ``out_dir`` is given, write the report files.
 
@@ -450,9 +451,23 @@ def run_audit(
     # One directory per run. Writing straight into `out_dir` meant auditing a
     # second workspace destroyed the first one's report, and re-auditing the
     # same workspace destroyed the run you were comparing against.
-    if out_dir:
-        from .run_output import new_run_dir, run_label
+    #
+    # `run_dir` overrides that and writes into an existing one. The KB refresh
+    # needs it: it re-crawls the SAME audit and replaces its report, so a second
+    # directory would leave the newest folder empty for the minutes the crawl
+    # takes - and `latest_run_dir` would then hand that empty run to scoring.
+    #
+    # A run directory has to exist before the crawl can write into it, so a run
+    # that fails partway leaves an empty one behind. Clear those first: an empty
+    # folder reads as "this audit found nothing", which is a very different
+    # claim from "this audit never finished".
+    if run_dir:
+        out_dir = Path(run_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+    elif out_dir:
+        from .run_output import new_run_dir, prune_empty_runs, run_label
 
+        prune_empty_runs(out_dir)
         out_dir = new_run_dir(out_dir, run_label(config.name, workspaces))
     provider = build_provider(config, token, refresh=refresh, token_refresher=token_refresher,
                               powerbi_token=powerbi_token, sql_token=sql_token,

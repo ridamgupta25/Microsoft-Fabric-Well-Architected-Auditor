@@ -104,3 +104,29 @@ def latest_run_dir(base: str | Path, label: str | None = None) -> Path | None:
     """The most recent run directory, or ``None`` when there is none."""
     found = run_dirs(base, label)
     return found[0] if found else None
+
+
+def prune_empty_runs(base: str | Path) -> list[Path]:
+    """Delete run directories that hold nothing, returning what was removed.
+
+    The directory is created before the crawl starts, so it has to exist before
+    anything can be written into it. An audit that fails partway - an expired
+    token, an unreachable tenant - therefore leaves an empty folder that looks
+    like a run which produced no findings rather than one that never got going.
+
+    Removing them at the start of the next audit keeps that from accumulating,
+    and only ever touches a directory with no files at all: a run that wrote
+    even one report is left alone.
+    """
+    removed: list[Path] = []
+    for directory in run_dirs(base):
+        try:
+            if any(directory.iterdir()):
+                continue
+            directory.rmdir()
+        except OSError:
+            # A permission problem or a concurrent writer - tidying is never
+            # worth failing an audit over.
+            continue
+        removed.append(directory)
+    return removed

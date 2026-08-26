@@ -351,16 +351,17 @@ class AuditRunner:
                         sql_token_refresher=sql_token_refresher,
                         weight_by_environment=weight_by_environment,
                         external_checks_csv=external_checks_csv,
+                        # The same audit, re-crawled. Writing a second directory
+                        # would leave the newest one empty while this runs, and
+                        # that is the folder both a person and `latest_run_dir`
+                        # reach for.
+                        run_dir=job.out_dir,
                     )
                 )
                 report = audit_service.to_json(run)
                 report["audit_id"] = job.id
                 report = self._merge_answers(job, report)
                 job.report = report
-                # The refresh is a second crawl, so it wrote a second run
-                # directory. Point the job at it: leaving `out_dir` on the
-                # cache-served run would serve downloads and advisory judging
-                # files that no longer match the report above.
                 job.out_dir = run.out_dir or job.out_dir
                 await self._repository.update(job)
                 logger.info(
