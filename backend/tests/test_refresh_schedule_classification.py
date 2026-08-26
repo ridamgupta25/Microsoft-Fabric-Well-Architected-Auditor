@@ -13,7 +13,18 @@ from __future__ import annotations
 
 import pytest
 
+from auditfast.clients import powerbi as powerbi_module
 from auditfast.clients.powerbi import PowerBIClient
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_sleep(monkeypatch):
+    """The read retries a transport failure three times, sleeping between.
+
+    Real sleeps would add seconds per test for nothing: the classification is
+    what is under test, not the backoff.
+    """
+    monkeypatch.setattr(powerbi_module.time, "sleep", lambda _seconds: None)
 
 
 class _StubClient(PowerBIClient):
@@ -22,15 +33,25 @@ class _StubClient(PowerBIClient):
     ``__init__`` is deliberately not called: the real one builds a ``requests``
     session, and this test needs none - only the classification logic sitting
     above the transport.
+
+    The override is ``_get_with_meta``, not ``_get``: the schedule read calls
+    the meta form so it can honour ``Retry-After``. Stubbing the wrong one lets
+    the real transport run, which fails on the missing session and reports every
+    outcome as ``transient`` - the tests then pass or fail for the wrong reason.
     """
 
     def __init__(self, responses):
         self._responses = list(responses)
         self.paths: list[str] = []
 
-    def _get(self, path: str):
+    def _get_with_meta(self, path: str):
         self.paths.append(path)
-        return self._responses.pop(0) if self._responses else (None, None)
+        status, body = self._responses.pop(0) if self._responses else (None, None)
+        return status, body, None
+
+    def _get(self, path: str):
+        status, body, _retry_after = self._get_with_meta(path)
+        return status, body
 
 
 def test_a_transport_failure_is_transient_not_forbidden():
