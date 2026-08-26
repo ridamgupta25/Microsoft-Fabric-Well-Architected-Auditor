@@ -271,8 +271,10 @@ GUIDES: dict[str, JudgingGuide] = {
             "notifier nested inside an If branch. It matches Teams, Outlook and\n"
             "SendEmail by activity type - a correctly wired one called 'Step_9'\n"
             "passes fine - but a Web or Function activity only counts when its\n"
-            "own name matches notif|alert|email|teams, so a Web activity posting\n"
-            "to a Slack webhook called 'Post_Status' is missed."
+            "own name matches notif|alert|email|teams|activator, so a Web\n"
+            "activity posting to a Slack webhook called 'Post_Status' is missed\n"
+            "while one called 'Send_To_Activator' is credited. Note this differs\n"
+            "from PL-NOTIFY, whose vocabulary has no 'activator'."
         ),
     ),
     "PL-DEADLETTER": JudgingGuide(
@@ -303,9 +305,16 @@ GUIDES: dict[str, JudgingGuide] = {
             "Only a Copy activity configures reject handling in the pipeline's\n"
             "own JSON, so it is the only kind you can judge directly.\n"
             "\n"
-            "The rule counts notebooks, scripts, stored procedures and Lookups as\n"
-            "visible data movement, so it fails pipelines whose reject handling\n"
-            "is somewhere it cannot see - on one estate, 15 of the 39 it named.\n"
+            "Only a COPY activity counts as visible data movement. A pipeline\n"
+            "that moves data solely through a notebook, script, stored\n"
+            "procedure, dataflow or child pipeline returns N/A, not FAIL -\n"
+            "its reject handling lives inside the referenced artifact and is\n"
+            "not knowable from here. (An earlier version failed those; on one\n"
+            "estate that was 15 wrong FAILs out of 39.) So a pipeline the rule\n"
+            "calls N/A may still route bad rows perfectly well inside its\n"
+            "notebook, and you cannot see that either - say so rather than\n"
+            "guessing.\n"
+            "\n"
             "It also credits any activity whose NAME matches reject|invalid|\n"
             "quarantine|dead.letter|error.output, so a step called\n"
             "'Check_Invalid_Rows' that only counts them passes. Look at where\n"
@@ -436,10 +445,18 @@ GUIDES: dict[str, JudgingGuide] = {
             "                              first run and the thousandth do the\n"
             "                              same thing.\n"
             "\n"
-            "The rule passes on the pipeline's NAME matching full.load|\n"
-            "incremental|initial.load, so 'PL_incremental_copy' passes on its\n"
-            "name alone and a properly parameterised pipeline whose parameter is\n"
-            "called 'run_type' fails. Read the parameters and the branches."
+            "The rule reads load-mode intent from the pipeline's NAME\n"
+            "(full_load|incr*load|incremental|initial_load) and from PARAMETER\n"
+            "names (load_type|load_mode|is_initial|full_load|incremental), so\n"
+            "'PL_incremental_copy' passes on its name alone and a properly\n"
+            "parameterised pipeline whose parameter is called 'run_type' fails.\n"
+            "\n"
+            "It does NOT look inside activity expressions. A ForEach that drives\n"
+            "the mode from a control-table column - Copy source SQL reading\n"
+            "@if(equals(item().load_type,'full'), ...), or a watermark Script\n"
+            "that runs only for incremental rows - separates the modes properly\n"
+            "and the rule still calls it FAIL. Read the expressions, not just\n"
+            "the parameters and the branches."
         ),
     ),
     "PL-DQ-GATE": JudgingGuide(
@@ -466,10 +483,13 @@ GUIDES: dict[str, JudgingGuide] = {
             "\n"
             "Use 'undetermined' when the pipeline validates nothing.\n"
             "\n"
-            "The rule finds validations by NAME (dq|validat|verif|assert|check),\n"
-            "so a Script activity running a row-count assertion called 'Step_3'\n"
-            "is never examined, and a Copy activity called 'copy_check_data' is\n"
-            "treated as a validation. Judge by what the activity runs."
+            "The rule finds validations by activity NAME - dq, data_quality,\n"
+            "validat*, verif*, assert*, reconcil*, integrity, sanity, and\n"
+            "<quality|null|count|row|record|schema|duplicate>_check. Bare\n"
+            "'check' does NOT match, so 'copy_check_data' is left alone while\n"
+            "'row_check_extract' is treated as a validation whatever it does.\n"
+            "A Script activity running a row-count assertion called 'Step_3' is\n"
+            "never examined. Judge by what the activity runs."
         ),
     ),
     "PL-SECRETS": JudgingGuide(
@@ -501,27 +521,56 @@ GUIDES: dict[str, JudgingGuide] = {
     "NB-MARKDOWN": JudgingGuide(
         ref="3.1.4",
         shape="graded",
-        labels=("explains_the_logic", "present_but_uninformative", "no_markdown"),
-        bands=(3, 1, 0),
+        labels=("explains_the_logic", "present_but_uninformative", "no_markdown",
+                "nothing_to_document"),
+        bands=(3, 1, 0, 0),
+        out_of_scope=("nothing_to_document",),
         evidence="notebook-code",
         classify=(
-            "Decide whether this notebook's markdown WOULD HELP the next person\n"
-            "who has to change it.\n"
+            "Decide whether this notebook's documentation WOULD HELP the next\n"
+            "person who has to change it.\n"
             "\n"
-            "  explains_the_logic        - the markdown says what the notebook is\n"
-            "                              for, what it reads and writes, or why\n"
-            "                              a rule is what it is.\n"
+            "The evidence begins with a count - '20 markdown cell(s), 10126\n"
+            "chars of code' - followed by the markdown itself under\n"
+            "'--- markdown ---'. READ THAT COUNT FIRST. Labelling a notebook\n"
+            "'no_markdown' when the line says 20 cells is a contradiction of the\n"
+            "evidence in front of you.\n"
+            "\n"
+            "  explains_the_logic        - the documentation says what the\n"
+            "                              notebook is for, what it reads and\n"
+            "                              writes, or why a rule is what it is.\n"
+            "                              An outline of headings counts when the\n"
+            "                              headings name the operation AND its\n"
+            "                              target - 'Create Managed Delta Tables',\n"
+            "                              'Skew join handling between orders and\n"
+            "                              customers' - because a reader learns\n"
+            "                              the shape of the notebook from them.\n"
             "  present_but_uninformative - markdown exists but carries no\n"
-            "                              meaning: a bare title, 'Notes', a\n"
-            "                              stack trace, sample output, a heading\n"
-            "                              with nothing under it.\n"
-            "  no_markdown               - none at all.\n"
+            "                              meaning: the notebook's own file name,\n"
+            "                              'New notebook', a bare topic word, a\n"
+            "                              stack trace, sample output.\n"
+            "  no_markdown               - the notebook is not explained ANYWHERE:\n"
+            "                              no markdown cells (or only empty ones)\n"
+            "                              AND no explanatory code comments. A\n"
+            "                              zero markdown count alone is not\n"
+            "                              enough - see the note below.\n"
+            "  nothing_to_document       - an empty stub carrying only Fabric's\n"
+            "                              'Type here in the cell editor'\n"
+            "                              placeholder and no code. It has no\n"
+            "                              logic to document, so a finding about\n"
+            "                              its documentation is a finding about\n"
+            "                              nothing.\n"
             "\n"
-            "The rule counts markdown cells and passes on one, so a notebook with\n"
-            "a single cell containing its own file name passes and a heavily\n"
-            "commented notebook with no markdown cell fails. You can see both -\n"
-            "the markdown and the code - so judge whether the notebook is\n"
-            "explained, not whether a cell type is present."
+            "Use 'undetermined' only when the definition could not be read.\n"
+            "\n"
+            "Documentation in `# comments` or Databricks `# MAGIC %md` blocks\n"
+            "counts as explaining the logic even though there is no markdown\n"
+            "cell - the question is whether the notebook is explained, not which\n"
+            "cell type was used.\n"
+            "\n"
+            "The rule counts non-empty markdown cells and passes on one, so a\n"
+            "single cell containing the notebook's own file name passes, and a\n"
+            "notebook documented entirely in comments fails."
         ),
     ),
     "NB-PII-TOKENISED": JudgingGuide(
@@ -1304,11 +1353,14 @@ GUIDES: dict[str, JudgingGuide] = {
             "That produces no score and the rule's verdict stands, which is the\n"
             "honest outcome. Do not manufacture a stale finding to avoid it.\n"
             "\n"
-            "The rule picks serving items from name words like gold, curated and\n"
-            "mart - and 'semantic', which every SemanticModel matches by virtue\n"
-            "of its own item type, so it selects things called 'TestSemanticModel'\n"
-            "and 'EmptySemanticModel'. It also matches a training exercise called\n"
-            "'gold_sales'. Judge from what the item is for and who reads it."
+            "Every Warehouse is selected by TYPE whatever it is called, so a\n"
+            "student warehouse counts. A Lakehouse or SemanticModel is selected\n"
+            "only when its NAME carries gold, serving, curated, mart,\n"
+            "presentation, published, consumption or semantic - so\n"
+            "'TestSemanticModel' is picked up because its name contains\n"
+            "'semantic', while a model called 'StarSchema' is never selected at\n"
+            "all. It also matches a training exercise called 'gold_sales'.\n"
+            "Judge from what the item is for and who reads it."
         ),
     ),
     "WS-DDM": JudgingGuide(
@@ -1485,9 +1537,11 @@ GUIDES: dict[str, JudgingGuide] = {
             "Use 'undetermined' when the notebook loads no fact table, or does no\n"
             "fact-to-dimension join.\n"
             "\n"
-            "The rule needs dim_/fact_ naming in the code to look at all, so a\n"
-            "correctly modelled estate using 'customers' and 'sales' is never\n"
-            "examined. Judge from what the join joins."
+            "The rule needs dimensional vocabulary in the code to look at all -\n"
+            "dim_, fact_, fct_ or the bare word 'dimension' - so a correctly\n"
+            "modelled estate using 'customers' and 'sales' is never examined,\n"
+            "while a notebook naming 'dimension_date' IS in scope even without a\n"
+            "dim_ prefix. Judge from what the join joins."
         ),
     ),
     "NB-RECON-COUNT": JudgingGuide(
