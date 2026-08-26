@@ -916,6 +916,55 @@ def test_load_mode_without_name_param_or_branch_still_fails():
     assert pl_load_mode(_named_pipe_ctx("PL_Generic_Copy", _COPY)).score == _FAIL
 
 
+def test_load_mode_reads_the_mode_out_of_a_copy_expression():
+    """A control-table-driven load separates the modes without a parameter.
+
+    A ForEach reads the mode per row and the Copy's own source SQL branches on
+    it, so nothing in the pipeline name, its parameters or an If/Switch says
+    "load mode" - and the rule used to FAIL it. On one estate that was 7
+    pipelines marked as having no separation while they plainly had one.
+    """
+    copy_with_mode = {
+        "name": "Copy_Table",
+        "type": "Copy",
+        "typeProperties": {
+            "source": {
+                "type": "AzureSqlSource",
+                "sqlReaderQuery": (
+                    "@concat('SELECT * FROM ', item().source_object, "
+                    "if(equals(item().load_type,'full'), '', "
+                    "concat(' WHERE ', item().watermark_column, ' > ''', "
+                    "item().watermark_value, '''')))"
+                ),
+            },
+        },
+    }
+    verdict = pl_load_mode(_named_pipe_ctx("pl_EMPN2025_ingest", copy_with_mode))
+    assert verdict.score == _PASS
+    assert "expression" in verdict.evidence.lower()
+
+
+def test_load_mode_ignores_a_column_that_merely_looks_like_a_mode():
+    """`incremental_flag` as a copied column is data, not load-mode separation.
+
+    The expression rule is restricted to strings carrying `@`, so a column
+    mapping cannot be mistaken for a branch on the mode.
+    """
+    copy_with_column = {
+        "name": "Copy_Table",
+        "type": "Copy",
+        "typeProperties": {
+            "translator": {
+                "mappings": [
+                    {"source": {"name": "incremental_flag"},
+                     "sink": {"name": "incremental_flag"}},
+                ],
+            },
+        },
+    }
+    assert pl_load_mode(_named_pipe_ctx("PL_Generic_Copy", copy_with_column)).score == _FAIL
+
+
 # -- PL-METADATA-DRIVEN ------------------------------------------------------
 
 def _metadata_lookup(name: str = "Lookup_Ingestion_Config", query: str | None = None) -> dict:

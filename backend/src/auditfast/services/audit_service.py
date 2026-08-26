@@ -62,6 +62,10 @@ class AuditRun:
     #: True when the roll-up was environment-weighted (opt-in). Display only —
     #: the per-check and per-workspace numbers are unchanged either way.
     weighted_by_environment: bool = False
+    #: The per-run directory everything was written to. Recorded so a later step
+    #: — advisory judging especially — can find this run's files instead of
+    #: guessing at the newest thing in the output folder.
+    out_dir: str | None = None
 
 
 # -- provider construction ----------------------------------------------------
@@ -442,6 +446,13 @@ def run_audit(
     Raises AuditError if the CSV is invalid.
     """
     config = load_project(project_path)
+    # One directory per run. Writing straight into `out_dir` meant auditing a
+    # second workspace destroyed the first one's report, and re-auditing the
+    # same workspace destroyed the run you were comparing against.
+    if out_dir:
+        from .run_output import new_run_dir, run_label
+
+        out_dir = new_run_dir(out_dir, run_label(config.name, workspaces))
     provider = build_provider(config, token, refresh=refresh, token_refresher=token_refresher,
                               powerbi_token=powerbi_token, sql_token=sql_token,
                               storage_token=storage_token,
@@ -530,6 +541,7 @@ def run_audit(
         "refreshing": served and not refresh and source == "live",
     }
     if out_dir:
+        run.out_dir = str(out_dir)
         run.files.update(write_reports(run, out_dir))
 
     # Stage 2 -- advisory (non-deterministic) checks, evaluated *after* the audit

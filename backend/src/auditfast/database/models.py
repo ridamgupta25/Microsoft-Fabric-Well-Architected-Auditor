@@ -44,6 +44,17 @@ class AuditJob:
     answers: dict[str, str] = field(default_factory=dict)
     #: True once :attr:`answers` have been recorded, even if all were skipped.
     answers_submitted: bool = False
+    #: Advisory judging is a separate, user-triggered step that runs *after* the
+    #: audit, so it carries its own state rather than reusing :attr:`status` -
+    #: an audit can be SUCCEEDED while its advisory run is still going, or has
+    #: never been asked for at all (``None``).
+    advisory_status: JobStatus | None = None
+    advisory_summary: dict[str, Any] | None = None
+    advisory_error: str | None = None
+    #: The per-run output directory this audit wrote to. Advisory judging reads
+    #: its jobs from here, so it works on the run the user is looking at rather
+    #: than on whatever happened to be written most recently.
+    out_dir: str | None = None
 
     @property
     def duration_seconds(self) -> float | None:

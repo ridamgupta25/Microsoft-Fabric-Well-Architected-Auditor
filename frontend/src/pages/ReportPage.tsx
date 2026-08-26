@@ -5,6 +5,7 @@
 import { useEffect } from "react";
 import { useParams } from "react-router-dom";
 
+import { AdvisoryPanel } from "@/components/AdvisoryPanel";
 import { FindingsTable } from "@/components/FindingsTable";
 import { PillarMatrix } from "@/components/PillarMatrix";
 import { EmptyState, ErrorBanner, ScoreBar, Section, Spinner } from "@/components/ui";
@@ -197,6 +198,14 @@ export function ReportPage() {
           </div>
         </div>
       </section>
+
+      {job && (
+        <AdvisoryPanel
+          auditId={auditId}
+          auditStatus={job.status}
+          initialStatus={job.advisory_status}
+        />
+      )}
 
       <Section title="Pillar scorecard">
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">

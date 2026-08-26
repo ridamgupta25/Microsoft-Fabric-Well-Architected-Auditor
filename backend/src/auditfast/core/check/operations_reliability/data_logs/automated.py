@@ -865,9 +865,11 @@ def monitoring_refresh_cadence(ctx: CheckContext) -> Verdict:
     a day is partial; daily is weak; weekly or less scores nothing. Items are
     selected by name (monitor / telemetry / audit / log / metric / SLA /
     heartbeat …); an alert or notification item is not itself monitoring data, so
-    it is not selected. In a Data Logs workspace — or a Mixed workspace, which
-    plays the Data Logs role too — every runnable item is part of the monitoring
-    estate, so all of them are used when no name matches.
+    it is not selected. In a **Data Logs** workspace every runnable item is part
+    of the monitoring estate, so all of them are used when no name matches. A
+    **Mixed** workspace gets no such fallback: it plays the Logs role among
+    others, so most of its items are ordinary ETL and measuring them would
+    report unrelated work as monitoring cadence.
 
     **What it cannot.** It does not read the *configured* schedule — the job
     scheduler's schedule API is not called — so a job configured hourly but
@@ -901,16 +903,29 @@ def monitoring_refresh_cadence(ctx: CheckContext) -> Verdict:
         item_id: stamps for item_id, stamps in history.items()
         if _MONITORING_NAME.search(_name(item_id))
     }
-    # A Data Logs workspace is entirely a monitoring estate; a Mixed workspace
-    # plays that role too (it is why this Logs-layer check runs on it at all), so
-    # both fall back to judging every item's cadence when nothing is named.
-    monitoring_estate = ctx.workspace.layer in (Layer.LOGS, Layer.MIXED)
+    # A Data Logs workspace is entirely a monitoring estate, so when nothing
+    # matches by name, judging every item's cadence is a fair reading of it.
+    #
+    # A Mixed workspace is NOT. It plays the Logs role among several others, so
+    # most of its items are ordinary ETL. Falling back there measured student
+    # notebooks and ingestion pipelines as if they were telemetry and reported
+    # "monitoring refreshes every 0.2h" for an estate whose actual monitoring
+    # items had never run - a PASS manufactured out of unrelated work. If the
+    # monitoring items cannot be identified, the honest answer is that this
+    # cannot be judged, not a guess drawn from everything that happened to run.
+    monitoring_estate = ctx.workspace.layer is Layer.LOGS
     candidates = named or (history if monitoring_estate else {})
     if not candidates:
+        mixed_note = (
+            " This workspace is tagged Mixed, which plays the Data Logs role among "
+            "others, so its runnable items are not assumed to be monitoring data"
+            if ctx.workspace.layer is Layer.MIXED else
+            " and this workspace is not tagged Data Logs"
+        )
         return not_applicable(
             f"None of the {len(history)} item(s) with a run history is identifiable as "
-            f"monitoring-oriented by name, and this workspace is not tagged Data Logs "
-            f"or Mixed, so there is no monitoring cadence to judge"
+            f"monitoring-oriented by name,{mixed_note}, so there is no monitoring "
+            f"cadence to judge"
         )
 
     intervals: dict[str, float] = {}

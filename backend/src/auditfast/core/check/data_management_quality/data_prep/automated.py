@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
 
 from auditfast.core.check._notebook import (
     NOTEBOOK_LAYERS,
@@ -566,6 +567,39 @@ _LOAD_MODE = re.compile(r"load_?type|load_?mode|is_?initial|full_?load|increment
 #: rather than by an in-pipeline parameter or branch.
 _FULL_LOAD_NAME = re.compile(r"full[_ ]?load", re.IGNORECASE)
 _LOAD_MODE_NAME = re.compile(r"full[_ ]?load|incr\w*load|incremental|initial[_ ]?load", re.IGNORECASE)
+
+
+def _expression_strings(node) -> Iterator[str]:
+    """Every string anywhere inside ``node``, however deeply nested."""
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for value in node.values():
+            yield from _expression_strings(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _expression_strings(value)
+
+
+def _mode_driven_by_expression(activities) -> bool:
+    """True when an activity *expression* selects the load mode.
+
+    A pipeline can separate first-load from incremental without a load-mode
+    parameter or an If/Switch: a ForEach over a control table reads the mode per
+    row and the Copy's own source SQL branches on it -
+    ``@if(equals(item().load_type,'full'), ...)``. Reading only parameter names
+    and branch activities missed that entirely; on one estate it was 7 pipelines
+    failed for a separation they plainly had.
+
+    Restricted to strings carrying ``@``, so this fires on a Fabric expression
+    and not on a source column that happens to be called ``incremental_flag``.
+    """
+    return any(
+        "@" in value and _LOAD_MODE.search(value)
+        for act in activities
+        for value in _expression_strings(act.get("typeProperties") or {})
+    )
+
 _LATE_ARRIVAL = re.compile(
     r"late[_ -]?arriv|out[_ -]?of[_ -]?order|event[_ -]?time|watermark|lookback|"
     r"sequence[_ -]?(?:number|no|id)|version[_ -]?(?:number|no|id)|effective[_ -]?date",
@@ -692,9 +726,15 @@ def pl_load_mode(ctx: CheckContext) -> Verdict:
         and _LOAD_MODE.search(json.dumps(a))
         for a in acts
     )
-    ok = param_mode or branch
+    expression = _mode_driven_by_expression(acts)
+    ok = param_mode or branch or expression
+    if ok and expression and not (param_mode or branch):
+        return binary(True, "Load mode is selected inside an activity expression — the "
+                            "mode is read per row (e.g. from a control table) and the "
+                            "load branches on it")
     return binary(ok, "Load mode is parameterized / branched (initial vs incremental)" if ok
-                  else "No initial-vs-incremental separation (load-mode parameter or branch) found")
+                  else "No initial-vs-incremental separation (load-mode parameter, branch "
+                       "or expression) found")
 
 
 # -- data quality framework checks (3.6.x) ------------------------------------
