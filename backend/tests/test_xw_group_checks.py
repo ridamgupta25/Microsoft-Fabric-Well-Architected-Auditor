@@ -418,8 +418,9 @@ def test_secret_scan_names_the_connected_repository():
                 repo="fabric", branch="main", scanning=True),
         _git_ws("PROD", connected=False),
     ))
-    assert "GitHub contoso/fabric@main" in verdict.evidence
-    assert "not connected to source control in PROD (L2)" in verdict.evidence
+    assert "GitHub repo `contoso/fabric` (branch `main`)" in verdict.evidence
+    assert "not connected to source control" in verdict.evidence
+    assert "**Prod**" in verdict.evidence
 
 
 def test_lineage_e2e_names_the_missing_stage_with_counts():
@@ -494,6 +495,6 @@ def test_wh_load_names_the_rowcount_audit_tables():
     assert "audit_detail" in verdict.evidence
     assert "delta_load_audit" in verdict.evidence
     # Every load job is named, split by run-history presence.
-    assert "no run history: LoadFinance" in verdict.evidence
-    assert "with run history: LoadSales" in verdict.evidence
-    assert "no run history: LoadHR" in verdict.evidence
+    assert "no history for 'LoadFinance'" in verdict.evidence
+    assert "only 'LoadSales'" in verdict.evidence
+    assert "'LoadHR' has no run history" in verdict.evidence

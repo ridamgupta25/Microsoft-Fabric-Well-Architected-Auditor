@@ -153,68 +153,108 @@ def medallion_consistent(ctx: GroupContext) -> Verdict:
 def pipeline_sla_monitored(ctx: GroupContext) -> Verdict:
     """Pipeline completion SLAs are set and monitored in every environment.
 
-    Monitoring is judged only from *DataPipeline* run history: each ``run_history``
-    key is resolved to its item type, so a notebook-only environment (run history
-    for Notebooks but no pipeline) is not miscounted as pipeline-monitored. An
-    environment with **no pipelines** is N/A for this check (nothing to monitor),
-    not a failure; an environment that *has* pipelines but no pipeline run history
-    is a real gap. The SLA dimension — a scheduled cadence and failure
-    notification — is read from the refresh/trigger schedules: when they are all
-    disabled, cadence and notification are reported as switched off. N/A when
-    fewer than two environments have pipelines to compare.
+    Two things must be true for each environment: pipeline *completions* are
+    visible (there is DataPipeline run history) and an *SLA* is actually
+    enforced (an enabled schedule plus a way to be alerted on failure). An
+    environment with no pipelines is N/A (nothing to monitor), not a failure.
+    A group where completions are visible everywhere but nothing enforces a
+    deadline is PARTIAL, not a pass. N/A when fewer than two environments have
+    pipelines to compare.
     """
-    monitored: list[str] = []
-    gaps: list[str] = []
-    no_pipelines: list[str] = []
-    schedules_present = schedules_all_disabled = False
+    recorded: list[tuple[str, int]] = []   # (env, pipelines with recorded runs)
+    gaps: list[tuple[str, list[str]]] = []  # (env, pipelines with no run history)
+    no_pipelines: list[str] = []            # env has no pipelines at all (N/A)
+    disabled_sched: list[str] = []          # env has schedules but all disabled
+    no_sched: list[str] = []                # env has no schedule or trigger
+    active_sla: list[str] = []              # env has enabled schedule + failure alert
     for member in ctx.members:
         ws = member.workspace
         if not (ws.has(Resource.ITEMS) and ws.has(Resource.ITEM_RUN_HISTORY)):
             continue
-        label = _xw.env_label(member)
+        tier = _xw.env_tier(member)
         if _xw.pipeline_item_count(ws) == 0:
-            no_pipelines.append(label)
+            no_pipelines.append(tier)
             continue
-        if _xw.has_typed_run_history(ws, {"DataPipeline"}):
-            monitored.append(label)
+        runs = _xw.typed_run_history_count(ws, {"DataPipeline"})
+        if runs > 0:
+            recorded.append((tier, runs))
         else:
-            missing = _pipelines_without_run_history(ws)
-            gaps.append(f"{label} (no run history: {_names(missing)})" if missing else label)
-        if ws.refresh_schedules:
-            schedules_present = True
-            if all(not s.get("enabled") for s in ws.refresh_schedules.values()):
-                schedules_all_disabled = True
+            gaps.append((tier, _pipelines_without_run_history(ws)))
+        if _xw.has_enabled_schedule(ws) and _has_failure_notification(ws):
+            active_sla.append(tier)
+        elif ws.refresh_schedules:
+            disabled_sched.append(tier)
+        else:
+            no_sched.append(tier)
 
-    judged = len(monitored) + len(gaps)
+    judged = len(recorded) + len(gaps)
     if judged < 2:
-        extra = f" ({', '.join(no_pipelines)} have no pipelines)" if no_pipelines else ""
+        extra = (f" ({_xw.and_list(no_pipelines)} have no pipelines to monitor)"
+                 if no_pipelines else "")
         return not_applicable(
             "fewer than two environments in this group have pipelines whose "
-            f"completion SLAs could be monitored{extra}"
+            f"completion SLAs could be compared{extra}"
         )
-    if schedules_present and schedules_all_disabled:
-        sla_note = (" SLA caveat: the refresh/trigger schedules present are all "
-                    "disabled, so scheduled cadence and failure notification are "
-                    "switched off (not monitored).")
-    elif not schedules_present:
-        sla_note = (" SLA caveat: no scheduled trigger was found, so completion "
-                    "cadence is not enforced.")
-    else:
-        sla_note = ""
-    na_note = f" {', '.join(no_pipelines)} have no pipelines (N/A)." if no_pipelines else ""
+
     if not gaps:
-        return covered(
-            judged, judged,
-            f"pipeline completion is monitored (DataPipeline run history present) in "
-            f"all {judged} environment(s) with pipelines: {', '.join(monitored)}."
-            f"{sla_note}{na_note}",
+        counts = ", ".join(f"{tier} {n}" for tier, n in recorded)
+        visible = (
+            f"Pipeline runs are recorded in all {judged} environments "
+            f"({counts} pipelines have recorded runs), so completions are visible."
         )
-    return covered(
-        len(monitored), judged,
-        f"pipeline completion is monitored in {len(monitored)} of {judged} "
-        f"environment(s) with pipelines ({', '.join(monitored) or 'none'}); no "
-        f"DataPipeline run history in {', '.join(gaps)}.{sla_note}{na_note}",
-    )
+    else:
+        rec = ", ".join(f"{tier} {n}" for tier, n in recorded) or "none"
+        gap_clauses = [
+            f"{tier} (no run history: {_names(names)})" if names else tier
+            for tier, names in gaps
+        ]
+        visible = (
+            f"Pipeline runs are recorded in {rec}, but {_xw.and_list(gap_clauses)} "
+            f"{'has' if len(gaps) == 1 else 'have'} pipelines with no recorded runs, "
+            "so their completions cannot be confirmed."
+        )
+
+    fully_enforced = bool(active_sla) and not disabled_sched and not no_sched
+    if fully_enforced:
+        sla = (
+            f"Every environment has an enabled schedule and a failure alert "
+            f"({_xw.and_list(active_sla)}), so completion deadlines are enforced."
+        )
+    else:
+        clauses: list[str] = []
+        if disabled_sched:
+            verb = "has" if len(disabled_sched) == 1 else "have"
+            clauses.append(f"{_xw.and_list(disabled_sched)} {verb} schedules "
+                           "but all are disabled")
+        if no_sched:
+            verb = "has" if len(no_sched) == 1 else "have"
+            clauses.append(f"{_xw.and_list(no_sched)} {verb} no schedule or trigger")
+        sla = (
+            "But there is no active SLA: " + "; ".join(clauses)
+            + " — so nothing enforces a completion deadline or raises a failure alert."
+        )
+
+    na = (f" {_xw.and_list(no_pipelines)} have no pipelines (N/A)."
+          if no_pipelines else "")
+    evidence = f"{visible} {sla}{na}"
+
+    if gaps:
+        return covered(len(recorded), judged, evidence)
+    if fully_enforced:
+        return graded(3, evidence)
+    return graded(1, evidence)
+
+
+def _has_failure_notification(ws: WorkspaceContext) -> bool:
+    """True when a failure on a pipeline run would notify someone.
+
+    Any of: a refresh schedule set to notify on failure, a pipeline activity
+    that emails/messages on a failure path, or an active Data Activator.
+    """
+    for schedule in (ws.refresh_schedules or {}).values():
+        if schedule.get("notifies_on_failure") or schedule.get("notify_option"):
+            return True
+    return _has_pipeline_failure_alert(ws) or _xw.has_active_activator(ws)
 
 
 #: A pipeline activity type that can raise a failure alert (email / Teams / web).
