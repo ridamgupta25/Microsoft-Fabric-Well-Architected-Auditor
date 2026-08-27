@@ -202,6 +202,42 @@ def test_repository_security_discovery_normalizes_github_and_caches():
     assert session.calls == [base]
 
 
+def test_repository_security_discovery_does_not_query_github_without_token():
+    provider = LiveFabricProvider("token")
+    session = _FakeSession({})
+    provider._session = session
+
+    result = provider._discover_repository_security({
+        "provider": "GitHub", "organization": "contoso", "repository": "fabric",
+    })
+
+    assert result["verified"] is False
+    assert result["enabled"] is None
+    assert "token not provided" in result["reason"]
+    assert session.calls == []
+
+
+def test_repository_security_discovery_normalizes_azure_devops_enablement():
+    provider = LiveFabricProvider(
+        "token", azure_devops_repository_security_token="repo-token"
+    )
+    url = (
+        "https://advsec.dev.azure.com/Contoso/Fabric/_apis/management/"
+        "repositories/repo-id/enablement?api-version=7.2-preview.1"
+    )
+    session = _FakeSession({url: _FakeResponse(200, {"advSecEnabled": True})})
+    provider._session = session
+
+    result = provider._discover_repository_security({
+        "provider": "AzureDevOps", "organization": "Contoso", "project": "Fabric",
+        "repository": "Repo", "repository_id": "repo-id",
+    })
+
+    assert result == {"enabled": True, "push_protection": None,
+                     "verified": True, "reason": None}
+    assert session.calls == [url]
+
+
 def test_notebook_monitoring_reads_latest_session_metrics():
     provider = LiveFabricProvider("token")
     base = provider.BASE

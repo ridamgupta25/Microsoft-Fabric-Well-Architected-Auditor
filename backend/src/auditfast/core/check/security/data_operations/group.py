@@ -74,9 +74,10 @@ def secret_scanning_consistent(ctx: GroupContext) -> Verdict:
         label = _xw.bold_member(member)
         if not ws.has(Resource.GIT):
             unreadable.append(tier)
+            reason = (ws.git_details or {}).get("reason") or "access was not available"
             bullets.append(
-                f"- {label} — the Git connection could not be read (it needs a "
-                "higher workspace role), so its secret-scanning status is unknown."
+                f"- {label} — the Git connection could not be read ({reason}), "
+                "so its secret-scanning status is unknown."
             )
             continue
         if not ws.git_connected:
