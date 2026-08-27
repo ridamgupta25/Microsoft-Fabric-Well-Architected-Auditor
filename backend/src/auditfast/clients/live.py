@@ -820,12 +820,19 @@ class LiveFabricProvider:
 
         if provider == "github":
             token = self._github_repository_security_token
-            url = f"https://api.github.com/repos/{quote(organization)}/{quote(repository)}"
-            headers = {"Accept": "application/vnd.github+json",
-                       "X-GitHub-Api-Version": "2022-11-28"}
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
-            metadata = self._fetch_repository_security(url, headers, "GitHub")
+            if not token:
+                metadata = self._unverified_security(
+                    "GitHub repository-security token not provided"
+                )
+            else:
+                url = f"https://api.github.com/repos/{quote(organization)}/{quote(repository)}"
+                metadata = self._fetch_repository_security(
+                    url,
+                    {"Authorization": f"Bearer {token}",
+                     "Accept": "application/vnd.github+json",
+                     "X-GitHub-Api-Version": "2022-11-28"},
+                    "GitHub",
+                )
         elif provider in {"azuredevops", "azure devops", "ado"}:
             token = self._azure_devops_repository_security_token
             if not token:
@@ -868,11 +875,23 @@ class LiveFabricProvider:
                 enabled = (analysis.get("secret_scanning") or {}).get("status")
                 push_protection = (analysis.get("secret_scanning_push_protection") or {}).get("status")
             else:
-                enabled = payload.get("status")
-                push_protection = payload.get("pushProtectionStatus")
-            verified = isinstance(enabled, str)
-            return {"enabled": enabled == "enabled" if verified else None,
-                    "push_protection": push_protection == "enabled" if isinstance(push_protection, str) else None,
+                # Azure DevOps returns ``advSecEnabled`` rather than GitHub's
+                # status strings from its Advanced Security enablement endpoint.
+                enabled = payload.get("advSecEnabled")
+                if not isinstance(enabled, bool):
+                    enabled = payload.get("secretScanningEnabled")
+                push_protection = payload.get("pushProtectionEnabled")
+            verified = isinstance(enabled, (bool, str))
+            enabled_value = enabled if isinstance(enabled, bool) else enabled == "enabled"
+            push_value = (
+                push_protection
+                if isinstance(push_protection, bool)
+                else push_protection == "enabled"
+                if isinstance(push_protection, str)
+                else None
+            )
+            return {"enabled": enabled_value if verified else None,
+                    "push_protection": push_value,
                     "verified": verified,
                     "reason": None if verified else "security status was absent"}
         except Exception:
@@ -1680,17 +1699,37 @@ class LiveFabricProvider:
         if Resource.GIT in wanted:
             git_status, git_body = self._get(f"/workspaces/{workspace_id}/git/connection")
             if git_status == 200:
-                ctx.git_details = self._git_connection(git_body)
-                ctx.git_connected = bool(ctx.git_details.get("connected"))
-                if ctx.git_connected:
-                    security = self._discover_repository_security(ctx.git_details)
-                    ctx.git_details["secret_scanning"] = security
-                    ctx.git_details["repository_security"] = {"secret_scanning": security}
+                details = self._git_connection(git_body)
+                if not details:
+                    ctx.git_details = {
+                        "readable": False,
+                        "reason": "Fabric returned an empty or invalid Git connection response",
+                    }
+                    ctx.unavailable.add(Resource.GIT)
+                else:
+                    ctx.git_details = details
+                    ctx.git_details["readable"] = True
+                    ctx.git_connected = bool(ctx.git_details.get("connected"))
+                    if ctx.git_connected:
+                        security = self._discover_repository_security(ctx.git_details)
+                        ctx.git_details["secret_scanning"] = security
+                        ctx.git_details["repository_security"] = {"secret_scanning": security}
             elif git_status in (400, 404):
                 ctx.git_connected = False  # genuinely not connected
+                ctx.git_details = {
+                    "connected": False,
+                    "readable": True,
+                    "reason": "workspace is not connected to source control",
+                }
             else:
                 # 401/403/500/transport failure: we could not determine it.
                 ctx.unavailable.add(Resource.GIT)
+                reason = (
+                    f"Fabric Git connection read was forbidden (HTTP {git_status})"
+                    if git_status in (401, 403)
+                    else f"Fabric Git connection could not be read (HTTP {git_status})"
+                )
+                ctx.git_details = {"connected": None, "readable": False, "reason": reason}
 
         if Resource.ENVIRONMENT_DEFINITIONS in wanted:
             environments = [i for i in ctx.items if i.type == "Environment"]
