@@ -102,7 +102,11 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
                               powerbi_token=powerbi_token,
                               sql_token=sql_token if settings.sql_endpoint_enabled else None,
                               storage_token=storage_token,
-                              sql_token_refresher=sql_token_refresher)
+                              sql_token_refresher=sql_token_refresher,
+                              github_repository_security_token=getattr(
+                                  settings, "github_repository_security_token", None),
+                              azure_devops_repository_security_token=getattr(
+                                  settings, "azure_devops_repository_security_token", None))
     provider = live
     if settings.cache_enabled:
         from .context_store import CachingProvider, ContextStore

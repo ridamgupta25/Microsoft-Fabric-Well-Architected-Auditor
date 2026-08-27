@@ -46,7 +46,7 @@ class _FakeSession:
         self.calls: list[str] = []
         self.headers: dict = {}
 
-    def get(self, url, timeout=None):
+    def get(self, url, headers=None, timeout=None):
         self.calls.append(url)
         return self.by_url[url]
 
@@ -57,7 +57,7 @@ class _SequenceGetSession:
         self.calls: list[str] = []
         self.headers: dict = {}
 
-    def get(self, url, timeout=None):
+    def get(self, url, headers=None, timeout=None):
         self.calls.append(url)
         return self.responses.pop(0)
 
@@ -179,6 +179,27 @@ def test_git_connection_reads_state_not_status():
     assert gh["organization"] == "octocat"
     # A missing / unparseable body -> empty facts (fetch treats this as not connected).
     assert parse(None) == {}
+
+
+def test_repository_security_discovery_normalizes_github_and_caches():
+    provider = LiveFabricProvider("token", github_repository_security_token="repo-token")
+    base = "https://api.github.com/repos/contoso/fabric"
+    session = _FakeSession({
+        base: _FakeResponse(200, {"security_and_analysis": {
+            "secret_scanning": {"status": "enabled"},
+            "secret_scanning_push_protection": {"status": "enabled"},
+        }}),
+    })
+    provider._session = session
+    details = {"provider": "GitHub", "organization": "contoso", "repository": "fabric"}
+
+    first = provider._discover_repository_security(details)
+    second = provider._discover_repository_security(details)
+
+    assert first == {"enabled": True, "push_protection": True,
+                     "verified": True, "reason": None}
+    assert second == first
+    assert session.calls == [base]
 
 
 def test_notebook_monitoring_reads_latest_session_metrics():
