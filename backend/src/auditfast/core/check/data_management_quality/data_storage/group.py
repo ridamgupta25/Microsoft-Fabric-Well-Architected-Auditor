@@ -263,29 +263,53 @@ def cross_layer_reconciliation(ctx: GroupContext) -> Verdict:
             "fewer than two workspaces had readable notebook definitions to compare"
         )
 
-    applicable: list[str] = []
-    reconciled: list[str] = []
+    applicable_total = 0
+    reconciled_total = 0
+    all_by_tier: list[tuple[str, list[str]]] = []
+    missing_by_tier: list[tuple[str, list[str]]] = []
     for member in readable:
         flows, controlled = _silver_to_gold_flows(member.workspace)
-        label = _xw.env_label(member)
-        applicable.extend(f"{label}/{name}" for name in flows)
-        reconciled.extend(f"{label}/{name}" for name in controlled)
+        if not flows:
+            continue
+        controlled_set = set(controlled)
+        tier = _xw.env_tier(member)
+        applicable_total += len(flows)
+        reconciled_total += len(controlled)
+        all_by_tier.append((tier, flows))
+        missing = [name for name in flows if name not in controlled_set]
+        if missing:
+            missing_by_tier.append((tier, missing))
 
-    if not applicable:
+    if applicable_total == 0:
         return not_applicable(
             "no Silver-to-Gold data flow (notebook write to a Gold-tier target, or "
             "a Silver-to-Warehouse pipeline) was found across the group"
         )
 
-    missing = sorted(set(applicable) - set(reconciled))
-    if not missing:
+    def _grouped(pairs: list[tuple[str, list[str]]]) -> str:
+        return "; ".join(
+            f"**{tier}** — " + ", ".join(f"'{name}'" for name in names)
+            for tier, names in pairs
+        )
+
+    if reconciled_total == applicable_total:
         return covered(
-            len(applicable), len(applicable),
-            f"Gold record counts reconcile with Silver (accounting for aggregation) "
-            f"in all {len(applicable)} Silver-to-Gold flow(s): {', '.join(sorted(reconciled))}",
+            applicable_total, applicable_total,
+            "Gold record counts reconcile with Silver (accounting for aggregation) in "
+            f"all {applicable_total} Silver-to-Gold flow(s): {_grouped(all_by_tier)}",
+        )
+    if reconciled_total == 0:
+        return covered(
+            0, applicable_total,
+            f"None of the {applicable_total} pipelines/notebooks that load data from "
+            "Silver into Gold check for row loss — they don't compare how many rows "
+            "were read from Silver against how many were written to Gold, so if a load "
+            f"silently dropped rows nobody would know. The {applicable_total} flow(s): "
+            f"{_grouped(all_by_tier)}.",
         )
     return covered(
-        len(reconciled), len(applicable),
-        f"Gold-to-Silver record-count reconciliation present in {len(reconciled)} of "
-        f"{len(applicable)} Silver-to-Gold flow(s); missing in {', '.join(missing)}",
+        reconciled_total, applicable_total,
+        f"{reconciled_total} of {applicable_total} Silver-to-Gold flow(s) compare "
+        "Silver source rows against Gold target rows; the rest do not check for row "
+        f"loss: {_grouped(missing_by_tier)}.",
     )
