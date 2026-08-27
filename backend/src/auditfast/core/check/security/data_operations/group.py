@@ -88,11 +88,14 @@ def secret_scanning_consistent(ctx: GroupContext) -> Verdict:
             continue
         repo = _repo_phrase(ws)
         provider = _provider_name(ws)
-        state = (ws.git_details.get("secret_scanning") or {}).get("enabled")
-        if state is True:
+        security = (ws.git_details.get("repository_security") or {}).get("secret_scanning")
+        security = security or (ws.git_details.get("secret_scanning") or {})
+        state = security.get("enabled")
+        verified = security.get("verified") is True
+        if verified and state is True:
             enabled.append(tier)
             bullets.append(f"- {label} has {provider} secret scanning enabled on {repo}.")
-        elif state is False:
+        elif verified and state is False:
             disabled.append(tier)
             bullets.append(
                 f"- {label} is connected to {repo}, but {provider} secret scanning "
@@ -100,11 +103,10 @@ def secret_scanning_consistent(ctx: GroupContext) -> Verdict:
             )
         else:  # connected, but the provider security status could not be verified
             unverified.append(tier)
+            reason = security.get("reason") or "provider security metadata is unverified"
             bullets.append(
                 f"- {label} is connected to {repo}, but whether {provider} secret "
-                "scanning / push protection is turned on is not readable — Fabric's "
-                "Git API doesn't expose it, and the audit has no repo-security token "
-                "to check."
+                f"scanning / push protection is turned on is not verified ({reason})."
             )
 
     detail = "\n".join(bullets)

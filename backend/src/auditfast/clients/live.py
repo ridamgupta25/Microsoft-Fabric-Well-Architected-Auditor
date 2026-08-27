@@ -27,6 +27,7 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from typing import Any
+from urllib.parse import quote
 
 import yaml
 
@@ -128,7 +129,9 @@ class LiveFabricProvider:
 
     def __init__(self, token: str, timeout: int = 60, token_refresher=None,
                  powerbi_token: str | None = None, sql_token: str | None = None,
-                 storage_token: str | None = None, sql_token_refresher=None):
+                 storage_token: str | None = None, sql_token_refresher=None,
+                 github_repository_security_token: str | None = None,
+                 azure_devops_repository_security_token: str | None = None):
         import requests  # imported lazily so offline mode needs no HTTP stack
 
         self._session = requests.Session()
@@ -167,6 +170,9 @@ class LiveFabricProvider:
         #: N/A rather than treating unreadable Files sections as empty.
         self._storage_token = storage_token
         self._onelake_client = None
+        self._github_repository_security_token = github_repository_security_token
+        self._azure_devops_repository_security_token = azure_devops_repository_security_token
+        self._repository_security_cache: dict[tuple[str, str, str, str], dict] = {}
 
     # -- transport -------------------------------------------------------------
     def _get(self, path: str) -> tuple[int | None, Any]:
@@ -778,6 +784,8 @@ class LiveFabricProvider:
             "organization": provider.get("organizationName") or provider.get("ownerName", ""),
             "project": provider.get("projectName", ""),
             "repository": provider.get("repositoryName", ""),
+            "repository_id": provider.get("repositoryId") or provider.get("id"),
+            "repository_url": provider.get("repositoryUrl") or provider.get("url", ""),
             "branch": provider.get("branchName", ""),
             "directory": provider.get("directoryName", ""),
             "head": sync.get("head"),
@@ -786,6 +794,90 @@ class LiveFabricProvider:
                 provider.get("gitProviderType", ""), connected
             ),
         }
+
+    @staticmethod
+    def _unverified_security(reason: str) -> dict:
+        return {"enabled": None, "push_protection": None, "verified": False,
+                "reason": reason}
+
+    def _discover_repository_security(self, details: dict) -> dict:
+        """Read normalized provider security settings once per repository."""
+        provider = str(details.get("provider") or "").strip().lower()
+        organization = str(details.get("organization") or "").strip()
+        project = str(details.get("project") or "").strip()
+        repository = str(details.get("repository") or "").strip()
+        repository_id = str(details.get("repository_id") or "").strip()
+        if not provider or not organization or not repository:
+            return self._unverified_security(
+                "repository owner, provider, or name is missing from Fabric Git metadata"
+            )
+
+        cache_key = (provider, organization, project, repository_id or repository)
+        with self._lock:
+            cached = self._repository_security_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+
+        if provider == "github":
+            token = self._github_repository_security_token
+            url = f"https://api.github.com/repos/{quote(organization)}/{quote(repository)}"
+            headers = {"Accept": "application/vnd.github+json",
+                       "X-GitHub-Api-Version": "2022-11-28"}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            metadata = self._fetch_repository_security(url, headers, "GitHub")
+        elif provider in {"azuredevops", "azure devops", "ado"}:
+            token = self._azure_devops_repository_security_token
+            if not token:
+                metadata = self._unverified_security(
+                    "Azure DevOps repository-security token not provided"
+                )
+            elif not repository_id:
+                metadata = self._unverified_security(
+                    "Azure DevOps repository id is missing from Fabric Git metadata"
+                )
+            else:
+                url = ("https://advsec.dev.azure.com/"
+                       f"{quote(organization)}/{quote(project)}/_apis/management/"
+                       f"repositories/{quote(repository_id)}/enablement?api-version=7.2-preview.1")
+                metadata = self._fetch_repository_security(
+                    url, {"Authorization": f"Bearer {token}",
+                          "Accept": "application/json"}, "Azure DevOps")
+        else:
+            metadata = self._unverified_security(f"Unsupported Git provider: {provider}")
+
+        with self._lock:
+            self._repository_security_cache[cache_key] = dict(metadata)
+        return metadata
+
+    def _fetch_repository_security(self, url: str, headers: dict, provider: str) -> dict:
+        try:
+            response = self._session.get(url, headers=headers, timeout=self._timeout)
+            if response.status_code in (401, 403):
+                return self._unverified_security(
+                    f"{provider} repository security returned HTTP {response.status_code}")
+            if response.status_code == 404:
+                return self._unverified_security(
+                    f"{provider} repository was not found or security metadata is unavailable")
+            if response.status_code != 200:
+                return self._unverified_security(
+                    f"{provider} repository security returned HTTP {response.status_code}")
+            payload = response.json() or {}
+            if provider == "GitHub":
+                analysis = payload.get("security_and_analysis") or {}
+                enabled = (analysis.get("secret_scanning") or {}).get("status")
+                push_protection = (analysis.get("secret_scanning_push_protection") or {}).get("status")
+            else:
+                enabled = payload.get("status")
+                push_protection = payload.get("pushProtectionStatus")
+            verified = isinstance(enabled, str)
+            return {"enabled": enabled == "enabled" if verified else None,
+                    "push_protection": push_protection == "enabled" if isinstance(push_protection, str) else None,
+                    "verified": verified,
+                    "reason": None if verified else "security status was absent"}
+        except Exception:
+            log.warning("%s repository security read failed", provider)
+            return self._unverified_security(f"{provider} repository security read failed")
 
     @staticmethod
     def _secret_scanning_status(provider_type: str, connected: bool) -> dict:
@@ -1590,6 +1682,10 @@ class LiveFabricProvider:
             if git_status == 200:
                 ctx.git_details = self._git_connection(git_body)
                 ctx.git_connected = bool(ctx.git_details.get("connected"))
+                if ctx.git_connected:
+                    security = self._discover_repository_security(ctx.git_details)
+                    ctx.git_details["secret_scanning"] = security
+                    ctx.git_details["repository_security"] = {"secret_scanning": security}
             elif git_status in (400, 404):
                 ctx.git_connected = False  # genuinely not connected
             else:

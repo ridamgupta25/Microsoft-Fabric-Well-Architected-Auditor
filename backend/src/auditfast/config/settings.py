@@ -85,6 +85,11 @@ class Settings(BaseSettings):
         description="Read column schemas and Warehouse RLS over the SQL analytics endpoint.",
     )
 
+    # Optional provider tokens used only to read repository security metadata.
+    # They are never written to the workspace knowledge base.
+    github_repository_security_token: str | None = None
+    azure_devops_repository_security_token: str | None = None
+
     # -- CORS -----------------------------------------------------------------
     # The React dev server runs on a different origin, so the API must allow it
     # explicitly. In production this should be the deployed frontend origin only.
