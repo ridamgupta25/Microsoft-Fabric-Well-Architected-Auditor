@@ -15,6 +15,7 @@ check module; it is imported explicitly by the ``group.py`` files that use it.
 """
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable
 
 from ..models import GroupContext, GroupMemberContext, WorkspaceContext
@@ -88,6 +89,52 @@ def _tokens(name: str) -> set[str]:
 def env_label(member: GroupMemberContext) -> str:
     """A stable, name-plus-level label for one environment in a group."""
     return f"{member.workspace.name} (L{member.environment_level})"
+
+
+#: Workspace-name tokens that name a human environment tier (Dev / UAT / Prod).
+TIER_LABELS: dict[str, str] = {
+    "dev": "Dev", "development": "Dev",
+    "sit": "SIT", "test": "Test", "qa": "QA", "uat": "UAT",
+    "staging": "Staging", "stage": "Staging", "preprod": "Pre-Prod",
+    "prod": "Prod", "production": "Prod",
+}
+
+
+def env_tier(member: GroupMemberContext) -> str:
+    """A plain environment name (Dev / UAT / Prod / ...) for one group member.
+
+    Derived from the first tier token in the workspace name, so a report never
+    prints an opaque ``L{n}``. Falls back to the workspace's own name when the
+    name carries no recognised tier token, so the label is always concrete.
+    """
+    for token in re.findall(r"[a-z0-9]+", member.workspace.name.lower()):
+        if token in TIER_LABELS:
+            return TIER_LABELS[token]
+    return member.workspace.name
+
+
+def member_label(member: GroupMemberContext) -> str:
+    """``Dev (workspace 'MLC_Fabric_DEV')`` — the tier plus the named workspace."""
+    tier = env_tier(member)
+    name = member.workspace.name
+    return f"{tier} (workspace '{name}')" if tier != name else f"workspace '{name}'"
+
+
+def bold_member(member: GroupMemberContext) -> str:
+    """``**Dev** (workspace 'MLC_Fabric_DEV')`` — a bolded tier plus the workspace."""
+    tier = env_tier(member)
+    name = member.workspace.name
+    return f"**{tier}** (workspace '{name}')" if tier != name else f"workspace **'{name}'**"
+
+
+def and_list(items: list[str]) -> str:
+    """``['Dev', 'UAT', 'Prod'] -> 'Dev, UAT and Prod'`` for readable prose."""
+    items = [item for item in items if item]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " and " + items[-1]
 
 
 def consistency(
@@ -309,6 +356,26 @@ def has_typed_run_history(ws: WorkspaceContext, types: Iterable[str]) -> bool:
         if id_to_type.get(item_id) in wanted:
             return True
     return False
+
+
+def typed_run_history_count(ws: WorkspaceContext, types: Iterable[str]) -> int:
+    """How many items *whose type is in* ``types`` have recorded run history.
+
+    Counts distinct items with at least one recorded run, so "8 pipelines have
+    recorded runs" is the number of monitored pipelines, not the number of run
+    events.
+    """
+    wanted = set(types)
+    id_to_type = {item.id: item.type for item in ws.items}
+    return sum(
+        1 for item_id, stamps in ws.run_history.items()
+        if stamps and id_to_type.get(item_id) in wanted
+    )
+
+
+def has_enabled_schedule(ws: WorkspaceContext) -> bool:
+    """True when at least one refresh/trigger schedule is *enabled* (not just present)."""
+    return any(schedule.get("enabled") for schedule in ws.refresh_schedules.values())
 
 
 def pipeline_item_count(ws: WorkspaceContext) -> int:

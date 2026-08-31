@@ -76,6 +76,24 @@ def _reporting_stage_present(ws: WorkspaceContext) -> bool:
     )
 
 
+def _lineage_stage_summary(ws: WorkspaceContext) -> str:
+    """A counted source -> store -> report breakdown, so a gap names the missing stage."""
+    counts: dict[str, int] = {}
+    for item in ws.items:
+        counts[item.type] = counts.get(item.type, 0) + 1
+    pipelines = counts.get("DataPipeline", 0) or len(ws.pipelines)
+    notebooks = counts.get("Notebook", 0)
+    dataflows = counts.get("Dataflow", 0)
+    stores = sum(counts.get(t, 0) for t in _xw.DATA_STORE_TYPES)
+    semantic = max(counts.get("SemanticModel", 0), len(ws.semantic_models))
+    reports = max(counts.get("Report", 0) + counts.get("PaginatedReport", 0), len(ws.reports))
+    return (
+        f"source: {pipelines} pipeline(s), {notebooks} notebook(s), {dataflows} dataflow(s); "
+        f"store: {stores} Lakehouse/Warehouse item(s); "
+        f"reporting: {semantic} semantic model(s), {reports} report(s)"
+    )
+
+
 def _captures_technical_metadata(ws: WorkspaceContext) -> bool:
     """True when technical metadata is captured in a model *or* in files/tables.
 
@@ -149,7 +167,7 @@ def lineage_e2e_consistent(ctx: GroupContext) -> Verdict:
         elif not has_report and _xw.has_recoverable_read_failures(ws):
             excluded.append(label)
         else:
-            absent.append(label)
+            absent.append(f"{label} [{_lineage_stage_summary(ws)}]")
 
     judged = len(present) + len(absent)
     excl_note = (
