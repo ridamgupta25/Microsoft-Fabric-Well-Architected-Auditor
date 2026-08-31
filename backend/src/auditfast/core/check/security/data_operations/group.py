@@ -11,7 +11,26 @@ from auditfast.core.check import _xw
 from auditfast.core.check.helpers import Verdict, covered, graded, not_applicable
 from auditfast.core.check.registry import group_check
 from auditfast.core.enums import Pillar, Resource, Severity
-from auditfast.core.models import GroupContext
+from auditfast.core.models import GroupContext, WorkspaceContext
+
+
+def _repo_phrase(ws: WorkspaceContext) -> str:
+    """A human ``GitHub repo `org/repo` (branch `x`)`` phrase from the Git details."""
+    details = ws.git_details or {}
+    provider = str(details.get("provider") or "").strip() or "the"
+    org = str(details.get("organization") or "").strip()
+    repo = str(details.get("repository") or "").strip()
+    branch = str(details.get("branch") or "").strip()
+    slug = "/".join(part for part in (org, repo) if part)
+    phrase = f"{provider} repo `{slug}`" if slug else f"the connected {provider} repository"
+    if branch:
+        phrase += f" (branch `{branch}`)"
+    return phrase
+
+
+def _provider_name(ws: WorkspaceContext) -> str:
+    """The Git provider name for prose (e.g. ``GitHub``), or a neutral fallback."""
+    return str((ws.git_details or {}).get("provider") or "").strip() or "the provider"
 
 
 @group_check(
@@ -42,6 +61,7 @@ def secret_scanning_consistent(ctx: GroupContext) -> Verdict:
             "fewer than two environments in this group could be compared"
         )
 
+    bullets: list[str] = []
     enabled: list[str] = []
     disabled: list[str] = []
     unverified: list[str] = []
@@ -50,56 +70,67 @@ def secret_scanning_consistent(ctx: GroupContext) -> Verdict:
 
     for member in ctx.members:
         ws = member.workspace
-        label = _xw.env_label(member)
+        tier = _xw.env_tier(member)
+        label = _xw.bold_member(member)
         if not ws.has(Resource.GIT):
-            unreadable.append(label)
+            unreadable.append(tier)
+            bullets.append(
+                f"- {label} — the Git connection could not be read (it needs a "
+                "higher workspace role), so its secret-scanning status is unknown."
+            )
             continue
         if not ws.git_connected:
-            not_connected.append(label)
+            not_connected.append(tier)
+            bullets.append(
+                f"- {label} is not connected to source control, so there is no "
+                "repository to scan."
+            )
             continue
-        scan = ws.git_details.get("secret_scanning") or {}
-        state = scan.get("enabled")
+        repo = _repo_phrase(ws)
+        provider = _provider_name(ws)
+        state = (ws.git_details.get("secret_scanning") or {}).get("enabled")
         if state is True:
-            enabled.append(label)
+            enabled.append(tier)
+            bullets.append(f"- {label} has {provider} secret scanning enabled on {repo}.")
         elif state is False:
-            disabled.append(label)
-        else:  # connected, but the provider security status was not verified
-            unverified.append(label)
+            disabled.append(tier)
+            bullets.append(
+                f"- {label} is connected to {repo}, but {provider} secret scanning "
+                "is turned off, so committed credentials are not detected or blocked."
+            )
+        else:  # connected, but the provider security status could not be verified
+            unverified.append(tier)
+            bullets.append(
+                f"- {label} is connected to {repo}, but whether {provider} secret "
+                "scanning / push protection is turned on is not readable — Fabric's "
+                "Git API doesn't expose it, and the audit has no repo-security token "
+                "to check."
+            )
 
-    parts: list[str] = []
-    if enabled:
-        parts.append(f"enabled in {', '.join(enabled)}")
-    if disabled:
-        parts.append(f"disabled in {', '.join(disabled)}")
-    if unverified:
-        parts.append(f"connected but secret-scanning status not verified in {', '.join(unverified)}")
-    if not_connected:
-        parts.append(f"not connected to source control in {', '.join(not_connected)}")
-    if unreadable:
-        parts.append(f"Git connection unreadable (unknown) in {', '.join(unreadable)}")
-    detail = "; ".join(parts)
+    detail = "\n".join(bullets)
 
     # PASS only when secret scanning is confirmed on in every environment.
     if enabled and not (disabled or unverified or not_connected or unreadable):
-        return covered(total, total,
-                       f"secret scanning confirmed enabled in all {total} environment(s): {detail}")
+        return covered(
+            total, total,
+            f"Secret scanning is confirmed enabled in all {total} environments:\n{detail}",
+        )
     if enabled:
         return covered(
             len(enabled), total,
-            f"secret scanning confirmed in {len(enabled)} of {total} environment(s); {detail}",
+            f"Secret scanning is confirmed enabled in {len(enabled)} of {total} "
+            f"environments; it could not be confirmed in the rest:\n{detail}",
         )
-    # Nothing confirmed. A real gap exists (a disconnected repo cannot be scanned),
-    # but a connected-yet-unverifiable repo is not a definite failure — so this is
-    # PARTIAL, with the accurate per-environment breakdown, never a false pass.
-    if unverified or (enabled == disabled == not_connected == []):
+    # Nothing confirmed. A connected-yet-unverifiable or unreadable repo is not a
+    # definite failure, so that is PARTIAL; a repo that cannot be scanned because
+    # scanning is off or it is not connected at all is a real gap (FAIL).
+    if unverified or unreadable:
         return graded(
             1,
-            f"secret scanning could not be confirmed on any of {total} "
-            f"environment(s): {detail}. Enable the provider's secret scanning on "
-            "each connected repository and grant the audit a repo-security token "
-            "so it can be verified.",
+            f"Secret scanning could not be confirmed in any of the {total} "
+            f"environments:\n{detail}",
         )
     return covered(
         0, total,
-        f"no environment has secret scanning enabled ({total} environment(s)): {detail}",
+        f"No environment has secret scanning enabled ({total} environments):\n{detail}",
     )

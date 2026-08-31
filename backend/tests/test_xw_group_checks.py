@@ -395,3 +395,106 @@ def test_lineage_crossdomain_group_check_is_registered_with_remediation():
     assert load_remediation(load_project(PROJECT_FILE)).get("8.1.5"), (
         "XW-LINEAGE-CROSSDOMAIN (ref 8.1.5) has no remediation text"
     )
+
+
+# -- Analysis enhancements folded onto dev's versions: name the specific item ---
+
+def test_secret_scan_names_the_connected_repository():
+    """11.1.8: a connected environment names its repository in the evidence."""
+    from auditfast.core.check.security.data_operations.group import (
+        secret_scanning_consistent,
+    )
+
+    def _git_ws(name, *, connected, provider="", org="", repo="", branch="", scanning=None):
+        details = {"connected": connected, "provider": provider,
+                   "organization": org, "repository": repo, "branch": branch}
+        if scanning is not None:
+            details["secret_scanning"] = {"enabled": scanning}
+        return WorkspaceContext(id=name, display_name=name, layer=Layer.MIXED,
+                                git_connected=connected, git_details=details)
+
+    verdict = secret_scanning_consistent(_layer_group(
+        _git_ws("DEV", connected=True, provider="GitHub", org="contoso",
+                repo="fabric", branch="main", scanning=True),
+        _git_ws("PROD", connected=False),
+    ))
+    assert "GitHub repo `contoso/fabric` (branch `main`)" in verdict.evidence
+    assert "not connected to source control" in verdict.evidence
+    assert "**Prod**" in verdict.evidence
+
+
+def test_lineage_e2e_names_the_missing_stage_with_counts():
+    """8.1.2: an incomplete environment shows the per-stage counts."""
+    from auditfast.core.check.governance_compliance.data_operations.group import (
+        lineage_e2e_consistent,
+    )
+
+    verdict = lineage_e2e_consistent(_layer_group(
+        _workspace("DEV", Layer.MIXED, "Notebook", "Lakehouse", "SemanticModel", "Report"),
+        _workspace("PROD", Layer.MIXED, "DataPipeline", "Warehouse"),
+    ))
+    assert verdict.score != 3
+    assert "PROD (L2) [" in verdict.evidence
+    assert "reporting: 0 semantic model(s), 0 report(s)" in verdict.evidence
+
+
+def test_pipeline_sla_names_pipelines_without_run_history():
+    """9.4.2: a gap environment names the pipelines lacking run history."""
+    from auditfast.core.check.operations_reliability.data_operations.group import (
+        pipeline_sla_monitored,
+    )
+
+    def _pl_ws(name, jobs):
+        items = [Item(id=f"{name}-{j}", type="DataPipeline", display_name=j,
+                      last_run_utc="2026-01-01T00:00:00Z" if ran else None)
+                 for j, ran in jobs.items()]
+        return WorkspaceContext(
+            id=name, display_name=name, layer=Layer.MIXED, items=items,
+            run_history={f"{name}-{j}": ["2026-01-01T00:00:00Z"]
+                         for j, ran in jobs.items() if ran},
+        )
+
+    verdict = pipeline_sla_monitored(_layer_group(
+        _pl_ws("DEV", {"LoadSales": True, "LoadFinance": True}),
+        _pl_ws("PROD", {"LoadFinance": False, "LoadHR": False}),
+    ))
+    assert "no run history: LoadFinance, LoadHR" in verdict.evidence
+
+
+def test_wh_load_names_the_rowcount_audit_tables():
+    """10.1.5: the row-count dimension names the audit table(s) it found."""
+    from auditfast.core.check.operations_reliability.data_logs.group import (
+        warehouse_load_monitored,
+    )
+
+    def _wh_pipeline():
+        return {"properties": {"activities": [
+            {"name": "Load", "type": "Copy",
+             "typeProperties": {"sink": {"type": "DataWarehouseSink"}},
+             "warehouse": {"type": "DataWarehouse"}}]}}
+
+    def _wh_ws(name, tables, jobs=None):
+        items = [Item(id=f"{name}-wh", type="Warehouse", display_name="WH")]
+        pipelines = {}
+        for job, ran in (jobs or {}).items():
+            items.append(Item(id=f"{name}-{job}", type="DataPipeline", display_name=job,
+                              last_run_utc="2026-01-01T00:00:00Z" if ran else None))
+            pipelines[job] = _wh_pipeline()
+        return WorkspaceContext(
+            id=name, display_name=name, layer=Layer.MIXED, items=items,
+            pipelines=pipelines,
+            tables={t: {"columns": [{"name": "source_count"}, {"name": "target_count"}]}
+                    for t in tables},
+        )
+
+    verdict = warehouse_load_monitored(_layer_group(
+        _wh_ws("DEV", ["audit_detail", "delta_load_audit"],
+               {"LoadSales": True, "LoadFinance": False}),
+        _wh_ws("PROD", ["audit_detail"], {"LoadHR": False}),
+    ))
+    assert "audit_detail" in verdict.evidence
+    assert "delta_load_audit" in verdict.evidence
+    # Every load job is named, split by run-history presence.
+    assert "no history for 'LoadFinance'" in verdict.evidence
+    assert "only 'LoadSales'" in verdict.evidence
+    assert "'LoadHR' has no run history" in verdict.evidence
