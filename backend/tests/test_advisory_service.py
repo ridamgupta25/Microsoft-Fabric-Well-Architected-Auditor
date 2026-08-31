@@ -15,7 +15,7 @@ import json
 import pytest
 
 from auditfast.ai import orchestrator
-from auditfast.ai.jobs import build_job
+from auditfast.ai.jobs import build_job, write_jobs
 from auditfast.ai.labels import read_labels
 from auditfast.core.check.registry import REGISTRY
 from auditfast.core.enums import Pillar, Scope, Severity, Status
@@ -159,3 +159,53 @@ def test_the_users_key_reaches_the_model_and_is_not_kept(monkeypatch, out_dir):
     # Nothing that goes back to a client, or into the job store, may carry it.
     assert "secret-key" not in json.dumps(summary)
     assert "secret-key" not in repr(creds)
+
+
+def _ws(name: str) -> WorkspaceContext:
+    """A workspace whose fact/dimension names are unique to it."""
+    return WorkspaceContext(id=name, display_name=name, tables={
+        f"dbo.Dim{name}": {"columns": [{"name": "k"}, {"name": "a"}, {"name": "b"}]},
+        f"dbo.Fact{name}": {"columns": [
+            {"name": "fk"}, {"name": "amount", "type": "decimal"},
+        ]},
+    })
+
+
+def _ws_result(name: str) -> CheckResult:
+    spec = REGISTRY.get(CHECK)
+    return CheckResult(
+        check_id=CHECK, ref=spec.ref, title=spec.title, pillar=Pillar.DATA_MODELING,
+        status=Status.FAIL, score=0, evidence="Star-schema naming not detected",
+        severity=Severity.MEDIUM, workspace=name, obj="", scope=Scope.WORKSPACE,
+    )
+
+
+def test_build_job_covers_every_workspace_not_just_the_first():
+    # The bug this guards: build_job built objects from results[0]'s workspace
+    # only, so a multi-workspace audit stranded every workspace after the first.
+    contexts = {"Alpha": _ws("Alpha"), "Beta": _ws("Beta")}
+    job = build_job(CHECK, [_ws_result("Alpha"), _ws_result("Beta")], contexts)
+
+    ids = [o["id"] for chunk in job["chunks"] for o in chunk["objects"]]
+    assert any(i.startswith("Alpha :: ") for i in ids), "Alpha's objects are missing"
+    assert any(i.startswith("Beta :: ") for i in ids), "Beta's objects are missing"
+    # A workspace-scoped check gets one finding per workspace, not a single
+    # collapsed one, so each workspace's verdict can be judged on its own.
+    assert len(job["findings"]) == 2
+
+
+def test_write_jobs_manifest_lists_all_workspaces(tmp_path):
+    contexts = {"Alpha": _ws("Alpha"), "Beta": _ws("Beta")}
+    write_jobs({CHECK: [_ws_result("Alpha"), _ws_result("Beta")]}, contexts, tmp_path)
+
+    manifest = json.loads(
+        (tmp_path / "advisory-manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["workspaces"] == ["Alpha", "Beta"]
+
+    # The label template must carry both workspaces' objects, with unique ids so
+    # the reader (which rejects a repeated object) can label all of them.
+    body = (tmp_path / advisory_service.JOBS_DIRNAME / f"{CHECK}-labels.csv").read_text(
+        encoding="utf-8"
+    )
+    assert "Alpha :: " in body and "Beta :: " in body

@@ -60,13 +60,21 @@ def _chunk(records: list[dict]) -> list[list[dict]]:
 def build_job(
     check_id: str,
     results: list[CheckResult],
-    workspace: WorkspaceContext,
+    contexts: WorkspaceContext | dict[str, WorkspaceContext],
 ) -> dict | None:
     """The judging job for one check, or ``None`` when it has no guide yet.
 
     A check without a guide is still advisory - it reaches the report with its
     deterministic verdict - so guides can be added one at a time without
     stranding anything.
+
+    ``contexts`` is either a single :class:`WorkspaceContext` (the common
+    single-workspace case) or a ``{workspace_name: context}`` map. A multi-
+    workspace audit must judge *every* workspace's objects, so the evidence is
+    built from each workspace that reported a result - not just the first - and
+    both the object ids and the finding names are qualified with the workspace,
+    so two workspaces each holding a ``Notebook 1`` do not collide in the label
+    file (which keys by object and rejects a repeat).
     """
     guide = guide_for(check_id)
     if guide is None or not results:
@@ -77,22 +85,52 @@ def build_job(
     first = results[0]
     ref = first.ref
     spec = REGISTRY.get(check_id)
-    objects = evidence_builders.build(guide.evidence, workspace)
+
+    single_ctx = contexts if isinstance(contexts, WorkspaceContext) else None
+    ctx_map = {} if single_ctx is not None else dict(contexts or {})
+
+    def _context(ws_name: str):
+        return ctx_map.get(ws_name) or single_ctx
+
+    # Workspaces this check reported against, kept in first-seen order.
+    ws_names = list(dict.fromkeys(r.workspace for r in results))
+    usable = [w for w in ws_names if _context(w) is not None]
+    if not usable:
+        return None
+    multi = len(usable) > 1
+
+    def _qualify(ws_name: str, name: str) -> str:
+        return f"{ws_name} :: {name}" if multi else name
+
+    # Build the objects to judge from every workspace, not just the first -
+    # otherwise a multi-workspace audit strands every workspace after the first.
+    objects: list[dict] = []
+    for ws_name in usable:
+        for record in evidence_builders.build(guide.evidence, _context(ws_name)):
+            record["id"] = _qualify(ws_name, record["id"])
+            record["workspace"] = ws_name
+            objects.append(record)
     if not objects:
         return None
 
     # Every object belongs to the finding whose score it contributes to. For a
-    # workspace-scoped check that is one finding fed by all of them; for an
-    # object-scoped check each object is its own finding. Pinning them all to
-    # the first result would collapse 40 notebooks into one verdict and leave
-    # 39 findings unjudged, so the mapping is built from the scope.
+    # workspace-scoped check that is one finding per workspace; for an object-
+    # scoped check each object is its own finding. Collapsing them onto the
+    # first result would leave every other workspace's finding unjudged.
     if first.scope is Scope.WORKSPACE:
-        by_finding = {(first.obj or WORKSPACE_FINDING): first}
+        by_finding: dict[str, CheckResult] = {}
+        ws_finding: dict[str, str] = {}
+        for r in results:
+            name = _qualify(r.workspace, r.obj or WORKSPACE_FINDING)
+            by_finding[name] = r
+            ws_finding[r.workspace] = name
         for record in objects:
-            record["finding"] = first.obj or WORKSPACE_FINDING
+            record["finding"] = ws_finding.get(
+                record["workspace"], _qualify(record["workspace"], WORKSPACE_FINDING)
+            )
     else:
-        by_finding = {r.obj: r for r in results if r.obj}
-        objects = [r for r in objects if r["id"] in by_finding]
+        by_finding = {_qualify(r.workspace, r.obj): r for r in results if r.obj}
+        objects = [o for o in objects if o["id"] in by_finding]
         if not objects:
             return None
         for record in objects:
@@ -100,10 +138,7 @@ def build_job(
             # The reader is told to treat `rule_says` as the rule's claim and
             # check it. For an object-scoped check the rule reaches a verdict
             # per object, and that verdict - not the descriptive fact the
-            # builder happened to derive - is the claim worth checking. Without
-            # this the field read "5 activities", which is nothing to agree or
-            # disagree with, and a reader had to dig into `findings` to find
-            # what the rule actually concluded.
+            # builder happened to derive - is the claim worth checking.
             verdict = by_finding[record["id"]]
             record["rule_says"] = (
                 f"{verdict.status.value}: {verdict.evidence}"
@@ -117,7 +152,7 @@ def build_job(
         "title": first.title,
         "theme": theme_of(ref),
         "question": question_for(theme_of(ref)),
-        "workspace": first.workspace,
+        "workspace": ", ".join(usable) if multi else first.workspace,
         "rule": (spec.description or (spec.fn.__doc__ or "")).strip() if spec else "",
         "why_advisory": reason_for(ref),
         "instruction": guide.classify,
@@ -161,6 +196,9 @@ def _finding_meta(result: CheckResult) -> dict:
         "scope": result.scope.value,
         "weight": result.weight,
         "scored": result.scored,
+        # The finding's own workspace, so a multi-workspace run rebuilds each
+        # row against the workspace it came from rather than the job's first.
+        "workspace": result.workspace,
         "obj": result.obj,
         "recommendation": result.recommendation,
         "deterministic": {
@@ -288,10 +326,9 @@ def write_jobs(
     written: dict[str, str] = {}
     summary: list[dict] = []
     for check_id, results in sorted(results_by_check.items()):
-        workspace = contexts.get(results[0].workspace) if results else None
-        if workspace is None:
-            continue
-        job = build_job(check_id, results, workspace)
+        # Pass every workspace's context, not just the first result's, so the
+        # job carries the objects of all workspaces the check reported against.
+        job = build_job(check_id, results, contexts)
         if job is None:
             continue
         path = jobs_dir / f"{check_id}.json"
@@ -314,7 +351,9 @@ def write_jobs(
         })
 
     manifest = {
-        "workspaces": sorted({r[0].workspace for r in results_by_check.values() if r}),
+        "workspaces": sorted(
+            {r.workspace for results in results_by_check.values() for r in results}
+        ),
         "checks": len(summary),
         "total_objects": sum(job["objects"] for job in summary),
         "labelling_rules": LABELLING_RULES,
