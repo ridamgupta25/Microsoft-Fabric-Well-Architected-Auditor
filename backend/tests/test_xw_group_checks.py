@@ -423,19 +423,30 @@ def test_secret_scan_names_the_connected_repository():
     assert "**Prod**" in verdict.evidence
 
 
-def test_lineage_e2e_names_the_missing_stage_with_counts():
-    """8.1.2: an incomplete environment shows the per-stage counts."""
+def test_lineage_e2e_names_the_untraceable_item():
+    """8.1.2: an item Fabric cannot trace is named, with its environment.
+
+    Rewritten when the check moved from "do a source, a store and a reporting
+    item coexist here?" to "can Fabric actually draw the lineage edge?". Item
+    *types* in the inventory say nothing about wiring, so the fixture now carries
+    real definitions: one pipeline naming a Fabric item, one reaching a raw
+    storage path that no lineage edge can hang off.
+    """
     from auditfast.core.check.governance_compliance.data_operations.group import (
         lineage_e2e_consistent,
     )
 
-    verdict = lineage_e2e_consistent(_layer_group(
-        _workspace("DEV", Layer.MIXED, "Notebook", "Lakehouse", "SemanticModel", "Report"),
-        _workspace("PROD", Layer.MIXED, "DataPipeline", "Warehouse"),
-    ))
+    dev = _workspace("DEV", Layer.MIXED)
+    dev.pipelines = {"PL_Load": {"properties": {"activities": [
+        {"typeProperties": {"notebookId": "nb-1"}}]}}}
+    prod = _workspace("PROD", Layer.MIXED)
+    prod.pipelines = {"PL_Raw": {"properties": {"activities": [
+        {"typeProperties": {"path": "abfss://d@x.dfs.core.windows.net/raw"}}]}}}
+
+    verdict = lineage_e2e_consistent(_layer_group(dev, prod))
     assert verdict.score != 3
-    assert "PROD (L2) [" in verdict.evidence
-    assert "reporting: 0 semantic model(s), 0 report(s)" in verdict.evidence
+    assert "PROD (L2)" in verdict.evidence
+    assert "pipeline 'PL_Raw' names no Fabric item" in verdict.evidence
 
 
 def test_pipeline_sla_names_pipelines_without_run_history():

@@ -4,7 +4,6 @@ from __future__ import annotations
 from auditfast.core.enums import Layer
 from auditfast.core.models import WorkspaceContext
 
-
 _LAYER_NAME_HINTS: tuple[tuple[str, Layer], ...] = (
     ("dataprep", Layer.PREP),
     ("data_prep", Layer.PREP),
