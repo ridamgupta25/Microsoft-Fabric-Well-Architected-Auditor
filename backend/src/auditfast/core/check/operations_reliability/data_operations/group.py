@@ -436,18 +436,65 @@ def sla_alerts_consistent(ctx: GroupContext) -> Verdict:
     requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=False,
 )
 def sla_history_consistent(ctx: GroupContext) -> Verdict:
-    """Runnable items retain execution history in every environment.
+    """Runnable items retain execution history in every environment that has any.
 
-    Historical SLA reporting needs recorded runs to report on. An environment
-    whose pipelines and notebooks have no run history cannot show historical
-    compliance. N/A when fewer than two members' run history could be read.
+    Historical SLA reporting needs recorded runs to report on, so this verifies
+    the *raw material* exists: pipelines and notebooks whose runs Fabric has
+    retained. Whether anyone turns that into a periodic attainment figure is
+    self-assessed (``OPS-SLA-HISTORY``) — the capacity-metrics and monitoring
+    admin APIs that would show it are not called here, and the evidence says so.
+
+    An environment holding **no pipeline or notebook** is excluded, not failed: a
+    reporting workspace runs nothing, so it has no execution history to retain
+    and telling its owner to keep some is not a finding.
+
+    Run history is resolved **by item type**, never by "the workspace recorded
+    some run somewhere" — a semantic-model refresh is not pipeline history. N/A
+    when fewer than two environments hold a runnable item.
     """
-    return _xw.consistency(
-        ctx,
-        readable=lambda ws: ws.has(Resource.ITEM_RUN_HISTORY) and ws.has(Resource.ITEMS),
-        implements=lambda ws: _xw.has_run_history(ws, {"DataPipeline", "Notebook"}),
-        practice="retains execution history for SLA reporting",
-        data_name="run history",
+    runnable = {"DataPipeline", "Notebook"}
+    retained: list[str] = []
+    missing: list[str] = []
+    skipped: list[str] = []
+
+    for member in ctx.members:
+        ws = member.workspace
+        if not (ws.has(Resource.ITEMS) and ws.has(Resource.ITEM_RUN_HISTORY)):
+            continue
+        label = _xw.env_label(member)
+        total = sum(1 for item in ws.items if item.type in runnable)
+        if total == 0:
+            skipped.append(f"{label} (holds no pipeline or notebook to run)")
+            continue
+        recorded = _xw.typed_run_history_count(ws, runnable)
+        if recorded:
+            retained.append(f"{label} ({recorded} of {total} have recorded runs)")
+        else:
+            missing.append(f"{label} (none of {total} have recorded runs)")
+
+    scope = (
+        ". Whether the retained runs are reported as an attainment figure is not "
+        "readable here — it needs the monitoring admin APIs this audit does not call"
+    )
+    excluded = (f"; {len(skipped)} environment(s) excluded: {'; '.join(skipped)}"
+                if skipped else "")
+
+    judged = len(retained) + len(missing)
+    if judged < 2:
+        return not_applicable(
+            "fewer than two environments in this group hold a pipeline or notebook "
+            f"whose execution history could be compared{excluded}{scope}"
+        )
+    if not missing:
+        return covered(
+            judged, judged,
+            f"all {judged} environment(s) retain execution history for SLA "
+            f"reporting: {'; '.join(retained)}{excluded}{scope}",
+        )
+    return covered(
+        len(retained), judged,
+        f"{len(retained)} of {judged} environment(s) retain execution history for "
+        f"SLA reporting; not in {'; '.join(missing)}{excluded}{scope}",
     )
 
 
