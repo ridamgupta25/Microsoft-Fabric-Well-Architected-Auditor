@@ -194,6 +194,31 @@ def test_build_job_covers_every_workspace_not_just_the_first():
     assert len(job["findings"]) == 2
 
 
+def test_workspace_objects_map_to_the_workspace_finding_not_a_model_detail_row():
+    # The bug this guards: a workspace-scoped check that also emits per-model
+    # detail rows mapped every object to the LAST model's finding instead of the
+    # "(workspace)" row, so the reader's labels scored the wrong finding.
+    spec = REGISTRY.get(CHECK)
+
+    def _model_row(ws: str, model: str) -> CheckResult:
+        return CheckResult(
+            check_id=CHECK, ref=spec.ref, title=spec.title, pillar=Pillar.DATA_MODELING,
+            status=Status.FAIL, score=0, evidence=f"{model} detail",
+            severity=Severity.MEDIUM, workspace=ws, obj=model, scope=Scope.WORKSPACE,
+        )
+
+    # Per-model detail rows come after the workspace row, reproducing the overwrite.
+    results = [
+        _ws_result("Alpha"), _model_row("Alpha", "ModelA"),
+        _ws_result("Beta"), _model_row("Beta", "ModelB"),
+    ]
+    job = build_job(CHECK, results, {"Alpha": _ws("Alpha"), "Beta": _ws("Beta")})
+
+    findings = {o["finding"] for chunk in job["chunks"] for o in chunk["objects"]}
+    assert findings == {"Alpha :: (workspace)", "Beta :: (workspace)"}, findings
+
+
+
 def test_write_jobs_manifest_lists_all_workspaces(tmp_path):
     contexts = {"Alpha": _ws("Alpha"), "Beta": _ws("Beta")}
     write_jobs({CHECK: [_ws_result("Alpha"), _ws_result("Beta")]}, contexts, tmp_path)
