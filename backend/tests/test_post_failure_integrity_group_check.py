@@ -125,11 +125,21 @@ def test_failure_branch_without_reconciliation_does_not_count():
 
 
 def test_reconciliation_without_a_failure_path_does_not_count():
-    # Routine reconciliation with no recovery/failure signal is 5.4.6, not 9.3.4.
+    """Routine reconciliation with no recovery/failure signal is 5.4.6, not 9.3.4.
+
+    Such an environment is now *excluded* rather than failed -- it runs nothing
+    after a failure, so there is no post-failure path to validate on -- but the
+    load-bearing part is unchanged: routine reconciliation must never be credited
+    as post-failure validation. Only DEV has a recovery path, so one judged
+    environment is left and the comparison is N/A.
+    """
     routine = {"properties": {"activities": [
         {"name": "Reconcile row_count", "type": "Lookup"},
     ]}}
     dev = _ws("ws-dev", notebooks={"NB": _nb(_VALIDATING_CODE)})
     prod = _ws("ws-prod", pipelines={"PL": routine})
     verdict = post_failure_integrity_consistent(_group((dev, 1), (prod, 10)))
-    assert verdict.score is not None and verdict.score < 3
+    assert verdict.status is Status.NA
+    assert verdict.scored is False
+    assert "ws-prod" in verdict.evidence
+    assert "no recovery, replay or backfill path exists" in verdict.evidence

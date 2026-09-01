@@ -13,6 +13,7 @@ from auditfast.core.check import _xw
 from auditfast.core.check._notebook import executable_code
 from auditfast.core.check.helpers import Verdict, covered, not_applicable
 from auditfast.core.check.operations_reliability.data_prep.automated import (
+    _RECOVERY_CONTEXTS,
     notebook_validates_post_failure_integrity,
 )
 from auditfast.core.check.registry import group_check
@@ -20,9 +21,14 @@ from auditfast.core.enums import Pillar, Resource, Severity
 from auditfast.core.models import GroupContext, WorkspaceContext
 
 #: A pipeline branch that runs after a failure, or a recovery/backfill pipeline.
+#: Each word is bounded, so ``repair``/``recover``/``rerun`` inside a longer
+#: identifier is not a recovery path.
 _PL_RECOVERY = re.compile(
     r'"dependencyConditions"\s*:\s*\[[^\]]*"Failed"'
-    r"|recover\w*|re-?run|backfill|replay|reprocess\w*|(?:^|\W)resume(?:\W|$)|repair",
+    r"|(?:^|\W|_)recover\w*|(?:^|\W|_)re-?run(?:\W|_|$)"
+    r"|(?:^|\W|_)backfill(?:\W|_|$)|(?:^|\W|_)replay(?:\W|_|$)"
+    r"|(?:^|\W|_)reprocess\w*|(?:^|\W|_)resume(?:\W|_|$)"
+    r"|(?:^|\W|_)repair(?:\W|_|$)",
     re.IGNORECASE,
 )
 #: A cross-layer integrity comparison expressed in a pipeline (Lookup/Script that
@@ -36,11 +42,17 @@ _PL_INTEGRITY = re.compile(
 )
 
 
-#: A notebook recovery/replay/backfill path (before the integrity re-check).
-_NB_RECOVERY = re.compile(
-    r"recover\w*|re-?run|backfill|replay|reprocess\w*|(?:^|\W)resume(?:\W|$)|repair",
-    re.IGNORECASE,
-)
+def _notebook_recovery_contexts(code: str) -> list[str]:
+    """The recovery wordings a notebook's executable code uses, if any.
+
+    Delegates to ``_RECOVERY_CONTEXTS`` — the same table the per-workspace
+    ``NB-POST-FAILURE-INTEGRITY`` uses on this ref — so the two cannot disagree
+    about what counts as a recovery path. A second, looser copy lived here and
+    matched ``recover``/``repair``/``rerun`` **anywhere inside a longer word**,
+    which is how capacity-metrics notebooks came to be reported as recovery
+    paths that fail to re-validate.
+    """
+    return [label for label, pattern in _RECOVERY_CONTEXTS if pattern.search(code)]
 
 
 def _pipeline_validates_post_failure_integrity(definition_json: str) -> bool:
@@ -67,7 +79,7 @@ def _post_failure_paths(ws: WorkspaceContext) -> tuple[list[str], list[str]]:
         if notebook_validates_post_failure_integrity(code):
             recovery.append(name)
             validated.append(name)
-        elif _NB_RECOVERY.search(code):
+        elif _notebook_recovery_contexts(code):
             recovery.append(name)
     for name, definition in (ws.pipelines or {}).items():
         blob = json.dumps(definition)
@@ -86,19 +98,24 @@ def _post_failure_paths(ws: WorkspaceContext) -> tuple[list[str], list[str]]:
     required=False,
 )
 def post_failure_integrity_consistent(ctx: GroupContext) -> Verdict:
-    """Every environment re-checks cross-layer integrity on a recovery path.
+    """Every environment that *has* a recovery path re-checks integrity on it.
 
     For each environment its notebooks and pipelines are scanned for a recovery /
     replay / backfill path that re-validates cross-layer row/key counts (a
-    source-vs-target count comparison referencing the run audit's
-    ``source_count`` / ``target_count``) and fails loudly on a mismatch. The
-    verdict is the coverage of environments that do so, and the evidence names
-    the paths inspected in each — the validated ones, or the recovery paths that
-    were found but do not re-validate. N/A when fewer than two members' notebook
-    or pipeline definitions could be read.
+    source-vs-target comparison that fails loudly on a mismatch). The evidence
+    names the paths inspected in each — the validated ones, or the recovery paths
+    found that do not re-validate.
+
+    An environment with **no recovery path at all** is excluded, not failed.
+    "Validate integrity after a failure" presupposes something that runs after a
+    failure; a workspace that has no such path has nothing to validate on, and
+    reporting it as a gap sends its owner to fix code that does not exist. That
+    is a separate finding — *whether* a recovery path should exist — and not this
+    one. N/A when fewer than two environments hold a recovery path.
     """
     present: list[str] = []
     absent: list[str] = []
+    skipped: list[str] = []
     for member in ctx.members:
         ws = member.workspace
         if not (ws.has(Resource.NOTEBOOK_DEFINITIONS)
@@ -114,23 +131,36 @@ def post_failure_integrity_consistent(ctx: GroupContext) -> Verdict:
                 "re-validate cross-layer counts)"
             )
         else:
-            absent.append(f"{label} (no recovery/replay/backfill path found)")
+            skipped.append(f"{label} (no recovery, replay or backfill path exists)")
+
+    excluded = (f"; {len(skipped)} environment(s) excluded with nothing to validate "
+                f"on: {'; '.join(skipped)}") if skipped else ""
 
     total = len(present) + len(absent)
     if total < 2:
+        # Only one environment has a recovery path, so there is no cross-environment
+        # comparison to make -- but that environment's own posture is a real
+        # finding and must not vanish into the N/A. Naming it keeps a lone
+        # unvalidated recovery path visible.
+        lone = ""
+        if present:
+            lone = f"; {'; '.join(present)} does re-validate on its recovery path"
+        elif absent:
+            lone = f"; {'; '.join(absent)}"
         return not_applicable(
-            "fewer than two environments had readable notebook or pipeline "
-            "definitions to compare"
+            "fewer than two environments in this group have a recovery, replay or "
+            f"backfill path whose integrity re-check could be compared{lone}{excluded}"
         )
     if not absent:
         return covered(
             total, total,
-            f"every environment re-validates cross-layer integrity on a recovery "
-            f"path: {'; '.join(present)}",
+            f"every environment with a recovery path re-validates cross-layer "
+            f"integrity on it: {'; '.join(present)}{excluded}",
         )
     passing = f"validated in {'; '.join(present)}. " if present else ""
     return covered(
         len(present), total,
         f"cross-layer integrity is re-validated on a recovery path in "
-        f"{len(present)} of {total} environment(s); {passing}not in {'; '.join(absent)}",
+        f"{len(present)} of {total} environment(s) that have one; {passing}not in "
+        f"{'; '.join(absent)}{excluded}",
     )
