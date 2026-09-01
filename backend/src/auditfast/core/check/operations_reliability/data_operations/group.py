@@ -127,19 +127,99 @@ def schema_drift(ctx: GroupContext) -> Verdict:
     required=False,
 )
 def medallion_consistent(ctx: GroupContext) -> Verdict:
-    """Every environment declares the medallion tiers, not just production.
+    """How much of Bronze -> Silver -> Gold *every* environment implements.
 
-    An environment "implements" the architecture when its data stores (or its own
-    name) name at least one medallion tier. Comparing across the group catches a
-    medallion built in Prod but never carried back to Dev/UAT. N/A when fewer than
-    two members' item inventories could be read.
+    Scored on the tiers common to all readable environments — the architecture
+    the project actually has everywhere — using the same 0-3 ladder as the
+    per-workspace ``WS-MEDALLION`` on this ref, so the two cannot disagree about
+    the same estate: 3 tiers = 3, 2 = 2, 1 = 1, none = 0.
+
+    Counting merely *some* tier as implementation was the earlier flaw: an estate
+    with only a Bronze Lakehouse scored full marks against a check whose title
+    promises the whole progression.
+
+    Distinct from ``XW-MEDALLION-DRIFT`` (11.4.3a), which asks whether the
+    environments *agree*; a group where every environment is equally missing Gold
+    has no drift but an incomplete architecture. A tier held only in some
+    environments is named here but scored there. N/A when fewer than two members'
+    item inventories could be read.
     """
-    return _xw.consistency(
-        ctx,
-        readable=lambda ws: ws.has(Resource.ITEMS),
-        implements=lambda ws: bool(_xw.medallion_tiers(ws)),
-        practice="declares medallion tiers",
-        data_name="item inventories",
+    readable = [m for m in ctx.members if m.workspace.has(Resource.ITEMS)]
+    if len(readable) < 2:
+        return not_applicable(
+            "fewer than two environments in this group had readable item "
+            "inventories to compare"
+        )
+
+    per_env = {_xw.env_label(m): _xw.medallion_tiers(m.workspace) for m in readable}
+    common = set.intersection(*per_env.values())
+    union = set().union(*per_env.values())
+
+    named = ", ".join(sorted(common, key=_xw.MEDALLION_ORDER.index))
+    missing = [t for t in _xw.MEDALLION_ORDER if t not in common]
+    total = len(readable)
+    where = ", ".join(sorted(per_env))
+
+    # A tier some environments have and others do not is real information, but it
+    # is 11.4.3a's verdict to score -- name it here, do not double-count it.
+    partial_tiers = sorted(union - common, key=_xw.MEDALLION_ORDER.index)
+    drift = ""
+    if partial_tiers:
+        drift = "; " + "; ".join(
+            f"{tier} is named only in "
+            f"{', '.join(sorted(label for label, tiers in per_env.items() if tier in tiers))}"
+            for tier in partial_tiers
+        )
+
+    if not common:
+        return graded(
+            0,
+            f"no medallion tier is named in all {total} environment(s) ({where}). "
+            f"No store or workspace name declares Bronze/Raw, Silver/Cleansed or "
+            f"Gold/Curated, so the layer boundaries are not expressed anywhere a "
+            f"reader can see them{drift}",
+        )
+
+    if missing:
+        return graded(
+            len(common),
+            f"{len(common)} of 3 medallion tier(s) are implemented in every "
+            f"environment ({named}, across {where}); no store or workspace name "
+            f"declares {' or '.join(missing)}"
+            f"{_missing_gold_hint(missing, readable)}{drift}",
+        )
+
+    return graded(
+        3,
+        f"Bronze -> Silver -> Gold are all named in every one of the {total} "
+        f"environment(s) ({where}){drift}",
+    )
+
+
+def _missing_gold_hint(missing: list[str], members: list[GroupMemberContext]) -> str:
+    """Point at a Warehouse that is probably the unnamed Gold layer.
+
+    The serving layer is often present but not *named* for its tier, which is
+    what this check can see. Naming the candidate turns "Gold is missing" into
+    something a reviewer can act on. Purely evidence -- it never changes the
+    score, because inferring a tier from an item's type is exactly the guess that
+    produces false verdicts.
+    """
+    if "Gold" not in missing:
+        return ""
+    candidates = [
+        f"{_xw.env_label(member)} holds Warehouse "
+        f"'{item.display_name or item.id}'"
+        for member in members
+        for item in member.workspace.items
+        if item.type == "Warehouse" and not _xw.medallion_tiers_of(item.display_name or "")
+    ]
+    if not candidates:
+        return ""
+    return (
+        f". A serving Warehouse is present but unnamed for its tier "
+        f"({'; '.join(sorted(candidates)[:3])}) — if that is the Gold layer, name "
+        f"it so the boundary is readable"
     )
 
 
@@ -423,6 +503,14 @@ _ISOLATION_RESOURCES = (
     Resource.REPORTS,
 )
 
+#: How much of the scanned definitions must have been read before "no reference
+#: found" counts as a judgement rather than a blind spot. A crawl is *technically*
+#: incomplete the moment one definition is throttled, but 98 of 99 notebooks is a
+#: sound basis for a verdict and 5 of 50 is not. Below this bar the environment is
+#: set aside as indeterminate; at or above it the environment is judged and the
+#: small remainder is disclosed instead.
+_MATERIAL_READ_COVERAGE = 0.90
+
 
 def _inspectable(ws: WorkspaceContext) -> bool:
     """True when the member has an id and at least one scannable definition set."""
@@ -513,9 +601,25 @@ def environment_isolation_consistent(ctx: GroupContext) -> Verdict:
     more than one environment; merely appearing in the tenant-wide connection
     catalog is not evidence of use. A non-OneLake storage location (ADLS / blob /
     S3 / GCS) hardcoded in more than one environment is flagged as a shared
-    mutable artifact. N/A when fewer than two members have inspectable metadata.
+    mutable artifact.
+
+    **Evidence found and evidence absent are not equally conclusive.** A
+    reference discovered in a partially-captured environment is real and is
+    reported; finding *none* there proves less, because the definitions that were
+    never read were never searched. How much less depends on the size of the gap:
+    an environment whose scanned definitions were **mostly** captured is judged
+    normally with the remainder disclosed, while one that was substantially
+    unread is **set aside as indeterminate** — never credited as isolated, and
+    never counted against the score either. A *flagged* environment stays flagged,
+    but its reference list is marked as possibly short, so a reviewer is not sent
+    to remove three references when twenty went unsearched. Every blind spot is
+    named in the evidence with its counts. N/A when fewer than two environments
+    can be judged.
     """
     members = [m for m in ctx.members if _inspectable(m.workspace)]
+    unreadable = [
+        _xw.env_label(m) for m in ctx.members if not _inspectable(m.workspace)
+    ]
     if len(members) < 2:
         return not_applicable(
             "fewer than two environments in this group had readable pipeline, "
@@ -579,13 +683,75 @@ def environment_isolation_consistent(ctx: GroupContext) -> Verdict:
                     f"shared external storage '{store}'"
                 )
 
-    total = len(members)
+    # A reference found in a partial crawl is still a real reference, so an
+    # offender stays an offender. Finding *nothing* is only conclusive in
+    # proportion to how much was actually searched: near-complete is judged with
+    # the remainder disclosed, substantially-unread is set aside as indeterminate
+    # rather than credited as isolated.
+    confirmed: list[str] = []
+    indeterminate: list[str] = []
+    partial_offenders: list[str] = []
+    caveated: list[str] = []
+    for member in members:
+        label = _xw.env_label(member)
+        gaps = _xw.incomplete_reads(member.workspace, _ISOLATION_RESOURCES)
+        gap_detail = f"{label} ({_xw.and_list(gaps)} could not be read)"
+        if label in offenders:
+            # Already proven non-isolated, so the bucket does not change — but the
+            # *list* of references is only as complete as the crawl, and a reviewer
+            # told to remove them needs to know more may be hiding.
+            if gaps:
+                partial_offenders.append(gap_detail)
+        elif not gaps:
+            confirmed.append(label)
+        elif _xw.read_coverage(
+            member.workspace, _ISOLATION_RESOURCES
+        ) >= _MATERIAL_READ_COVERAGE:
+            # Near-complete: judged on the evidence, with the remainder disclosed.
+            confirmed.append(label)
+            caveated.append(gap_detail)
+        else:
+            indeterminate.append(gap_detail)
+
+    notes: list[str] = []
+    if indeterminate:
+        notes.append(
+            f"{len(indeterminate)} environment(s) excluded as indeterminate — a "
+            "cross-environment reference could not be ruled out where too little of "
+            f"the scanned definitions was captured: {'; '.join(indeterminate)}"
+        )
+    if caveated:
+        notes.append(
+            f"{len(caveated)} environment(s) judged on a near-complete crawl, with a "
+            f"small unread remainder: {'; '.join(caveated)}"
+        )
+    if partial_offenders:
+        notes.append(
+            f"{len(partial_offenders)} flagged environment(s) may hold further "
+            "cross-environment references that were never searched: "
+            f"{'; '.join(partial_offenders)}"
+        )
+    if unreadable:
+        notes.append(
+            f"{len(unreadable)} environment(s) excluded with no readable pipeline, "
+            f"notebook, shortcut or report metadata: {', '.join(unreadable)}"
+        )
+    note_text = f"; {'; '.join(notes)}" if notes else ""
+
+    judged = len(confirmed) + len(offenders)
+    if judged < 2:
+        return not_applicable(
+            "fewer than two environments in this group could be judged for "
+            f"cross-environment dependencies{note_text}"
+        )
+
     if not offenders:
         return covered(
-            total, total,
-            f"all {total} environment(s) are isolated: no pipelines, notebooks, "
-            f"shortcuts or reports reference another environment's workspace or "
-            f"artifacts, and no referenced connection is shared",
+            judged, judged,
+            f"all {judged} judged environment(s) are isolated: no pipelines, "
+            f"notebooks, shortcuts or reports reference another environment's "
+            f"workspace or artifacts, and no referenced connection is "
+            f"shared{note_text}",
         )
 
     detail = "; ".join(
@@ -593,7 +759,7 @@ def environment_isolation_consistent(ctx: GroupContext) -> Verdict:
         for label, refs in sorted(offenders.items())[:3]
     )
     return covered(
-        total - len(offenders), total,
-        f"{len(offenders)} of {total} environment(s) have a cross-environment "
-        f"dependency: {detail}",
+        len(confirmed), judged,
+        f"{len(offenders)} of {judged} judged environment(s) have a "
+        f"cross-environment dependency: {detail}{note_text}",
     )

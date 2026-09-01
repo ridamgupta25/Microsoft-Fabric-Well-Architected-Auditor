@@ -22,15 +22,27 @@ class _StubClient(PowerBIClient):
     ``__init__`` is deliberately not called: the real one builds a ``requests``
     session, and this test needs none - only the classification logic sitting
     above the transport.
+
+    **The seam is** :meth:`PowerBIClient._get_with_meta`, **not** ``_get``.
+    ``dataset_refresh_schedule`` reads through the meta form so it can honour
+    ``Retry-After``, and ``_get`` is now only a thin wrapper over it. A stub
+    overriding ``_get`` was therefore never called at all: the real
+    ``_get_with_meta`` ran, reached for the ``requests`` session this stub does
+    not build, and turned every scripted status into a transport error - so the
+    403 case asserting ``forbidden`` silently saw ``transient``, and the
+    URL-order case recorded no paths. Always stub the lowest method that touches
+    the network.
     """
 
     def __init__(self, responses):
         self._responses = list(responses)
         self.paths: list[str] = []
 
-    def _get(self, path: str):
+    def _get_with_meta(self, path: str):
         self.paths.append(path)
-        return self._responses.pop(0) if self._responses else (None, None)
+        status, body = self._responses.pop(0) if self._responses else (None, None)
+        # No Retry-After: the scripted cases exercise classification, not backoff.
+        return status, body, None
 
 
 def test_a_transport_failure_is_transient_not_forbidden():
@@ -90,3 +102,19 @@ def test_the_group_scoped_url_is_tried_first():
     client = _StubClient([(404, None)])
     client.dataset_refresh_schedule("ds", group_id="ws")
     assert client.paths[0].startswith("/groups/ws/datasets/ds")
+
+
+def test_the_stub_is_wired_to_the_method_production_actually_calls():
+    """Regression: the stub overrode ``_get``, which this code path never calls.
+
+    Every scripted status was then replaced by a transport error, so four tests
+    quietly asserted the wrong thing and one could not see any URL at all. If
+    ``dataset_refresh_schedule`` is ever re-plumbed onto a different transport
+    helper, this fails immediately instead of turning the suite into a slow
+    retry loop that agrees with itself.
+    """
+    client = _StubClient([(200, {"enabled": True})])
+    schedule, failure = client.dataset_refresh_schedule("ds", group_id="ws")
+    assert client.paths, "the stub's transport was never called"
+    assert failure == "", "a scripted 200 must not read as a transport failure"
+    assert schedule is not None

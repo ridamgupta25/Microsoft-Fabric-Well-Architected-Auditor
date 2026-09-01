@@ -5,10 +5,11 @@ deployment/test posture of the operational estate.
 """
 from __future__ import annotations
 
-import json
 import re
 
 from auditfast.core.check._pipeline import script_sql, walk_activities
+from auditfast.core.check._xw import MEDALLION_ORDER as _XW_MEDALLION_ORDER
+from auditfast.core.check._xw import MEDALLION_TOKENS as _XW_MEDALLION_TOKENS
 from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable, note
 from auditfast.core.check.registry import check
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
@@ -947,22 +948,19 @@ def environment_tier_is_declared(ctx: CheckContext) -> Verdict:
 # 1.1.5 — medallion architecture (Bronze -> Silver -> Gold)
 # =============================================================================
 
-#: Name tokens that place a store in a medallion tier, mapped to the tier. Each
-#: tier lists the words teams actually use for it, so a ``LH_Raw_Landing`` reads
-#: as Bronze and a ``WH_Presentation`` as Gold. Deliberately conservative: a word
-#: that means something else as often as it means a tier (``STAGE``, ``FINAL``)
-#: is left out rather than guessed at.
+#: Name tokens that place a store in a medallion tier. Derived from the shared
+#: vocabulary in ``_xw`` (upper-cased for :func:`_name_tokens`) so the
+#: per-workspace and cross-workspace checks on ref 1.1.5 cannot disagree about
+#: what counts as Gold — as two hand-maintained copies previously did. That
+#: vocabulary is deliberately conservative: a word meaning something else as
+#: often as it means a tier (``STAGE``, ``FINAL``) is left out rather than
+#: guessed at.
 MEDALLION_TOKENS: dict[str, str] = {
-    "BRONZE": "Bronze", "RAW": "Bronze", "LANDING": "Bronze", "INGEST": "Bronze",
-    "INGESTION": "Bronze", "SOURCE": "Bronze",
-    "SILVER": "Silver", "CLEANSED": "Silver", "CLEAN": "Silver",
-    "CONFORMED": "Silver", "REFINED": "Silver", "ENRICHED": "Silver",
-    "GOLD": "Gold", "CURATED": "Gold", "MART": "Gold", "DATAMART": "Gold",
-    "PRESENTATION": "Gold", "SERVING": "Gold", "SEMANTIC": "Gold",
+    token.upper(): tier for token, tier in _XW_MEDALLION_TOKENS.items()
 }
 
 #: The tiers in the order the architecture flows.
-MEDALLION_ORDER: tuple[str, ...] = ("Bronze", "Silver", "Gold")
+MEDALLION_ORDER: tuple[str, ...] = _XW_MEDALLION_ORDER
 
 #: The store type the checklist point asks each tier to be built on. Bronze and
 #: Silver are file/Delta workloads (a Lakehouse); Gold is the modelled serving
