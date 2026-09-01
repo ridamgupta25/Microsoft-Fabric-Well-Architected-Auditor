@@ -123,7 +123,10 @@ def build_job(
         for r in results:
             name = _qualify(r.workspace, r.obj or WORKSPACE_FINDING)
             by_finding[name] = r
-            ws_finding[r.workspace] = name
+            # Only the workspace-level result scores an object; per-model detail
+            # rows must not be mistaken for the workspace finding.
+            if not r.obj:
+                ws_finding[r.workspace] = name
         for record in objects:
             record["finding"] = ws_finding.get(
                 record["workspace"], _qualify(record["workspace"], WORKSPACE_FINDING)

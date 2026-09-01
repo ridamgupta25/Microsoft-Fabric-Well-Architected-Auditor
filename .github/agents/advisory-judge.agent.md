@@ -128,6 +128,68 @@ cannot tell, say so - that is the correct answer, not a guess.
 **Never invent an object id.** If an object seems missing from the job, say so in
 your report rather than adding a row for it.
 
+**Verify before you override.** Before flipping a rule verdict, confirm it against
+the object's real definition - not a keyword. A rule that matched a name may still
+be right: a pipeline whose source query filters ``WHERE date >= SYSDATE-2`` is
+genuinely incremental even when a quick skim of the JSON saw no predicate; a
+metadata-driven load hides its filter in a dynamic ``@item()``/``@activity(...)``
+query. Read the resolved query and the nested activities. If you cannot resolve
+them, the object is ``undetermined`` - do not record a disagreement you could not
+check. Overriding a verdict that was already correct is worse than leaving it.
+
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 1B - RUN TO COMPLETION AT SCALE (AUTONOMOUS, STRICT)
+# ═══════════════════════════════════════════════════════════════════
+
+A run can carry thousands of objects across dozens of checks - more than one
+context window holds. That is expected and handled. Do not stop to ask about it;
+follow this protocol and keep going.
+
+**Finish every in-scope advisory check in this invocation.** For an unscoped
+audit run, that means every job in the manifest: every object labelled, every
+labels file complete, every check scored, and the final report written before
+you stop. Context pressure, elapsed time, estate size, or the availability of a
+later resume are not reasons to stop. Continue through context compaction and
+use the files on disk as working state. The only permitted early-stop conditions
+are the blockers listed in PHASE 4.
+
+**Finish whole checks, not fragments.** A fully-labelled check scores; a
+half-labelled one wastes the pass and its objects fall back to the rule. Work the
+smallest check to completion, score it, then take the next. Never leave a check
+partly done to start another.
+
+**Persist after every check.** The moment a check's labels file is complete, run
+``advisory-score`` (PHASE 2). Labels live on disk, so every finished check
+survives interruptions or context compaction. Persistence is a checkpoint for
+reliability, not permission to end the invocation before all in-scope checks are
+complete.
+
+**Pre-label the mechanical checks first.** Before judging, run
+``..\.venv\Scripts\python.exe tools/advisory_run_all.py`` from ``backend`` (or
+``tools/advisory_prelabel.py <CHECK-ID>`` for one check). It fills the labels a
+fixed rule can settle - a notifier on a Failed edge, a Copy sink's write mode, an
+unreadable definition - and leaves every judgement blank with a NEEDS-REVIEW
+reason. You then judge only the blank rows, which is what lets a large run fit. It
+never overwrites a label already written and never touches check_id/finding/object.
+
+**Read evidence with a script, not by eye.** The job JSON holds each object's full
+definition, but reading it object-by-object burns context fast. Dump the
+untruncated field you need with a short Python one-liner
+(``..\.venv\Scripts\python.exe``), decide the label from that, and write the CSV
+the same way. Judging from extracted facts - a Copy's ``sink.writeBehavior``, a
+measure body, a notebook's cells - is how a large check fits at all.
+
+**Write the labels file safely.** It already exists pre-filled, so a create-file
+tool will refuse it: write your completed rows to a temp file beside it and
+``Move-Item -Force`` over it, or edit the three empty columns in place. Keep
+``check_id``, ``finding`` and ``object`` byte-for-byte as pre-filled - a changed
+``finding`` scores the wrong row, a changed ``object`` is rejected.
+
+**Scope when the estate is large.** Your argument may name a single ref or theme;
+when the user explicitly supplies that scope, judge every check and every object
+within it before stopping. Without an explicit scope, the scope is the entire
+manifest and must be completed in this invocation.
+
 # ═══════════════════════════════════════════════════════════════════
 # PHASE 2 - SCORE AND REPORT
 # ═══════════════════════════════════════════════════════════════════
@@ -147,8 +209,9 @@ Read the counts:
 
 - **`changed by the reader`** - where your labels moved a score. This is the
   useful output; lead with it in your report.
-- **`checks left to rules`** - jobs you did not label. Expected only if you ran
-  out of room; say which.
+- **`checks left to rules`** - this must be **0** at successful completion. If it
+  is nonzero, continue judging; only report it when a PHASE 4 blocker forced an
+  early stop.
 - **`objects labelled`** and how many were undetermined.
 - **`REJECTED (not advisory)`** must be **0**. Anything else means a job aimed at
   a scored check - stop and report it.
@@ -192,5 +255,5 @@ Stop and report, rather than working around it, if:
 - labels are **rejected as not belonging to the job** - the export is stale;
   re-export before judging.
 
-Otherwise keep going. Partial coverage with an honest report beats stopping to
-ask a question you can answer yourself.
+Otherwise keep going until every in-scope check is complete and
+``checks left to rules`` is 0. Partial coverage is not a successful completion.
