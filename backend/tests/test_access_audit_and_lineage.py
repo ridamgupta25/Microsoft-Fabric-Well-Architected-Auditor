@@ -35,6 +35,7 @@ def _ws(name: str, **kwargs) -> WorkspaceContext:
     ctx.pipelines = dict(kwargs.pop("pipelines", {}))
     ctx.notebooks = dict(kwargs.pop("notebooks", {}))
     ctx.reports = list(kwargs.pop("reports", []))
+    ctx.semantic_models = dict(kwargs.pop("semantic_models", {}))
     for resource in kwargs.pop("unavailable", ()):
         ctx.unavailable.add(resource)
     return ctx
@@ -85,6 +86,48 @@ def test_login_only_audit_does_not_count_as_a_data_access_trail():
     assert "no action group records data access" in verdict.evidence
 
 
+def test_one_audited_warehouse_does_not_vouch_for_the_unaudited_ones():
+    """The reviewer's "can incorrectly pass": coverage is counted per Warehouse.
+
+    Six Warehouses with one properly audited is a one-sixth access trail, not a
+    pass. Scoring per environment hid exactly this.
+    """
+    def _six(name: str) -> WorkspaceContext:
+        return _ws(
+            name,
+            items=[_warehouse(f"WH{i}") for i in range(6)],
+            warehouse_audit={
+                "WH0": _audit(True, DATA_ACCESS_GROUPS, 90),
+                **{f"WH{i}": _audit(False, DEFAULT_GROUPS, 0) for i in range(1, 6)},
+            },
+        )
+
+    verdict = access_audit_consistent(_group((_six("dev"), 1), (_six("prod"), 10)))
+    assert verdict.score == 0
+    assert "2 of 12 Warehouse(s)" in verdict.evidence
+    assert "1 of 6 Warehouse(s) audited" in verdict.evidence
+
+
+def test_unauditable_stores_are_counted_and_disclosed_never_failed():
+    """Lakehouses have no sqlAudit surface, so they are reported, not scored."""
+    def _mixed(name: str) -> WorkspaceContext:
+        return _ws(
+            name,
+            items=[_warehouse("WH"),
+                   *(Item(id=f"{name}-lh{i}", type="Lakehouse", display_name=f"LH{i}")
+                     for i in range(4))],
+            warehouse_audit={"WH": _audit(True, DATA_ACCESS_GROUPS, 90)},
+        )
+
+    verdict = access_audit_consistent(_group((_mixed("dev"), 1), (_mixed("prod"), 10)))
+    # The auditable surface is fully audited, so this passes...
+    assert verdict.score == 3
+    # ...but the estate it does not cover is stated, so the pass is not mistaken
+    # for whole-estate coverage.
+    assert "8 Lakehouse/SQL database(s)" in verdict.evidence
+    assert "only in the tenant audit log" in verdict.evidence
+
+
 def test_data_access_group_without_retention_is_not_a_pass():
     envs = [
         _ws(name, items=[_warehouse("WH")],
@@ -104,7 +147,7 @@ def test_enabled_with_data_access_and_retention_passes():
     ]
     verdict = access_audit_consistent(_group((envs[0], 1), (envs[1], 10)))
     assert verdict.score == 3
-    assert "audit Warehouse data access with retention" in verdict.evidence
+    assert "audit data access with retention" in verdict.evidence
 
 
 def test_disabled_audit_is_still_a_real_failure():
@@ -115,7 +158,7 @@ def test_disabled_audit_is_still_a_real_failure():
     ]
     verdict = access_audit_consistent(_group((envs[0], 1), (envs[1], 10)))
     assert verdict.score == 0
-    assert "SQL audit is disabled" in verdict.evidence
+    assert "0 of 2 Warehouse(s)" in verdict.evidence
 
 
 def test_every_verdict_scopes_itself_away_from_tenant_audit_logging():
@@ -140,7 +183,6 @@ def test_a_warehouseless_member_does_not_drag_down_the_others():
         _group((good[0], 1), (reporting, 5), (good[1], 10)))
     assert verdict.score == 3
     assert "1 environment(s) excluded" in verdict.evidence
-
 
 # -- 8.1.2 ---------------------------------------------------------------------
 
@@ -223,6 +265,100 @@ def test_no_lineage_bearing_item_anywhere_is_na():
     verdict = lineage_e2e_consistent(_group((envs[0], 1), (envs[1], 10)))
     assert verdict.status is Status.NA
     assert verdict.scored is False
+
+
+# -- the model -> store hop -----------------------------------------------------
+
+def _model(**storage) -> dict:
+    """A parsed-TMSL model whose single table carries the given storage facts."""
+    return {"tables": ["Sales"], "storage": {"Sales": dict(storage)}, "expressions": []}
+
+
+def test_a_direct_lake_model_naming_an_entity_is_traceable():
+    """Closes the hop the check previously assumed.
+
+    A Direct Lake partition names the Lakehouse table it reads. That reference
+    was parsed away before, so the model -> store link was unreadable.
+    """
+    envs = [
+        _ws(name, semantic_models={"SM": _model(
+            source_types=["entity"],
+            entity_sources=[{"entity": "fact_sales", "schema": "",
+                             "expression_source": "DatabaseQuery"}],
+        )})
+        for name in ("a", "b")
+    ]
+    verdict = lineage_e2e_consistent(_group((envs[0], 1), (envs[1], 10)))
+    assert verdict.score == 3
+
+
+def test_an_import_model_with_a_native_query_is_traceable():
+    envs = [
+        _ws(name, semantic_models={"SM": _model(
+            source_types=["m"],
+            native_query_expressions=['let Source = Sql.Database("x", "warehouse")'],
+        )})
+        for name in ("a", "b")
+    ]
+    verdict = lineage_e2e_consistent(_group((envs[0], 1), (envs[1], 10)))
+    assert verdict.score == 3
+
+
+def test_a_model_level_expression_alone_resolves_the_source():
+    model = {"tables": ["Sales"], "storage": {},
+             "expressions": [{"name": "DatabaseQuery", "expression": "Sql.Database(...)"}]}
+    envs = [_ws(name, semantic_models={"SM": model}) for name in ("a", "b")]
+    verdict = lineage_e2e_consistent(_group((envs[0], 1), (envs[1], 10)))
+    assert verdict.score == 3
+
+
+def test_a_model_naming_no_source_breaks_the_chain():
+    """A hand-built or push-only model has no edge for lineage to hang off."""
+    envs = [
+        _ws(name, semantic_models={"SM_Orphan": _model(source_types=["calculated"])})
+        for name in ("a", "b")
+    ]
+    verdict = lineage_e2e_consistent(_group((envs[0], 1), (envs[1], 10)))
+    assert verdict.score == 0
+    assert "semantic model 'SM_Orphan' names no source store" in verdict.evidence
+
+
+def test_a_model_from_a_pre_fix_snapshot_is_not_judged():
+    """A cached snapshot parsed before the fix had its source stripped out.
+
+    Scoring those models as "names no source store" would turn a stale KB into a
+    wave of false findings the moment this code ships. Absent ``expressions``
+    marks the old shape, and such models are skipped until a re-crawl.
+    """
+    old_shape = {"tables": ["Sales"], "storage": {"Sales": {"source_types": ["entity"]}}}
+    envs = [
+        _ws(name, semantic_models={"SM_Old": old_shape},
+            reports=[{"name": "R", "dataset_id": "m1"}])
+        for name in ("a", "b")
+    ]
+    verdict = lineage_e2e_consistent(_group((envs[0], 1), (envs[1], 10)))
+    # Only the two reports are judged; the un-judgeable models are left out.
+    assert verdict.score == 3
+    assert "2 lineage-bearing item(s)" in verdict.evidence
+    assert "SM_Old" not in verdict.evidence
+
+
+def test_the_full_report_to_model_to_store_chain_is_scored():
+    """Report -> model -> store, all three links readable and all three counted."""
+    envs = [
+        _ws(name,
+            reports=[{"name": "R", "dataset_id": "m1"}],
+            semantic_models={"SM": _model(
+                source_types=["entity"],
+                entity_sources=[{"entity": "fact_sales", "schema": "",
+                                 "expression_source": "DatabaseQuery"}],
+            )},
+            pipelines={"PL": _WIRED_PIPELINE})
+        for name in ("a", "b")
+    ]
+    verdict = lineage_e2e_consistent(_group((envs[0], 1), (envs[1], 10)))
+    assert verdict.score == 3
+    assert "6 lineage-bearing item(s)" in verdict.evidence
 
 
 # -- the attached-store metadata path -------------------------------------------

@@ -64,6 +64,12 @@ def _table_storage(table: dict) -> dict:
     source_types: set[str] = set()
     native_queries = 0
     native_expressions: list[str] = []
+    #: Where a Direct Lake partition actually points. TMSL records it as
+    #: ``entityName`` (the Lakehouse/Warehouse table) plus ``expressionSource``
+    #: (the model-level M expression naming the store). Both were previously
+    #: dropped, so a Direct Lake model's source was unreadable and the
+    #: model -> store hop of the lineage chain could not be resolved at all.
+    entity_sources: list[dict] = []
     for part in table.get("partitions") or []:
         if not isinstance(part, dict):
             continue
@@ -80,6 +86,14 @@ def _table_storage(table: dict) -> dict:
             if expression:
                 native_queries += 1
                 native_expressions.append(expression[:_MAX_QUERY_EXPRESSION_CHARS])
+        if source_type == "entity":
+            entity = {
+                "entity": str(source.get("entityName") or ""),
+                "schema": str(source.get("schemaName") or ""),
+                "expression_source": str(source.get("expressionSource") or ""),
+            }
+            if any(entity.values()):
+                entity_sources.append(entity)
         mode = str(part.get("mode") or "").strip()
         modes.add(mode or _SOURCE_TYPE_MODE.get(source_type, ""))
     return {
@@ -87,6 +101,7 @@ def _table_storage(table: dict) -> dict:
         "source_types": sorted(source_types),
         "native_query_partitions": native_queries,
         "native_query_expressions": native_expressions,
+        "entity_sources": entity_sources,
     }
 
 
@@ -185,7 +200,7 @@ def parse_tmsl(document: dict) -> dict:
         return {
             "tables": [], "measures": [], "relationships": [], "roles": [],
             "storage": {}, "refresh_policies": [], "aggregations": [],
-            "columns": [], "direct_lake_behavior": "",
+            "columns": [], "expressions": [], "direct_lake_behavior": "",
         }
 
     model = document.get("model") if isinstance(document.get("model"), dict) else document
@@ -262,6 +277,16 @@ def parse_tmsl(document: dict) -> dict:
         })
 
     roles: list[dict] = []
+    model_expressions: list[dict] = []
+    for expression in model.get("expressions") or []:
+        if not isinstance(expression, dict):
+            continue
+        text = _expression(expression.get("expression")).strip()
+        if text:
+            model_expressions.append({
+                "name": str(expression.get("name") or ""),
+                "expression": text[:_MAX_QUERY_EXPRESSION_CHARS],
+            })
     for role in model.get("roles") or []:
         if not isinstance(role, dict):
             continue
@@ -301,6 +326,11 @@ def parse_tmsl(document: dict) -> dict:
         #: Every column *declaration* in the model (name + declared types +
         #: hidden/key flags). Structure only — never a distinct-value count.
         "columns": model_columns,
+        #: Model-level shared M expressions, ``name -> capped expression``. A
+        #: Direct Lake partition names one of these in ``expressionSource``, and
+        #: the expression is where the Lakehouse/Warehouse it reads is actually
+        #: written down — so without it the model -> store hop is unresolvable.
+        "expressions": model_expressions,
         #: Model-level Direct Lake fallback: automatic | directLakeOnly | directQueryOnly.
         "direct_lake_behavior": str(model.get("directLakeBehavior") or ""),
     }

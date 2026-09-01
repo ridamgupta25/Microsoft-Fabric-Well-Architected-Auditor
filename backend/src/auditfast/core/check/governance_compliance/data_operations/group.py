@@ -105,46 +105,49 @@ _TENANT_AUDIT_CAVEAT = (
 )
 
 
-def _warehouse_audit_posture(ws: WorkspaceContext) -> tuple[str, str]:
-    """Classify one environment's Warehouse SQL audit as ``(verdict, detail)``.
+#: Stores that hold data but expose no ``settings/sqlAudit`` surface. Their access
+#: trail lives in the tenant audit log, which needs Fabric-admin scopes this audit
+#: does not hold — so they can be *counted* and disclosed, never failed.
+_UNAUDITABLE_STORE_TYPES: frozenset[str] = frozenset(
+    {"Lakehouse", "SQLDatabase", "MirroredWarehouse"}
+)
 
-    Four outcomes, because "no Warehouse" and "Warehouse with audit off" are
-    different findings and were previously identical:
 
-    * ``"n/a"``     — the environment holds no Warehouse, so there is no Warehouse
-      SQL audit to enable. Not a failure.
-    * ``"off"``     — a Warehouse exists and audit is disabled.
-    * ``"shallow"`` — audit is on, but records no data access, or retains nothing.
-    * ``"full"``    — audit is on, records data access, and retains it.
+def _warehouse_audit_coverage(ws: WorkspaceContext) -> tuple[int, int, int, list[str]]:
+    """``(properly_audited, warehouses, unauditable_stores, gaps)`` for one environment.
+
+    Coverage is counted **per Warehouse**, not "does any Warehouse have it on".
+    An estate with six Warehouses and one audited one has a one-sixth access
+    trail; scoring that as a pass was the reviewer's "can incorrectly pass an
+    environment even when the complete data-access audit trail is missing".
+
+    A Warehouse counts as properly audited only when audit is enabled, its action
+    groups record **data access**, and the records are **retained**.
+
+    Lakehouses and SQL databases are counted separately and never failed: they
+    have no per-item audit configuration to read, so "we cannot verify this" must
+    not become "this is misconfigured".
     """
     warehouses = [item for item in ws.items if item.type == "Warehouse"]
-    if not warehouses and not ws.warehouse_audit:
-        return "n/a", "holds no Warehouse, so there is no Warehouse SQL audit to enable"
+    unauditable = sum(1 for item in ws.items if item.type in _UNAUDITABLE_STORE_TYPES)
+    total = len(warehouses) or len(ws.warehouse_audit)
 
-    enabled = {name: settings for name, settings in ws.warehouse_audit.items()
-               if settings.get("enabled")}
-    if not enabled:
-        return "off", (
-            f"SQL audit is disabled on all {len(ws.warehouse_audit) or len(warehouses)} "
-            f"Warehouse(s)"
-        )
-
+    audited = 0
     gaps: list[str] = []
-    for name, settings in sorted(enabled.items()):
+    for name, settings in sorted(ws.warehouse_audit.items()):
+        if not settings.get("enabled"):
+            continue
         groups = {str(g).strip().upper() for g in (settings.get("action_groups") or [])}
-        retention = settings.get("retention_days")
         if not groups & _DATA_ACCESS_ACTION_GROUPS:
             gaps.append(
                 f"'{name}' audits {', '.join(sorted(groups)) or 'nothing'} — no "
                 f"action group records data access"
             )
-        elif not retention:
+        elif not settings.get("retention_days"):
             gaps.append(f"'{name}' records data access but retains it for 0 days")
-    if gaps:
-        return "shallow", "; ".join(gaps[:3])
-    return "full", (
-        f"{len(enabled)} Warehouse(s) audit data access with retention configured"
-    )
+        else:
+            audited += 1
+    return audited, total, unauditable, gaps
 
 
 @group_check(
@@ -154,26 +157,27 @@ def _warehouse_audit_posture(ws: WorkspaceContext) -> tuple[str, str]:
     requires=[Resource.WAREHOUSE_AUDIT, Resource.ITEMS], required=False,
 )
 def access_audit_consistent(ctx: GroupContext) -> Verdict:
-    """Every environment records *who read or wrote which data*, and retains it.
+    """Every Warehouse records *who read or wrote which data*, and retains it.
 
-    Judged from the Warehouse ``settings/sqlAudit`` configuration, which is the
-    only data-access audit surface readable without tenant-admin. Three things
-    must hold, not one:
+    Scored as the share of Warehouses across the group that are properly audited
+    — enabled, with an action group that records **data access**, and with
+    non-zero **retention**. All three must hold: the three groups Fabric enables
+    by default record logins and batch completion, so an audit carrying only
+    those answers "who signed in", never "who read this table".
 
-    * audit is **enabled** on a Warehouse;
-    * its action groups actually record **data access** — the three Fabric enables
-      by default record logins and batch completion, so an audit carrying only
-      those answers "who signed in", never "who read this table";
-    * the records are **retained** for a non-zero period.
+    Counting per Warehouse rather than per environment is what stops one audited
+    Warehouse from vouching for five unaudited ones.
 
-    Scoring only the ``enabled`` flag — while the crawl already stored the action
-    groups and retention — let a login-only audit with zero retention read as a
-    complete data-access trail.
+    Two things are deliberately **not** failed, only disclosed:
 
-    An environment with **no Warehouse** is excluded, not failed: a reporting
-    workspace has no Warehouse SQL audit to switch on, and telling its owner to
-    enable one is not a finding. N/A when fewer than two environments hold a
-    Warehouse to compare.
+    * an environment with **no Warehouse** is excluded — a reporting workspace has
+      no Warehouse SQL audit to switch on;
+    * **Lakehouses and SQL databases** have no per-item audit surface at all;
+      their access trail lives in the tenant audit log, which needs Fabric-admin
+      scopes this read-only audit does not hold. Their count is reported so a
+      pass is never mistaken for whole-estate coverage.
+
+    N/A when fewer than two environments hold a Warehouse.
     """
     readable = [m for m in ctx.members if m.workspace.has(Resource.WAREHOUSE_AUDIT)]
     if not readable:
@@ -182,34 +186,85 @@ def access_audit_consistent(ctx: GroupContext) -> Verdict:
             f"configuration. {_TENANT_AUDIT_CAVEAT}"
         )
 
-    buckets: dict[str, list[str]] = {"full": [], "shallow": [], "off": [], "n/a": []}
+    judged: list[str] = []
+    skipped: list[str] = []
+    all_gaps: list[str] = []
+    audited_total = warehouse_total = unauditable_total = 0
+
     for member in readable:
-        verdict, detail = _warehouse_audit_posture(member.workspace)
-        buckets[verdict].append(f"{_xw.env_label(member)} ({detail})")
+        label = _xw.env_label(member)
+        audited, warehouses, unauditable, gaps = _warehouse_audit_coverage(member.workspace)
+        unauditable_total += unauditable
+        if warehouses == 0:
+            skipped.append(
+                f"{label} (holds no Warehouse, so there is no Warehouse SQL audit "
+                f"to enable)"
+            )
+            continue
+        audited_total += audited
+        warehouse_total += warehouses
+        judged.append(f"{label} {audited} of {warehouses} Warehouse(s) audited")
+        all_gaps.extend(gaps)
 
-    judged = len(buckets["full"]) + len(buckets["shallow"]) + len(buckets["off"])
-    skipped = (f"; {len(buckets['n/a'])} environment(s) excluded: "
-               f"{'; '.join(buckets['n/a'])}") if buckets["n/a"] else ""
+    excluded = (f"; {len(skipped)} environment(s) excluded: {'; '.join(skipped)}"
+                if skipped else "")
+    uncovered = (
+        f"; a further {unauditable_total} Lakehouse/SQL database(s) across the group "
+        f"expose no audit configuration to read — their access trail is only in the "
+        f"tenant audit log"
+    ) if unauditable_total else ""
 
-    if judged < 2:
+    if len(judged) < 2:
         return not_applicable(
             f"fewer than two environments in this group hold a Warehouse whose SQL "
-            f"audit could be compared{skipped}. {_TENANT_AUDIT_CAVEAT}"
+            f"audit could be compared{excluded}{uncovered}. {_TENANT_AUDIT_CAVEAT}"
         )
 
-    if len(buckets["full"]) == judged:
+    detail = "; ".join(judged)
+    if audited_total == warehouse_total:
         return covered(
-            judged, judged,
-            f"all {judged} environment(s) audit Warehouse data access with "
-            f"retention: {'; '.join(buckets['full'])}{skipped}. {_TENANT_AUDIT_CAVEAT}",
+            warehouse_total, warehouse_total,
+            f"all {warehouse_total} Warehouse(s) across {len(judged)} environment(s) "
+            f"audit data access with retention: {detail}{excluded}{uncovered}. "
+            f"{_TENANT_AUDIT_CAVEAT}",
         )
 
-    problems = "; ".join(buckets["shallow"] + buckets["off"])
+    reasons = f"; {'; '.join(all_gaps[:3])}" if all_gaps else ""
     return covered(
-        len(buckets["full"]), judged,
-        f"{len(buckets['full'])} of {judged} environment(s) record and retain "
-        f"Warehouse data access; {problems}{skipped}. {_TENANT_AUDIT_CAVEAT}",
+        audited_total, warehouse_total,
+        f"{audited_total} of {warehouse_total} Warehouse(s) across "
+        f"{len(judged)} environment(s) record and retain data access: {detail}"
+        f"{reasons}{excluded}{uncovered}. {_TENANT_AUDIT_CAVEAT}",
     )
+
+
+def _model_names_a_source(model: dict) -> bool:
+    """True when a semantic model's TMSL says where its data comes from.
+
+    This is the model -> store hop, and the reason 8.1.2 could previously only
+    check that a model *existed* beside a store rather than that it reads from
+    one. Three readable forms, in the order Fabric writes them:
+
+    * a **native query / M partition** carries its own source query text;
+    * a **Direct Lake** partition names an ``entityName`` (the Lakehouse or
+      Warehouse table) and/or the model-level expression that resolves the store;
+    * a **model-level shared expression** names the SQL endpoint the tables read.
+
+    A model with none of these declares no source at all — a hand-built or
+    push-only model that no lineage edge can hang off.
+    """
+    storage = (model or {}).get("storage") or {}
+    for table in storage.values():
+        if not isinstance(table, dict):
+            continue
+        if table.get("native_query_expressions"):
+            return True
+        for entity in table.get("entity_sources") or []:
+            if isinstance(entity, dict) and (
+                entity.get("entity") or entity.get("expression_source")
+            ):
+                return True
+    return bool((model or {}).get("expressions"))
 
 
 def _traceable_items(ws: WorkspaceContext) -> tuple[int, int, list[str]]:
@@ -222,7 +277,7 @@ def _traceable_items(ws: WorkspaceContext) -> tuple[int, int, list[str]]:
     coexistence of a pipeline and a lakehouse in the same workspace, is what
     "end-to-end lineage is visible" means.
 
-    Three populations, each judged by whether Fabric can draw an edge from it:
+    Four populations, each judged by whether Fabric can draw an edge from it:
 
     * **pipelines** — traceable when an activity names a Fabric item
       (``artifactId``/``notebookId``/``pipelineId``… or a Fabric linked-service
@@ -231,7 +286,10 @@ def _traceable_items(ws: WorkspaceContext) -> tuple[int, int, list[str]]:
       catalog rather than a URL. A notebook that touches no data at all (a helper
       or a utility) is not counted either way — it is not part of any chain;
     * **reports** — traceable when bound to a semantic model (``datasetId``),
-      which is the only report-side edge the REST surface exposes.
+      which is the only report-side edge the REST surface exposes;
+    * **semantic models** — traceable when their TMSL names a source, closing the
+      report -> model -> store chain. Without this the middle of the chain was
+      simply assumed.
     """
     traceable = total = 0
     gaps: list[str] = []
@@ -268,6 +326,19 @@ def _traceable_items(ws: WorkspaceContext) -> tuple[int, int, list[str]]:
                 f"semantic model"
             )
 
+    for name, model in (ws.semantic_models or {}).items():
+        if not isinstance(model, dict) or "expressions" not in model:
+            # This snapshot predates the TMSL parser keeping the Direct Lake
+            # entity and the model-level expressions. Its source was parsed away,
+            # not absent -- and "we cannot tell" must never be scored as "no
+            # source". Re-crawl to judge these models.
+            continue
+        total += 1
+        if _model_names_a_source(model):
+            traceable += 1
+        else:
+            gaps.append(f"semantic model '{name}' names no source store")
+
     return traceable, total, gaps
 
 
@@ -277,7 +348,7 @@ def _traceable_items(ws: WorkspaceContext) -> tuple[int, int, list[str]]:
     pillar=Pillar.DATA_GOVERNANCE, severity=Severity.MEDIUM,
     requires=[
         Resource.ITEMS, Resource.PIPELINE_DEFINITIONS, Resource.NOTEBOOK_DEFINITIONS,
-        Resource.REPORTS,
+        Resource.REPORTS, Resource.SEMANTIC_MODEL_DEFINITIONS,
     ],
     required=False,
 )
