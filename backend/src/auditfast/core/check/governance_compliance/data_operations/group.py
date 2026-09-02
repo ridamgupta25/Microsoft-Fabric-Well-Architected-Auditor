@@ -35,49 +35,80 @@ _EXTERNAL_STORE = re.compile(
 )
 
 
-def _has_opaque_cross_domain_ref(ws: WorkspaceContext) -> bool:
-    """True when a dependency leaving this workspace cannot be named/traced.
+def _cross_domain_refs(ws: WorkspaceContext) -> tuple[int, int]:
+    """``(dependencies that leave this workspace, how many are untraceable)``.
 
-    Mirrors the identifiable-vs-opaque test of the per-workspace
-    ``GOV-LINEAGE-CROSSDOMAIN`` check: a shortcut without a name and target type,
-    a OneLake path whose workspace/item segment is a bare GUID, or a raw external
-    storage URL is an *undocumented* cross-domain dependency.
+    A dependency is a shortcut, a OneLake path into *another* workspace, or a raw
+    external storage URL. It is *opaque* when nobody can trace it to an owning
+    domain: a shortcut with no name and target type, a path whose workspace or
+    item segment is a bare GUID, or an external URL.
+
+    The **count** matters as much as the opacity. Phrased only as "has an opaque
+    reference", a workspace holding no dependencies at all answers "no" and passes
+    a practice it never performed — on one real tenant two empty workspaces were
+    credited with documenting dependencies they did not have.
     """
     own = {
         (ws.display_name or "").strip().lower(),
         (ws.id or "").strip().lower(),
     } - {""}
+    total = opaque = 0
     for _lakehouse, shortcuts in (ws.shortcuts or {}).items():
         for shortcut in shortcuts or []:
-            if isinstance(shortcut, dict) and not (
-                shortcut.get("name") and shortcut.get("target_type")
-            ):
-                return True
+            if not isinstance(shortcut, dict):
+                continue
+            total += 1
+            if not (shortcut.get("name") and shortcut.get("target_type")):
+                opaque += 1
     texts = dict(pipeline_texts(ws))
     texts.update(notebook_texts(ws))
     for text in texts.values():
         for ws_seg, item_seg in ONELAKE_PATH.findall(text):
             if ws_seg.strip().lower() in own:
                 continue  # a path back into this same workspace is not cross-domain
+            total += 1
             if GUID.match(ws_seg) or GUID.match(item_seg):
+                opaque += 1
+        for _match in _EXTERNAL_STORE.finditer(text):
+            total += 1
+            opaque += 1
+    return total, opaque
+
+
+def _model_documents_schema(ws: WorkspaceContext) -> bool:
+    """True when a semantic model carries metadata a modeller had to *write*.
+
+    Two signals, both deliberate acts: a measure with a description, or a table
+    with a declared ``dataCategory``. Descriptions are the documentation Power BI
+    surfaces to consumers; a data category is a semantic annotation nobody sets by
+    accident. Both are captured by the TMSL parser.
+    """
+    for model in (ws.semantic_models or {}).values():
+        if not isinstance(model, dict):
+            continue
+        for measure in model.get("measures") or []:
+            if isinstance(measure, dict) and str(measure.get("description") or "").strip():
                 return True
-        if _EXTERNAL_STORE.search(text):
+        categories = model.get("data_categories") or {}
+        if isinstance(categories, dict) and any(str(v or "").strip() for v in categories.values()):
             return True
     return False
 
 
 def _captures_technical_metadata(ws: WorkspaceContext) -> bool:
-    """True when technical metadata is captured in a model *or* in files/tables.
+    """True when technical metadata is *deliberately* captured.
 
-    Either form counts: table schema (column/type definitions), a semantic model,
-    or a separate metadata registry (``*_metadata`` / ``audit_*`` / load-list
-    control table).
+    Two things count: a separate metadata registry (``*_metadata`` / ``audit_*``
+    / a load-list control table), or a semantic model that documents its schema.
+
+    Deliberately **not** counted: the bare existence of a semantic model, and the
+    presence of readable table columns. Every reporting workspace has a model, and
+    readable columns only say the crawl succeeded — crediting either made this
+    check pass all five lines of business on one real tenant, including a
+    workspace holding five items and nothing else. A check that cannot fail
+    reports nothing.
     """
-    return (
-        _xw.has_columns_captured(ws)
-        or bool(ws.semantic_models)
-        or _xw.has_metadata_registry(ws)
-    )
+    return _xw.has_metadata_registry(ws) or _model_documents_schema(ws)
 
 
 #: SQL audit action groups that record *data access* — a read or write against a
@@ -414,14 +445,13 @@ def lineage_e2e_consistent(ctx: GroupContext) -> Verdict:
     requires=[Resource.TABLE_COLUMNS, Resource.SEMANTIC_MODEL_DEFINITIONS], required=False,
 )
 def tech_metadata_consistent(ctx: GroupContext) -> Verdict:
-    """Every environment captures technical metadata — in a model *or* in files.
+    """Every environment captures technical metadata deliberately.
 
-    Technical metadata counts when captured in **either** form: (a) table *schema*
-    metadata — column/type definitions read for at least one table; (b) a
-    *semantic model*; or (c) a separate metadata registry — a ``*_metadata`` /
-    ``audit_*`` / load-list control table. Schema and semantic metadata are scored
-    together but not conflated: an environment with readable table schema is
-    credited even when its semantic model was not fetched.
+    Technical metadata counts when a **capture mechanism** exists: a separate
+    metadata registry (a ``*_metadata`` / ``audit_*`` / load-list control table),
+    or a semantic model that documents its schema (measure descriptions, or a
+    declared data category). The mere presence of a semantic model, or of readable
+    table columns, does not count — see :func:`_captures_technical_metadata`.
 
     An environment that captures none of these *and* whose crawl hit recoverable
     read failures is excluded as *not fetched* (N/A), never failed. N/A when fewer
@@ -486,15 +516,27 @@ def lineage_crossdomain_consistent(ctx: GroupContext) -> Verdict:
     path that names its workspace and item, rather than a bare GUID or a raw
     external URL nobody can trace to an owning domain. Surfacing it per group
     catches an environment that documents its dependencies while a peer leaves
-    them undocumented. N/A when fewer than two members' definitions/shortcuts
-    could be read.
+    them undocumented.
+
+    An environment with **no** dependency leaving it is excluded, not passed:
+    there is nothing to document, and crediting it would inflate the group score
+    on an empty workspace. N/A when fewer than two environments have one.
     """
+    refs: dict[str, tuple[int, int]] = {}
+
+    def counted(ws) -> tuple[int, int]:
+        if ws.id not in refs:
+            refs[ws.id] = _cross_domain_refs(ws)
+        return refs[ws.id]
+
     return _xw.consistency(
         ctx,
         readable=lambda ws: ws.has(Resource.PIPELINE_DEFINITIONS)
         or ws.has(Resource.NOTEBOOK_DEFINITIONS)
         or ws.has(Resource.SHORTCUTS),
-        implements=lambda ws: not _has_opaque_cross_domain_ref(ws),
+        applicable=lambda ws: counted(ws)[0] > 0,
+        implements=lambda ws: counted(ws)[1] == 0,
         practice="documents its cross-domain dependencies as identifiable references",
         data_name="item definitions and shortcuts",
+        inapplicable_reason="holding no dependency that leaves the workspace",
     )

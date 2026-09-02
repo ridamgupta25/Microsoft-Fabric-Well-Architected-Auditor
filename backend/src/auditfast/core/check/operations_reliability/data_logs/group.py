@@ -19,42 +19,15 @@ from auditfast.core.models import GroupContext, WorkspaceContext
 
 from .automated import _LOAD_ACTION, _WAREHOUSE_TARGET
 
-
-@group_check(
-    id="XW-SPARK-LOGS", ref="10.1.2",
-    title="Spark application logs captured for historical analysis",
-    pillar=Pillar.RELIABILITY, severity=Severity.LOW,
-    requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=False,
-)
-def spark_logs_consistent(ctx: GroupContext) -> Verdict:
-    """Spark application/driver logs retained for historical analysis.
-
-    Spark *application* logs (driver/executor logs, the Spark history server) are
-    a different artefact from a notebook's *run history*: run history records that
-    a notebook ran and when, not the Spark logs themselves. Fabric exposes no
-    read-only REST surface for Spark log **retention** — ``spark/settings`` carries
-    only the runtime version and default environment, not a log-retention policy —
-    so whether Spark logs are separately retained cannot be determined from the
-    crawl for *any* environment. This is therefore a single, consistent N/A across
-    the group (never a per-environment pass keyed off run history, which would be
-    misleading), decoupled from notebook run history entirely.
-    """
-    settings_seen = any(member.workspace.spark_settings for member in ctx.members)
-    tiers = [_xw.env_tier(member) for member in ctx.members]
-    settings_detail = (
-        "the Spark settings expose only the runtime version and default "
-        "environment — there is no log-retention setting"
-        if settings_seen
-        else "the Spark settings could not be read, so no log-retention setting is exposed"
-    )
-    return not_applicable(
-        "Whether Spark application logs are retained cannot be determined from what "
-        f"the audit can read. In all {len(tiers)} environments ({_xw.and_list(tiers)}) "
-        f"{settings_detail}, and notebook run history is not the same as Spark "
-        "driver/executor logs. This is neither pass nor fail; it can't be checked "
-        "from here. Verify Spark log retention in each environment's Fabric "
-        "capacity settings / Monitoring hub."
-    )
+# 10.1.2 (Spark application logs retained) has no group check by design. Spark
+# *application* logs — driver/executor logs, the Spark history server — are a
+# different artefact from a notebook's run history, and Fabric exposes no
+# read-only surface for Spark log retention: ``spark/settings`` carries the
+# runtime version and default environment, nothing more. A group check here could
+# only ever return a hardcoded N/A on every group in every tenant, which reads as
+# a crawl failure rather than the honest "a human must confirm this". The ref is
+# covered instead by the ``OPS-SPARK-LOGS`` questionnaire check in
+# ``questionnaire.py``, where the reviewer answers it directly.
 
 
 def _rowcount_audit_tables(ws: WorkspaceContext) -> list[str]:

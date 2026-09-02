@@ -36,11 +36,33 @@ def _pipelines_without_run_history(ws: WorkspaceContext) -> list[str]:
     )
 
 
+#: Tables nobody modelled, excluded from drift. A name that is one long hex/GUID
+#: run — optionally several joined by ``_``, including Fabric's URL-escaped
+#: hyphens (``002d``) — is machine-generated, as are Power BI's hidden auto
+#: date/time tables and the usual scratch prefixes. On one real Dev/UAT/Prod
+#: estate these made 822 of 928 tables "drift", the first of them named
+#: ``<guid>_<guid>``: true, but about tables nobody deploys.
+_GENERATED_TABLE = re.compile(
+    r"^[0-9a-f]{16,}(?:[_-][0-9a-f]{4,})*$"
+    r"|^(?:localdatetable|datetabletemplate)_"
+    r"|^(?:tmp|temp|stg|staging|scratch|bak|backup|old)[_-]"
+    r"|[_-](?:tmp|temp|stg|staging|scratch|bak|backup|old)$",
+    re.IGNORECASE,
+)
+
+
+def _is_generated_table(name: str) -> bool:
+    """True when a table is machine-generated rather than modelled."""
+    return bool(_GENERATED_TABLE.search(str(name).split(".")[-1].strip()))
+
+
 def _table_signatures(member: GroupMemberContext) -> dict[str, frozenset[tuple[str, str]]] | None:
     """A member's ``{table -> {(column, type)}}`` signature, or None if unreadable.
 
     Table and column names are lower-cased because SQL identifiers are not
     case-sensitive, so a mere casing difference is not schema drift.
+    Machine-generated tables are dropped — they are not part of the schema any
+    environment is supposed to match.
     """
     workspace = member.workspace
     if not workspace.has(Resource.TABLE_COLUMNS):
@@ -48,7 +70,7 @@ def _table_signatures(member: GroupMemberContext) -> dict[str, frozenset[tuple[s
     signature: dict[str, frozenset[tuple[str, str]]] = {}
     for name, table in workspace.tables.items():
         columns = table.get("columns") or []
-        if not columns:
+        if not columns or _is_generated_table(name):
             continue
         signature[str(name).lower()] = frozenset(
             (str(col.get("name", "")).lower(), str(col.get("type", "")).lower())
@@ -69,10 +91,20 @@ def _table_signatures(member: GroupMemberContext) -> dict[str, frozenset[tuple[s
 def schema_drift(ctx: GroupContext) -> Verdict:
     """Table schemas match across the group's environments (Dev/UAT/Prod).
 
-    Drift is either a table present in some environments but not others, or a
-    table whose column set (name + type) differs between them. A workspace whose
-    column schemas could not be read is left out of the comparison; when fewer
-    than two members remain there is nothing to compare and the check is N/A.
+    Scored on **shared** tables: of the tables present in every environment, how
+    many have an identical column set (name + type). That is what "schema drift"
+    means — the same table modelled differently in two places, which is what
+    breaks a deployment.
+
+    A table present in only some environments is an *inventory* difference, not
+    schema drift: Dev legitimately holds work in progress Prod has never seen.
+    Those are counted and named in the evidence but do not drive the score —
+    scoring them made a real estate 88% "drifted" on tables nobody deploys.
+    Machine-generated tables are excluded entirely (see :func:`_is_generated_table`).
+
+    A workspace whose column schemas could not be read is left out; when fewer
+    than two remain, or no table is shared, there is nothing to compare and the
+    check is N/A.
     """
     labelled = []
     for member in ctx.members:
@@ -93,30 +125,43 @@ def schema_drift(ctx: GroupContext) -> Verdict:
         return not_applicable("no tables were found to compare across environments")
 
     labels = [label for label, _ in labelled]
-    drifted: list[str] = []
-    for table in all_tables:
-        present_in = [label for label, sig in labelled if table in sig]
-        if len(present_in) != len(labelled):
-            missing = sorted(set(labels) - set(present_in))
-            drifted.append(f"{table} (missing in {', '.join(missing)})")
-            continue
-        distinct = {sig[table] for _, sig in labelled}
-        if len(distinct) > 1:
-            drifted.append(f"{table} (column mismatch)")
+    shared = [t for t in all_tables if all(t in sig for _, sig in labelled)]
+    partial = [t for t in all_tables if t not in shared]
 
-    consistent = len(all_tables) - len(drifted)
+    inventory = ""
+    if partial:
+        sample = "; ".join(
+            f"{table} (missing in "
+            f"{', '.join(sorted(set(labels) - {lab for lab, sig in labelled if table in sig}))})"
+            for table in partial[:3]
+        )
+        extra = "" if len(partial) <= 3 else f" (+{len(partial) - 3} more)"
+        inventory = (
+            f". Separately, {len(partial)} table(s) exist in some environments but "
+            f"not all — an inventory difference, not schema drift: {sample}{extra}"
+        )
+
+    if not shared:
+        return not_applicable(
+            f"no table is present in all {len(labels)} environments "
+            f"({', '.join(labels)}), so there is no shared schema to compare"
+            f"{inventory}"
+        )
+
+    drifted = [t for t in shared if len({sig[t] for _, sig in labelled}) > 1]
+    matching = len(shared) - len(drifted)
     if not drifted:
         return covered(
-            consistent, len(all_tables),
-            f"all {len(all_tables)} table(s) match across {len(labels)} "
-            f"environments ({', '.join(labels)})",
+            len(shared), len(shared),
+            f"all {len(shared)} shared table(s) have an identical column set "
+            f"across {len(labels)} environments ({', '.join(labels)}){inventory}",
         )
-    shown = "; ".join(drifted[:5])
+    shown = "; ".join(f"{table} (column mismatch)" for table in drifted[:5])
     more = "" if len(drifted) <= 5 else f" (+{len(drifted) - 5} more)"
     return covered(
-        consistent, len(all_tables),
-        f"{len(drifted)} of {len(all_tables)} table(s) drift across "
-        f"{', '.join(labels)}: {shown}{more}",
+        matching, len(shared),
+        f"{len(drifted)} of {len(shared)} shared table(s) have a different column "
+        f"set across {', '.join(labels)}: {shown}{more}{inventory}",
     )
 
 

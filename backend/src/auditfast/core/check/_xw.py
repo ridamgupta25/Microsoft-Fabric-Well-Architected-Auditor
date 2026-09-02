@@ -152,6 +152,8 @@ def consistency(
     implements: Callable[[WorkspaceContext], bool],
     practice: str,
     data_name: str,
+    applicable: Callable[[WorkspaceContext], bool] | None = None,
+    inapplicable_reason: str = "the practice does not apply there",
 ) -> Verdict:
     """Score whether ``implements`` holds in every *readable* environment.
 
@@ -160,26 +162,41 @@ def consistency(
     check is N/A. Otherwise the verdict is the coverage ratio of environments
     that implement the practice, so a practice present in Prod but missing in Dev
     is surfaced as drift rather than a pass.
+
+    ``applicable`` separates "does not do this" from "has nothing to do it to". A
+    readable member for which it returns False is **excluded and named**, never
+    counted as implementing. Without it, a predicate phrased as an absence ("none
+    of its references is opaque") passes an empty workspace vacuously and inflates
+    the score — which is the mirror image of the N/A-not-FAIL rule.
     """
     present: list[str] = []
     absent: list[str] = []
+    excluded: list[str] = []
     for member in ctx.members:
         if not readable(member.workspace):
             continue
-        (present if implements(member.workspace) else absent).append(env_label(member))
+        label = env_label(member)
+        if applicable is not None and not applicable(member.workspace):
+            excluded.append(label)
+            continue
+        (present if implements(member.workspace) else absent).append(label)
+
+    note = (f"; {len(excluded)} environment(s) excluded, {inapplicable_reason}: "
+            f"{', '.join(excluded)}") if excluded else ""
     total = len(present) + len(absent)
     if total < 2:
         return not_applicable(
             f"fewer than two environments in this group had readable {data_name} "
-            f"to compare"
+            f"to compare{note}"
         )
     if not absent:
         return covered(total, total,
-                       f"all {total} environment(s) {practice}: {', '.join(present)}")
+                       f"all {total} environment(s) {practice}: "
+                       f"{', '.join(present)}{note}")
     return covered(
         len(present), total,
         f"{practice} in {len(present)} of {total} environment(s); not in "
-        f"{', '.join(absent)}",
+        f"{', '.join(absent)}{note}",
     )
 
 

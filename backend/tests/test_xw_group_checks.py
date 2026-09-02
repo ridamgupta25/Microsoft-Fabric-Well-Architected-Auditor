@@ -12,19 +12,27 @@ import pytest
 from auditfast.core.check.data_management_quality.data_operations.group import (
     layer_separation_consistent,
 )
+from auditfast.core.check.governance_compliance.data_operations.group import (
+    tech_metadata_consistent,
+)
 from auditfast.core.check.data_management_quality.data_storage.group import (
     _aggregate_derivations,
     aggregate_consistency,
     cross_layer_reconciliation,
 )
-from auditfast.core.check.registry import GROUP_REGISTRY, CheckRegistry
+from auditfast.core.check.registry import GROUP_REGISTRY, REGISTRY, CheckRegistry
+from auditfast.core.check.security.data_operations.group import (
+    secret_scanning_consistent,
+)
 from auditfast.core.engine import run_audit
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity, Status
 from auditfast.core.models import GroupContext, GroupMemberContext, Item, WorkspaceContext
 
 from .conftest import FIXTURE_SETTINGS
 
-#: The 16 checks ported from the local set, id -> ref.
+#: The checks ported from the local set, id -> ref. 10.1.2 was ported here too but
+#: has been withdrawn: it could never reach a verdict from crawlable data, and the
+#: ref is covered by the ``OPS-SPARK-LOGS`` questionnaire check instead.
 PORTED = {
     "XW-MEDALLION-CONSIST": "1.1.5",
     "XW-PIPELINE-SLA": "9.4.2",
@@ -32,7 +40,6 @@ PORTED = {
     "XW-SLA-HISTORY": "9.4.4",
     "XW-TIER-SEP": "11.3.1",
     "XW-MEDALLION-DRIFT": "11.4.3a",
-    "XW-SPARK-LOGS": "10.1.2",
     "XW-WH-LOAD-MON": "10.1.5",
     "XW-AUDIT-SCHEMA": "10.2.1",
     "XW-AUDIT-QUERYABLE": "10.2.5",
@@ -54,11 +61,25 @@ _THREE_MEMBER_GROUP = [(
 )]
 
 
-def test_all_sixteen_ported_checks_are_registered():
+def test_all_ported_checks_are_registered():
     specs = {spec.id: spec for spec in GROUP_REGISTRY}
     for check_id, ref in PORTED.items():
         assert check_id in specs, f"{check_id} not registered"
         assert specs[check_id].ref == ref
+
+
+def test_spark_logs_is_a_questionnaire_check_not_a_group_check():
+    """10.1.2 is answered by the reviewer, not by a crawl.
+
+    Fabric exposes no read-only surface for Spark log retention, so a group check
+    could only return a hardcoded N/A on every group -- indistinguishable, to a
+    reader, from a failed crawl. The ref must be covered exactly once, by the
+    questionnaire.
+    """
+    assert not [spec for spec in GROUP_REGISTRY if spec.ref == "10.1.2"]
+    standard = [spec for spec in REGISTRY if spec.ref == "10.1.2"]
+    assert [spec.id for spec in standard] == ["OPS-SPARK-LOGS"]
+    assert standard[0].manual is True
 
 
 #: A stored procedure that declares the rollup: it groups the detail table and
@@ -196,6 +217,121 @@ IF @detail_total <> @aggregate_total THROW 51000, 'Rollup mismatch', 1;
     verdict = aggregate_consistency(
         _aggregate_group(sql=sql, members=(("PROD", 10),))
     )
+    assert verdict.score == 3
+
+
+def test_a_rollup_is_not_failed_when_the_sql_endpoint_could_not_be_read():
+    """Views and stored procedures are where a SQL reconciliation lives.
+
+    The real Sales case: a notebook rollup was found, no reconciliation was
+    visible, and the check scored 0 -- but ``tableColumns`` was unreadable in
+    every workspace, so the SQL endpoint had never been crawled and a
+    reconciling stored procedure could not have been seen. Unreadable is not
+    absent.
+    """
+    code = (
+        "df = spark.table('fact_sales')\n"
+        "df.groupBy('sale_day').agg({'amount': 'sum'})"
+        ".write.saveAsTable('daily_sales_aggregate')\n"
+    )
+    verdict = aggregate_consistency(_aggregate_group(
+        rollup=False,
+        notebooks={"nb_rollup": {"cells": [{"cell_type": "code", "source": code}]}},
+        unavailable={Resource.TABLE_COLUMNS},
+    ))
+    assert verdict.status is Status.NA
+    assert verdict.scored is False
+    assert "could not be judged" in verdict.evidence
+    assert "SQL endpoint could not be read" in verdict.evidence
+
+
+# -- 11.1.8 secret scanning ----------------------------------------------------
+
+
+def _git_group(*members: tuple[str, bool, bool]) -> GroupContext:
+    """``(name, git_readable, git_connected)`` per environment."""
+    built = []
+    for index, (name, readable, connected) in enumerate(members):
+        built.append(GroupMemberContext(
+            WorkspaceContext(
+                id=name, display_name=name, layer=Layer.OPERATIONS,
+                git_connected=connected,
+                unavailable=set() if readable else {Resource.GIT},
+            ),
+            (index + 1) * 5,
+            Layer.OPERATIONS,
+        ))
+    return GroupContext(name="Proj", members=tuple(built), settings={})
+
+
+def test_secret_scanning_is_na_when_no_git_connection_could_be_read():
+    """The real MDM case: git unreadable in all 3, yet it scored 1 of 3.
+
+    A blocked read is a permission gap, not a security finding. Scoring it turns
+    "we could not determine this" into a Security deduction.
+    """
+    verdict = secret_scanning_consistent(
+        _git_group(("dev", False, False), ("uat", False, False), ("prod", False, False))
+    )
+    assert verdict.status is Status.NA
+    assert verdict.scored is False
+    assert "permission gap" in verdict.evidence
+
+
+def test_secret_scanning_still_scores_when_one_environment_is_readable():
+    """Partial readability is a coverage question, so it stays scored."""
+    verdict = secret_scanning_consistent(
+        _git_group(("dev", True, False), ("prod", False, False))
+    )
+    assert verdict.scored is True
+    assert verdict.score is not None
+
+
+# -- 8.3.2 technical metadata --------------------------------------------------
+
+
+def _metadata_group(*models: dict) -> GroupContext:
+    built = []
+    for index, model in enumerate(models):
+        built.append(GroupMemberContext(
+            WorkspaceContext(
+                id=f"ws{index}", display_name=f"ws{index}", layer=Layer.STORAGE,
+                tables={"sales": {"columns": [{"name": "id", "type": "int"}]}},
+                semantic_models={"Model": model},
+            ),
+            (index + 1) * 5,
+            Layer.STORAGE,
+        ))
+    return GroupContext(name="Proj", members=tuple(built), settings={})
+
+
+def test_a_bare_semantic_model_is_not_captured_technical_metadata():
+    """Every reporting workspace has a model; crediting one passed every estate.
+
+    Regression: ``bool(ws.semantic_models)`` made this check score 3 in all five
+    lines of business, including a workspace holding five items and one model.
+    """
+    plain = {"tables": ["sales"], "measures": [{"name": "Total", "description": ""}]}
+    verdict = tech_metadata_consistent(_metadata_group(plain, plain))
+    assert verdict.score == 0
+    assert "missing in" in verdict.evidence
+
+
+def test_a_documented_measure_is_captured_technical_metadata():
+    documented = {
+        "tables": ["sales"],
+        "measures": [{"name": "Total", "description": "Net sales excluding tax"}],
+    }
+    verdict = tech_metadata_consistent(_metadata_group(documented, documented))
+    assert verdict.score == 3
+
+
+def test_a_declared_data_category_is_captured_technical_metadata():
+    categorised = {
+        "tables": ["dim_date"], "measures": [],
+        "data_categories": {"dim_date": "Time"},
+    }
+    verdict = tech_metadata_consistent(_metadata_group(categorised, categorised))
     assert verdict.score == 3
 
 
