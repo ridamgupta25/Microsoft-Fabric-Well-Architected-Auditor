@@ -104,27 +104,29 @@ def test_a_recovery_path_without_a_recheck_still_fails():
     assert "do not re-validate cross-layer counts" in verdict.evidence
 
 
-def test_a_lone_unvalidated_recovery_path_is_still_named_in_the_na():
-    """N/A must not swallow a real finding.
+def test_a_lone_unvalidated_recovery_path_is_scored_not_hidden_in_an_na():
+    """The cross-LOB case: one environment has a path, and it does not re-validate.
 
-    Only DEV has a recovery path, so there is no cross-environment comparison --
-    but "DEV has a recovery path that does not re-validate" is exactly what 9.3.4
-    exists to surface, and it would otherwise disappear into the N/A message.
+    There is no consistency to compare, but this is exactly the finding 9.3.4
+    exists to make. Returning N/A buried it in a message nobody reads as a
+    finding -- and the per-workspace sibling is notebook-scoped, so a pipeline's
+    on-failure branch is caught nowhere else.
     """
     dev = _ws("dev", notebooks={"NB_Backfill": _nb(_BARE_RECOVERY)})
     rep = _ws("rep", notebooks={"NB": _nb("df = spark.table('sales')")})
     verdict = post_failure_integrity_consistent(_group((dev, 1), (rep, 10)))
-    assert verdict.status is Status.NA
+    assert verdict.score == 0
+    assert verdict.scored is True
     assert "NB_Backfill" in verdict.evidence
-    assert "do not re-validate cross-layer counts" in verdict.evidence
+    assert "does not re-validate" in verdict.evidence
 
 
-def test_a_lone_validating_environment_is_named_in_the_na():
+def test_a_lone_validating_environment_scores_a_pass():
     dev = _ws("dev", notebooks={"NB_Backfill": _nb(_VALIDATING)})
     rep = _ws("rep", notebooks={"NB": _nb("df = spark.table('sales')")})
     verdict = post_failure_integrity_consistent(_group((dev, 1), (rep, 10)))
-    assert verdict.status is Status.NA
-    assert "does re-validate on its recovery path" in verdict.evidence
+    assert verdict.score == 3
+    assert "the only environment with a recovery path re-validates" in verdict.evidence
 
 
 # -- the recovery vocabulary ----------------------------------------------------

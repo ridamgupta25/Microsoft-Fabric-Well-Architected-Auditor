@@ -111,7 +111,13 @@ def post_failure_integrity_consistent(ctx: GroupContext) -> Verdict:
     failure; a workspace that has no such path has nothing to validate on, and
     reporting it as a gap sends its owner to fix code that does not exist. That
     is a separate finding — *whether* a recovery path should exist — and not this
-    one. N/A when fewer than two environments hold a recovery path.
+    one.
+
+    When only **one** environment has a recovery path there is no consistency to
+    compare, but its own posture is still scored: an unvalidated recovery path is
+    the finding this ref exists to make, and the per-workspace sibling is
+    notebook-scoped, so a pipeline's on-failure branch is caught nowhere else.
+    N/A only when no environment has a recovery path at all.
     """
     present: list[str] = []
     absent: list[str] = []
@@ -137,19 +143,28 @@ def post_failure_integrity_consistent(ctx: GroupContext) -> Verdict:
                 f"on: {'; '.join(skipped)}") if skipped else ""
 
     total = len(present) + len(absent)
-    if total < 2:
-        # Only one environment has a recovery path, so there is no cross-environment
-        # comparison to make -- but that environment's own posture is a real
-        # finding and must not vanish into the N/A. Naming it keeps a lone
-        # unvalidated recovery path visible.
-        lone = ""
+    if total == 1:
+        # Only one environment has a recovery path, so there is no *consistency*
+        # to compare -- but "this environment's recovery path does not re-validate"
+        # is the finding 9.3.4 exists to make, and returning N/A buried it in a
+        # message nobody reads as a finding. The per-workspace sibling is
+        # notebook-scoped, so a pipeline's on-failure branch is caught nowhere
+        # else. Scored on the one environment that could be judged.
         if present:
-            lone = f"; {'; '.join(present)} does re-validate on its recovery path"
-        elif absent:
-            lone = f"; {'; '.join(absent)}"
+            return covered(
+                1, 1,
+                f"the only environment with a recovery path re-validates "
+                f"cross-layer integrity on it: {'; '.join(present)}{excluded}",
+            )
+        return covered(
+            0, 1,
+            f"the only environment with a recovery path does not re-validate "
+            f"cross-layer integrity on it: {'; '.join(absent)}{excluded}",
+        )
+    if total == 0:
         return not_applicable(
-            "fewer than two environments in this group have a recovery, replay or "
-            f"backfill path whose integrity re-check could be compared{lone}{excluded}"
+            "no environment in this group has a recovery, replay or backfill path "
+            f"whose integrity re-check could be judged{excluded}"
         )
     if not absent:
         return covered(

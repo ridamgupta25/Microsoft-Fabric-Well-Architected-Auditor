@@ -129,20 +129,25 @@ def schema_drift(ctx: GroupContext) -> Verdict:
 def medallion_consistent(ctx: GroupContext) -> Verdict:
     """How much of Bronze -> Silver -> Gold *every* environment implements.
 
-    Scored on the tiers common to all readable environments — the architecture
-    the project actually has everywhere — using the same 0-3 ladder as the
-    per-workspace ``WS-MEDALLION`` on this ref, so the two cannot disagree about
-    the same estate: 3 tiers = 3, 2 = 2, 1 = 1, none = 0.
+    Scored on the tiers common to all readable environments **that hold a data
+    store** — the architecture the project actually has everywhere — using the
+    same 0-3 ladder as the per-workspace ``WS-MEDALLION`` on this ref, so the two
+    cannot disagree about the same estate: 3 tiers = 3, 2 = 2, 1 = 1, none = 0.
 
     Counting merely *some* tier as implementation was the earlier flaw: an estate
     with only a Bronze Lakehouse scored full marks against a check whose title
     promises the whole progression.
 
+    An environment holding **no Lakehouse, Warehouse or database** is excluded,
+    not failed. It implements no medallion tier because it has nothing to place
+    in one; scoring a pure reporting workspace 0 for "not declaring its layers"
+    is a finding about a practice it cannot have.
+
     Distinct from ``XW-MEDALLION-DRIFT`` (11.4.3a), which asks whether the
     environments *agree*; a group where every environment is equally missing Gold
     has no drift but an incomplete architecture. A tier held only in some
-    environments is named here but scored there. N/A when fewer than two members'
-    item inventories could be read.
+    environments is named here but scored there. N/A when fewer than two
+    environments hold a data store.
     """
     readable = [m for m in ctx.members if m.workspace.has(Resource.ITEMS)]
     if len(readable) < 2:
@@ -151,13 +156,37 @@ def medallion_consistent(ctx: GroupContext) -> Verdict:
             "inventories to compare"
         )
 
-    per_env = {_xw.env_label(m): _xw.medallion_tiers(m.workspace) for m in readable}
+    # A workspace holding no data store implements no medallion tier -- there is
+    # nothing there to name. Scoring it 0 says "you failed to declare your layers"
+    # to a reporting workspace that has no layers to declare, which is the same
+    # category error as telling a Warehouse-less workspace to enable SQL audit.
+    # The per-workspace WS-MEDALLION on this ref already returns N/A here.
+    storeless = [
+        _xw.env_label(m) for m in readable
+        if not any(item.type in _xw.DATA_STORE_TYPES for item in m.workspace.items)
+    ]
+    judged = [
+        m for m in readable
+        if any(item.type in _xw.DATA_STORE_TYPES for item in m.workspace.items)
+    ]
+    excluded = (
+        f"; {len(storeless)} environment(s) excluded, holding no Lakehouse, "
+        f"Warehouse or database to place in a tier: {', '.join(storeless)}"
+    ) if storeless else ""
+
+    if len(judged) < 2:
+        return not_applicable(
+            "fewer than two environments in this group hold a data store whose "
+            f"medallion tiers could be compared{excluded}"
+        )
+
+    per_env = {_xw.env_label(m): _xw.medallion_tiers(m.workspace) for m in judged}
     common = set.intersection(*per_env.values())
     union = set().union(*per_env.values())
 
     named = ", ".join(sorted(common, key=_xw.MEDALLION_ORDER.index))
     missing = [t for t in _xw.MEDALLION_ORDER if t not in common]
-    total = len(readable)
+    total = len(judged)
     where = ", ".join(sorted(per_env))
 
     # A tier some environments have and others do not is real information, but it
@@ -174,10 +203,10 @@ def medallion_consistent(ctx: GroupContext) -> Verdict:
     if not common:
         return graded(
             0,
-            f"no medallion tier is named in all {total} environment(s) ({where}). "
-            f"No store or workspace name declares Bronze/Raw, Silver/Cleansed or "
-            f"Gold/Curated, so the layer boundaries are not expressed anywhere a "
-            f"reader can see them{drift}",
+            f"no medallion tier is named in all {total} environment(s) with a data "
+            f"store ({where}). No store or workspace name declares Bronze/Raw, "
+            f"Silver/Cleansed or Gold/Curated, so the layer boundaries are not "
+            f"expressed anywhere a reader can see them{drift}{excluded}",
         )
 
     if missing:
@@ -186,13 +215,13 @@ def medallion_consistent(ctx: GroupContext) -> Verdict:
             f"{len(common)} of 3 medallion tier(s) are implemented in every "
             f"environment ({named}, across {where}); no store or workspace name "
             f"declares {' or '.join(missing)}"
-            f"{_missing_gold_hint(missing, readable)}{drift}",
+            f"{_missing_gold_hint(missing, judged)}{drift}{excluded}",
         )
 
     return graded(
         3,
         f"Bronze -> Silver -> Gold are all named in every one of the {total} "
-        f"environment(s) ({where}){drift}",
+        f"environment(s) ({where}){drift}{excluded}",
     )
 
 
