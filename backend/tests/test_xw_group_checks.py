@@ -13,6 +13,7 @@ from auditfast.core.check.data_management_quality.data_operations.group import (
     layer_separation_consistent,
 )
 from auditfast.core.check.data_management_quality.data_storage.group import (
+    _aggregate_derivations,
     aggregate_consistency,
     cross_layer_reconciliation,
 )
@@ -60,12 +61,31 @@ def test_all_sixteen_ported_checks_are_registered():
         assert specs[check_id].ref == ref
 
 
+#: A stored procedure that declares the rollup: it groups the detail table and
+#: *writes* the result into the aggregate. Under the derivation model this is what
+#: makes 5.4.3 applicable at all -- a table merely *named* like a summary no longer
+#: counts, and neither does a plain view, which Fabric recomputes on every read.
+_ROLLUP_ROUTINE = {
+    "schema": "dbo", "name": "load_daily_sales_aggregate",
+    "type": "PROCEDURE", "store": "SalesWarehouse",
+    "definition": (
+        "INSERT INTO daily_sales_aggregate (sale_day, total_amount) "
+        "SELECT sale_day, SUM(amount) FROM fact_sales GROUP BY sale_day"
+    ),
+}
+
+
 def _aggregate_group(
     *, measure: dict | None = None, sql: str = "",
+    aggregations: list[dict] | None = None,
+    rollup: bool = True,
+    views: list[dict] | None = None,
+    notebooks: dict | None = None,
+    members: tuple[tuple[str, int], ...] = (("DEV", 1), ("PROD", 10)),
     unavailable: set[Resource] | None = None,
 ) -> GroupContext:
-    members = []
-    for name, level in (("DEV", 1), ("PROD", 10)):
+    group_members = []
+    for name, level in members:
         workspace = WorkspaceContext(
             id=name,
             display_name=name,
@@ -74,22 +94,127 @@ def _aggregate_group(
             semantic_models={
                 "Sales": {
                     "tables": ["fact_sales", "daily_sales_aggregate"],
-                    "measures": [measure],
+                    "measures": [measure] if measure else [],
+                    "aggregations": list(aggregations or []),
                 },
-            } if measure else {},
-            sql_routines=[{
-                "schema": "audit", "name": "validate_sales_rollup",
-                "type": "PROCEDURE", "definition": sql, "store": "SalesWarehouse",
-            }] if sql else [],
+            } if (measure or aggregations) else {},
+            notebooks=dict(notebooks or {}),
+            sql_views=[dict(view) for view in (views or ())],
+            sql_routines=(
+                ([dict(_ROLLUP_ROUTINE)] if rollup else [])
+                + ([{
+                    "schema": "audit", "name": "validate_sales_rollup",
+                    "type": "PROCEDURE", "definition": sql, "store": "SalesWarehouse",
+                }] if sql else [])
+            ),
             unavailable=set(unavailable or ()),
         )
-        members.append(GroupMemberContext(workspace, level, Layer.STORAGE))
-    return GroupContext(name="Sales", members=tuple(members), settings={})
+        group_members.append(GroupMemberContext(workspace, level, Layer.STORAGE))
+    return GroupContext(name="Sales", members=tuple(group_members), settings={})
 
 
-def test_aggregate_table_names_alone_do_not_prove_reconciliation():
+def test_a_declared_rollup_without_reconciliation_fails():
+    """The rollup is real, nothing verifies it - that is the finding."""
     verdict = aggregate_consistency(_aggregate_group())
-    assert verdict.score != 3
+    assert verdict.score == 0
+    assert "none reconciled" in verdict.evidence
+
+
+def test_no_declared_rollup_is_na_not_a_failure():
+    """Names that look like a summary are no longer enough to make this apply.
+
+    Regression: the old gate opened on any table named ``*aggregate*``, so an
+    imported source table could make an environment fail a rollup control it
+    never had. It also missed real rollups named ``balances`` or ``consolidated``.
+    """
+    verdict = aggregate_consistency(_aggregate_group(rollup=False))
+    assert verdict.status is Status.NA
+    assert verdict.scored is False
+    assert "builds no materialised aggregate rollup" in verdict.evidence
+
+
+def test_a_group_by_view_is_not_a_materialised_rollup():
+    """A Fabric Warehouse view is recomputed on every read, so it cannot drift.
+
+    Regression: counting one as a rollup produced seven "unreconciled" findings on
+    a real tenant, every one a plain view that recalculates from the detail each
+    time it is queried and so has no way to lose a row.
+    """
+    view = {
+        "schema": "dbo", "name": "vw_daily_sales", "store": "SalesWarehouse",
+        "definition": (
+            "SELECT sale_day, SUM(amount) AS total_amount "
+            "FROM fact_sales GROUP BY sale_day"
+        ),
+    }
+    verdict = aggregate_consistency(_aggregate_group(rollup=False, views=[view]))
+    assert verdict.status is Status.NA
+    assert "builds no materialised aggregate rollup" in verdict.evidence
+
+
+def test_a_python_import_is_not_read_as_a_detail_table():
+    """``from pyspark.sql import functions`` is an import, not a ``FROM`` clause.
+
+    Regression: it was captured as a detail table named ``sql``, inventing a
+    rollup of ``sql`` into the target in every PySpark notebook that grouped.
+    """
+    code = (
+        "from pyspark.sql import functions as F\n"
+        "df = spark.table('fact_sales')\n"
+        "df.groupBy('sale_day').agg(F.sum('amount'))"
+        ".write.saveAsTable('daily_sales_aggregate')\n"
+    )
+    group = _aggregate_group(
+        rollup=False,
+        notebooks={"nb_rollup": {"cells": [{"cell_type": "code", "source": code}]}},
+    )
+    derivations = _aggregate_derivations(group.members[0].workspace)
+    assert derivations, "the real groupBy -> saveAsTable rollup should still be found"
+    assert all(detail != "sql" for _, detail, _ in derivations)
+    assert any(detail == "fact_sales" for _, detail, _ in derivations)
+
+
+def test_a_lone_environment_with_an_unreconciled_rollup_is_still_scored():
+    """One environment is enough to report a real gap.
+
+    Regression: a two-environment floor discarded genuine findings -- on a real
+    tenant only one workspace per group built a rollup at all, so every group
+    returned N/A while unreconciled rollups sat unreported in the estate.
+    """
+    verdict = aggregate_consistency(_aggregate_group(members=(("PROD", 10),)))
+    assert verdict.scored is True
+    assert verdict.score == 0
+    assert "the only environment" in verdict.evidence
+
+
+def test_a_lone_environment_that_reconciles_its_rollup_passes():
+    sql = """
+DECLARE @detail_total decimal(18,2) = (SELECT SUM(amount) FROM fact_sales);
+DECLARE @aggregate_total decimal(18,2) = (SELECT SUM(total_amount) FROM daily_sales_aggregate);
+IF @detail_total <> @aggregate_total THROW 51000, 'Rollup mismatch', 1;
+"""
+    verdict = aggregate_consistency(
+        _aggregate_group(sql=sql, members=(("PROD", 10),))
+    )
+    assert verdict.score == 3
+
+
+def test_a_semantic_model_alternate_of_declares_the_rollup():
+    """TMSL states the base table outright - the strongest signal available."""
+    verdict = aggregate_consistency(_aggregate_group(
+        rollup=False,
+        aggregations=[{
+            "table": "daily_sales_aggregate", "column": "total_amount",
+            "summarization": "sum",
+            "base_table": "fact_sales", "base_column": "amount",
+        }],
+        measure={
+            "name": "Rollup variance",
+            "expression": "SUM(fact_sales[amount]) - SUM(daily_sales_aggregate[total_amount])",
+        },
+    ))
+    assert verdict.score == 3
+    assert "declares" in verdict.evidence
 
 
 def test_semantic_model_detail_to_aggregate_variance_measure_passes():
@@ -124,12 +249,19 @@ IF @detail_total <> @aggregate_total THROW 51000, 'Rollup mismatch', 1;
 
 
 def test_semantic_reconciliation_does_not_require_warehouse_readability():
+    """The model can declare the rollup *and* verify it, with no SQL read at all."""
     measure = {
         "name": "Detail vs Aggregate Variance",
         "expression": "SUM(fact_sales[amount]) - SUM(daily_sales_aggregate[total_amount])",
     }
     verdict = aggregate_consistency(_aggregate_group(
-        measure=measure, unavailable={Resource.TABLE_COLUMNS},
+        measure=measure, rollup=False,
+        aggregations=[{
+            "table": "daily_sales_aggregate", "column": "total_amount",
+            "summarization": "sum",
+            "base_table": "fact_sales", "base_column": "amount",
+        }],
+        unavailable={Resource.TABLE_COLUMNS},
     ))
     assert verdict.score == 3
 
