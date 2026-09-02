@@ -29,111 +29,290 @@ _RECON_CONTROL = re.compile(
     re.IGNORECASE,
 )
 
-#: Table-name substrings that mark a detail (fact-grain) or an aggregate table.
-_DETAIL_HINTS = ("detail", "fact", "transaction")
-_AGGREGATE_HINTS = ("daily", "agg", "aggregate", "summary", "rollup")
-_TOTAL_OPERATION = re.compile(r"\b(?:count|sum)\s*\(", re.IGNORECASE)
-_RECONCILIATION_NAME = re.compile(
-    r"\b(?:reconcil|variance|difference|mismatch|detail\s+vs\s+aggregate)",
+#: A rollup in SQL: it both groups and aggregates. Either alone is not a rollup —
+#: ``GROUP BY`` without an aggregate is a DISTINCT, and ``SUM()`` without a
+#: ``GROUP BY`` is a scalar.
+_SQL_GROUP_BY = re.compile(r"\bGROUP\s+BY\b", re.IGNORECASE)
+_SQL_AGGREGATION = re.compile(r"\b(?:SUM|COUNT|AVG|MIN|MAX)\s*\(", re.IGNORECASE)
+#: Where a routine writes its result — the aggregate side of a derivation.
+_SQL_WRITE_TARGET = re.compile(
+    r"\bINSERT\s+INTO\s+([\w.\[\]\"]+)|\bINTO\s+([\w.\[\]\"]+)\s+FROM\b",
     re.IGNORECASE,
 )
+#: Where it reads from — the detail side.
+_SQL_READ_SOURCE = re.compile(r"\b(?:FROM|JOIN)\s+([\w.\[\]\"]+)", re.IGNORECASE)
+
+#: A rollup in Spark: a grouping call and an aggregation over it.
+_NB_GROUPING = re.compile(r"\.(?:groupBy|groupby|rollup|cube)\s*\(", re.IGNORECASE)
+_NB_AGGREGATION = re.compile(r"\.(?:agg|sum|count|avg|mean|min|max)\s*\(", re.IGNORECASE)
+_NB_WRITE_TARGET = re.compile(
+    r"""(?:\.saveAsTable\s*\(\s*|\.insertInto\s*\(\s*)(?:[rubf]{0,2})?["'`]([\w.]+)"""
+    r"""|INSERT\s+(?:INTO|OVERWRITE(?:\s+TABLE)?)\s+([\w.]+)""",
+    re.IGNORECASE,
+)
+#: The ``(?!...import)`` guard keeps Python's own ``from pyspark.sql import
+#: functions`` out of the table list — without it every PySpark notebook appears
+#: to read a detail table called ``sql``. The lookahead sits *before* the capture
+#: so the engine cannot backtrack into a shorter name to satisfy it.
+_NB_READ_SOURCE = re.compile(
+    r"""spark\.(?:read\.)?table\s*\(\s*(?:[rubf]{0,2})?["'`]([\w.]+)"""
+    r"""|\bFROM\s+(?![\w.]+\s+import\b)([\w.]+)""",
+    re.IGNORECASE,
+)
+
+#: A comparison that can fail, and something that stops the run when it does.
 _SQL_MISMATCH = re.compile(r"\b(?:if|where|having)\b[^;]*(?:<>|!=)", re.IGNORECASE)
 _SQL_STOP = re.compile(r"\b(?:throw|raiserror)\b", re.IGNORECASE)
 
-
-def _names_have_detail_and_aggregate(names) -> bool:
-    names = [str(name).lower() for name in names]
-    has_detail = any(any(h in n for h in _DETAIL_HINTS) for n in names)
-    has_aggregate = any(any(h in n for h in _AGGREGATE_HINTS) for n in names)
-    return has_detail and has_aggregate
+#: How many derivations one workspace may contribute. A rollup-heavy warehouse
+#: could otherwise pair every table with every source it reads.
+_MAX_DERIVATIONS = 200
 
 
-def _warehouse_is_applicable(ws) -> bool:
-    return (
-        ws.has(Resource.TABLE_COLUMNS)
-        and _names_have_detail_and_aggregate(ws.tables)
-    )
+def _bare(name) -> str:
+    """The unqualified, lower-cased table name — ``Bronze_LH.SALES`` -> ``sales``."""
+    cleaned = str(name or "").strip()
+    for character in '[]"`':
+        cleaned = cleaned.replace(character, "")
+    return cleaned.split(".")[-1].strip().lower()
 
 
-def _semantic_model_is_applicable(ws) -> bool:
-    if not ws.has(Resource.SEMANTIC_MODEL_DEFINITIONS):
+def _references(text: str, table: str) -> bool:
+    """True when ``text`` names ``table`` as a whole identifier.
+
+    A schema qualifier is transparent (``dbo.sales`` references ``sales``), but a
+    longer name is not (``sales_archive`` does not reference ``sales``).
+    """
+    if not table:
         return False
-    names = []
-    for model in ws.semantic_models.values():
-        names.extend(
-            table.get("name", "") if isinstance(table, dict) else table
-            for table in (model.get("tables") or [])
-        )
-    return _names_have_detail_and_aggregate(names)
+    return bool(re.search(rf"(?<![\w]){re.escape(table)}(?![\w])", text, re.IGNORECASE))
 
 
-def _mentions_both_grains(text: str) -> bool:
-    lowered = text.lower()
-    return (
-        any(hint in lowered for hint in _DETAIL_HINTS)
-        and any(hint in lowered for hint in _AGGREGATE_HINTS)
-    )
+def _model_derivations(ws) -> list[tuple[str, str, str]]:
+    """Rollups the semantic model *declares* through ``alternateOf``.
+
+    The strongest signal there is: Power BI records the base table and column an
+    aggregation column summarises, so nothing is inferred.
+    """
+    found: list[tuple[str, str, str]] = []
+    for model_name, model in (ws.semantic_models or {}).items():
+        for aggregation in model.get("aggregations") or []:
+            if not isinstance(aggregation, dict):
+                continue
+            aggregate = _bare(aggregation.get("table"))
+            detail = _bare(aggregation.get("base_table"))
+            if aggregate and detail and aggregate != detail:
+                found.append((aggregate, detail, (
+                    f"semantic model '{model_name}' declares '{aggregate}' as an "
+                    f"aggregation of '{detail}'"
+                )))
+    return found
 
 
-def _semantic_model_reconciles(ws) -> bool:
-    for model in ws.semantic_models.values():
-        for measure in model.get("measures") or []:
-            name = str(measure.get("name") or "")
-            expression = str(measure.get("expression") or "")
-            signal = f"{name} {expression}"
-            if (
-                _RECONCILIATION_NAME.search(name)
-                and _mentions_both_grains(signal)
-                and len(_TOTAL_OPERATION.findall(expression)) >= 2
-                and "-" in expression
-            ):
-                return True
-    return False
+def _sql_derivations(ws) -> list[tuple[str, str, str]]:
+    """Rollups computed in SQL: a routine that groups one table *into* another.
+
+    Only a routine that **writes** its grouped result counts. A ``GROUP BY`` view
+    is deliberately not a rollup here: a Fabric Warehouse view is computed at
+    query time and is never materialised, so its totals are recalculated from the
+    detail on every read and cannot drift from it. There is nothing to reconcile,
+    and treating one as a rollup would fail an estate for a risk it cannot carry —
+    on one real tenant every "finding" this check produced was a plain view.
+    """
+    found: list[tuple[str, str, str]] = []
+    for routine in ws.sql_routines or []:
+        sql = strip_sql_comments(str(routine.get("definition") or ""))
+        if not (_SQL_GROUP_BY.search(sql) and _SQL_AGGREGATION.search(sql)):
+            continue
+        targets = {
+            _bare(group)
+            for match in _SQL_WRITE_TARGET.finditer(sql)
+            for group in match.groups() if group
+        }
+        sources = {_bare(m.group(1)) for m in _SQL_READ_SOURCE.finditer(sql)}
+        for aggregate in targets:
+            for detail in sources - targets:
+                if aggregate and detail:
+                    found.append((aggregate, detail, (
+                        f"{str(routine.get('type') or 'routine').lower()} "
+                        f"'{routine.get('name')}' groups '{detail}' into '{aggregate}'"
+                    )))
+    return found
 
 
-def _warehouse_reconciles(ws) -> bool:
-    for sql_object in (*ws.sql_views, *ws.sql_routines):
+def _notebook_derivations(ws) -> list[tuple[str, str, str]]:
+    """Rollups computed in a notebook: a grouped aggregation written to a table."""
+    found: list[tuple[str, str, str]] = []
+    for name, definition in (ws.notebooks or {}).items():
+        code = executable_code(definition)
+        if not (_NB_GROUPING.search(code) and _NB_AGGREGATION.search(code)):
+            continue
+        targets = {
+            _bare(group)
+            for match in _NB_WRITE_TARGET.finditer(code)
+            for group in match.groups() if group
+        }
+        sources = {
+            _bare(group)
+            for match in _NB_READ_SOURCE.finditer(code)
+            for group in match.groups() if group
+        }
+        for aggregate in targets:
+            for detail in sources - targets:
+                if aggregate and detail:
+                    found.append((aggregate, detail, (
+                        f"notebook '{name}' groups '{detail}' into '{aggregate}'"
+                    )))
+    return found
+
+
+def _aggregate_derivations(ws) -> list[tuple[str, str, str]]:
+    """Every detail-to-aggregate rollup this workspace *declares*, deduplicated.
+
+    A rollup is only counted where the estate says so itself — a TMSL
+    ``alternateOf``, or code that groups one table into another. Nothing is
+    inferred from a table being *named* like a summary, which both missed real
+    rollups (a finance estate calls them balances) and would have counted an
+    imported source table that merely had the word in its name.
+    """
+    seen: set[tuple[str, str]] = set()
+    unique: list[tuple[str, str, str]] = []
+    for aggregate, detail, how in (
+        _model_derivations(ws) + _sql_derivations(ws) + _notebook_derivations(ws)
+    ):
+        if (aggregate, detail) in seen:
+            continue
+        seen.add((aggregate, detail))
+        unique.append((aggregate, detail, how))
+        if len(unique) >= _MAX_DERIVATIONS:
+            break
+    return unique
+
+
+def _reconciles(ws, aggregate: str, detail: str) -> str:
+    """Describe the control that proves this rollup did not lose data, or ``""``.
+
+    The control must reference **both** tables of the derivation, total them, and
+    act on a mismatch. Requiring the two real table names — rather than the words
+    "detail" and "summary" appearing somewhere — is what makes this independent
+    of naming convention.
+    """
+    for sql_object in (*(ws.sql_views or []), *(ws.sql_routines or [])):
         sql = strip_sql_comments(str(sql_object.get("definition") or ""))
         if (
-            _mentions_both_grains(sql)
-            and len(_TOTAL_OPERATION.findall(sql)) >= 2
+            _references(sql, aggregate)
+            and _references(sql, detail)
+            and len(_SQL_AGGREGATION.findall(sql)) >= 2
             and _SQL_MISMATCH.search(sql)
             and _SQL_STOP.search(sql)
         ):
-            return True
-    return False
+            return f"SQL '{sql_object.get('name')}' compares the totals and stops on a mismatch"
 
+    for model_name, model in (ws.semantic_models or {}).items():
+        for measure in model.get("measures") or []:
+            expression = str(measure.get("expression") or "")
+            if (
+                _references(expression, aggregate)
+                and _references(expression, detail)
+                and len(_SQL_AGGREGATION.findall(expression)) >= 2
+                and "-" in expression
+            ):
+                return (
+                    f"measure '{measure.get('name')}' in '{model_name}' differences "
+                    f"the two grains"
+                )
 
-def _has_aggregate_reconciliation(ws) -> bool:
-    return (
-        (_semantic_model_is_applicable(ws) and _semantic_model_reconciles(ws))
-        or (_warehouse_is_applicable(ws) and _warehouse_reconciles(ws))
-    )
+    for name, definition in (ws.notebooks or {}).items():
+        code = executable_code(definition)
+        if (
+            _references(code, aggregate)
+            and _references(code, detail)
+            and _RECON_CONTROL.search(code)
+        ):
+            return f"notebook '{name}' compares the two grains and fails on a mismatch"
+    return ""
 
 
 @group_check(
     id="XW-AGG-CONSIST", ref="5.4.3",
     title="Aggregate consistency: sum of detail records equals aggregate totals (no data loss in rollup)",
     pillar=Pillar.DATA_QUALITY, severity=Severity.HIGH,
-    requires=[Resource.TABLE_COLUMNS, Resource.SEMANTIC_MODEL_DEFINITIONS],
+    requires=[
+        Resource.TABLE_COLUMNS, Resource.SEMANTIC_MODEL_DEFINITIONS,
+        Resource.NOTEBOOK_DEFINITIONS,
+    ],
     required=False,
 )
 def aggregate_consistency(ctx: GroupContext) -> Verdict:
-    """Every applicable environment enforces detail-to-aggregate reconciliation.
+    """Every environment that builds a rollup verifies it against its detail.
 
-    Table/model names determine whether an aggregate rollup exists; they never
-    count as proof. A PASS requires either an explicit semantic-model variance
-    measure over both grains or Warehouse SQL that compares both totals and stops
-    execution on a mismatch.
+    A rollup is found from what the estate **declares** — a semantic-model
+    ``alternateOf`` aggregation, or SQL/Spark code that groups one table into
+    another and writes the result — never from a table being *named* like a
+    summary. Naming both missed real rollups (a finance estate calls them
+    balances, not summaries) and risked counting an imported source table that
+    happened to carry the word.
+
+    An environment passes when at least one of its rollups is verified: something
+    reads **both** tables of the derivation, totals them, and acts on a mismatch.
+
+    An environment that builds no rollup is excluded, not failed — there is no
+    aggregate to reconcile. N/A only when *no* environment builds one: a single
+    environment with an unreconciled rollup is a real finding, not an
+    unanswerable question.
     """
-    return _xw.consistency(
-        ctx,
-        readable=lambda ws: (
-            _warehouse_is_applicable(ws) or _semantic_model_is_applicable(ws)
-        ),
-        implements=_has_aggregate_reconciliation,
-        practice="implements detail-to-aggregate total reconciliation in the Warehouse or semantic model",
-        data_name="applicable Warehouse and semantic-model definitions",
+    verified: list[str] = []
+    unverified: list[str] = []
+    skipped: list[str] = []
+
+    for member in ctx.members:
+        ws = member.workspace
+        if not (ws.has(Resource.TABLE_COLUMNS)
+                or ws.has(Resource.SEMANTIC_MODEL_DEFINITIONS)
+                or ws.has(Resource.NOTEBOOK_DEFINITIONS)):
+            continue
+        label = _xw.env_label(member)
+        derivations = _aggregate_derivations(ws)
+        if not derivations:
+            skipped.append(f"{label} (builds no materialised aggregate rollup)")
+            continue
+        proof = ""
+        for aggregate, detail, how in derivations:
+            proof = _reconciles(ws, aggregate, detail)
+            if proof:
+                verified.append(f"{label} ({how}; {proof})")
+                break
+        if not proof:
+            first = derivations[0][2]
+            unverified.append(
+                f"{label} ({len(derivations)} rollup(s), none reconciled — e.g. {first})"
+            )
+
+    excluded = (f"; {len(skipped)} environment(s) excluded with no rollup to "
+                f"reconcile: {'; '.join(skipped)}") if skipped else ""
+
+    judged = len(verified) + len(unverified)
+    if judged == 0:
+        return not_applicable(
+            "no environment in this group builds a materialised detail-to-aggregate "
+            f"rollup whose reconciliation could be judged{excluded}"
+        )
+    if not unverified:
+        return covered(
+            judged, judged,
+            f"all {judged} environment(s) reconcile their rollups against the "
+            f"detail: {'; '.join(verified)}{excluded}",
+        )
+    if judged == 1:
+        return covered(
+            0, 1,
+            "the only environment that builds a rollup does not reconcile it "
+            f"against the detail: {'; '.join(unverified)}{excluded}",
+        )
+    return covered(
+        len(verified), judged,
+        f"{len(verified)} of {judged} environment(s) reconcile a rollup against "
+        f"its detail; not in {'; '.join(unverified)}{excluded}",
     )
 
 
