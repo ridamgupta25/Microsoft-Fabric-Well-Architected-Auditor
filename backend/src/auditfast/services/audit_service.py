@@ -11,6 +11,8 @@ cheap to add.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +28,8 @@ from ..core.enums import Layer, Pillar
 from ..core.models import CheckResult, WorkspaceContext
 from ..core.scoring import aggregate
 from .project import ProjectConfig, load_project, load_remediation
+
+log = logging.getLogger(__name__)
 
 #: Check id used for workspaces that could not be read at all.
 ACCESS_CHECK_ID = "WS-ACCESS"
@@ -134,6 +138,42 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
         archive = KBArchive(settings.resolve(settings.kb_archive_dir))
         provider = ArchivingProvider(provider, archive)
     return provider
+
+
+class _RunScopedProvider:
+    """Memoizes each workspace's context for one audit run.
+
+    The audit fetches every workspace up to three times in a run - once for the
+    deterministic crawl, once for the advisory checks, once for the advisory
+    contexts. When a snapshot is *incomplete* (a SQL endpoint on a blocked port,
+    a throttled Power BI read, a failed getDefinition) the ``CachingProvider``
+    refuses to serve it and re-crawls live *every* time, so an estate that
+    crawls in 20 minutes can spend two more hours re-crawling for the advisory
+    stage. Memoizing by workspace id for the life of one run collapses those
+    repeat fetches to one: the live crawl always fetches every resource, so the
+    first context is complete for every later stage, and every stage then judges
+    exactly the same evidence.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._contexts: dict[str, WorkspaceContext] = {}
+        self._lock = threading.Lock()
+
+    def fetch(self, workspace_id, *args, **kwargs):
+        with self._lock:
+            ctx = self._contexts.get(workspace_id)
+        if ctx is not None:
+            return ctx
+        ctx = self._inner.fetch(workspace_id, *args, **kwargs)
+        with self._lock:
+            self._contexts[workspace_id] = ctx
+        return ctx
+
+    def __getattr__(self, name):
+        # Delegate everything else (list_workspaces, probe, served_from_cache,
+        # force_refresh) to the wrapped provider.
+        return getattr(self._inner, name)
 
 
 def _build_snapshot_provider(settings, snapshots: Sequence[dict] | None):
@@ -474,6 +514,9 @@ def run_audit(
                               storage_token=storage_token,
                               sql_token_refresher=sql_token_refresher,
                               source=source, snapshots=snapshots)
+    # One fetch per workspace for the whole run: the advisory stage reuses the
+    # crawl's context instead of re-crawling an incomplete snapshot three times.
+    provider = _RunScopedProvider(provider)
     targets = _resolve_targets(config, workspaces)
     groups = _resolve_groups(workspaces)
     weights = _resolve_weights(workspaces, weight_by_environment)
@@ -490,7 +533,11 @@ def run_audit(
 
     deterministic_registry, advisory_registry = _split_registries()
 
+    # Phase timings so a slow run can be split into crawl vs advisory export.
+    _phase = {"crawl": 0.0, "advisory_contexts": 0.0, "advisory_export": 0.0}
+
     # Stage 1 -- the deterministic audit. This crawl is what builds the KB.
+    _t = time.monotonic()
     raw_results = run_engine(
         provider,
         targets,
@@ -502,6 +549,7 @@ def run_audit(
         weights=weights,
         groups=group_targets,
     )
+    _phase["crawl"] = time.monotonic() - _t
 
     # Merge external checks if provided
     if external_checks_csv:
@@ -578,10 +626,12 @@ def run_audit(
     # Gathered once and shared by both judging routes: each call re-fetches every
     # workspace and rebuilds its WorkspaceContext, and the two routes must ground
     # a verdict in exactly the same evidence anyway.
+    _t = time.monotonic()
     contexts = (
         _advisory_contexts(provider, targets, advisory_registry)
         if advisory_results else {}
     )
+    _phase["advisory_contexts"] = time.monotonic() - _t
     # AI re-judges the advisory checks against the knowledge base for a more
     # accurate verdict. When AI is off (the default) this is a no-op and the
     # deterministic verdicts are kept unchanged.
@@ -593,7 +643,13 @@ def run_audit(
         # The offline judging bundle is written whether or not a model is
         # configured: it is the route for reviewers who have no server-side key,
         # and it costs one small file. It never affects this run's numbers.
+        _t = time.monotonic()
         run.files.update(_write_advisory_bundle(advisory_results, contexts, out_dir))
+        _phase["advisory_export"] = time.monotonic() - _t
+    log.info(
+        "audit phases (seconds): crawl=%.1f advisory_contexts=%.1f advisory_export=%.1f",
+        _phase["crawl"], _phase["advisory_contexts"], _phase["advisory_export"],
+    )
     return run
 
 
