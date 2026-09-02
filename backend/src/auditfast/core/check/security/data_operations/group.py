@@ -53,7 +53,10 @@ def secret_scanning_consistent(ctx: GroupContext) -> Verdict:
     connection could not be read is reported as *unknown* and counted, not
     silently dropped, so "1 of 3 (UAT unreadable)" never masquerades as "1 of 2".
     A connected repo whose provider security status cannot be verified is
-    reported as *unverified* — it never implies coverage.
+    reported as *unverified* — it never implies coverage. But when **no**
+    environment's Git connection could be read there is nothing to be covered, so
+    the verdict is N/A: a blocked read is a permission gap, not a security
+    finding.
     """
     total = len(ctx.members)
     if total < 2:
@@ -108,6 +111,17 @@ def secret_scanning_consistent(ctx: GroupContext) -> Verdict:
             )
 
     detail = "\n".join(bullets)
+
+    # Nothing at all could be read: every environment's Git connection was
+    # blocked, so there is no evidence either way. Scoring that would turn a
+    # permission gap into a Security finding — "we could not determine this" is
+    # not the same as "this is not configured".
+    if len(unreadable) == total:
+        return not_applicable(
+            f"the Git connection could not be read in any of the {total} "
+            f"environments, so secret-scanning status is unknown across the "
+            f"group — this is a permission gap, not a finding:\n{detail}"
+        )
 
     # PASS only when secret scanning is confirmed on in every environment.
     if enabled and not (disabled or unverified or not_connected or unreadable):

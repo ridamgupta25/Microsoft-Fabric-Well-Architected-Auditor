@@ -257,12 +257,16 @@ def aggregate_consistency(ctx: GroupContext) -> Verdict:
     reads **both** tables of the derivation, totals them, and acts on a mismatch.
 
     An environment that builds no rollup is excluded, not failed — there is no
-    aggregate to reconcile. N/A only when *no* environment builds one: a single
-    environment with an unreconciled rollup is a real finding, not an
-    unanswerable question.
+    aggregate to reconcile. An environment that builds one but whose SQL endpoint
+    could not be read is *undetermined*, not failed: the reconciliation control is
+    most often a view or stored procedure, and those are exactly what an unread
+    endpoint hides. N/A only when no environment can be judged either way — a
+    single environment with an unreconciled rollup, read in full, is a real
+    finding rather than an unanswerable question.
     """
     verified: list[str] = []
     unverified: list[str] = []
+    undetermined: list[str] = []
     skipped: list[str] = []
 
     for member in ctx.members:
@@ -282,17 +286,37 @@ def aggregate_consistency(ctx: GroupContext) -> Verdict:
             if proof:
                 verified.append(f"{label} ({how}; {proof})")
                 break
-        if not proof:
-            first = derivations[0][2]
+        if proof:
+            continue
+        first = derivations[0][2]
+        if not ws.has(Resource.TABLE_COLUMNS):
+            # Views and stored procedures come from the SQL endpoint. Without it
+            # a reconciliation written in SQL is unreadable, not absent, so this
+            # environment cannot be failed for the absence.
+            undetermined.append(
+                f"{label} ({len(derivations)} rollup(s) — e.g. {first}; the SQL "
+                "endpoint could not be read, so a reconciliation implemented as a "
+                "view or stored procedure would be invisible here)"
+            )
+        else:
             unverified.append(
                 f"{label} ({len(derivations)} rollup(s), none reconciled — e.g. {first})"
             )
 
     excluded = (f"; {len(skipped)} environment(s) excluded with no rollup to "
                 f"reconcile: {'; '.join(skipped)}") if skipped else ""
+    undetermined_note = (
+        f"; {len(undetermined)} environment(s) build a rollup but could not be "
+        f"judged: {'; '.join(undetermined)}"
+    ) if undetermined else ""
 
     judged = len(verified) + len(unverified)
     if judged == 0:
+        if undetermined:
+            return not_applicable(
+                "no environment's rollup could be reconciled from what was read"
+                f"{undetermined_note}{excluded}"
+            )
         return not_applicable(
             "no environment in this group builds a materialised detail-to-aggregate "
             f"rollup whose reconciliation could be judged{excluded}"
@@ -301,18 +325,18 @@ def aggregate_consistency(ctx: GroupContext) -> Verdict:
         return covered(
             judged, judged,
             f"all {judged} environment(s) reconcile their rollups against the "
-            f"detail: {'; '.join(verified)}{excluded}",
+            f"detail: {'; '.join(verified)}{undetermined_note}{excluded}",
         )
     if judged == 1:
         return covered(
             0, 1,
             "the only environment that builds a rollup does not reconcile it "
-            f"against the detail: {'; '.join(unverified)}{excluded}",
+            f"against the detail: {'; '.join(unverified)}{undetermined_note}{excluded}",
         )
     return covered(
         len(verified), judged,
         f"{len(verified)} of {judged} environment(s) reconcile a rollup against "
-        f"its detail; not in {'; '.join(unverified)}{excluded}",
+        f"its detail; not in {'; '.join(unverified)}{undetermined_note}{excluded}",
     )
 
 
