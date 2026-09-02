@@ -10,7 +10,7 @@ from auditfast.core.check.operations_reliability.data_prep.group import (
     post_failure_integrity_consistent,
 )
 from auditfast.core.check.registry import GROUP_REGISTRY
-from auditfast.core.enums import Layer, Resource, Status
+from auditfast.core.enums import Layer, Resource
 from auditfast.core.models import GroupContext, GroupMemberContext, WorkspaceContext
 
 #: A notebook whose recovery path compares two layers and blocks on a mismatch.
@@ -85,11 +85,17 @@ def test_commented_out_validation_does_not_count():
 
 
 def test_fewer_than_two_readable_members_is_na():
+    """An unreadable member leaves one environment, which is now scored alone.
+
+    DEV's recovery path re-validates, so the lone-environment verdict is a pass.
+    N/A is reserved for "no environment has a recovery path at all", which is a
+    different statement from "only one could be read".
+    """
     dev = _ws("ws-dev", notebooks={"NB": _nb(_VALIDATING_CODE)})
     prod = _ws("ws-prod", readable=False)
     verdict = post_failure_integrity_consistent(_group((dev, 1), (prod, 10)))
-    assert verdict.status is Status.NA
-    assert verdict.scored is False
+    assert verdict.score == 3
+    assert "the only environment with a recovery path re-validates" in verdict.evidence
 
 
 #: A pipeline whose on-failure branch runs a row-count reconciliation.
@@ -127,11 +133,11 @@ def test_failure_branch_without_reconciliation_does_not_count():
 def test_reconciliation_without_a_failure_path_does_not_count():
     """Routine reconciliation with no recovery/failure signal is 5.4.6, not 9.3.4.
 
-    Such an environment is now *excluded* rather than failed -- it runs nothing
-    after a failure, so there is no post-failure path to validate on -- but the
-    load-bearing part is unchanged: routine reconciliation must never be credited
-    as post-failure validation. Only DEV has a recovery path, so one judged
-    environment is left and the comparison is N/A.
+    PROD is *excluded* rather than failed -- it runs nothing after a failure, so
+    there is no post-failure path to validate on. The load-bearing part is
+    unchanged: routine reconciliation must never be credited as post-failure
+    validation, so PROD is named as having no recovery path rather than as
+    having a validated one.
     """
     routine = {"properties": {"activities": [
         {"name": "Reconcile row_count", "type": "Lookup"},
@@ -139,7 +145,8 @@ def test_reconciliation_without_a_failure_path_does_not_count():
     dev = _ws("ws-dev", notebooks={"NB": _nb(_VALIDATING_CODE)})
     prod = _ws("ws-prod", pipelines={"PL": routine})
     verdict = post_failure_integrity_consistent(_group((dev, 1), (prod, 10)))
-    assert verdict.status is Status.NA
-    assert verdict.scored is False
     assert "ws-prod" in verdict.evidence
     assert "no recovery, replay or backfill path exists" in verdict.evidence
+    # Only DEV is judged, and its recovery path does re-validate.
+    assert verdict.score == 3
+    assert "the only environment with a recovery path re-validates" in verdict.evidence

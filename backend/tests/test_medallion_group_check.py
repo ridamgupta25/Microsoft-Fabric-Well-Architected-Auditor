@@ -119,6 +119,46 @@ def test_untiered_warehouse_is_named_as_the_gold_candidate():
     assert "WH_Reporting_Store" in verdict.evidence
 
 
+def test_a_workspace_with_no_data_store_is_excluded_not_failed():
+    """The cross-LOB case: a reporting workspace has no tier to declare.
+
+    A workspace holding no Lakehouse, Warehouse or database implements no
+    medallion tier because it has nothing to place in one. Scoring it 0 for "not
+    declaring its layers" is a finding about a practice it cannot have -- the
+    same category error as telling a Warehouse-less workspace to enable SQL
+    audit. The per-workspace WS-MEDALLION already returns N/A here.
+    """
+    reporting = [
+        _ws(name, ("Sales Report", "Report"), ("Sales Model", "SemanticModel"))
+        for name in ("rep-a", "rep-b")
+    ]
+    verdict = medallion_consistent(_group((reporting[0], 9), (reporting[1], 10)))
+    assert verdict.status is Status.NA
+    assert verdict.scored is False
+    assert "holding no Lakehouse, Warehouse or database" in verdict.evidence
+
+
+def test_a_storeless_member_does_not_drag_down_the_others():
+    """Two store-holding environments are still judged; the third is excluded."""
+    dev = _full("dev")
+    prod = _full("prod")
+    reporting = _ws("rep", ("Sales Report", "Report"))
+    verdict = medallion_consistent(
+        _group((dev, 1), (reporting, 5), (prod, 10)))
+    assert verdict.score == 3
+    assert "1 environment(s) excluded" in verdict.evidence
+    assert "rep" in verdict.evidence
+
+
+def test_stores_present_but_unnamed_is_still_a_real_zero():
+    """The exclusion must not swallow the genuine finding it sits next to."""
+    envs = [_ws(name, ("LH_One", "Lakehouse"), ("WH_Two", "Warehouse"))
+            for name in ("dev", "prod")]
+    verdict = medallion_consistent(_group((envs[0], 1), (envs[1], 10)))
+    assert verdict.score == 0
+    assert "no medallion tier is named" in verdict.evidence
+
+
 def test_fewer_than_two_readable_members_is_na():
     dev = _full("dev")
     prod = _ws("prod", ("LH_Bronze", "Lakehouse"), unreadable=True)
