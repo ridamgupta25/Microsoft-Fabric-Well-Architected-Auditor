@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterable
 
+from ..enums import Resource
 from ..models import GroupContext, GroupMemberContext, WorkspaceContext
 from .helpers import Verdict, covered, not_applicable
 
@@ -34,14 +35,21 @@ SOURCE_TYPES: frozenset[str] = frozenset({"DataPipeline", "Notebook", "Dataflow"
 REPORTING_TYPES: frozenset[str] = frozenset({"SemanticModel", "Report", "PaginatedReport"})
 
 #: Name tokens that place a store in a medallion tier, mapped to the tier.
+#: The single source of truth for the medallion vocabulary. ``WS-MEDALLION`` and
+#: the group checks share ref 1.1.5, so they must agree on what "Gold" means; the
+#: per-workspace module derives its upper-cased copy from this dict rather than
+#: restating it, because the two literals had already drifted apart.
 MEDALLION_TOKENS: dict[str, str] = {
     "bronze": "Bronze", "raw": "Bronze", "landing": "Bronze", "ingest": "Bronze",
     "ingestion": "Bronze", "source": "Bronze",
     "silver": "Silver", "cleansed": "Silver", "clean": "Silver",
     "conformed": "Silver", "refined": "Silver", "enriched": "Silver",
     "gold": "Gold", "curated": "Gold", "mart": "Gold", "datamart": "Gold",
-    "presentation": "Gold", "serving": "Gold",
+    "presentation": "Gold", "serving": "Gold", "semantic": "Gold",
 }
+
+#: Bronze -> Silver -> Gold, in the order the architecture flows.
+MEDALLION_ORDER: tuple[str, ...] = ("Bronze", "Silver", "Gold")
 
 #: Name tokens that declare an environment tier.
 TIER_TOKENS: frozenset[str] = frozenset(
@@ -144,6 +152,8 @@ def consistency(
     implements: Callable[[WorkspaceContext], bool],
     practice: str,
     data_name: str,
+    applicable: Callable[[WorkspaceContext], bool] | None = None,
+    inapplicable_reason: str = "the practice does not apply there",
 ) -> Verdict:
     """Score whether ``implements`` holds in every *readable* environment.
 
@@ -152,26 +162,41 @@ def consistency(
     check is N/A. Otherwise the verdict is the coverage ratio of environments
     that implement the practice, so a practice present in Prod but missing in Dev
     is surfaced as drift rather than a pass.
+
+    ``applicable`` separates "does not do this" from "has nothing to do it to". A
+    readable member for which it returns False is **excluded and named**, never
+    counted as implementing. Without it, a predicate phrased as an absence ("none
+    of its references is opaque") passes an empty workspace vacuously and inflates
+    the score — which is the mirror image of the N/A-not-FAIL rule.
     """
     present: list[str] = []
     absent: list[str] = []
+    excluded: list[str] = []
     for member in ctx.members:
         if not readable(member.workspace):
             continue
-        (present if implements(member.workspace) else absent).append(env_label(member))
+        label = env_label(member)
+        if applicable is not None and not applicable(member.workspace):
+            excluded.append(label)
+            continue
+        (present if implements(member.workspace) else absent).append(label)
+
+    note = (f"; {len(excluded)} environment(s) excluded, {inapplicable_reason}: "
+            f"{', '.join(excluded)}") if excluded else ""
     total = len(present) + len(absent)
     if total < 2:
         return not_applicable(
             f"fewer than two environments in this group had readable {data_name} "
-            f"to compare"
+            f"to compare{note}"
         )
     if not absent:
         return covered(total, total,
-                       f"all {total} environment(s) {practice}: {', '.join(present)}")
+                       f"all {total} environment(s) {practice}: "
+                       f"{', '.join(present)}{note}")
     return covered(
         len(present), total,
         f"{practice} in {len(present)} of {total} environment(s); not in "
-        f"{', '.join(absent)}",
+        f"{', '.join(absent)}{note}",
     )
 
 
@@ -217,18 +242,23 @@ def superset_consistency(
 
 # -- per-workspace detectors, shared across the group checks -------------------
 
+def medallion_tiers_of(name: str) -> set[str]:
+    """The medallion tiers a single store or workspace *name* declares.
+
+    Names are the only readable signal for layer intent: no Fabric item metadata
+    records which tier a store belongs to, or which store a pipeline writes to.
+    """
+    return {MEDALLION_TOKENS[tok] for tok in _tokens(name) if tok in MEDALLION_TOKENS}
+
+
 def medallion_tiers(ws: WorkspaceContext) -> set[str]:
     """The medallion tiers (Bronze/Silver/Gold) the workspace's stores declare."""
     tiers: set[str] = set()
     for item in ws.items:
         if item.type in DATA_STORE_TYPES:
-            for tok in _tokens(item.display_name):
-                if tok in MEDALLION_TOKENS:
-                    tiers.add(MEDALLION_TOKENS[tok])
-    for tok in _tokens(ws.name):
-        if tok in MEDALLION_TOKENS:
-            tiers.add(MEDALLION_TOKENS[tok])
-    return tiers
+            tiers |= medallion_tiers_of(item.display_name)
+    # An estate that gives each tier its own workspace declares the tier there.
+    return tiers | medallion_tiers_of(ws.name)
 
 
 def declares_env_tier(ws: WorkspaceContext) -> bool:
@@ -335,6 +365,64 @@ def has_recoverable_read_failures(ws: WorkspaceContext) -> bool:
         stat.get("forbidden") or stat.get("transient")
         for stat in ws.read_failures.values()
     )
+
+
+def incomplete_reads(ws: WorkspaceContext, resources: Iterable[Resource]) -> list[str]:
+    """Describe the *partial* reads among ``resources``, newest gap first.
+
+    :func:`has_recoverable_read_failures` answers "was this crawl degraded at
+    all?" across every resource. A check that searches a member's content for
+    evidence needs a narrower question: "did I see all of the content I actually
+    searched?" — a throttled Lakehouse table read says nothing about whether the
+    notebooks were fully captured.
+
+    The gap this closes is invisible through :meth:`WorkspaceContext.has`, which
+    is only false when a resource was read **zero** times. A member whose 45 of
+    50 notebook definitions were blocked still reports ``has(...) is True``, so a
+    search over the surviving 5 looks exactly like a search over all 50. Finding
+    evidence in a partial read is still valid — the evidence exists — but finding
+    *none* is not evidence of absence, and that distinction needs these counts.
+
+    Returns one ``"45 of 50 notebookDefinitions"`` phrase per partially-read
+    resource, ordered by the number missed, so the evidence can name the blind
+    spot precisely. Empty when every requested resource was read whole (or was
+    never attempted, which is not a gap).
+    """
+    gaps: list[tuple[int, str]] = []
+    for resource in resources:
+        stat = ws.read_failures.get(resource.value)
+        if not stat:
+            continue
+        failed = int(stat.get("failed", 0) or 0)
+        attempted = int(stat.get("attempted", 0) or 0)
+        if failed > 0 and attempted > 0:
+            gaps.append((failed, f"{failed} of {attempted} {resource.value}"))
+    return [phrase for _, phrase in sorted(gaps, key=lambda gap: -gap[0])]
+
+
+def read_coverage(ws: WorkspaceContext, resources: Iterable[Resource]) -> float:
+    """The worst read fraction among ``resources`` — 1.0 when nothing failed.
+
+    :func:`incomplete_reads` answers *whether* there is a blind spot; this answers
+    *how big*. The two are not the same decision: one throttled notebook out of
+    99 leaves a technically-incomplete crawl, but 98 definitions are still a sound
+    basis for a judgement, whereas 5 of 50 plainly are not. A caller that treated
+    both identically would either discard almost-complete evidence or trust
+    almost-absent evidence.
+
+    Reported as the *minimum* across the resources, so a single badly-read
+    resource is not averaged away by its well-read neighbours.
+    """
+    worst = 1.0
+    for resource in resources:
+        stat = ws.read_failures.get(resource.value)
+        if not stat:
+            continue
+        attempted = int(stat.get("attempted", 0) or 0)
+        if attempted <= 0:
+            continue
+        worst = min(worst, int(stat.get("read", 0) or 0) / attempted)
+    return worst
 
 
 # -- strict, type-resolved run history ----------------------------------------
