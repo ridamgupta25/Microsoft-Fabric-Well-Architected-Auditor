@@ -89,24 +89,61 @@ def notebook_texts(workspace) -> dict[str, str]:
 
 
 def attached_lakehouses(definition: dict) -> list[str]:
-    """The lakehouses attached to a notebook, per its ``trident`` metadata.
+    """The lakehouses attached to a notebook, from its metadata.
 
     An attached lakehouse is the strongest possible wiring signal: Fabric draws
     the lineage edge from the attachment itself, with no code inspection at all.
+
+    Fabric writes this block in **two** places depending on the notebook's
+    vintage: the older Synapse-derived ``metadata.trident.lakehouse``, and the
+    current ``metadata.dependencies.lakehouse``. Reading only ``trident`` made
+    every modern notebook look unattached — 0 of 171 on a real estate — so both
+    are merged here. A notebook carrying neither is genuinely unattached.
     """
-    trident = ((definition or {}).get("metadata") or {}).get("trident") or {}
-    lakehouse = trident.get("lakehouse") or {}
-    known = lakehouse.get("known_lakehouses") or []
+    metadata = (definition or {}).get("metadata") or {}
     names: list[str] = []
-    for entry in known:
-        if isinstance(entry, dict):
-            value = entry.get("id") or entry.get("name") or ""
-        else:
-            value = str(entry)
-        if value:
-            names.append(str(value))
-    default = lakehouse.get("default_lakehouse_name") or lakehouse.get("default_lakehouse")
-    if default and str(default) not in names:
-        names.append(str(default))
+    for block in (metadata.get("trident") or {}, metadata.get("dependencies") or {}):
+        lakehouse = block.get("lakehouse") or {}
+        if not isinstance(lakehouse, dict):
+            continue
+        for entry in lakehouse.get("known_lakehouses") or []:
+            if isinstance(entry, dict):
+                value = entry.get("id") or entry.get("name") or ""
+            else:
+                value = str(entry)
+            if value and str(value) not in names:
+                names.append(str(value))
+        default = (lakehouse.get("default_lakehouse_name")
+                   or lakehouse.get("default_lakehouse"))
+        if default and str(default) not in names:
+            names.append(str(default))
+    return names
+
+
+def attached_stores(definition: dict) -> list[str]:
+    """Every Fabric store a notebook is attached to — lakehouses *and* warehouses.
+
+    ``attached_lakehouses`` answers the narrower question its callers ask. A
+    lineage edge is drawn from a warehouse attachment
+    (``metadata.dependencies.warehouse``) just as readily, so a notebook that
+    only ever attaches a Warehouse is wired, not dangling.
+    """
+    metadata = (definition or {}).get("metadata") or {}
+    names = list(attached_lakehouses(definition))
+    for block in (metadata.get("trident") or {}, metadata.get("dependencies") or {}):
+        warehouse = block.get("warehouse") or {}
+        if not isinstance(warehouse, dict):
+            continue
+        for entry in warehouse.get("known_warehouses") or []:
+            if isinstance(entry, dict):
+                value = entry.get("id") or entry.get("name") or ""
+            else:
+                value = str(entry)
+            if value and str(value) not in names:
+                names.append(str(value))
+        default = (warehouse.get("default_warehouse_name")
+                   or warehouse.get("default_warehouse"))
+        if default and str(default) not in names:
+            names.append(str(default))
     return names
 

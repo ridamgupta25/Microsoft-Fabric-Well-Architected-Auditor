@@ -12,18 +12,27 @@ import pytest
 from auditfast.core.check.data_management_quality.data_operations.group import (
     layer_separation_consistent,
 )
+from auditfast.core.check.governance_compliance.data_operations.group import (
+    tech_metadata_consistent,
+)
 from auditfast.core.check.data_management_quality.data_storage.group import (
+    _aggregate_derivations,
     aggregate_consistency,
     cross_layer_reconciliation,
 )
-from auditfast.core.check.registry import GROUP_REGISTRY, CheckRegistry
+from auditfast.core.check.registry import GROUP_REGISTRY, REGISTRY, CheckRegistry
+from auditfast.core.check.security.data_operations.group import (
+    secret_scanning_consistent,
+)
 from auditfast.core.engine import run_audit
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity, Status
 from auditfast.core.models import GroupContext, GroupMemberContext, Item, WorkspaceContext
 
 from .conftest import FIXTURE_SETTINGS
 
-#: The 16 checks ported from the local set, id -> ref.
+#: The checks ported from the local set, id -> ref. 10.1.2 was ported here too but
+#: has been withdrawn: it could never reach a verdict from crawlable data, and the
+#: ref is covered by the ``OPS-SPARK-LOGS`` questionnaire check instead.
 PORTED = {
     "XW-MEDALLION-CONSIST": "1.1.5",
     "XW-PIPELINE-SLA": "9.4.2",
@@ -31,7 +40,6 @@ PORTED = {
     "XW-SLA-HISTORY": "9.4.4",
     "XW-TIER-SEP": "11.3.1",
     "XW-MEDALLION-DRIFT": "11.4.3a",
-    "XW-SPARK-LOGS": "10.1.2",
     "XW-WH-LOAD-MON": "10.1.5",
     "XW-AUDIT-SCHEMA": "10.2.1",
     "XW-AUDIT-QUERYABLE": "10.2.5",
@@ -53,19 +61,52 @@ _THREE_MEMBER_GROUP = [(
 )]
 
 
-def test_all_sixteen_ported_checks_are_registered():
+def test_all_ported_checks_are_registered():
     specs = {spec.id: spec for spec in GROUP_REGISTRY}
     for check_id, ref in PORTED.items():
         assert check_id in specs, f"{check_id} not registered"
         assert specs[check_id].ref == ref
 
 
+def test_spark_logs_is_a_questionnaire_check_not_a_group_check():
+    """10.1.2 is answered by the reviewer, not by a crawl.
+
+    Fabric exposes no read-only surface for Spark log retention, so a group check
+    could only return a hardcoded N/A on every group -- indistinguishable, to a
+    reader, from a failed crawl. The ref must be covered exactly once, by the
+    questionnaire.
+    """
+    assert not [spec for spec in GROUP_REGISTRY if spec.ref == "10.1.2"]
+    standard = [spec for spec in REGISTRY if spec.ref == "10.1.2"]
+    assert [spec.id for spec in standard] == ["OPS-SPARK-LOGS"]
+    assert standard[0].manual is True
+
+
+#: A stored procedure that declares the rollup: it groups the detail table and
+#: *writes* the result into the aggregate. Under the derivation model this is what
+#: makes 5.4.3 applicable at all -- a table merely *named* like a summary no longer
+#: counts, and neither does a plain view, which Fabric recomputes on every read.
+_ROLLUP_ROUTINE = {
+    "schema": "dbo", "name": "load_daily_sales_aggregate",
+    "type": "PROCEDURE", "store": "SalesWarehouse",
+    "definition": (
+        "INSERT INTO daily_sales_aggregate (sale_day, total_amount) "
+        "SELECT sale_day, SUM(amount) FROM fact_sales GROUP BY sale_day"
+    ),
+}
+
+
 def _aggregate_group(
     *, measure: dict | None = None, sql: str = "",
+    aggregations: list[dict] | None = None,
+    rollup: bool = True,
+    views: list[dict] | None = None,
+    notebooks: dict | None = None,
+    members: tuple[tuple[str, int], ...] = (("DEV", 1), ("PROD", 10)),
     unavailable: set[Resource] | None = None,
 ) -> GroupContext:
-    members = []
-    for name, level in (("DEV", 1), ("PROD", 10)):
+    group_members = []
+    for name, level in members:
         workspace = WorkspaceContext(
             id=name,
             display_name=name,
@@ -74,22 +115,242 @@ def _aggregate_group(
             semantic_models={
                 "Sales": {
                     "tables": ["fact_sales", "daily_sales_aggregate"],
-                    "measures": [measure],
+                    "measures": [measure] if measure else [],
+                    "aggregations": list(aggregations or []),
                 },
-            } if measure else {},
-            sql_routines=[{
-                "schema": "audit", "name": "validate_sales_rollup",
-                "type": "PROCEDURE", "definition": sql, "store": "SalesWarehouse",
-            }] if sql else [],
+            } if (measure or aggregations) else {},
+            notebooks=dict(notebooks or {}),
+            sql_views=[dict(view) for view in (views or ())],
+            sql_routines=(
+                ([dict(_ROLLUP_ROUTINE)] if rollup else [])
+                + ([{
+                    "schema": "audit", "name": "validate_sales_rollup",
+                    "type": "PROCEDURE", "definition": sql, "store": "SalesWarehouse",
+                }] if sql else [])
+            ),
             unavailable=set(unavailable or ()),
         )
-        members.append(GroupMemberContext(workspace, level, Layer.STORAGE))
-    return GroupContext(name="Sales", members=tuple(members), settings={})
+        group_members.append(GroupMemberContext(workspace, level, Layer.STORAGE))
+    return GroupContext(name="Sales", members=tuple(group_members), settings={})
 
 
-def test_aggregate_table_names_alone_do_not_prove_reconciliation():
+def test_a_declared_rollup_without_reconciliation_fails():
+    """The rollup is real, nothing verifies it - that is the finding."""
     verdict = aggregate_consistency(_aggregate_group())
-    assert verdict.score != 3
+    assert verdict.score == 0
+    assert "none reconciled" in verdict.evidence
+
+
+def test_no_declared_rollup_is_na_not_a_failure():
+    """Names that look like a summary are no longer enough to make this apply.
+
+    Regression: the old gate opened on any table named ``*aggregate*``, so an
+    imported source table could make an environment fail a rollup control it
+    never had. It also missed real rollups named ``balances`` or ``consolidated``.
+    """
+    verdict = aggregate_consistency(_aggregate_group(rollup=False))
+    assert verdict.status is Status.NA
+    assert verdict.scored is False
+    assert "builds no materialised aggregate rollup" in verdict.evidence
+
+
+def test_a_group_by_view_is_not_a_materialised_rollup():
+    """A Fabric Warehouse view is recomputed on every read, so it cannot drift.
+
+    Regression: counting one as a rollup produced seven "unreconciled" findings on
+    a real tenant, every one a plain view that recalculates from the detail each
+    time it is queried and so has no way to lose a row.
+    """
+    view = {
+        "schema": "dbo", "name": "vw_daily_sales", "store": "SalesWarehouse",
+        "definition": (
+            "SELECT sale_day, SUM(amount) AS total_amount "
+            "FROM fact_sales GROUP BY sale_day"
+        ),
+    }
+    verdict = aggregate_consistency(_aggregate_group(rollup=False, views=[view]))
+    assert verdict.status is Status.NA
+    assert "builds no materialised aggregate rollup" in verdict.evidence
+
+
+def test_a_python_import_is_not_read_as_a_detail_table():
+    """``from pyspark.sql import functions`` is an import, not a ``FROM`` clause.
+
+    Regression: it was captured as a detail table named ``sql``, inventing a
+    rollup of ``sql`` into the target in every PySpark notebook that grouped.
+    """
+    code = (
+        "from pyspark.sql import functions as F\n"
+        "df = spark.table('fact_sales')\n"
+        "df.groupBy('sale_day').agg(F.sum('amount'))"
+        ".write.saveAsTable('daily_sales_aggregate')\n"
+    )
+    group = _aggregate_group(
+        rollup=False,
+        notebooks={"nb_rollup": {"cells": [{"cell_type": "code", "source": code}]}},
+    )
+    derivations = _aggregate_derivations(group.members[0].workspace)
+    assert derivations, "the real groupBy -> saveAsTable rollup should still be found"
+    assert all(detail != "sql" for _, detail, _ in derivations)
+    assert any(detail == "fact_sales" for _, detail, _ in derivations)
+
+
+def test_a_lone_environment_with_an_unreconciled_rollup_is_still_scored():
+    """One environment is enough to report a real gap.
+
+    Regression: a two-environment floor discarded genuine findings -- on a real
+    tenant only one workspace per group built a rollup at all, so every group
+    returned N/A while unreconciled rollups sat unreported in the estate.
+    """
+    verdict = aggregate_consistency(_aggregate_group(members=(("PROD", 10),)))
+    assert verdict.scored is True
+    assert verdict.score == 0
+    assert "the only environment" in verdict.evidence
+
+
+def test_a_lone_environment_that_reconciles_its_rollup_passes():
+    sql = """
+DECLARE @detail_total decimal(18,2) = (SELECT SUM(amount) FROM fact_sales);
+DECLARE @aggregate_total decimal(18,2) = (SELECT SUM(total_amount) FROM daily_sales_aggregate);
+IF @detail_total <> @aggregate_total THROW 51000, 'Rollup mismatch', 1;
+"""
+    verdict = aggregate_consistency(
+        _aggregate_group(sql=sql, members=(("PROD", 10),))
+    )
+    assert verdict.score == 3
+
+
+def test_a_rollup_is_not_failed_when_the_sql_endpoint_could_not_be_read():
+    """Views and stored procedures are where a SQL reconciliation lives.
+
+    The real Sales case: a notebook rollup was found, no reconciliation was
+    visible, and the check scored 0 -- but ``tableColumns`` was unreadable in
+    every workspace, so the SQL endpoint had never been crawled and a
+    reconciling stored procedure could not have been seen. Unreadable is not
+    absent.
+    """
+    code = (
+        "df = spark.table('fact_sales')\n"
+        "df.groupBy('sale_day').agg({'amount': 'sum'})"
+        ".write.saveAsTable('daily_sales_aggregate')\n"
+    )
+    verdict = aggregate_consistency(_aggregate_group(
+        rollup=False,
+        notebooks={"nb_rollup": {"cells": [{"cell_type": "code", "source": code}]}},
+        unavailable={Resource.TABLE_COLUMNS},
+    ))
+    assert verdict.status is Status.NA
+    assert verdict.scored is False
+    assert "could not be judged" in verdict.evidence
+    assert "SQL endpoint could not be read" in verdict.evidence
+
+
+# -- 11.1.8 secret scanning ----------------------------------------------------
+
+
+def _git_group(*members: tuple[str, bool, bool]) -> GroupContext:
+    """``(name, git_readable, git_connected)`` per environment."""
+    built = []
+    for index, (name, readable, connected) in enumerate(members):
+        built.append(GroupMemberContext(
+            WorkspaceContext(
+                id=name, display_name=name, layer=Layer.OPERATIONS,
+                git_connected=connected,
+                unavailable=set() if readable else {Resource.GIT},
+            ),
+            (index + 1) * 5,
+            Layer.OPERATIONS,
+        ))
+    return GroupContext(name="Proj", members=tuple(built), settings={})
+
+
+def test_secret_scanning_is_na_when_no_git_connection_could_be_read():
+    """The real MDM case: git unreadable in all 3, yet it scored 1 of 3.
+
+    A blocked read is a permission gap, not a security finding. Scoring it turns
+    "we could not determine this" into a Security deduction.
+    """
+    verdict = secret_scanning_consistent(
+        _git_group(("dev", False, False), ("uat", False, False), ("prod", False, False))
+    )
+    assert verdict.status is Status.NA
+    assert verdict.scored is False
+    assert "permission gap" in verdict.evidence
+
+
+def test_secret_scanning_still_scores_when_one_environment_is_readable():
+    """Partial readability is a coverage question, so it stays scored."""
+    verdict = secret_scanning_consistent(
+        _git_group(("dev", True, False), ("prod", False, False))
+    )
+    assert verdict.scored is True
+    assert verdict.score is not None
+
+
+# -- 8.3.2 technical metadata --------------------------------------------------
+
+
+def _metadata_group(*models: dict) -> GroupContext:
+    built = []
+    for index, model in enumerate(models):
+        built.append(GroupMemberContext(
+            WorkspaceContext(
+                id=f"ws{index}", display_name=f"ws{index}", layer=Layer.STORAGE,
+                tables={"sales": {"columns": [{"name": "id", "type": "int"}]}},
+                semantic_models={"Model": model},
+            ),
+            (index + 1) * 5,
+            Layer.STORAGE,
+        ))
+    return GroupContext(name="Proj", members=tuple(built), settings={})
+
+
+def test_a_bare_semantic_model_is_not_captured_technical_metadata():
+    """Every reporting workspace has a model; crediting one passed every estate.
+
+    Regression: ``bool(ws.semantic_models)`` made this check score 3 in all five
+    lines of business, including a workspace holding five items and one model.
+    """
+    plain = {"tables": ["sales"], "measures": [{"name": "Total", "description": ""}]}
+    verdict = tech_metadata_consistent(_metadata_group(plain, plain))
+    assert verdict.score == 0
+    assert "missing in" in verdict.evidence
+
+
+def test_a_documented_measure_is_captured_technical_metadata():
+    documented = {
+        "tables": ["sales"],
+        "measures": [{"name": "Total", "description": "Net sales excluding tax"}],
+    }
+    verdict = tech_metadata_consistent(_metadata_group(documented, documented))
+    assert verdict.score == 3
+
+
+def test_a_declared_data_category_is_captured_technical_metadata():
+    categorised = {
+        "tables": ["dim_date"], "measures": [],
+        "data_categories": {"dim_date": "Time"},
+    }
+    verdict = tech_metadata_consistent(_metadata_group(categorised, categorised))
+    assert verdict.score == 3
+
+
+def test_a_semantic_model_alternate_of_declares_the_rollup():
+    """TMSL states the base table outright - the strongest signal available."""
+    verdict = aggregate_consistency(_aggregate_group(
+        rollup=False,
+        aggregations=[{
+            "table": "daily_sales_aggregate", "column": "total_amount",
+            "summarization": "sum",
+            "base_table": "fact_sales", "base_column": "amount",
+        }],
+        measure={
+            "name": "Rollup variance",
+            "expression": "SUM(fact_sales[amount]) - SUM(daily_sales_aggregate[total_amount])",
+        },
+    ))
+    assert verdict.score == 3
+    assert "declares" in verdict.evidence
 
 
 def test_semantic_model_detail_to_aggregate_variance_measure_passes():
@@ -124,12 +385,19 @@ IF @detail_total <> @aggregate_total THROW 51000, 'Rollup mismatch', 1;
 
 
 def test_semantic_reconciliation_does_not_require_warehouse_readability():
+    """The model can declare the rollup *and* verify it, with no SQL read at all."""
     measure = {
         "name": "Detail vs Aggregate Variance",
         "expression": "SUM(fact_sales[amount]) - SUM(daily_sales_aggregate[total_amount])",
     }
     verdict = aggregate_consistency(_aggregate_group(
-        measure=measure, unavailable={Resource.TABLE_COLUMNS},
+        measure=measure, rollup=False,
+        aggregations=[{
+            "table": "daily_sales_aggregate", "column": "total_amount",
+            "summarization": "sum",
+            "base_table": "fact_sales", "base_column": "amount",
+        }],
+        unavailable={Resource.TABLE_COLUMNS},
     ))
     assert verdict.score == 3
 
@@ -423,19 +691,30 @@ def test_secret_scan_names_the_connected_repository():
     assert "**Prod**" in verdict.evidence
 
 
-def test_lineage_e2e_names_the_missing_stage_with_counts():
-    """8.1.2: an incomplete environment shows the per-stage counts."""
+def test_lineage_e2e_names_the_untraceable_item():
+    """8.1.2: an item Fabric cannot trace is named, with its environment.
+
+    Rewritten when the check moved from "do a source, a store and a reporting
+    item coexist here?" to "can Fabric actually draw the lineage edge?". Item
+    *types* in the inventory say nothing about wiring, so the fixture now carries
+    real definitions: one pipeline naming a Fabric item, one reaching a raw
+    storage path that no lineage edge can hang off.
+    """
     from auditfast.core.check.governance_compliance.data_operations.group import (
         lineage_e2e_consistent,
     )
 
-    verdict = lineage_e2e_consistent(_layer_group(
-        _workspace("DEV", Layer.MIXED, "Notebook", "Lakehouse", "SemanticModel", "Report"),
-        _workspace("PROD", Layer.MIXED, "DataPipeline", "Warehouse"),
-    ))
+    dev = _workspace("DEV", Layer.MIXED)
+    dev.pipelines = {"PL_Load": {"properties": {"activities": [
+        {"typeProperties": {"notebookId": "nb-1"}}]}}}
+    prod = _workspace("PROD", Layer.MIXED)
+    prod.pipelines = {"PL_Raw": {"properties": {"activities": [
+        {"typeProperties": {"path": "abfss://d@x.dfs.core.windows.net/raw"}}]}}}
+
+    verdict = lineage_e2e_consistent(_layer_group(dev, prod))
     assert verdict.score != 3
-    assert "PROD (L2) [" in verdict.evidence
-    assert "reporting: 0 semantic model(s), 0 report(s)" in verdict.evidence
+    assert "PROD (L2)" in verdict.evidence
+    assert "pipeline 'PL_Raw' names no Fabric item" in verdict.evidence
 
 
 def test_pipeline_sla_names_pipelines_without_run_history():

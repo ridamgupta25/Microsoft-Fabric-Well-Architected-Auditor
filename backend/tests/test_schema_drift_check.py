@@ -1,8 +1,10 @@
-"""Step 4b: the first real cross-workspace check — schema drift (ref 9.1.4).
+"""The cross-workspace schema-drift check (ref 11.4.3b).
 
-Unit-tests the ``XW-SCHEMA-DRIFT`` group check directly: it compares each group
-member's table/column signatures and flags tables that are missing in some
-environment or whose columns differ. Missing schemas ⇒ N/A, never a low score.
+Unit-tests the ``XW-SCHEMA-DRIFT`` group check directly. It scores **shared**
+tables — those present in every environment — on whether their column sets match.
+A table present in only some environments is an inventory difference, reported but
+not scored, and machine-generated tables are excluded outright. Missing schemas ⇒
+N/A, never a low score.
 """
 from __future__ import annotations
 
@@ -41,12 +43,40 @@ def test_identical_schemas_pass():
     assert verdict.scored is True
 
 
-def test_missing_table_is_drift():
+def test_a_table_in_only_one_environment_is_reported_but_not_scored():
+    """An inventory difference, not schema drift.
+
+    Dev legitimately holds work in progress Prod has never seen. Scoring those
+    made a real Dev/UAT/Prod estate 88% "drifted" (822 of 928 tables) and buried
+    the finding that matters: the same table modelled two different ways.
+    """
     dev = {"fact": {"columns": _cols("a", "b")}, "scratch": {"columns": _cols("x")}}
     prod = {"fact": {"columns": _cols("a", "b")}}
     verdict = schema_drift(_group(("DEV", dev, 1), ("PROD", prod, 10)))
-    assert verdict.score is not None and verdict.score < 3
+    assert verdict.score == 3
+    assert "inventory difference" in verdict.evidence
     assert "scratch" in verdict.evidence
+
+
+def test_a_machine_generated_table_is_not_compared_at_all():
+    """The real MDM case: the first 'drifted' table was named ``<guid>_<guid>``."""
+    guid_table = ("9fb7a13f6f324e3d929eddb3453222de_667e88b1_002d1954"
+                  "_002d4541_002da514_002d5a0149c19352")
+    dev = {"fact": {"columns": _cols("a", "b")}, guid_table: {"columns": _cols("x")}}
+    prod = {"fact": {"columns": _cols("a", "b")}}
+    verdict = schema_drift(_group(("DEV", dev, 1), ("PROD", prod, 10)))
+    assert verdict.score == 3
+    assert guid_table not in verdict.evidence
+    assert "inventory difference" not in verdict.evidence
+
+
+def test_na_when_no_table_is_present_in_every_environment():
+    dev = {"only_dev": {"columns": _cols("a")}}
+    prod = {"only_prod": {"columns": _cols("a")}}
+    verdict = schema_drift(_group(("DEV", dev, 1), ("PROD", prod, 10)))
+    assert verdict.status is Status.NA
+    assert verdict.scored is False
+    assert "no shared schema" in verdict.evidence
 
 
 def test_column_mismatch_is_drift():
