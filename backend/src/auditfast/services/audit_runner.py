@@ -103,6 +103,96 @@ class AuditRunner:
         task.add_done_callback(self._tasks.discard)
         return job
 
+    # -- advisory judging -----------------------------------------------------
+    async def submit_advisory(
+        self,
+        audit_id: str,
+        organization_id: str | None,
+        *,
+        out_dir: str | None = None,
+        credentials=None,
+    ) -> AuditJob | None:
+        """Start advisory judging for a finished audit; ``None`` if unknown.
+
+        Separate from :meth:`submit` because judging is a deliberate act taken
+        after the audit, not part of it: it costs tokens, it needs a key the
+        user supplies, and a reviewer may want the deterministic report without
+        ever paying for it.
+
+        Judging reads **this run's** directory, recorded when the audit wrote
+        its files. ``out_dir`` is only a fallback for a job from before per-run
+        directories existed.
+        """
+        job = await self._repository.get(audit_id, organization_id)
+        if job is None:
+            return None
+        if job.advisory_status is JobStatus.RUNNING:
+            return job
+
+        target = job.out_dir or out_dir
+        if not target:
+            job.advisory_status = JobStatus.FAILED
+            job.advisory_error = (
+                "This audit did not record an output directory, so its judging jobs "
+                "cannot be located. Re-run the audit."
+            )
+            await self._repository.update(job)
+            return job
+
+        job.advisory_status = JobStatus.RUNNING
+        job.advisory_error = None
+        await self._repository.update(job)
+
+        task = asyncio.create_task(
+            self._execute_advisory(
+                job,
+                out_dir=target,
+                credentials=credentials,
+                parent_correlation_id=correlation_id.get(),
+            )
+        )
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return job
+
+    async def _execute_advisory(
+        self,
+        job: AuditJob,
+        *,
+        out_dir: str,
+        credentials=None,
+        parent_correlation_id: str = "-",
+    ) -> None:
+        """Judge one audit's advisory jobs, recording success or failure."""
+        correlation_id.set(parent_correlation_id)
+        from . import advisory_service
+
+        try:
+            summary = await asyncio.to_thread(
+                advisory_service.run_advisory,
+                out_dir,
+                credentials=credentials,
+                project_name=job.project_name or "Advisory",
+            )
+            job.advisory_summary = summary
+            job.advisory_status = JobStatus.SUCCEEDED
+            logger.info(
+                "advisory judging finished",
+                extra={
+                    "audit_id": job.id,
+                    "checks_judged": summary.get("checks_judged"),
+                    "findings_changed": summary.get("findings_changed"),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - failure must be recorded, not raised
+            job.advisory_status = JobStatus.FAILED
+            # str(exc), never the exception object: a provider error can carry
+            # the request payload, and that payload holds the user's key.
+            job.advisory_error = str(exc)
+            logger.warning("advisory judging failed", extra={"audit_id": job.id})
+        finally:
+            await self._repository.update(job)
+
     async def _execute(
         self,
         job: AuditJob,
@@ -175,6 +265,7 @@ class AuditRunner:
                 report: dict[str, Any] = audit_service.to_json(run)
                 report["audit_id"] = job.id
                 report = self._merge_answers(job, report)
+                job.out_dir = run.out_dir
                 job.mark_succeeded(report)
                 logger.info(
                     "audit finished",
@@ -260,12 +351,18 @@ class AuditRunner:
                         sql_token_refresher=sql_token_refresher,
                         weight_by_environment=weight_by_environment,
                         external_checks_csv=external_checks_csv,
+                        # The same audit, re-crawled. Writing a second directory
+                        # would leave the newest one empty while this runs, and
+                        # that is the folder both a person and `latest_run_dir`
+                        # reach for.
+                        run_dir=job.out_dir,
                     )
                 )
                 report = audit_service.to_json(run)
                 report["audit_id"] = job.id
                 report = self._merge_answers(job, report)
                 job.report = report
+                job.out_dir = run.out_dir or job.out_dir
                 await self._repository.update(job)
                 logger.info(
                     "audit knowledge base refreshed",

@@ -10,6 +10,8 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, status
 
 from ...schemas.audit import (
+    AdvisoryRunOut,
+    AdvisoryRunRequest,
     AuditAccepted,
     AuditAnswersRequest,
     AuditJobOut,
@@ -95,6 +97,125 @@ async def get_audit(
         report=AuditReport(**job.report) if job.report else None,
         questionnaire=[QuestionnaireItem(**item) for item in job.questionnaire],
         answers_submitted=job.answers_submitted,
+        advisory_status=job.advisory_status,
+    )
+
+
+@router.post(
+    "/{audit_id}/advisory",
+    response_model=AdvisoryRunOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Run advisory judging for a finished audit",
+    responses={
+        404: {"description": "No audit with that id."},
+        409: {"description": "The audit has not finished yet."},
+    },
+)
+async def run_advisory(
+    audit_id: str,
+    request: AdvisoryRunRequest,
+    runner: RunnerDep,
+    settings: SettingsDep,
+    organization_id: OrganizationDep,
+) -> AdvisoryRunOut:
+    """Judge this audit's advisory checks with a model, in the background.
+
+    Deliberately a separate call rather than part of the audit: judging costs
+    tokens against a key the reviewer supplies, so it is something they choose
+    to do once they have seen the deterministic report - not a side effect of
+    running one.
+
+    The key is used for this run and discarded. It is never persisted and never
+    returned.
+    """
+    from ...ai.orchestrator import Credentials, is_enabled
+    from ...schemas.audit import JobStatus
+
+    job = await runner.get(audit_id, organization_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No audit found with id {audit_id!r}.",
+        )
+    if job.status is not JobStatus.SUCCEEDED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Audit {audit_id!r} is {job.status.value}. Advisory judging reads the "
+                "jobs an audit writes when it finishes, so it can only run after one."
+            ),
+        )
+
+    credentials = None
+    if request.api_key:
+        credentials = Credentials(
+            provider=request.provider,
+            api_key=request.api_key,
+            endpoint=request.endpoint,
+            deployment=request.deployment,
+            base_url=request.base_url,
+            model=request.model,
+        )
+        if not credentials.is_usable():
+            needs = (
+                "base_url and model" if request.provider == "openai"
+                else "endpoint and deployment"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"provider '{request.provider}' also needs {needs}.",
+            )
+    elif not is_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "No model is configured on the server, so supply an api_key (and the "
+                "matching endpoint/deployment or base_url/model) with this request."
+            ),
+        )
+
+    started = await runner.submit_advisory(
+        audit_id,
+        organization_id,
+        out_dir=str(settings.output_path),
+        credentials=credentials,
+    )
+    if started is None:  # pragma: no cover - the 404 above already covered this
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No audit found with id {audit_id!r}.",
+        )
+    return AdvisoryRunOut(
+        audit_id=started.id,
+        advisory_status=started.advisory_status,
+        advisory_error=started.advisory_error,
+        summary=started.advisory_summary,
+    )
+
+
+@router.get(
+    "/{audit_id}/advisory",
+    response_model=AdvisoryRunOut,
+    summary="Get advisory judging status",
+    responses={404: {"description": "No audit with that id."}},
+)
+async def get_advisory(
+    audit_id: str,
+    runner: RunnerDep,
+    organization_id: OrganizationDep,
+) -> AdvisoryRunOut:
+    """Poll advisory judging; the summary appears once it has finished."""
+    job = await runner.get(audit_id, organization_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No audit found with id {audit_id!r}.",
+        )
+    return AdvisoryRunOut(
+        audit_id=job.id,
+        advisory_status=job.advisory_status,
+        advisory_error=job.advisory_error,
+        summary=job.advisory_summary,
     )
 
 

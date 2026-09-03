@@ -135,7 +135,15 @@ def failure_notification(ctx: CheckContext) -> Verdict:
         return (activity_type in NOTIFY_CALL_TYPES
                 and bool(NOTIFY_NAME_RE.search(activity.get("name", ""))))
 
-    has_notify = any(is_notifier(a) for a in walk_activities(ctx.obj))
+    activities_found = walk_activities(ctx.obj)
+    if not activities_found:
+        # An empty or unreadable pipeline has nothing to notify *about*, so
+        # "no notification activity" is not a finding about it. Scoring 0 here
+        # asserts a control is missing from something that does no work - the
+        # N/A-not-FAIL rule. On one real estate this failed 11 empty pipelines.
+        return not_applicable("Pipeline has no activities to assess")
+
+    has_notify = any(is_notifier(a) for a in activities_found)
     return binary(has_notify, "A notification activity is present" if has_notify
                   else "No notification activity found")
 
@@ -516,18 +524,34 @@ def pl_deadletter(ctx: CheckContext) -> Verdict:
     if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
         return not_applicable("Pipeline definitions could not be read from Fabric")
     acts = walk_activities(ctx.obj)
-    data_acts = [a for a in acts if (a.get("type") or "") in _DATA_MOVE_TYPES]
-    if not data_acts:
+
+    # Only a Copy activity configures failed-record handling in this pipeline's
+    # own JSON. A notebook, a script, a stored procedure or a child pipeline
+    # does it inside the referenced artifact, and a Lookup moves no rows at all
+    # - it reads a control value for branching.
+    #
+    # The opaque branch below was gated on `data_acts` being empty, so a single
+    # TridentNotebook or Script kept the list non-empty and disabled it: a
+    # pipeline whose entire load runs in a notebook was FAILed for having no
+    # visible reject route. On one estate that produced 15 wrong FAILs out of
+    # 39, including a pipeline of three InvokePipeline calls and one
+    # `EXEC dbo.sp_load_gold`, whose row handling is not knowable from here.
+    visible_acts = [a for a in acts if (a.get("type") or "") == "Copy"]
+    if not visible_acts:
         opaque = sorted({a.get("type") for a in acts
-                         if (a.get("type") or "") in _OPAQUE_MOVE_TYPES})
+                         if (a.get("type") or "") in _DATA_MOVE_TYPES
+                         or (a.get("type") or "") in _OPAQUE_MOVE_TYPES})
+        opaque = [t for t in opaque if t != "Lookup"]
         if opaque:
             return not_applicable(
                 f"Pipeline '{ctx.obj_name}' moves data only through {', '.join(opaque)}, "
                 f"whose failed-record handling is configured inside the referenced artifact "
-                f"(Copy Job / dataflow / child pipeline), not in this pipeline - it cannot be "
-                f"judged from the pipeline definition"
+                f"(notebook / script / Copy Job / dataflow / child pipeline), not in this "
+                f"pipeline - it cannot be judged from the pipeline definition"
             )
         return not_applicable("No data-movement activity to assess for failed records")
+
+    data_acts = visible_acts
 
     redirecting = [
         str(a.get("name") or "?") for a in data_acts if _redirects_bad_rows(a)

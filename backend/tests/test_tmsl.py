@@ -78,6 +78,9 @@ def test_parse_tmsl_tolerates_bare_model_and_garbage():
         # Storage/refresh/aggregation/column metadata degrades to empty on the same terms.
         "storage": {}, "refresh_policies": [], "aggregations": [],
         "columns": [],
+        # Model-level shared M expressions - where a Direct Lake model names the
+        # store it reads. Empty, but present, on a model that declares none.
+        "expressions": [],
         "direct_lake_behavior": "",
         # Declared dataCategory per table - a role signal the classifier prefers
         # over any inference, and empty on a model that declares none.
@@ -271,9 +274,11 @@ def test_a_model_with_no_partitions_still_parses():
     model = parse_tmsl(_TMSL)
     assert model["storage"] == {"Sales": {"modes": [], "source_types": [],
                                           "native_query_partitions": 0,
-                                          "native_query_expressions": []},
+                                          "native_query_expressions": [],
+                                          "entity_sources": []},
                                 "Date": {"modes": [], "source_types": [],
                                          "native_query_partitions": 0,
-                                         "native_query_expressions": []}}
+                                         "native_query_expressions": [],
+                                         "entity_sources": []}}
     assert model["refresh_policies"] == []
     assert model["aggregations"] == []

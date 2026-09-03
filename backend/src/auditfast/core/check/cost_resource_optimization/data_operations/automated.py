@@ -8,7 +8,6 @@ from auditfast.core.check.helpers import (
     Verdict,
     binary,
     covered,
-    graded,
     not_applicable,
     note,
 )
@@ -260,67 +259,4 @@ def capacity_metrics_app(ctx: CheckContext) -> Verdict:
         "normally installed once in an admin workspace and read from there, so "
         "this is not evidence the tenant lacks it — confirm the tenant-level "
         "install with the capacity admin. Reported, not scored."
-    )
-
-
-# =============================================================================
-# 12.2.7 — CU consumption alerting
-# =============================================================================
-
-#: Fabric item types for Data Activator. The REST API reports ``Reflex``;
-#: ``Activator`` is accepted for forward compatibility with the newer name.
-_ACTIVATOR_TYPES: frozenset[str] = frozenset({"Reflex", "Activator"})
-
-
-@check(
-    id="WS-CU-ALERTS", ref="12.2.7",
-    title="CU consumption alerts configured for proactive throttling prevention",
-    pillar=Pillar.COST_MANAGEMENT, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
-    layers=(Layer.OPERATIONS,), requires=[Resource.WORKSPACE, Resource.ITEMS], required=True,
-)
-def cu_consumption_alerts(ctx: CheckContext) -> Verdict:
-    """Some alerting mechanism exists that *could* warn before the capacity throttles.
-
-    The only readable signal is a Data Activator (Reflex) item in the workspace.
-    The trigger conditions inside it — what it watches, at what threshold — are
-    **not** fetched, so a Reflex watching capacity CU usage is indistinguishable
-    from one watching a pipeline failure or a row count.
-
-    Because of that this check **can never award a full pass**: presence caps at
-    a partial credit, and the evidence states outright that the trigger was not
-    inspected. Reporting a PASS would assert something the data cannot support.
-
-    Distinct from ``WS-ACTIVATOR`` (ref 10.5.1), which asks whether the
-    operational workspace has event-driven alerting *at all* and gates on there
-    being pipelines/datasets to raise events about — that check can and does
-    pass. This is the capacity-specific variant: it gates on the workspace being
-    on a **capacity** (no capacity, no CU to throttle, so N/A) and caps the
-    credit because CU-specificity is unverifiable.
-    """
-    if not ctx.workspace.has(Resource.ITEMS):
-        return not_applicable("Workspace items could not be read from Fabric")
-    if not ctx.workspace.has(Resource.WORKSPACE):
-        return not_applicable("Workspace metadata could not be read from Fabric")
-    if not ctx.workspace.capacity_id:
-        return not_applicable(
-            "Workspace is not assigned to a Fabric capacity, so it consumes no "
-            "capacity units to alert on"
-        )
-
-    activators = [i for i in ctx.workspace.items if i.type in _ACTIVATOR_TYPES]
-    if activators:
-        names = ", ".join(sorted(i.display_name or i.id for i in activators)[:3])
-        return graded(
-            2,
-            f"{len(activators)} Data Activator item(s) present ({names}) on capacity "
-            f"'{ctx.workspace.capacity_id}' — an alerting mechanism exists, but the "
-            f"trigger conditions are not fetched, so whether any of them watches CU "
-            f"consumption or a throttling threshold cannot be confirmed. Partial "
-            f"credit only: this check can never award a full pass.",
-        )
-    return graded(
-        0,
-        f"No Data Activator (Reflex) item in a workspace assigned to capacity "
-        f"'{ctx.workspace.capacity_id}' — nothing in the workspace can raise a "
-        f"proactive alert before the capacity throttles.",
     )
