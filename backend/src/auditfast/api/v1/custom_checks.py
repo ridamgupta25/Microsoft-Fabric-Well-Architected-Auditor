@@ -14,6 +14,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, status
 
 from ...ai.orchestrator.ai_config import AiConfig
+from ...services import auth_service
 from ...schemas.custom_checks import (
     AiConfigIn,
     CustomChecksRequest,
@@ -53,11 +54,16 @@ async def run(request: CustomChecksRequest) -> CustomChecksResult:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="No non-empty custom-check prompts were provided.",
         )
+    # Live fetch is opt-in and gated: a token is resolved only to build the gated
+    # provider, which itself returns None unless the feature setting is on.
+    token = auth_service.token_for(request.auth_session) if request.auth_session else None
+    live_provider = custom_checks_service.build_live_provider(token)
     result = custom_checks_service.run_custom_checks(
         prompts,
         workspace_ids=request.workspace_ids,
         approved_check_ids=request.approved_check_ids,
         ai=_to_ai_config(request.ai),
+        live_provider=live_provider,
     )
     return CustomChecksResult(**result)
 

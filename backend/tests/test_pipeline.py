@@ -99,6 +99,35 @@ def test_unique_missing_data_without_provider_stays_pending():
     assert check.fetch_plan is not None
 
 
+def test_data_unavailable_falls_through_to_codegen(monkeypatch):
+    # A fetch that fails only because the data is not in the KB (404 ->
+    # ITEM_TYPE_NOT_SUPPORTED) should reach code-gen when AI is on, so the check
+    # returns a clean N/A instead of a dead-end KB_FETCH_FAILED.
+    monkeypatch.setattr(pipeline, "is_enabled", lambda ai=None: True)
+    session = CustomCheckSession()
+    provider = FakeProvider(FetchResponse(404))
+    pipeline.run_batch(
+        ["ensure semantic models have incremental refresh"],
+        session=session, provider=provider, router=_NOOP_ROUTER, generator=_GEN, reviewer=None,
+    )
+    check = session.checks[0]
+    assert check.lifecycle_status is LifecycleStatus.PROCESSED_CUSTOM
+    assert check.code_gen.status == "GENERATED"
+
+
+def test_permission_error_keeps_its_diagnostic(monkeypatch):
+    # A 403 carries an actionable remediation, so it must NOT be masked by the
+    # code-gen fallback — it stays KB_FETCH_FAILED.
+    monkeypatch.setattr(pipeline, "is_enabled", lambda ai=None: True)
+    session = CustomCheckSession()
+    provider = FakeProvider(FetchResponse(403))
+    pipeline.run_batch(
+        ["ensure semantic models have incremental refresh"],
+        session=session, provider=provider, router=_NOOP_ROUTER, generator=_GEN, reviewer=None,
+    )
+    assert session.checks[0].lifecycle_status is LifecycleStatus.KB_FETCH_FAILED
+
+
 # -- HITL ----------------------------------------------------------------------
 
 def test_hitl_approve_reject_and_pending_review():

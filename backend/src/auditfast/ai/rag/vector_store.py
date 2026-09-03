@@ -94,4 +94,35 @@ class VectorStore:
 STORE = VectorStore()
 
 
-__all__ = ["VectorStore", "Neighbor", "STORE"]
+def create_store():
+    """Build the configured vector-store backend, falling back to in-memory.
+
+    Reads ``vector_store_backend`` from settings: ``"qdrant"`` builds a persistent
+    Qdrant local store (requires the ``qdrant`` extra); anything else — or an
+    import/setup failure — returns the always-available in-memory store, so the
+    router/identifier never break because an optional backend is missing.
+    """
+    import logging
+
+    from ...config.settings import get_settings
+
+    settings = get_settings()
+    if getattr(settings, "vector_store_backend", "memory") != "qdrant":
+        return VectorStore()
+    try:
+        from .qdrant_store import QdrantVectorStore
+
+        path = str(settings.resolve(settings.vector_store_dir))
+        return QdrantVectorStore(path)
+    except Exception:  # noqa: BLE001 - optional backend must never break startup
+        logging.getLogger("auditfast.custom_checks").warning(
+            "Qdrant backend unavailable; using the in-memory vector store.", exc_info=True
+        )
+        return VectorStore()
+
+
+#: Rebind the process-wide store to the configured backend (in-memory by default).
+STORE = create_store()
+
+
+__all__ = ["VectorStore", "Neighbor", "STORE", "create_store"]

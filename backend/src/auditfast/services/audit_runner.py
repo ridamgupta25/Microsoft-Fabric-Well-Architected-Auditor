@@ -265,6 +265,7 @@ class AuditRunner:
                 report: dict[str, Any] = audit_service.to_json(run)
                 report["audit_id"] = job.id
                 report = self._merge_answers(job, report)
+                report = self._attach_custom_checks(job, report)
                 job.out_dir = run.out_dir
                 job.mark_succeeded(report)
                 logger.info(
@@ -361,6 +362,7 @@ class AuditRunner:
                 report = audit_service.to_json(run)
                 report["audit_id"] = job.id
                 report = self._merge_answers(job, report)
+                report = self._attach_custom_checks(job, report)
                 job.report = report
                 job.out_dir = run.out_dir or job.out_dir
                 await self._repository.update(job)
@@ -410,6 +412,28 @@ class AuditRunner:
         return questionnaire_service.merge_answers_into_report(
             report, job.answers, question_ids
         )
+
+    def _attach_custom_checks(self, job: AuditJob, report: dict[str, Any]) -> dict[str, Any]:
+        """Additively fold reviewer-approved custom checks into a report.
+
+        Read-only and never touches the deterministic score: it reuses validated,
+        cached check code and runs it against the audited workspaces' KB. A failure
+        here must never fail the audit, so it is caught and logged.
+        """
+        try:
+            from . import custom_checks_service
+
+            ws_ids = [
+                w.get("id")
+                for w in (job.request.get("workspaces") or [])
+                if isinstance(w, dict) and w.get("id")
+            ]
+            section = custom_checks_service.approved_checks_report(ws_ids or None)
+            if section and section.get("checks"):
+                report["custom_checks"] = section
+        except Exception:  # noqa: BLE001 - additive extra, never fatal to the audit
+            logger.exception("failed to attach custom checks", extra={"audit_id": job.id})
+        return report
 
     # -- reading --------------------------------------------------------------
     async def get(self, job_id: str, organization_id: str | None = None) -> AuditJob | None:

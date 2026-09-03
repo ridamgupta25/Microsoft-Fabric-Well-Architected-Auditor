@@ -40,8 +40,14 @@ class CustomChecksMemory:
         except (ValueError, OSError):
             return {}
 
-    def record(self, ledger: list[dict[str, Any]]) -> None:
-        """Upsert each ledger row into memory (keyed by ``check_id``)."""
+    def record(self, ledger: list[dict[str, Any]], workspace_ids: list[str] | None = None) -> None:
+        """Upsert each ledger row into memory (keyed by ``check_id``).
+
+        ``workspace_ids`` is the scope of *this* run; an approval is remembered
+        against exactly those workspaces so a check is only recalled where it was
+        actually approved.
+        """
+        scope = sorted({str(w) for w in (workspace_ids or []) if w})
         with self._lock:
             store = self._load()
             for row in ledger:
@@ -49,12 +55,25 @@ class CustomChecksMemory:
                 if not cid:
                     continue
                 prev = store.get(cid, {})
+                # A fresh run reports approved=None (no decision made this run);
+                # that must not erase a decision the reviewer made earlier.
+                new_approved = row.get("approved")
+                approved = new_approved if new_approved is not None else prev.get("approved")
+                # The workspaces an approval covers: this run's scope when the
+                # reviewer just approved, otherwise whatever was remembered.
+                if new_approved is True:
+                    approved_ws = scope
+                elif new_approved is False:
+                    approved_ws = []
+                else:
+                    approved_ws = prev.get("approved_workspaces", [])
                 store[cid] = {
                     "check_id": cid,
                     "raw_prompt": row.get("raw_prompt"),
                     "lifecycle_status": row.get("lifecycle_status"),
                     "feasibility": row.get("feasibility"),
-                    "approved": row.get("approved", prev.get("approved")),
+                    "approved": approved,
+                    "approved_workspaces": approved_ws,
                     # Keep the most recent non-empty generated code.
                     "generated_code": row.get("generated_code") or prev.get("generated_code"),
                     "runs": int(prev.get("runs", 0)) + 1,
@@ -79,6 +98,39 @@ class CustomChecksMemory:
             for cid, entry in self._load().items()
             if entry.get("approved") is not None
         }
+
+    def previously_approved(self, workspace_ids: list[str] | None) -> set[str]:
+        """Checks approved for a scope covering all of ``workspace_ids``.
+
+        A check counts as previously approved only when the current selection is
+        within the workspaces its approval covered — so an approval on one
+        workspace is not recalled on a different one. An approval with no recorded
+        scope (older data) is treated as unrestricted for backward compatibility.
+        """
+        wanted = {str(w) for w in (workspace_ids or []) if w}
+        if not wanted:
+            return set()
+        out: set[str] = set()
+        for cid, entry in self._load().items():
+            if not entry.get("approved"):
+                continue
+            scope = {str(w) for w in (entry.get("approved_workspaces") or [])}
+            if not scope or wanted <= scope:
+                out.add(cid)
+        return out
+
+    def approved_checks(self) -> list[dict[str, Any]]:
+        """Every reviewer-approved check that still has validated code to run."""
+        return [
+            {
+                "check_id": cid,
+                "raw_prompt": entry.get("raw_prompt"),
+                "generated_code": entry["generated_code"],
+                "approved_workspaces": list(entry.get("approved_workspaces") or []),
+            }
+            for cid, entry in self._load().items()
+            if entry.get("approved") and entry.get("generated_code")
+        ]
 
 
 __all__ = ["CustomChecksMemory"]

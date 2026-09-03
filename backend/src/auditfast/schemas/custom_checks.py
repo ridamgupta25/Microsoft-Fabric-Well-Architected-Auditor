@@ -48,6 +48,10 @@ class CustomChecksRequest(BaseModel):
         default=None,
         description="Optional per-request AI key/model. When omitted, AI stays off (deterministic).",
     )
+    auth_session: str | None = Field(
+        default=None,
+        description="Optional sign-in session. Only used when live fetch is enabled; ignored otherwise.",
+    )
 
 
 class VerifyAiResult(BaseModel):

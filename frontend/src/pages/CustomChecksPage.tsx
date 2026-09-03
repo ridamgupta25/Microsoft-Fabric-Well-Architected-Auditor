@@ -88,7 +88,14 @@ export function CustomChecksPage() {
         ai: ai ?? undefined,
       });
       setResult(data);
-      if (!approvedIds) setApproved(new Set());
+      if (!approvedIds) {
+        // Pre-tick checks the reviewer approved in a past run so trusted checks
+        // stay approved without re-ticking them every time.
+        const remembered = data.ledger
+          .filter((row) => row.previously_approved)
+          .map((row) => row.check_id);
+        setApproved(new Set(remembered));
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -179,7 +186,7 @@ export function CustomChecksPage() {
               ))}
             </div>
 
-            <div className="mt-4">
+            <div className="mt-4 space-y-1">
               <button
                 type="button"
                 className="btn-primary px-4 py-1.5 text-sm"
@@ -188,6 +195,10 @@ export function CustomChecksPage() {
               >
                 Update report with {approved.size} approved
               </button>
+              <p className="text-xs text-slate-500">
+                Tick <strong>Approve</strong> on the AI-generated checks you trust, then
+                update the report — only approved checks are included.
+              </p>
             </div>
           </Section>
 
@@ -240,11 +251,28 @@ function CheckCard({
               {row.feasibility}
             </span>
           )}
+          {row.previously_approved && (
+            <span
+              className="badge bg-green-100 text-green-700 dark:bg-green-950/60 dark:text-green-400"
+              title="You approved this check in an earlier run — pre-selected for you."
+            >
+              Previously approved
+            </span>
+          )}
           {canApprove && (
-            <label className="flex items-center gap-1.5 text-sm text-slate-600 dark:text-slate-300">
-              <input type="checkbox" checked={approved} onChange={onToggle} />
-              Approve
-            </label>
+            <button
+              type="button"
+              onClick={onToggle}
+              aria-pressed={approved}
+              title="Approve this AI-generated check to include it in the report"
+              className={
+                approved
+                  ? "inline-flex items-center gap-1.5 rounded-md bg-green-600 px-3 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-green-700"
+                  : "inline-flex items-center gap-1.5 rounded-md border border-green-600 px-3 py-1.5 text-sm font-semibold text-green-700 hover:bg-green-50 dark:text-green-400 dark:hover:bg-green-950/40"
+              }
+            >
+              {approved ? "✓ Approved" : "Approve"}
+            </button>
           )}
         </div>
       </div>

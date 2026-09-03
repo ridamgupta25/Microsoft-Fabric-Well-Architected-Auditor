@@ -24,9 +24,10 @@ from ..agents import (
 from ..agents.kb_updater_agent import FetchProvider
 from ..custom_runtime.local_runner import load_and_run
 from ..rag import semantic_router
-from . import kb_source
+from . import is_enabled, kb_source
 from .ai_config import AiConfig
-from .state import CustomCheck, CustomCheckSession, LifecycleStatus
+from .live_provider import ChainedFetchProvider
+from .state import CustomCheck, CustomCheckSession, FetchErrorClass, LifecycleStatus
 
 Router = Callable[[CustomCheck], CustomCheck]
 
@@ -72,6 +73,16 @@ def run_check(
         kb_updater_agent.augment(check, provider, session)  # Node 3b
     # No provider -> the check stays PENDING (data needed, none available).
 
+    # A fetch that failed only because the data is not in the KB (not a permission
+    # or transient error) should not dead-end: with code-gen available, evaluate
+    # it anyway. The generated check reads the collection directly and returns a
+    # clean N/A (e.g. "no notebooks in this workspace") — consistent with a
+    # workspace that does have the items.
+    if check.lifecycle_status is LifecycleStatus.KB_FETCH_FAILED and is_enabled(ai):
+        diag = check.kb_update.diagnostic if check.kb_update else None
+        if diag in (FetchErrorClass.METADATA_UNAVAILABLE, FetchErrorClass.ITEM_TYPE_NOT_SUPPORTED):
+            check.lifecycle_status = LifecycleStatus.PROCESSED_CUSTOM
+
     if check.lifecycle_status in _READY_FOR_CODEGEN:
         code_gen_agent.generate(  # Node 4
             check, session, generator=generator, reviewer=reviewer,
@@ -115,17 +126,25 @@ def run_custom_checks(
     max_attempts: int = 3,
     ai: AiConfig | None = None,
     code_cache: dict[str, str] | None = None,
+    live_provider: FetchProvider | None = None,
 ) -> CustomCheckSession:
     """Run ``prompts`` against already-crawled ``contexts`` (read-only, no HTTP).
 
     Seeds the shared KB from the crawled snapshot(s) and serves any missing field
     from the same snapshot via :class:`SnapshotFetchProvider` - so the pipeline
-    works against real workspace data without issuing a single new API call.
+    works against real workspace data without issuing a single new API call. When
+    a gated ``live_provider`` is supplied, it is chained *after* the snapshot, so a
+    field still missing offline may be fetched live (read-only) — the snapshot is
+    always tried first and the live path is skipped entirely when the provider is
+    disabled.
     """
     session = CustomCheckSession()
     if seed:
         kb_source.seed_session(session, contexts)
-    provider = kb_source.SnapshotFetchProvider(contexts)
+    snapshot = kb_source.SnapshotFetchProvider(contexts)
+    provider = (
+        ChainedFetchProvider(snapshot, live_provider) if live_provider is not None else snapshot
+    )
     return run_batch(
         prompts, session=session, provider=provider, router=router,
         generator=generator, reviewer=reviewer, max_attempts=max_attempts, ai=ai,

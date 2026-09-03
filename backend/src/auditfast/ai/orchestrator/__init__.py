@@ -117,13 +117,52 @@ def complete(
         return None
 
 
+def diagnose(
+    system: str,
+    user: str,
+    *,
+    max_tokens: int = 5,
+    ai: AiConfig | None = None,
+) -> tuple[str | None, str | None]:
+    """Like :func:`complete`, but returns ``(reply, error)``.
+
+    ``error`` is a **sanitized** exception string (the API key is scrubbed) so a
+    caller can show *why* a model call failed — e.g. a 404 wrong-model or a 401
+    auth error — instead of a generic message. ``error`` is ``None`` on success.
+    """
+    if not (is_enabled(ai) if ai is not None else is_enabled()):
+        return None, "AI is not configured."
+    try:
+        client, model = _client_for(ai)
+        response = client.chat.completions.create(
+            model=model,  # type: ignore[arg-type]
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            max_tokens=max_tokens,
+            temperature=0.2,
+        )
+        return (response.choices[0].message.content or "").strip() or None, None
+    except Exception as exc:  # noqa: BLE001 - surfaced as a sanitized string
+        message = str(exc)
+        if ai is not None and ai.api_key:
+            message = message.replace(ai.api_key, "***")
+        return None, message[:300]
+
+
+def _timeout() -> float:
+    """Per-request AI call timeout (seconds) — fail fast on a slow gateway."""
+    return get_settings().ai_request_timeout_seconds
+
+
 def _client_for(ai: AiConfig | None):  # pragma: no cover - needs a live SDK/model
     """Build the OpenAI/Azure client + model name from ``ai`` or ``settings``."""
     if ai is not None:
         if ai.provider == "openai":
             from openai import OpenAI
 
-            return OpenAI(base_url=ai.base_url, api_key=ai.api_key), ai.model
+            return OpenAI(base_url=ai.base_url, api_key=ai.api_key, timeout=_timeout()), ai.model
         from openai import AzureOpenAI
 
         return (
@@ -131,6 +170,7 @@ def _client_for(ai: AiConfig | None):  # pragma: no cover - needs a live SDK/mod
                 azure_endpoint=ai.endpoint,  # type: ignore[arg-type]
                 api_key=ai.api_key,
                 api_version="2024-06-01",
+                timeout=_timeout(),
             ),
             ai.deployment,
         )
@@ -139,7 +179,7 @@ def _client_for(ai: AiConfig | None):  # pragma: no cover - needs a live SDK/mod
         from openai import OpenAI
 
         return (
-            OpenAI(base_url=settings.openai_base_url, api_key=settings.openai_api_key),
+            OpenAI(base_url=settings.openai_base_url, api_key=settings.openai_api_key, timeout=_timeout()),
             settings.openai_model,
         )
     from openai import AzureOpenAI
@@ -148,6 +188,7 @@ def _client_for(ai: AiConfig | None):  # pragma: no cover - needs a live SDK/mod
         AzureOpenAI(
             azure_endpoint=settings.azure_openai_endpoint,  # type: ignore[arg-type]
             api_version="2024-06-01",
+            timeout=_timeout(),
         ),
         settings.azure_openai_deployment,
     )
@@ -158,7 +199,7 @@ def _client_from_credentials(credentials: Credentials):  # pragma: no cover - ne
     if credentials.provider == "openai":
         from openai import OpenAI
 
-        return OpenAI(base_url=credentials.base_url, api_key=credentials.api_key), credentials.model
+        return OpenAI(base_url=credentials.base_url, api_key=credentials.api_key, timeout=_timeout()), credentials.model
     from openai import AzureOpenAI
 
     return (
@@ -166,6 +207,7 @@ def _client_from_credentials(credentials: Credentials):  # pragma: no cover - ne
             azure_endpoint=credentials.endpoint,  # type: ignore[arg-type]
             api_key=credentials.api_key,
             api_version="2024-06-01",
+            timeout=_timeout(),
         ),
         credentials.deployment,
     )

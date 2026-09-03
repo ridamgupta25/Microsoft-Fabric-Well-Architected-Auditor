@@ -213,9 +213,26 @@ class AdvisorySection(BaseModel):
     results: list[CheckResultOut] = Field(default_factory=list)
 
 
+class CustomCheckReportRow(BaseModel):
+    """One reviewer-approved custom check, evaluated for the audited workspaces."""
+
+    check_id: str
+    prompt: str | None = None
+    status: str | None = None
+    score: float | None = None
+    findings: list[str] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
+
+
+class CustomChecksSection(BaseModel):
+    """Approved custom checks folded into a report — 0-100, kept separate."""
+
+    workspaces: int = 0
+    checks: list[CustomCheckReportRow] = Field(default_factory=list)
+
+
 class AuditReport(BaseModel):
     """The full result of a completed audit."""
-
     audit_id: str | None = None
     partial: bool = Field(
         default=False,
@@ -258,6 +275,11 @@ class AuditReport(BaseModel):
         default_factory=AdvisorySection,
         description="Non-deterministic (advisory) checks: excluded from the "
         "deterministic score above and reported separately for human / KB review.",
+    )
+    custom_checks: CustomChecksSection | None = Field(
+        default=None,
+        description="Reviewer-approved custom checks folded into the report "
+        "(scored 0-100, kept separate from the deterministic scorecard).",
     )
 
 

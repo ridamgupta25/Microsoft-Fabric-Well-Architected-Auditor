@@ -21,6 +21,44 @@ function environmentLabel(level: number): string {
   return "Production";
 }
 
+/** Badge/bar/text/row colours for a custom-check status (N/A stays neutral). */
+function customStatusStyle(status: string | null): {
+  badge: string;
+  bar: string;
+  text: string;
+  row: string;
+} {
+  const s = (status ?? "").toUpperCase();
+  if (s.includes("PASS") || s === "OK")
+    return {
+      badge: "bg-green-100 text-green-700 dark:bg-green-950/60 dark:text-green-400",
+      bar: "bg-green-500",
+      text: "text-green-600 dark:text-green-400",
+      row: "bg-green-50/60 dark:bg-green-950/30",
+    };
+  if (s.includes("FAIL") || s.includes("ERROR"))
+    return {
+      badge: "bg-red-100 text-red-800 dark:bg-red-950/40 dark:text-red-300",
+      bar: "bg-red-500",
+      text: "text-red-600",
+      row: "bg-red-50/70 dark:bg-red-950/30",
+    };
+  if (s.includes("WARN") || s.includes("PARTIAL"))
+    return {
+      badge: "bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300",
+      bar: "bg-amber-500",
+      text: "text-amber-600 dark:text-amber-400",
+      row: "bg-amber-50/70 dark:bg-amber-950/30",
+    };
+  // N/A and anything else: neutral, so a not-evaluated check never reads as "Excellent".
+  return {
+    badge: "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300",
+    bar: "bg-slate-400",
+    text: "text-slate-500 dark:text-slate-400",
+    row: "",
+  };
+}
+
 export function ReportPage() {
   const { auditId = "" } = useParams();
   const { data: job, loading, error, reload } = useAsync(
@@ -353,6 +391,79 @@ export function ReportPage() {
       >
         <FindingsTable results={report.results} />
       </Section>
+
+      {(report.custom_checks?.checks.length ?? 0) > 0 && (
+        <Section
+          title="Custom checks"
+          description="Reviewer-approved plain-English checks, scored 0-100 and kept separate from the deterministic scorecard."
+        >
+          <p className="mb-3 text-sm text-slate-500 dark:text-slate-400">
+            {report.custom_checks!.checks.length} approved check
+            {report.custom_checks!.checks.length === 1 ? "" : "s"} evaluated across{" "}
+            {report.custom_checks!.workspaces} workspace
+            {report.custom_checks!.workspaces === 1 ? "" : "s"}.
+          </p>
+          <div className="scroll-x">
+            <table className="table-base">
+              <thead>
+                <tr>
+                  <th className="min-w-[16rem]">Check</th>
+                  <th>Workspace</th>
+                  <th>Object</th>
+                  <th>Status</th>
+                  <th>Score</th>
+                  <th className="min-w-[16rem]">Evidence</th>
+                  <th className="min-w-[14rem]">Recommendation</th>
+                </tr>
+              </thead>
+              <tbody>
+                {report.custom_checks!.checks.map((row) => {
+                  const style = customStatusStyle(row.status);
+                  return (
+                    <tr key={row.check_id} className={style.row}>
+                      <td className="font-medium text-slate-800 dark:text-slate-100">
+                        {row.prompt ?? row.check_id}
+                      </td>
+                      <td className="whitespace-nowrap text-slate-600 dark:text-slate-300">
+                        {heading}
+                      </td>
+                      <td className="text-slate-400">—</td>
+                      <td>
+                        <span className={`badge ${style.badge}`}>{row.status ?? "—"}</span>
+                      </td>
+                      <td className={`whitespace-nowrap font-semibold ${style.text}`}>
+                        {typeof row.score === "number" ? row.score : "—"} / 100
+                      </td>
+                      <td className="text-slate-600 dark:text-slate-300">
+                        {row.findings.length > 0 ? (
+                          <ul className="list-disc space-y-0.5 pl-4">
+                            {row.findings.map((f, i) => (
+                              <li key={i}>{f}</li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <span className="text-slate-400">—</span>
+                        )}
+                      </td>
+                      <td className="text-slate-500">
+                        {row.recommendations.length > 0 ? (
+                          <ul className="list-disc space-y-0.5 pl-4">
+                            {row.recommendations.map((r, i) => (
+                              <li key={i}>{r}</li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <span className="text-slate-400">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Section>
+      )}
     </div>
   );
 }
