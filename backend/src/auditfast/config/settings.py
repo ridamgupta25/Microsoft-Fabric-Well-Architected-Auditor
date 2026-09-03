@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -95,6 +96,32 @@ class Settings(BaseSettings):
     custom_checks_memory_file: str = Field(
         default="custom-checks-runs/memory.json",
         description="Gitignored JSON file backing the custom-checks memory.",
+    )
+
+    # -- custom-checks live fetch (gated, OFF by default) ---------------------
+    # When a check needs a KB field the snapshot lacks, the AI writes read-only
+    # fetch code. Executing it means live Fabric calls, so it is gated OFF: the
+    # executor refuses to run unless this is explicitly enabled AND a signed-in
+    # read-only client is supplied. Off => the pipeline stays fully offline.
+    custom_checks_live_fetch_enabled: bool = Field(
+        default=False,
+        description="Allow executing AI-generated read-only fetch code against a live Fabric client.",
+    )
+    custom_checks_live_fetch_max_calls: int = Field(
+        default=20,
+        description="Max client.get() calls one fetch may make (runaway-loop guard).",
+    )
+    custom_checks_live_fetch_max_bytes: int = Field(
+        default=2_000_000,
+        description="Max serialized bytes a single fetch response may return (size cap).",
+    )
+
+    # -- AI request timeout ---------------------------------------------------
+    # Per-request timeout for a model call, so a slow/unresponsive gateway fails
+    # fast with a clear message instead of hanging until the client aborts.
+    ai_request_timeout_seconds: float = Field(
+        default=30.0,
+        description="Seconds to wait for a single AI model call before giving up.",
     )
 
     # -- SQL analytics endpoint ------------------------------------------------
@@ -194,6 +221,20 @@ class Settings(BaseSettings):
     )
     router_top_k: int = Field(
         default=5, description="How many semantic candidates to retrieve for the intent critic."
+    )
+
+    # -- vector store backend -------------------------------------------------
+    # Nodes 2/3a reach the store only through ``ai/rag/vector_store.py``. The
+    # default in-memory cosine store is fine for the small collections here; set
+    # this to "qdrant" (and ``pip install .[qdrant]``) to persist and scale via
+    # Qdrant local mode. Unknown/unavailable => falls back to memory.
+    vector_store_backend: Literal["memory", "qdrant"] = Field(
+        default="memory",
+        description="Which vector-store backend Nodes 2/3a use.",
+    )
+    vector_store_dir: str = Field(
+        default="kb-cache/vector_store",
+        description="On-disk location for the Qdrant local store (when backend='qdrant').",
     )
 
     # -- custom-checks KB identifier (Node 3a) --------------------------------

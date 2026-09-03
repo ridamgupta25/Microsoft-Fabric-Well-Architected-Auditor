@@ -95,7 +95,7 @@ def test_generate_without_key_is_ai_required(monkeypatch):
 # -- verify_ai -----------------------------------------------------------------
 
 def test_verify_ai_ok(monkeypatch):
-    monkeypatch.setattr(custom_checks_service, "complete", lambda *a, **k: "ok")
+    monkeypatch.setattr(custom_checks_service, "diagnose", lambda *a, **k: ("ok", None))
     result = custom_checks_service.verify_ai(_OPENAI)
     assert result["ok"] is True
 
@@ -106,6 +106,8 @@ def test_verify_ai_incomplete_config():
 
 
 def test_verify_ai_unreachable(monkeypatch):
-    monkeypatch.setattr(custom_checks_service, "complete", lambda *a, **k: None)
+    monkeypatch.setattr(
+        custom_checks_service, "diagnose", lambda *a, **k: (None, "connection refused")
+    )
     result = custom_checks_service.verify_ai(_OPENAI)
     assert result["ok"] is False

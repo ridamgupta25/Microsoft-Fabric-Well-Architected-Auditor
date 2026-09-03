@@ -108,6 +108,8 @@ export interface CustomCheckRow {
   generated_code?: string | null;
   /** Present for generated checks: the 0-100 evaluation over the KB. */
   evaluation?: CustomCheckEvaluation | null;
+  /** True when this check was approved in an earlier run (remembered in memory). */
+  previously_approved?: boolean;
   [key: string]: unknown;
 }
 
@@ -461,6 +463,23 @@ export interface AuditReport {
   kb?: KBProvenance;
   /** Non-deterministic (advisory) checks, scored and reported separately. */
   advisory?: AdvisorySection;
+  /** Reviewer-approved custom checks, scored 0-100, kept out of the scorecard. */
+  custom_checks?: CustomChecksSection;
+}
+
+/** Approved custom checks folded into a report — separate 0-100 scores. */
+export interface CustomChecksSection {
+  workspaces: number;
+  checks: CustomCheckReportRow[];
+}
+
+export interface CustomCheckReportRow {
+  check_id: string;
+  prompt: string | null;
+  status: string | null;
+  score: number | null;
+  findings: string[];
+  recommendations: string[];
 }
 
 /** The non-deterministic checks, kept out of the deterministic scorecard. */
