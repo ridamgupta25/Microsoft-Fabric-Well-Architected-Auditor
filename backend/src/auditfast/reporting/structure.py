@@ -52,6 +52,23 @@ def _asset(result: CheckResult) -> str:
     return result.workspace or "Project-wide"
 
 
+#: Reading order for grouped evidence. A judged verdict is what the reader needs
+#: first; "could not be assessed" is context for the rest. Grouping alone ordered
+#: by workspace name, so an N/A from an alphabetically earlier workspace led the
+#: evidence and the real finding sat below it.
+_EVIDENCE_ORDER = {
+    Status.FAIL: 0,
+    Status.PARTIAL: 1,
+    Status.PASS: 2,
+    Status.INFO: 3,
+    Status.NA: 4,
+}
+
+
+def _evidence_rank(result: CheckResult) -> int:
+    return _EVIDENCE_ORDER.get(result.status, len(_EVIDENCE_ORDER))
+
+
 def _evidence_line(result: CheckResult) -> str:
     evidence = (result.evidence or "No additional evidence recorded").strip()
     return f"{_asset(result)}: {evidence}"
@@ -61,8 +78,13 @@ def _grouped_evidence(
     results: tuple[CheckResult, ...],
     statuses: tuple[Status, ...] | None = None,
 ) -> str:
+    """Distinct evidence lines, judged verdicts first and N/A last.
+
+    The sort is stable, so results sharing a status keep the order they were
+    consolidated in; only the status bands move.
+    """
     grouped: dict[str, list[str]] = {}
-    for result in results:
+    for result in sorted(results, key=_evidence_rank):
         if statuses is not None and result.status not in statuses:
             continue
         evidence = (result.evidence or "No additional evidence recorded").strip()
