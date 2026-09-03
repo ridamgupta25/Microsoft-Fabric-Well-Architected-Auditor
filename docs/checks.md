@@ -74,6 +74,46 @@ await the data needed to judge them.
 The catalog is **not** maintained by hand here — browse the live source of truth:
 `GET /api/v1/catalog/checks`, or `auditfast checks --pillar Security`.
 
+### TLS source-connection evidence
+
+`WS-TLS` (`6.3.4`) is backed by Fabric connection metadata and requires an
+explicit minimum TLS version to produce a scored result. Fabric's
+`connectionEncryption = "Encrypted"` value alone does not prove TLS 1.2+;
+missing minimum-version evidence is reported as N/A. See
+[TLS Evidence for Source Connections](tls-evidence.md) for the provider data
+contract and the source-specific evidence required for live PASS/FAIL results.
+
+---
+
+## Validation flag (Validated vs. Pending)
+
+Independently of its automation category, every check carries a **validation
+flag** — **Validated** once its checklist point has been reviewed against real
+workspace data, or **Pending validation** while it still awaits review. The flag
+is a reviewer-confidence signal; it **does not change any score, status, or
+count**.
+
+There is one source of truth,
+[`core/validation.py`](../backend/src/auditfast/core/validation.py): the
+`VALIDATED_CHECKLIST` mapping, keyed by a check's **`ref`** (not its `id`). Add a
+`"<ref>": "<checklist item>"` line to mark the matching check(s) Validated;
+remove it to send them back to Pending. One `ref` can map to several checks (e.g.
+a pipeline and a notebook variant of the same point) — the flag then applies to
+all of them, and a typo (a `ref` no check owns) is caught by
+[`tests/test_validation.py`](../backend/tests/test_validation.py).
+
+The flag renders everywhere at once:
+
+| Surface | Where it shows |
+|---------|----------------|
+| Catalog page / `GET /api/v1/catalog/checks` | a `validated` field + *Validation* column |
+| UI audit report | a *Validation* column + Validated/Pending filter on the Findings table |
+| Excel report | a *Validation* column on the consolidated `Checklist` sheet + a *Coverage and Validation* block on `Summary` |
+| Markdown report | a *Validation* column in `Checklist` + the same executive-level coverage block |
+
+Editing the checklist changes no scores, counts, or rows, so there is **nothing
+to re-pin**. See [managing-checks.md](managing-checks.md) §4 for the full how-to.
+
 ---
 
 ## Which checks run

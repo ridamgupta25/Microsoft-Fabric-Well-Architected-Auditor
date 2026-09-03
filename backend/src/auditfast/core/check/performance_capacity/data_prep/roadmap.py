@@ -8,15 +8,13 @@ it. When that data is available a check can be promoted to a real evaluator.
 
 Do not edit by hand — regenerate with build-manual-checks.py.
 """
-from auditfast.core.check._gated import Requirement, gated
+from auditfast.core.check._gated import Requirement, gated, pillar_for_ref
 from auditfast.core.check.registry import check
-from auditfast.core.enums import Automation, Layer, Pillar, Resource, Scope
+from auditfast.core.enums import Automation, Layer, Resource, Scope
 
 # (id, ref, title, layers, required, requirement)
 _CHECKS: list[tuple[str, str, str, tuple[str, ...], bool, str]] = [
 
-    ("R-3-4-5", "3.4.5", "Python/Spark version is current and supported", (Layer.PREP,), True, "ITEM_DEFINITION"),
-    ("R-3-5-5", "3.5.5", "No full-table scans when partition pruning is possible", (Layer.PREP,), True, "ITEM_DEFINITION"),
     ("R-3-5-7", "3.5.7", "Gold-layer tables optimized for common query patterns (Z-ORDER on filter columns)", (Layer.PREP,), True, "ITEM_DEFINITION"),
     ("R-3-5-8", "3.5.8", "Predicate pushdown verified for shortcut/external reads", (Layer.PREP,), True, "ITEM_DEFINITION"),
 ]
@@ -24,7 +22,7 @@ _CHECKS: list[tuple[str, str, str, tuple[str, ...], bool, str]] = [
 for _id, _ref, _title, _layers, _required, _requirement in _CHECKS:
     check(
         id=_id, ref=_ref, title=_title,
-        pillar=Pillar.PERFORMANCE, scope=Scope.WORKSPACE,
+        pillar=pillar_for_ref(_ref), scope=Scope.WORKSPACE,
         layers=list(_layers), requires=[Resource.WORKSPACE], required=_required,
         automation=Automation.ROADMAP,
     )(gated(Requirement[_requirement]))

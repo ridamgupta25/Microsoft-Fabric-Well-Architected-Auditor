@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     # -- audit defaults -------------------------------------------------------
     default_project: str = "config/project.example.yaml"
     output_dir: str = "output"
+    fabric_api_timeout_seconds: int = Field(
+        default=180,
+        ge=1,
+        description="HTTP request and getDefinition polling timeout for Fabric APIs.",
+    )
 
     # -- knowledge-base cache -------------------------------------------------
     # Audits are served from an on-disk snapshot of each workspace (the KB) so a
@@ -65,6 +70,19 @@ class Settings(BaseSettings):
     kb_archive_dir: str = Field(
         default="Fabric workspace kb",
         description="Root folder for the permanent, per-run KB archive.",
+    )
+
+    # -- SQL analytics endpoint ------------------------------------------------
+    # Column schemas and Warehouse security policies are not in the Fabric REST
+    # API; they are only readable over TDS (port 1433) against the SQL analytics
+    # endpoint Fabric provisions per Lakehouse/Warehouse. The endpoint address is
+    # discovered over REST, so nothing is ever asked of the user - but the port
+    # must be open outbound and an ODBC driver must be installed. Disable this to
+    # skip the SQL reads entirely; column-level checks then report N/A exactly as
+    # they did before the endpoint was wired in.
+    sql_endpoint_enabled: bool = Field(
+        default=True,
+        description="Read column schemas and Warehouse RLS over the SQL analytics endpoint.",
     )
 
     # -- CORS -----------------------------------------------------------------

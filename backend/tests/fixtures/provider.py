@@ -55,9 +55,13 @@ class RecordedProvider:
             items=[Item.from_api(i) for i in raw.get("items", [])],
             pipelines=dict(raw.get("pipelines") or {}),
             notebooks=dict(raw.get("notebooks") or {}),
+            environments=dict(raw.get("environments") or {}),
             tables=dict(raw.get("tables") or {}),
             shortcuts=dict(raw.get("shortcuts") or {}),
             semantic_models=dict(raw.get("semanticModels") or {}),
+            reports=list(raw.get("reports") or []),
+            lakehouse_files=dict(raw.get("lakehouseFiles") or {}),
+            activators=dict(raw.get("activators") or {}),
         )
 
     def list_workspaces(self) -> list[dict]:

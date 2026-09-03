@@ -8,9 +8,9 @@ it. When that data is available a check can be promoted to a real evaluator.
 
 Do not edit by hand — regenerate with build-manual-checks.py.
 """
-from auditfast.core.check._gated import Requirement, gated
+from auditfast.core.check._gated import Requirement, gated, pillar_for_ref
 from auditfast.core.check.registry import check
-from auditfast.core.enums import Automation, Layer, Pillar, Resource, Scope
+from auditfast.core.enums import Automation, Layer, Resource, Scope
 
 # (id, ref, title, layers, required, requirement)
 _CHECKS: list[tuple[str, str, str, tuple[str, ...], bool, str]] = [
@@ -18,18 +18,14 @@ _CHECKS: list[tuple[str, str, str, tuple[str, ...], bool, str]] = [
     ("R-4-1-2", "4.1.2", "Clear separation between Lakehouse and Warehouse workloads", (Layer.STORAGE,), True, "SQL_ENDPOINT"),
     ("R-4-1-3", "4.1.3", "OneLake used as the single data lake — no shadow storage outside OneLake (except justified ADLS)", (Layer.STORAGE,), True, "SQL_ENDPOINT"),
     ("R-4-1-4", "4.1.4", "Shortcuts don't create circular references or ungoverned data access paths", (Layer.STORAGE,), True, "SQL_ENDPOINT"),
-    ("R-4-2-2", "4.2.2", "Partitioning strategy defined for large tables (by date, region, etc.)", (Layer.STORAGE,), True, "SQL_ENDPOINT"),
-    ("R-4-4-3", "4.4.3", "Fact tables contain only foreign keys and measures (no descriptive attributes)", (Layer.STORAGE,), True, "SQL_ENDPOINT"),
-    ("R-4-4-5", "4.4.5", "Dimension tables are denormalized appropriately (star over snowflake unless justified)", (Layer.STORAGE,), True, "SQL_ENDPOINT"),
     ("R-4-4-6", "4.4.6", "Conformed dimensions shared across fact tables (no duplicate dimension versions)", (Layer.STORAGE,), True, "SQL_ENDPOINT"),
-    ("R-4-4-9", "4.4.9", "SCD strategy defined and implemented per dimension (Type 1 / Type 2 / Type 3 / Hybrid)", (Layer.STORAGE,), True, "SQL_ENDPOINT"),
     ("R-4-4-17", "4.4.17", "Referential integrity enforced: every FK in fact tables has a matching dimension record", (Layer.STORAGE,), True, "SQL_ENDPOINT"),
 ]
 
 for _id, _ref, _title, _layers, _required, _requirement in _CHECKS:
     check(
         id=_id, ref=_ref, title=_title,
-        pillar=Pillar.DATA, scope=Scope.WORKSPACE,
+        pillar=pillar_for_ref(_ref), scope=Scope.WORKSPACE,
         layers=list(_layers), requires=[Resource.WORKSPACE], required=_required,
         automation=Automation.ROADMAP,
     )(gated(Requirement[_requirement]))

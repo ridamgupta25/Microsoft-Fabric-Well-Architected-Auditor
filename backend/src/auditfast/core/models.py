@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from .enums import ITEM_TYPE_SCOPE, Automation, Layer, Pillar, Resource, Scope, Severity, Status
+from .validation import is_validated
 
 #: Highest score any single check can award.
 MAX_SCORE = 3
@@ -32,18 +33,28 @@ class Item:
     display_name: str = ""
     sensitivity_label: str | None = None
     last_run_utc: str | None = None
+    #: ISO-8601 creation timestamp. For semantic models this comes from the Power
+    #: BI datasets API (``createdDate``) — available without admin or capacity, so
+    #: it is the reliable "when created" signal even when there is no refresh
+    #: history. Other item types leave it ``None`` (the List Items API omits it).
+    created_date: str | None = None
 
     @classmethod
     def from_api(cls, raw: dict) -> Item:
+        # Two spellings are real: the Fabric Core items API documents
+        # ``sensitivityLabel.id``, while the Power BI admin/scanner API returns
+        # ``sensitivityLabel.labelId``. Accepting both means a label read through
+        # either route lands in the same field.
         label = raw.get("sensitivityLabel")
         if isinstance(label, dict):
-            label = label.get("labelId")
+            label = label.get("id") or label.get("labelId")
         return cls(
             id=raw.get("id") or "",
             type=raw.get("type") or "",
             display_name=raw.get("displayName") or "",
             sensitivity_label=label,
             last_run_utc=raw.get("lastRunUtc") or raw.get("lastUpdatedDate"),
+            created_date=raw.get("createdDate"),
         )
 
 
@@ -100,12 +111,100 @@ class WorkspaceContext:
     items: list[Item] = field(default_factory=list)
     pipelines: dict[str, dict] = field(default_factory=dict)
     notebooks: dict[str, dict] = field(default_factory=dict)
+    environments: dict[str, dict] = field(default_factory=dict)
+    #: The workspace's default Spark runtime, from
+    #: ``/workspaces/{id}/spark/settings``: ``{"runtime_version": "1.3",
+    #: "default_environment": str}``. A notebook that binds to no named
+    #: Environment inherits this, so without it the runtime check reported N/A on
+    #: the commonest configuration of all. Empty when the settings could not be
+    #: read - which the check must treat as unknown, never as out of date.
+    spark_settings: dict = field(default_factory=dict)
     tables: dict[str, dict] = field(default_factory=dict)
     shortcuts: dict[str, list] = field(default_factory=dict)
     semantic_models: dict[str, dict] = field(default_factory=dict)
+    #: Per-semantic-model refresh *schedule configuration*, keyed by model display
+    #: name: ``{"enabled": bool, "notify_option": str, "notifies_on_failure": bool,
+    #: "days": [str], "times": [str], "local_time_zone_id": str}``. A model absent
+    #: from the map has no configured schedule (Direct Lake, push, or refresh
+    #: driven entirely by a pipeline) — which is a real, readable answer, not a
+    #: read failure. Read failures mark the resource unavailable instead.
+    refresh_schedules: dict[str, dict] = field(default_factory=dict)
+    #: Warehouse row-level-security policies, keyed by warehouse name. Read over the
+    #: SQL analytics endpoint (``sys.security_policies``) because the Fabric REST
+    #: API does not expose them. An empty list for a warehouse is a real finding
+    #: ("defines no policy"); the warehouse being absent from the map means it could
+    #: not be read, which is N/A.
+    warehouse_security: dict[str, list] = field(default_factory=dict)
+    #: Per-Warehouse database options that govern automatic statistics, keyed by
+    #: store name: ``auto_create_stats`` / ``auto_update_stats`` /
+    #: ``auto_update_stats_async``. Read from ``sys.databases``.
+    #:
+    #: These are the *auditable* statistics setting. Fabric maintains statistics
+    #: itself, so no manual UPDATE STATISTICS is required - but a user can switch
+    #: the automatic behaviour off with ALTER DATABASE, and Microsoft says OFF
+    #: "can cause suboptimal query plans and degraded query performance".
+    #: ``None`` means the value could not be read, which is never the same as
+    #: "off".
+    warehouse_options: dict[str, dict] = field(default_factory=dict)
+    #: Per-Warehouse SQL audit *configuration*, keyed by warehouse display name.
+    #: Each value is the normalised ``settings/sqlAudit`` payload:
+    #: ``{"state": str, "enabled": bool, "action_groups": [str], "retention_days": int|None}``.
+    #: A warehouse missing from the map could not be read (N/A); a warehouse
+    #: present with ``enabled=False`` is a real finding. Audit *rows* are never
+    #: fetched — only the configuration.
+    warehouse_audit: dict[str, dict] = field(default_factory=dict)
+    #: Per-item job-run timestamps (ISO-8601 UTC, newest first), keyed by item id.
+    #: Read from the same ``…/jobs/instances`` page that yields
+    #: :attr:`Item.last_run_utc` — no extra call — but retained in full so an
+    #: *observed cadence* (the interval between consecutive runs) can be derived.
+    #: Semantic models are absent: their refresh history is read one row at a time
+    #: from the Power BI API, so no interval is derivable for them.
+    run_history: dict[str, list[str]] = field(default_factory=dict)
+    #: Tenant-level Fabric connection metadata. Credentials and secrets are
+    #: never stored; TLS version and health remain unknown unless a provider
+    #: supplies explicit evidence for them.
+    connections: list[dict] = field(default_factory=list)
+    #: Report → semantic-model bindings, one dict per report in the workspace:
+    #: ``{"id": str, "name": str, "dataset_id": str, "dataset_workspace_id": str}``.
+    #: Only what the reuse checks need — no report definition, no pages, no
+    #: visuals. ``dataset_id`` is empty for a paginated (RDL) report that binds to
+    #: no semantic model, which is a real answer, not a read failure; a failed
+    #: read marks the resource unavailable instead.
+    reports: list[dict] = field(default_factory=list)
+    #: Per-Lakehouse OneLake Files-section summary, keyed by Lakehouse display
+    #: name. Each value is a bounded aggregate only: counts, byte buckets, a small
+    #: top-level folder sample, depth/date counts, and truncation flags. Individual
+    #: file names/paths are deliberately never persisted in the KB.
+    lakehouse_files: dict[str, dict] = field(default_factory=dict)
+    #: Per-Lakehouse summary of the **Tables** section - the same bounded shape as
+    #: :attr:`lakehouse_files`, but for the Delta data files. A Lakehouse's tables
+    #: live under ``Tables/``, so a file-size check that read only ``Files/`` was
+    #: measuring loose landing-area files and ignoring every Parquet file the
+    #: point is actually about. Empty when the listing could not be read, which
+    #: the checks must treat as unknown rather than as an empty Lakehouse.
+    lakehouse_tables_files: dict[str, dict] = field(default_factory=dict)
+    #: Per-Data-Activator (Reflex) rule summary, keyed by item display name:
+    #: ``{"rules": int, "active_rules": int, "sources": int, "actions": int}``,
+    #: parsed from the item's ``ReflexEntities.json`` definition. An Activator
+    #: absent from the map had no readable definition (N/A); one present with
+    #: ``rules=0`` is a real finding — an empty Activator with no trigger.
+    activators: dict[str, dict] = field(default_factory=dict)
     #: The Git provider connection details (provider, org, repo, branch, dir) when
     #: the workspace is Git-connected — the authoritative source for item code.
     git_details: dict = field(default_factory=dict)
+    #: View definitions read over the SQL analytics endpoint:
+    #: ``{"schema", "name", "definition", "store"}``. The definition is capped by
+    #: the reader, so this cannot grow with the size of the data.
+    sql_views: list[dict] = field(default_factory=list)
+    #: Stored procedures and functions, same shape as :attr:`sql_views` plus
+    #: ``type``. This is the Warehouse load logic that no Fabric REST endpoint
+    #: exposes - TRY/CATCH handling, incremental patterns, statistics maintenance.
+    sql_routines: list[dict] = field(default_factory=list)
+    #: Database-scoped principals from the SQL endpoint:
+    #: ``{"name", "type", "authentication", "store"}``. A second, admin-free view
+    #: of "who has access", for the workspace whose role assignments could not be
+    #: read from Fabric REST.
+    sql_principals: list[dict] = field(default_factory=list)
     #: Resources the provider tried and failed to read. A check whose data lands
     #: here must report N/A rather than failing: "we could not determine this" is
     #: not the same finding as "this is not configured".
@@ -123,16 +222,22 @@ class WorkspaceContext:
 
     @property
     def is_complete(self) -> bool:
-        """True when the crawl read everything it attempted.
+        """True when the crawl read everything a re-crawl could still recover.
 
-        Incomplete when a per-item definition/table read failed (tracked in
-        :attr:`read_failures`) or a core list read — items or role assignments —
-        was unavailable. Such a snapshot must not be cached and served as if
-        whole: it would freeze a permission/throttle gap into a believable-looking
-        low score. A lone GIT read failure is tolerated (cheap, rarely blocking).
+        Incomplete when a per-item definition/table read was *blocked* — forbidden
+        or throttled (tracked in :attr:`read_failures`) — or a core list read,
+        items or role assignments, was unavailable. Such a snapshot must not be
+        cached and served as if whole: it would freeze a permission/throttle gap
+        into a believable-looking low score. A lone GIT read failure is tolerated
+        (cheap, rarely blocking), and so is an ``empty`` count — a definition that
+        came back unusable is reported, but re-crawling will not change it.
         """
         blocking = {Resource.ITEMS, Resource.ROLE_ASSIGNMENTS}
-        return not self.read_failures and not (self.unavailable & blocking)
+        recoverable = any(
+            stat.get("forbidden") or stat.get("transient")
+            for stat in self.read_failures.values()
+        )
+        return not recoverable and not (self.unavailable & blocking)
 
     @property
     def name(self) -> str:
@@ -180,10 +285,25 @@ class WorkspaceContext:
             "items": [asdict(i) for i in self.items],
             "pipelines": self.pipelines,
             "notebooks": self.notebooks,
+            "environments": self.environments,
+            "spark_settings": self.spark_settings,
             "tables": self.tables,
             "shortcuts": self.shortcuts,
             "semantic_models": self.semantic_models,
+            "refresh_schedules": self.refresh_schedules,
+            "warehouse_security": self.warehouse_security,
+            "warehouse_options": self.warehouse_options,
+            "warehouse_audit": self.warehouse_audit,
+            "run_history": self.run_history,
+            "connections": self.connections,
+            "reports": self.reports,
+            "lakehouse_files": self.lakehouse_files,
+            "lakehouse_tables_files": self.lakehouse_tables_files,
+            "activators": self.activators,
             "git_details": self.git_details,
+            "sql_views": self.sql_views,
+            "sql_routines": self.sql_routines,
+            "sql_principals": self.sql_principals,
             "unavailable": sorted(r.value for r in self.unavailable),
             "read_failures": self.read_failures,
         }
@@ -202,10 +322,25 @@ class WorkspaceContext:
             items=[Item(**i) for i in data.get("items", [])],
             pipelines=dict(data.get("pipelines", {})),
             notebooks=dict(data.get("notebooks", {})),
+            environments=dict(data.get("environments", {})),
+            spark_settings=dict(data.get("spark_settings", {})),
             tables=dict(data.get("tables", {})),
             shortcuts=dict(data.get("shortcuts", {})),
             semantic_models=dict(data.get("semantic_models", {})),
+            refresh_schedules=dict(data.get("refresh_schedules", {})),
+            warehouse_security=dict(data.get("warehouse_security", {})),
+            warehouse_options=dict(data.get("warehouse_options", {})),
+            warehouse_audit=dict(data.get("warehouse_audit", {})),
+            run_history=dict(data.get("run_history", {})),
+            connections=list(data.get("connections", [])),
+            reports=list(data.get("reports", [])),
+            lakehouse_files=dict(data.get("lakehouse_files", {})),
+            lakehouse_tables_files=dict(data.get("lakehouse_tables_files", {})),
+            activators=dict(data.get("activators", {})),
             git_details=dict(data.get("git_details", {})),
+            sql_views=list(data.get("sql_views", [])),
+            sql_routines=list(data.get("sql_routines", [])),
+            sql_principals=list(data.get("sql_principals", [])),
             unavailable={Resource(v) for v in data.get("unavailable", [])},
             read_failures=dict(data.get("read_failures", {})),
         )
@@ -228,6 +363,55 @@ class CheckContext:
     def setting(self, key: str, default: Any = None) -> Any:
         """Read a tunable from the project YAML's ``project:`` block."""
         return self.settings.get(key, default)
+
+
+@dataclass(frozen=True, slots=True)
+class GroupMemberContext:
+    """One workspace inside a project group, with the environment it represents.
+
+    ``environment_level`` is the 1..10 position the reviewer gave it (1 =
+    dev/least critical, 10 = prod/most critical), so a cross-workspace check can
+    tell *which* member is production without reading its name.
+    """
+
+    workspace: WorkspaceContext
+    environment_level: int
+    layer: Layer
+
+
+@dataclass(frozen=True, slots=True)
+class GroupContext:
+    """Everything a cross-workspace (group) check is handed.
+
+    Holds the already-fetched contexts of the group's *readable* members, sorted
+    by environment level (dev -> prod). A group check compares them and returns a
+    single :class:`~auditfast.core.check.helpers.Verdict` for the project. It must
+    still obey N/A-not-FAIL: when fewer than two members are readable there is
+    nothing to compare, and the engine reports N/A rather than a low score.
+    """
+
+    name: str
+    members: tuple[GroupMemberContext, ...]
+    settings: dict
+
+    def setting(self, key: str, default: Any = None) -> Any:
+        """Read a tunable from the project YAML's ``project:`` block."""
+        return self.settings.get(key, default)
+
+    @property
+    def workspaces(self) -> tuple[WorkspaceContext, ...]:
+        """The member workspace contexts, dev -> prod."""
+        return tuple(member.workspace for member in self.members)
+
+    @property
+    def lowest(self) -> GroupMemberContext | None:
+        """The least production-like readable member (min environment level)."""
+        return self.members[0] if self.members else None
+
+    @property
+    def highest(self) -> GroupMemberContext | None:
+        """The most production-like readable member (max environment level)."""
+        return self.members[-1] if self.members else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,6 +512,54 @@ class CheckSpec:
             "question": self.question or self.title,
             "options": [option.to_dict() for option in self.options],
             "description": self.description or (self.fn.__doc__ or "").strip(),
+            # Whether this check's checklist point has completed Phase 1
+            # validation. Keyed by ref; source of truth:
+            # auditfast.core.validation.VALIDATED_CHECKLIST.
+            "validated": is_validated(self.ref),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class GroupCheckSpec:
+    """Metadata for a cross-workspace (group) check.
+
+    Unlike :class:`CheckSpec` it has no ``scope`` or ``layers``: a group check is
+    not dispatched per object or per layer, but once per project group, receiving
+    a :class:`GroupContext` of the group's readable members. ``requires`` lists
+    the resources each member workspace must have fetched for the comparison.
+    """
+
+    id: str
+    ref: str
+    title: str
+    pillar: Pillar
+    fn: Callable[[GroupContext], Any]
+    severity: Severity = Severity.MEDIUM
+    requires: frozenset[Resource] = frozenset()
+    weight: float = 1.0
+    description: str = ""
+    required: bool = True
+
+    def to_dict(self) -> dict:
+        """Serializable form -- used by the catalog API and the MCP tools."""
+        return {
+            "id": self.id,
+            "ref": self.ref,
+            "title": self.title,
+            "pillar": self.pillar.value,
+            "scope": "group",
+            "severity": self.severity.value,
+            "layers": ["*"],
+            "requires": sorted(r.value for r in self.requires),
+            "weight": self.weight,
+            "required": self.required,
+            "manual": False,
+            "automation": Automation.AUTOMATED.value,
+            "interactive": False,
+            "question": self.title,
+            "options": [],
+            "description": self.description or (self.fn.__doc__ or "").strip(),
+            "validated": is_validated(self.ref),
         }
 
 
@@ -351,6 +583,8 @@ class CheckResult:
     scope: Scope = Scope.WORKSPACE
     weight: float = 1.0
     scored: bool = True
+    #: Source of this check result: "automated" (from engine) or "external" (from CSV).
+    source: str = "automated"
 
     #: Kept as a class attribute so callers can reference ``CheckResult.MAX_SCORE``.
     MAX_SCORE = MAX_SCORE
@@ -383,9 +617,14 @@ class CheckResult:
             "scope": self.scope.value,
             "weight": self.weight,
             "scored": self.scored,
+            "source": self.source,
             # Workspace-level checks are common to every project regardless of
             # source system; the UI flags them as such.
             "common": self.scope is Scope.WORKSPACE,
+            # Whether this check's checklist point has completed Phase 1
+            # validation. Keyed by ref; source of truth:
+            # auditfast.core.validation.VALIDATED_CHECKLIST.
+            "validated": is_validated(self.ref),
         }
 
     @classmethod
@@ -413,4 +652,5 @@ class CheckResult:
             scope=Scope(data.get("scope", Scope.WORKSPACE.value)),
             weight=data.get("weight", 1.0),
             scored=data.get("scored", True),
+            source=data.get("source", "automated"),
         )

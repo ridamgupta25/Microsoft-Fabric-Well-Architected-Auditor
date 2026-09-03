@@ -12,13 +12,14 @@ always produces the same score.
 | # | Document | Read it when you want to… |
 |---|----------|---------------------------|
 | 1 | **[getting-started.md](getting-started.md)** | **Set the project up and run it.** Prerequisites, install, both servers, first audit, troubleshooting |
-| 2 | [architecture.md](architecture.md) | Understand the layers, the runtime flow, and the contracts everything hangs off |
-| 3 | [checks.md](checks.md) | See every check, or add a new one |
-| 4 | [managing-checks.md](managing-checks.md) | **Step-by-step**: add / remove checks, and run automated-only vs. the self-assessed questionnaire (share this with colleagues) |
-| 5 | [scoring.md](scoring.md) | Understand how 0–3 scores roll up into pillar percentages |
-| 6 | [api.md](api.md) | Call the API from a client, a script, or a test |
-| 7 | [migration.md](migration.md) | See what changed from the Flask original, what was reused, and why |
-| 8 | [scalability.md](scalability.md) | Plan for scale, Azure deployment, and the future AI layer |
+| 2 | **[how-to-use.md](how-to-use.md)** | **Use the tool, screen by screen.** Sign in, run an audit, read the report, use the CLI — the guide to share with colleagues |
+| 3 | [architecture.md](architecture.md) | Understand the layers, the runtime flow, and the contracts everything hangs off |
+| 4 | [checks.md](checks.md) | See every check, or add a new one |
+| 5 | [managing-checks.md](managing-checks.md) | **Step-by-step**: add / remove checks, and run automated-only vs. the self-assessed questionnaire |
+| 6 | [scoring.md](scoring.md) | Understand how 0–3 scores roll up into pillar percentages |
+| 7 | [api.md](api.md) | Call the API from a client, a script, or a test |
+| 8 | [migration.md](migration.md) | See what changed from the Flask original, what was reused, and why |
+| 9 | [scalability.md](scalability.md) | Plan for scale, Azure deployment, and the future AI layer |
 
 New to the codebase? **getting-started.md** then **architecture.md**. The rest
 assumes their vocabulary.

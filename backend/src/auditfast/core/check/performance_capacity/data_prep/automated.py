@@ -11,11 +11,18 @@ guidance from the vendored ``fabric-skills``.
 """
 from __future__ import annotations
 
-from auditfast.core.check._notebook import notebook_code
-from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities
+import re
+from datetime import datetime, timezone
+
+from auditfast.core.check._notebook import (
+    executable_code,
+    notebook_code,
+    strip_sql_comments,
+)
+from auditfast.core.check._pipeline import PIPELINE_LAYERS, activities, walk_activities
 from auditfast.core.check.helpers import Verdict, binary, covered, graded, not_applicable
 from auditfast.core.check.registry import check
-from auditfast.core.enums import Pillar, Resource, Scope, Severity
+from auditfast.core.enums import Layer, Pillar, Resource, Scope, Severity
 from auditfast.core.models import CheckContext
 
 from . import _spark
@@ -24,23 +31,45 @@ from ._spark import NOTEBOOK_LAYERS, pip_targets, unpinned_targets, writes_delta
 # -- Delta table maintenance (3.3.x) ------------------------------------------
 
 @check(
-    id="DELTA-MERGE", ref="3.3.1", title="Upserts use a single atomic MERGE",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
-    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+    id="DELTA-MERGE", ref="3.3.1", title="Single `MERGE INTO` handles I/U/D atomically — not separate sequential DELETE/INSERT/UPDATE",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=(*NOTEBOOK_LAYERS, Layer.STORAGE),
+    requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def delta_merge(ctx: CheckContext) -> Verdict:
-    """A single ``MERGE INTO`` handles insert/update/delete, not sequential DML."""
-    code = notebook_code(ctx.obj)
-    if _spark.MERGE.search(code):
+    """A single ``MERGE INTO`` handles insert/update/delete, not sequential DML.
+
+    Sequential DML counts as the "should be one MERGE" anti-pattern only when the
+    statements form one logical upsert of one table — so they are grouped **per
+    code cell**, not across the whole notebook. That stops an ad-hoc / scratch
+    notebook, whose independent one-off statements (register a metadata row here,
+    fix a watermark there) are scattered across separate cells, from being read as
+    a single delete-insert upsert. Commented-out DML (Python ``#`` and SQL ``--``
+    / ``/* */``) is ignored.
+    """
+    violations = _spark.sequential_dml_violations(ctx.obj)
+    if violations:
+        evidence = "; ".join(
+            f"{target} ({' + '.join(target_operations).upper()})"
+            for target, target_operations in sorted(violations.items())
+        )
+        return graded(
+            0,
+            f"Separate DML statements in one cell target the same table instead of "
+            f"a single MERGE: {evidence}. "
+            f"Consolidate them into one `MERGE INTO <target> USING <source> ON <key>` with "
+            f"WHEN MATCHED / WHEN NOT MATCHED clauses so the insert, update, and delete "
+            f"apply atomically in a single pass instead of separate sequential "
+            f"DELETE/INSERT/UPDATE statements.",
+        )
+    if _spark.MERGE.search(strip_sql_comments(executable_code(ctx.obj))):
         return binary(True, "Uses MERGE INTO for atomic upserts")
-    if _spark.SEQ_DELETE.search(code) and _spark.SEQ_INSERT.search(code):
-        return graded(0, "Separate DELETE + INSERT detected instead of a single MERGE")
     return not_applicable("Notebook performs no upsert/merge logic")
 
 
 @check(
-    id="DELTA-OPTIMIZE", ref="3.3.2", title="OPTIMIZE runs after write-heavy operations",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    id="DELTA-OPTIMIZE", ref="3.3.2", title="`OPTIMIZE` (bin-compaction) scheduled appropriately (not after every micro-batch)",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def delta_optimize(ctx: CheckContext) -> Verdict:
@@ -54,8 +83,8 @@ def delta_optimize(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="DELTA-VACUUM", ref="3.3.3", title="VACUUM scheduled to clean up old Delta files",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    id="DELTA-VACUUM", ref="3.3.3", title="`VACUUM` scheduled to clean up old Delta files",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def delta_vacuum(ctx: CheckContext) -> Verdict:
@@ -69,8 +98,8 @@ def delta_vacuum(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="DELTA-ZORDER", ref="3.3.4", title="Z-ORDER applied on high-cardinality filter columns",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    id="DELTA-ZORDER", ref="3.3.4", title="Z-ORDER / liquid clustering applied on high-cardinality filter columns",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def delta_zorder(ctx: CheckContext) -> Verdict:
@@ -84,17 +113,30 @@ def delta_zorder(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="DELTA-VORDER", ref="3.3.5", title="V-Order enabled for read-optimized workloads",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    id="DELTA-VORDER", ref="3.3.5", title="V-Order enabled where Fabric recommends for read-optimized workloads",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def delta_vorder(ctx: CheckContext) -> Verdict:
-    """Explicit V-Order configuration is present where read-optimization matters."""
-    code = notebook_code(ctx.obj)
+    """Explicit V-Order configuration is present where read-optimization matters.
+
+    **What it cannot determine.** The *effective* setting. V-Order is on by
+    default in Fabric and can also be set on the environment, the session or the
+    table property - none of which is readable from a notebook definition. So a
+    notebook with no explicit configuration is N/A ("we cannot tell"), never a
+    finding: writing no V-Order line is the normal, correct case.
+    """
+    code = executable_code(ctx.obj)
     if not writes_delta(code):
         return not_applicable("Notebook does not write Delta tables")
+    if _spark.VORDER_DISABLED.search(code):
+        return binary(False, "V-Order is explicitly disabled for a Delta write")
+    if _spark.VORDER_ENABLED.search(code):
+        return binary(True, "V-Order is explicitly enabled for a Delta write")
     if _spark.VORDER.search(code):
-        return binary(True, "Explicit V-Order configuration found")
+        return not_applicable(
+            "V-Order is referenced, but its effective value is not a static true/false setting"
+        )
     return not_applicable(
         "No explicit V-Order config; Fabric enables V-Order by default "
         "(cannot verify the effective setting from code)"
@@ -102,13 +144,20 @@ def delta_vorder(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="DELTA-TBLPROPS", ref="3.3.6", title="Delta table optimization properties set",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    id="DELTA-TBLPROPS", ref="3.3.6", title="Table properties set appropriately (optimizeWrite, autoCompaction)",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def delta_tblprops(ctx: CheckContext) -> Verdict:
-    """Write-side tuning (autoOptimize / optimizeWrite / autoCompaction) is set."""
-    code = notebook_code(ctx.obj)
+    """Write-side tuning (autoOptimize / optimizeWrite / autoCompaction) is set.
+
+    Unlike its V-Order and retention siblings this one *scores* the absent case,
+    at 1 rather than 0: write tuning is a deliberate choice a notebook author
+    makes in code, so its absence is a real (if minor) observation rather than
+    something unknowable. The properties can also be set on the table or the
+    environment, which is why it is a partial score and not a failure.
+    """
+    code = executable_code(ctx.obj)
     if not writes_delta(code):
         return not_applicable("Notebook does not write Delta tables")
     if _spark.TBLPROPS.search(code):
@@ -120,28 +169,51 @@ def delta_tblprops(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="DELTA-RETENTION", ref="3.3.7", title="Delta history retention configured",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    id="DELTA-RETENTION", ref="3.3.7", title="Delta table history / log retention configured and monitored",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def delta_retention(ctx: CheckContext) -> Verdict:
-    """Log / deleted-file retention is tuned rather than left at the default."""
-    code = notebook_code(ctx.obj)
+    """Log / deleted-file retention is deliberately configured or actively maintained.
+
+    Passes only on a **positive** signal that retention is being managed:
+
+    * a ``delta.logRetentionDuration`` / ``delta.deletedFileRetentionDuration``
+      table property — set via ``TBLPROPERTIES(...)``, ``ALTER TABLE ... SET
+      TBLPROPERTIES(...)``, or a session ``spark.conf.set(...)``; or
+    * a ``VACUUM``, which actively enforces the deleted-file retention window.
+
+    **N/A, never a finding, on absence.** The absence of a retention line is not
+    proof of a policy: the *effective* retention can be set on the table, the
+    environment, or by a ``VACUUM`` run in another notebook, and the table
+    properties are not part of the crawl snapshot — so "no signal in this code" is
+    *unknowable*, not misconfigured. Awarding a pass for the absence of
+    configuration would claim a "configured and monitored" policy that could not
+    be seen, so absence maps to N/A. Comments (Python ``#`` and SQL ``--`` /
+    ``/* */``) are stripped first so a commented-out setting never counts.
+    """
+    code = strip_sql_comments(executable_code(ctx.obj))
     if not writes_delta(code):
         return not_applicable("Notebook does not write Delta tables")
     if _spark.RETENTION.search(code):
-        return binary(True, "Delta history/log retention explicitly configured")
+        return binary(True, "Delta log/deleted-file retention is explicitly configured "
+                      "(delta.logRetentionDuration / delta.deletedFileRetentionDuration)")
+    if _spark.VACUUM.search(code):
+        return binary(True, "Runs VACUUM, which actively enforces the Delta "
+                      "deleted-file retention window")
     return not_applicable(
-        "No explicit Delta retention config; Fabric defaults apply "
-        "(cannot verify from code)"
+        "Delta retention not assessable — no delta.logRetentionDuration / "
+        "delta.deletedFileRetentionDuration TBLPROPERTIES, ALTER TABLE SET "
+        "TBLPROPERTIES, or VACUUM found in code, and table properties were not "
+        "fetched, so Fabric defaults apply and cannot be verified from the notebook"
     )
 
 
 # -- Spark environment & tuning (3.4.x / 3.5.x) -------------------------------
 
 @check(
-    id="SPARK-ENV", ref="3.4.1", title="Fabric Environments manage Spark dependencies",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    id="SPARK-ENV", ref="3.4.1", title="Fabric Environments used to manage Spark dependencies",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def spark_env(ctx: CheckContext) -> Verdict:
@@ -158,8 +230,8 @@ def spark_env(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="SPARK-LIBPIN", ref="3.4.2", title="Custom library versions pinned (not floating)",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    id="SPARK-LIBPIN", ref="3.4.2", title="Custom library versions pinned (not latest/floating)",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def spark_libpin(ctx: CheckContext) -> Verdict:
@@ -186,8 +258,8 @@ def spark_libpin(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="SPARK-CONF", ref="3.4.4", title="Spark configuration tuned from defaults",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    id="SPARK-CONF", ref="3.4.4", title="Spark configuration tuned from defaults where justified (shuffle partitions, memory)",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def spark_conf(ctx: CheckContext) -> Verdict:
@@ -202,8 +274,8 @@ def spark_conf(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="SPARK-SHUFFLE", ref="3.5.2", title="Shuffle partition count tuned for data size",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    id="SPARK-SHUFFLE", ref="3.5.2", title="Partition count appropriate (not 200 default for small/medium data)",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def spark_shuffle(ctx: CheckContext) -> Verdict:
@@ -217,8 +289,8 @@ def spark_shuffle(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="SPARK-CACHE", ref="3.5.3", title="Caching used judiciously and released",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    id="SPARK-CACHE", ref="3.5.3", title="Caching (`persist`/`cache`) used judiciously, not indiscriminately",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def spark_cache(ctx: CheckContext) -> Verdict:
@@ -232,23 +304,123 @@ def spark_cache(ctx: CheckContext) -> Verdict:
 
 
 @check(
-    id="SPARK-REPARTITION", ref="3.5.4", title="Write partition strategy is explicit",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    id="SPARK-REPARTITION", ref="3.5.4", title="Write operations use appropriate partition strategy (coalesce vs repartition; right-sized files)",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def spark_repartition(ctx: CheckContext) -> Verdict:
-    """Writes use an explicit ``coalesce``/``repartition`` rather than the default."""
-    code = notebook_code(ctx.obj)
+    """Managed/table writes declare partitioning or file-sizing rather than defaulting.
+
+    Accepted definition signals include ``coalesce``/``repartition``, writer
+    ``partitionBy``, Fabric Optimize Write with a target bin size, and automatic
+    compaction. The definition cannot prove the resulting physical files are
+    right-sized; that requires table/file statistics which this check does not
+    fetch.
+    """
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+
+    code = strip_sql_comments(executable_code(ctx.obj))
     if not writes_delta(code):
         return not_applicable("Notebook does not write tables")
-    if _spark.REPARTITION.search(code):
-        return binary(True, "Explicit coalesce/repartition before writes")
-    return not_applicable("No explicit repartition/coalesce; default partitioning on write")
+
+    def write_path_uses(method: str) -> bool:
+        direct = re.search(
+            rf"\.{method}\s*\([^)]*\)\s*\.?\s*\\?\s*\.write\b",
+            code,
+            re.IGNORECASE,
+        )
+        if direct:
+            return True
+        assignments = re.finditer(
+            rf"(?m)^\s*([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\.{method}\s*\(",
+            code,
+            re.IGNORECASE,
+        )
+        return any(
+            re.search(rf"\b{re.escape(match.group(1))}\s*\.write\b", code[match.end():], re.IGNORECASE)
+            for match in assignments
+        )
+
+    strategies: list[str] = []
+    if write_path_uses("repartition"):
+        strategies.append("repartition")
+    if write_path_uses("coalesce"):
+        strategies.append("coalesce")
+
+    partition_match = re.search(
+        r"\.write\b(?:\s*\\?\s*\.\w+\s*\([^)]*\))*?"
+        r"\s*\\?\s*\.partitionBy\s*\(([^)\n]*)\)",
+        code,
+        re.IGNORECASE,
+    )
+    partition_columns: list[str] = []
+    if partition_match:
+        partition_columns = re.findall(r"[\"']([^\"']+)[\"']", partition_match.group(1))
+        label = ", ".join(partition_columns) if partition_columns else "declared columns"
+        strategies.append(f"partitionBy({label})")
+
+    optimize_write = bool(re.search(
+        r"(?:spark\.microsoft\.delta\.optimizeWrite\.enabled|"
+        r"delta\.autoOptimize\.optimizeWrite|optimizeWrite)[\"']?\s*"
+        r"(?:,\s*|[=:]\s*)[\"']?true\b",
+        code,
+        re.IGNORECASE,
+    ))
+    bin_match = re.search(
+        r"optimizeWrite\.binSize[\"']?\s*(?:,\s*|[=:]\s*)[\"']?(\d+)",
+        code,
+        re.IGNORECASE,
+    )
+    bin_size = int(bin_match.group(1)) if bin_match else None
+    auto_compact = bool(re.search(
+        r"(?:delta\.autoOptimize\.autoCompact|autoCompaction|autoCompact)[\"']?\s*"
+        r"(?:,\s*|[=:]\s*)[\"']?true\b",
+        code,
+        re.IGNORECASE,
+    ))
+
+    if optimize_write:
+        strategies.append("Optimize Write is enabled")
+    if bin_size is not None:
+        if bin_size % (1024 ** 3) == 0:
+            size_label = f"{bin_size // (1024 ** 3)} GiB"
+        elif bin_size % (1024 ** 2) == 0:
+            size_label = f"{bin_size // (1024 ** 2)} MiB"
+        else:
+            size_label = f"{bin_size} bytes"
+        strategies.append(f"Optimize Write target {size_label}")
+    if auto_compact:
+        strategies.append("automatic compaction enabled")
+
+    runtime_note = "actual physical file sizes require runtime table/file statistics"
+    if any(strategy in strategies for strategy in ("repartition", "coalesce")) or (
+        optimize_write and bin_size is not None
+    ):
+        return graded(
+            3,
+            f"Managed/table write has an explicit partition/file-sizing strategy: "
+            f"{'; '.join(strategies)}; {runtime_note}",
+        )
+    if strategies:
+        return graded(
+            2,
+            f"Managed/table write has a partial partition/file-sizing strategy: "
+            f"{'; '.join(strategies)}, but no explicit coalesce/repartition or enabled "
+            f"Optimize Write file-size target; {runtime_note}",
+        )
+    return binary(
+        False,
+        "Managed/table write uses default partitioning: no executable coalesce(...), "
+        "repartition(...), partitionBy(...), enabled Optimize Write, or automatic "
+        "compaction strategy was found, so output partition/file counts are not "
+        "explicitly controlled",
+    )
 
 
 @check(
-    id="SPARK-SELECT", ref="3.5.9", title="Explicit column projection (no SELECT *)",
-    pillar=Pillar.PERFORMANCE, scope=Scope.NOTEBOOK, severity=Severity.LOW,
+    id="SPARK-SELECT", ref="3.5.8", title="Unnecessary columns eliminated in reads (explicit select, not `SELECT *`)",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.LOW,
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
 )
 def spark_select(ctx: CheckContext) -> Verdict:
@@ -261,24 +433,576 @@ def spark_select(ctx: CheckContext) -> Verdict:
     return binary(True, "Projects explicit columns (no SELECT *)")
 
 
-# -- Copy activity parallelism (2.6.2) ----------------------------------------
+# -- Workload evidence (3.4.x / 3.5.x) ----------------------------------------
 
 @check(
-    id="PL-COPY-PARALLEL", ref="2.6.2", title="Copy activities use appropriate parallelism",
-    pillar=Pillar.PERFORMANCE, scope=Scope.PIPELINE, severity=Severity.LOW,
+    id="SPARK-RUNTIME", ref="3.4.5", title="Python/Spark runtime version is current and supported",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS, Resource.ENVIRONMENT_DEFINITIONS], required=True,
+)
+def spark_runtime(ctx: CheckContext) -> Verdict:
+    """The Spark runtime a notebook actually runs on is current and supported.
+
+    **Three sources, strongest first.** A notebook bound to a named Environment
+    runs that Environment's runtime; failing that, the workspace's *default*
+    runtime from ``/workspaces/{id}/spark/settings``, which is what a notebook
+    with no binding inherits and the commonest setup of all; failing that, a
+    Spark version captured in the notebook's own output.
+
+    Before the workspace default was read, a notebook that bound to no
+    Environment reported "no runtime found" - N/A on the majority configuration,
+    while the estates most worth auditing looked unassessable.
+
+    **What it cannot determine.** Whether a runtime is *supported today*: Fabric
+    retires runtimes on its own schedule, so the bar is the project's
+    ``minimum_spark_version`` rather than a live support matrix. An unrecognised
+    runtime is N/A, never a failure - a runtime newer than this code knows about
+    must not read as out of date.
+    """
+    environment = ctx.obj.get("_auditfast_environment") if isinstance(ctx.obj, dict) else None
+    configured = environment.get("runtime_version") if isinstance(environment, dict) else None
+    source = f"Environment {environment.get('name', 'bound Environment')}" if configured else ""
+
+    if not configured:
+        settings = ctx.workspace.spark_settings or {}
+        configured = settings.get("runtime_version") or ""
+        if configured:
+            named = settings.get("default_environment")
+            source = (f"workspace default runtime (Environment {named})" if named
+                      else "workspace default runtime")
+
+    if configured:
+        runtime = _spark.fabric_runtime_to_spark(str(configured))
+        minimum = _spark.parse_version(ctx.setting("minimum_spark_version", "3.5"))
+        if runtime is None:
+            return not_applicable(
+                f"Runtime {configured!r} is not one this check knows how to map to a "
+                f"Spark version, so it is not judged - a runtime newer than this code "
+                f"must not read as out of date"
+            )
+        if minimum is None:
+            return not_applicable("Project minimum_spark_version is invalid; expected major.minor[.patch]")
+        actual = ".".join(map(str, runtime))
+        required = ".".join(map(str, minimum))
+        return binary(
+            runtime >= minimum,
+            f"{source} is Fabric runtime {configured} (Spark {actual}); "
+            f"required minimum is {required}",
+        )
+
+    versions = _spark.captured_spark_versions(ctx.obj)
+    if not versions:
+        return not_applicable(
+            "No Environment binding, no workspace default Spark runtime, and no "
+            "captured Spark version in the notebook output, so the runtime this "
+            "notebook runs on is not readable"
+        )
+    minimum = _spark.parse_version(ctx.setting("minimum_spark_version", "3.5"))
+    if minimum is None:
+        return not_applicable("Project minimum_spark_version is invalid; expected major.minor[.patch]")
+    runtime = versions[-1]
+    actual = ".".join(map(str, runtime))
+    required = ".".join(map(str, minimum))
+    return binary(
+        runtime >= minimum,
+        f"Captured Spark runtime {actual}; required minimum is {required}",
+    )
+
+
+@check(
+    id="SPARK-POOL", ref="3.4.3", title="Spark pool size appropriate for workload (not over- or under-provisioned)",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def spark_pool(ctx: CheckContext) -> Verdict:
+    """Recent Spark resource usage stays within deterministic utilization limits."""
+    usage = _spark.monitoring(ctx.obj).get("resource_usage")
+    if not isinstance(usage, dict):
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' has no captured Spark resource-usage metrics "
+            f"(duration, idleTime, coreEfficiency, capacityExceeded)"
+        )
+    duration = _spark.number(usage.get("duration"))
+    efficiency = _spark.number(usage.get("coreEfficiency"), -1)
+    idle_ratio = _spark.number(usage.get("idleTime")) / duration if duration > 0 else -1
+    if efficiency < 0 or idle_ratio < 0:
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' has Spark metrics, but duration, idleTime, "
+            f"or coreEfficiency is missing or invalid"
+        )
+    minimum_efficiency = _spark.number(ctx.setting("minimum_spark_core_efficiency", 0.5), -1)
+    maximum_idle = _spark.number(ctx.setting("maximum_spark_idle_ratio", 0.3), -1)
+    if minimum_efficiency < 0 or maximum_idle < 0:
+        return not_applicable("Spark pool utilization thresholds are invalid")
+    exceeded = bool(usage.get("capacityExceeded"))
+    ok = efficiency >= minimum_efficiency and idle_ratio <= maximum_idle and not exceeded
+    duration_minutes = duration / 60_000
+    return binary(
+        ok,
+        f"Notebook '{ctx.obj_name}': duration={duration_minutes:.1f} min, "
+        f"coreEfficiency={efficiency:.4f} (minimum={minimum_efficiency:.4f}), "
+        f"idleRatio={idle_ratio:.4f} (maximum={maximum_idle:.4f}), "
+        f"capacityExceeded={exceeded}",
+    )
+
+
+@check(
+    id="SPARK-UI", ref="3.5.1", title="Spark UI reviewed for skew, spill, shuffle issues on key jobs",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def spark_ui_review(ctx: CheckContext) -> Verdict:
+    """Recent Spark Advisor and stage metrics show no material performance issue."""
+    evidence = _spark.monitoring(ctx.obj)
+    if "advice" not in evidence and "stages" not in evidence:
+        return not_applicable("Spark Advisor and stage metrics are unavailable for this notebook")
+    threshold = int(_spark.number(ctx.setting("heavy_shuffle_bytes", 1_073_741_824), -1))
+    if threshold < 0:
+        return not_applicable("Project heavy_shuffle_bytes threshold is invalid")
+    issues = _spark.performance_issues(ctx.obj, threshold)
+    return binary(not issues, "No skew, spill, or heavy-shuffle issue detected" if not issues
+                  else f"Detected: {', '.join(issues)}")
+
+
+@check(
+    id="SPARK-PARTITION", ref="3.5.5", title="No full-table scans when partition pruning is possible",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.HIGH,
+    layers=NOTEBOOK_LAYERS,
+    requires=[Resource.NOTEBOOK_DEFINITIONS, Resource.TABLE_SCHEMAS, Resource.LAKEHOUSE_FILES],
+    required=True,
+)
+def spark_partition_pruning(ctx: CheckContext) -> Verdict:
+    """Every SQL read of a partitioned table filters a partition column.
+
+    Partitioned tables are discovered from the workspace's lakehouse/Delta
+    metadata — the tables that actually declare partition columns — never from a
+    static, hard-coded table name. A schema-qualified read (``schema.table``) is
+    matched to a table by its bare name, so a *schema* is never mistaken for a
+    partitioned *table*.
+
+    **What it cannot determine.** Anything, when no table in the workspace exposes
+    partition metadata: the OneLake partition listing carries the only readable
+    partition keys, and Fabric's table listing has none. With no partitioned table
+    to prune against, the notebook is reported N/A — plainly, and without naming a
+    table that may not exist — rather than judged against a guess.
+    """
+    partitioned = _spark.discover_partitioned_tables(ctx.workspace.tables)
+    if not partitioned:
+        tables = ctx.workspace.tables or {}
+        listing_done = any((meta or {}).get("partitions_listed") for meta in tables.values())
+        if listing_done:
+            # The OneLake partition listing succeeded and showed nothing
+            # partitioned — a real "nothing to prune", not "we could not look".
+            return not_applicable(
+                f"Notebook '{ctx.obj_name}' was not assessed: the OneLake partition "
+                f"listing was available and no Delta table declares partition "
+                f"columns, so there is no partition-pruning requirement to check"
+            )
+        if tables:
+            return not_applicable(
+                f"Notebook '{ctx.obj_name}' was not assessed: the OneLake partition "
+                f"listing was unavailable for this workspace's tables, so their "
+                f"partition columns could not be read and partition pruning cannot "
+                f"be assessed"
+            )
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' was not assessed: no lakehouse tables were "
+            f"read for this workspace, so there is no partitioned table to prune "
+            f"against"
+        )
+    code = notebook_code(ctx.obj)
+    reads = _spark.partitioned_sql_reads(code, partitioned)
+    if not reads:
+        return not_applicable(
+            f"Notebook '{ctx.obj_name}' has no SQL read of a partitioned table "
+            f"(assessed against {len(partitioned)} partitioned table(s) discovered "
+            f"in the workspace's lakehouse metadata)"
+        )
+    unfiltered = sorted({table for table, filtered in reads if not filtered})
+    if unfiltered:
+        details = ", ".join(
+            f"{table} ({'/'.join(_spark.partition_columns_for(table, partitioned))})"
+            for table in unfiltered
+        )
+        return binary(False, f"Notebook '{ctx.obj_name}' reads partitioned table(s) "
+                      f"without a partition predicate: {details}")
+    return binary(True, f"Notebook '{ctx.obj_name}': all {len(reads)} partitioned-table "
+                  f"read(s) filter a declared partition column")
+
+
+@check(
+    id="SPARK-PROFILE", ref="3.5.6", title="Long-running notebooks profiled and optimized",
+    pillar=Pillar.DATA_PROCESSING, scope=Scope.NOTEBOOK, severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=True,
+)
+def spark_profile(ctx: CheckContext) -> Verdict:
+    """Long-running applications carry Spark profiling evidence.
+
+    This check verifies profiling *coverage*: a long-running notebook should have
+    Advisor or stage metrics to look at in the first place. The **quality** of
+    what those metrics show - skew, spill, heavy shuffle - is scored by
+    ``SPARK-UI`` (ref 3.5.1), which calls the same
+    ``performance_issues()`` helper. Scoring the issues here too failed one
+    notebook twice under two refs for a single underlying problem, so this one
+    deliberately stops at "is there anything to review?".
+    """
+    evidence = _spark.monitoring(ctx.obj)
+    usage = evidence.get("resource_usage")
+    if not isinstance(usage, dict):
+        return not_applicable("Spark application duration and profiling metrics are unavailable")
+    duration = _spark.number(usage.get("duration"))
+    if duration <= 0:
+        return not_applicable("Spark application duration is unavailable")
+    threshold = int(_spark.number(ctx.setting("long_running_notebook_ms", 300_000), -1))
+    if threshold < 0:
+        return not_applicable("Project long_running_notebook_ms threshold is invalid")
+    if duration < threshold:
+        return not_applicable(
+            f"Latest Spark application ran for {int(duration)} ms; below {threshold} ms threshold"
+        )
+    profiled = "advice" in evidence or "stages" in evidence
+    return binary(
+        profiled,
+        f"Profiled {int(duration)} ms application; Advisor/stage metrics are available "
+        f"to review (what they show is scored by ref 3.5.1)"
+        if profiled else
+        f"Long-running application ({int(duration)} ms) has no Advisor or stage "
+        f"profiling metrics, so its performance cannot be reviewed",
+    )
+
+@check(
+    id="NB-PUSHDOWN",
+    ref="3.5.7",
+    title="Predicate pushdown verified for shortcut/external reads",
+    pillar=Pillar.DATA_PROCESSING,
+    scope=Scope.NOTEBOOK,
+    severity=Severity.MEDIUM,
+    layers=NOTEBOOK_LAYERS,
+    requires=[Resource.NOTEBOOK_DEFINITIONS],
+    required=True,
+)
+def nb_pushdown(ctx: CheckContext) -> Verdict:
+    """Notebooks reading shortcut or external data apply filter predicates early."""
+    if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
+        return not_applicable("Notebook definitions could not be read from Fabric")
+
+    code = notebook_code(ctx.obj)
+    lines = code.splitlines()
+
+    read_idxs = [i for i, line in enumerate(lines) if _spark.EXTERNAL_READ.search(line)]
+    if not read_idxs:
+        return not_applicable("Notebook does not read from shortcut or external data sources")
+
+    for i in read_idxs:
+        window = "\n".join(lines[i : i + 12])  # include read line + next ~11 lines
+        if re.search(r"\.filter\s*\(|\.where\s*\(", window, re.IGNORECASE):
+            return binary(True, "Filter predicates applied to external/shortcut reads")
+
+    return graded(
+        1,
+        "Reads from shortcut or external source without applying filter predicates — "
+        "all rows are scanned before any selection, preventing predicate pushdown",
+    )
+
+# -- Copy activity parallelism (2.6.2) ----------------------------------------
+@check(
+    id="PL-COPY-PARALLEL", ref="2.6.2", title="Copy activities use appropriate parallelism (DIU, degree of copy parallelism)",
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.LOW,
     layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
 )
 def copy_parallelism(ctx: CheckContext) -> Verdict:
-    """Copy activities set ``parallelCopies`` or ``dataIntegrationUnits``."""
+    """Copy activities set ``parallelCopies`` or ``dataIntegrationUnits``.
+
+    A lone Copy activity with no explicit parallelism is N/A, not a finding: DIU
+    and parallelCopies default to Auto, and tuning them is only material across
+    multiple copies or at a data volume the audit cannot see. An explicitly-tuned
+    single copy is still credited.
+    """
     copies = [a for a in activities(ctx.obj) if a.get("type") == "Copy"]
     if not copies:
         return not_applicable("Pipeline has no Copy activities")
-    tuned = 0
-    for activity in copies:
-        props = activity.get("typeProperties") or {}
-        if props.get("parallelCopies") or props.get("dataIntegrationUnits"):
-            tuned += 1
+    tuned = sum(
+        1 for a in copies
+        if (a.get("typeProperties") or {}).get("parallelCopies")
+        or (a.get("typeProperties") or {}).get("dataIntegrationUnits")
+    )
+    if len(copies) == 1 and tuned == 0:
+        return not_applicable(
+            "Only 1 Copy activity with no explicit parallelism — DIU / parallelCopies "
+            "default to Auto; tuning is material mainly across multiple or large copies"
+        )
     return covered(
         tuned, len(copies),
         f"{tuned} of {len(copies)} Copy activities set parallelCopies/DIU",
     )
+
+
+# -- Relational-source ingestion tuning (2.6.5) -------------------------------
+
+#: A Copy *source* that reads a relational SQL database — Azure SQL DB, SQL
+#: Server/MI, Synapse, or an RDS-hosted SQL Server. Matched on the source type
+#: name rather than a source-system name, so the rule holds for every relational
+#: feed rather than one tenant's.
+_SQL_SOURCE_TYPE = re.compile(r"^(?=.*sql).*source$", re.IGNORECASE)
+
+#: A reader query that folds nothing: the whole table, every column.
+_UNFOLDED_QUERY = re.compile(r"select\s+\*", re.IGNORECASE)
+#: A predicate or a pipeline expression inside the reader query — the projection
+#: or restriction being pushed down to the source engine.
+_FOLDED_QUERY = re.compile(r"\bwhere\b|\btop\b|@\{|@pipeline\s*\(|@activity\s*\(", re.IGNORECASE)
+
+
+def _sql_copy_sources(definition: dict) -> list[tuple[str, dict, dict]]:
+    """``(activity name, source, sink)`` for every Copy reading a SQL database.
+
+    Uses :func:`walk_activities` so a Copy nested inside a ForEach — the usual
+    shape for metadata-driven ingestion — is judged like a top-level one.
+    """
+    found: list[tuple[str, dict, dict]] = []
+    for activity in walk_activities(definition):
+        if activity.get("type") != "Copy":
+            continue
+        props = activity.get("typeProperties") or {}
+        source = props.get("source") if isinstance(props.get("source"), dict) else {}
+        sink = props.get("sink") if isinstance(props.get("sink"), dict) else {}
+        if _SQL_SOURCE_TYPE.match(str(source.get("type") or "")):
+            found.append((activity.get("name") or "?", source, sink))
+    return found
+
+
+def _folds_source_read(source: dict) -> bool:
+    """The source read pushes projection or restriction into the database.
+
+    A stored procedure always folds — the work happens in the source engine. A
+    reader query folds when it names its columns or carries a predicate; a bare
+    ``SELECT *`` with no ``WHERE`` reads the whole table and folds nothing.
+    """
+    if source.get("sqlReaderStoredProcedureName"):
+        return True
+    query = source.get("sqlReaderQuery") or source.get("query") or ""
+    if isinstance(query, dict):  # an expression object — value lives under "value"
+        query = query.get("value") or ""
+    query = str(query)
+    if not query.strip():
+        return False
+    return bool(_FOLDED_QUERY.search(query)) or not _UNFOLDED_QUERY.search(query)
+
+
+def _partitions_source_read(source: dict) -> bool:
+    """The read is split into partitions rather than pulled as one stream.
+
+    Whether the partition column is *indexed* is not readable — Fabric exposes no
+    source-schema metadata — so a configured ``partitionOption`` is the readable
+    proxy for an index-friendly ranged read. ``"None"`` is the default and means
+    nothing was chosen.
+    """
+    option = str(source.get("partitionOption") or "").strip()
+    return bool(option) and option.lower() != "none"
+
+
+def _sizes_write_batch(sink: dict) -> bool:
+    """The sink writes in explicitly sized batches instead of the default."""
+    return bool(sink.get("writeBatchSize") or sink.get("writeBatchTimeout"))
+
+
+@check(
+    id="PL-SQL-INGEST-TUNED", ref="2.6.5",
+    title="Relational (Azure SQL DB) ingestion is tuned — query folding, ranged source reads, batch sizing",
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.PIPELINE, severity=Severity.MEDIUM,
+    layers=PIPELINE_LAYERS, requires=[Resource.PIPELINE_DEFINITIONS], required=True,
+)
+def sql_ingestion_tuned(ctx: CheckContext) -> Verdict:
+    """Copy activities reading a SQL database fold, partition, and batch their I/O.
+
+    Three independent tunings, each read straight off the Copy activity:
+
+    * *query folding* — a reader query or stored procedure that projects columns
+      or carries a predicate, so the source engine does the filtering rather than
+      the whole table crossing the wire;
+    * *ranged source read* — a ``partitionOption`` other than ``None``, so the
+      read is split instead of pulled as one long-running stream. Index metadata
+      is not exposed by any Fabric API, so this is the readable proxy for an
+      index-friendly read, and the docstring says so rather than pretending;
+    * *batch sizing* — an explicit ``writeBatchSize``/``writeBatchTimeout`` on the
+      sink instead of the conservative default.
+
+    Scored as coverage over all three signals across every SQL-source Copy, so a
+    pipeline that folds but never partitions lands in the middle rather than at
+    either extreme. A pipeline that reads no SQL database is N/A.
+    """
+    if not ctx.workspace.has(Resource.PIPELINE_DEFINITIONS):
+        return not_applicable("Pipeline definitions could not be read from Fabric")
+
+    sql_copies = _sql_copy_sources(ctx.obj)
+    if not sql_copies:
+        return not_applicable("Pipeline has no Copy activity reading a SQL database")
+
+    folded = [name for name, source, _ in sql_copies if _folds_source_read(source)]
+    partitioned = [name for name, source, _ in sql_copies if _partitions_source_read(source)]
+    batched = [name for name, _, sink in sql_copies if _sizes_write_batch(sink)]
+
+    total = len(sql_copies)
+    met = len(folded) + len(partitioned) + len(batched)
+    gaps = [
+        label for label, hit in (
+            ("query folding", folded), ("ranged source read", partitioned),
+            ("sink batch sizing", batched),
+        ) if len(hit) < total
+    ]
+    detail = (f"{total} SQL-source Copy activit(y/ies): {len(folded)} fold the source read, "
+              f"{len(partitioned)} set a partitionOption, {len(batched)} set a sink write "
+              f"batch size")
+    if gaps:
+        detail += f" — untuned on {', '.join(gaps)}"
+    return covered(met, total * 3, detail)
+
+
+# -- 2.6.4 — scheduling spread across the capacity -----------------------------
+#
+# Read entirely from ``Resource.ITEM_RUN_HISTORY``, which retains up to 25 run
+# stamps per runnable item. No schedule API is called and no row data is touched.
+
+#: Runnable item types whose starts compete for the same capacity.
+_SCHEDULED_TYPES: frozenset[str] = frozenset({
+    "DataPipeline", "Notebook", "Dataflow", "SparkJobDefinition",
+})
+
+#: The window inside which two runs count as "at the same time". Five minutes is
+#: deliberately coarse: a job scheduled on the hour does not fire at exactly
+#: :00:00, and a tighter window would score clock jitter instead of contention.
+_WINDOW_MINUTES = 5
+
+#: Below this many distinct items, a workspace cannot demonstrate contention no
+#: matter how it is scheduled — two items overlapping is a coincidence.
+_MIN_ITEMS = 3
+#: …and below this many stamps overall there is not enough history to judge.
+_MIN_STAMPS = 6
+
+#: Share of items allowed to share the busiest window before it reads as a pile-up.
+_SPREAD_GOOD = 0.34
+_SPREAD_FAIR = 0.50
+_SPREAD_POOR = 0.75
+
+
+def _run_moment(stamp: str) -> datetime | None:
+    """Parse an ISO-8601 UTC run stamp, or ``None`` when it is unreadable."""
+    try:
+        parsed = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+@check(
+    id="WS-SCHEDULE-STAGGER", ref="2.6.4",
+    title="Pipeline scheduling avoids capacity contention (staggered across domains, not all at once)",
+    pillar=Pillar.DATA_INTEGRATION, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
+    layers=(Layer.PREP, Layer.MIXED),
+    requires=[Resource.ITEMS, Resource.ITEM_RUN_HISTORY], required=True,
+)
+def schedule_stagger(ctx: CheckContext) -> Verdict:
+    """Runnable items do not all pile into the same few minutes of the clock.
+
+    **What it can determine.** How the workspace's runs are spread over the
+    clock, from the job-run stamps the scheduler history already returns — up to
+    25 per item, so no extra call is made. Runs are bucketed into
+    5-minute windows; the score is driven by the *busiest* window, measured as
+    the share of distinct runnable items that appear in it. A third or fewer is a
+    well-staggered estate; more than three quarters of the items landing in one
+    window is everything firing at once and competing for the same capacity. The
+    classic "everything on the hour" shape is reported alongside, as the share of
+    stamps falling within two minutes of the top of an hour.
+
+    **What it cannot — read this before acting on it.**
+
+    * These are **observed run stamps, not the configured schedule.** The Fabric
+      job-schedule API is not called. A job whose trigger is staggered but which
+      queues behind a busy capacity still shows up clustered here, and that is
+      arguably the more useful answer — but it is not the same claim as "the
+      schedule is misconfigured".
+    * The stamps are each run's **end time**, falling back to its start time for
+      a run still in flight, because that is what ``jobs/instances`` yields for
+      the one page already fetched. Clustered *completions* are strong evidence
+      of concurrent capacity use, but they are a proxy for clustered starts, not
+      a measurement of them.
+    * It sees **one workspace at a time**. "Staggered across domains" in the
+      point's sense — different domains in different workspaces — is only
+      partially visible; contention created by a *sibling* workspace on the same
+      capacity is invisible here.
+    * A workspace with fewer than three runnable items with history, or fewer
+      than six readable stamps in total, is **N/A**: it cannot demonstrate
+      contention either way. Unreadable run history is N/A, never FAIL.
+    """
+    if not ctx.workspace.has(Resource.ITEM_RUN_HISTORY):
+        return not_applicable(
+            "Per-item run history (jobs/instances) could not be read from Fabric, so the "
+            "spread of run times over the clock cannot be derived"
+        )
+    history = ctx.workspace.run_history or {}
+    if not history:
+        return not_applicable(
+            "No item in this workspace has a recorded run history, so there is no "
+            "observed schedule to judge for contention"
+        )
+
+    by_id = {i.id: i for i in ctx.workspace.items if i.id}
+
+    def _name(item_id: str) -> str:
+        item = by_id.get(item_id)
+        return (item.display_name or item.id) if item else item_id
+
+    # Only the item types that actually consume capacity when they run.
+    moments: dict[str, list[datetime]] = {}
+    for item_id, stamps in history.items():
+        item = by_id.get(item_id)
+        if item is not None and item.type and item.type not in _SCHEDULED_TYPES:
+            continue
+        parsed = [m for m in (_run_moment(s) for s in stamps) if m is not None]
+        if parsed:
+            moments[item_id] = parsed
+
+    total_stamps = sum(len(v) for v in moments.values())
+    if len(moments) < _MIN_ITEMS or total_stamps < _MIN_STAMPS:
+        return not_applicable(
+            f"Only {len(moments)} runnable item(s) with {total_stamps} readable run "
+            f"stamp(s) — fewer than the {_MIN_ITEMS} items and {_MIN_STAMPS} stamps needed "
+            f"before a pile-up can be told apart from coincidence"
+        )
+
+    # Bucket every run into a fixed 5-minute window of absolute time, recording
+    # which *items* landed there. Counting items rather than runs stops one
+    # chatty item's retry storm reading as an estate-wide pile-up.
+    windows: dict[int, set[str]] = {}
+    on_the_hour = 0
+    for item_id, runs in moments.items():
+        for moment in runs:
+            bucket = int(moment.timestamp()) // (_WINDOW_MINUTES * 60)
+            windows.setdefault(bucket, set()).add(item_id)
+            if moment.minute <= 2 or moment.minute >= 58:
+                on_the_hour += 1
+
+    busiest = max(windows.values(), key=len)
+    peak = len(busiest)
+    share = peak / len(moments)
+    hour_share = on_the_hour / total_stamps
+
+    detail = (
+        f"{len(moments)} runnable item(s), {total_stamps} observed run stamp(s): the busiest "
+        f"{_WINDOW_MINUTES}-minute window holds {peak} of them ({share:.0%}), across "
+        f"{len(windows)} distinct window(s); {hour_share:.0%} of runs land within two "
+        f"minutes of the top of an hour"
+    )
+    if peak > 1:
+        detail += f" — concurrent in the busiest window: {', '.join(sorted(_name(i) for i in busiest)[:5])}"
+    detail += (
+        ". Derived from observed run stamps (each run's end time, or its start time while "
+        "still running), not from the configured schedule, and from this workspace only"
+    )
+
+    if share <= _SPREAD_GOOD:
+        return graded(3, detail + " — well staggered")
+    if share <= _SPREAD_FAIR:
+        return graded(2, detail + " — partly staggered; a sizeable group still overlaps")
+    if share <= _SPREAD_POOR:
+        return graded(1, detail + " — most items run in one window and compete for capacity")
+    return graded(0, detail + " — effectively everything runs at once")

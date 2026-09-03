@@ -6,8 +6,9 @@ roles were re-declared in three separate places; keeping them here means adding 
 pillar or a layer is a one-line change.
 
 All enums subclass ``str`` so they serialize straight to JSON and compare equal to
-their string value — ``Pillar.SECURITY == "Security"`` is ``True``. That keeps the
-API responses and the YAML config human-readable without a conversion layer.
+their string value — ``Pillar.SECURITY_ACCESS == "Security & Access Control"`` is
+``True``. That keeps the API responses and the YAML config human-readable without a
+conversion layer.
 """
 from __future__ import annotations
 
@@ -33,29 +34,91 @@ class StrEnum(str, Enum):
 
 
 class Pillar(StrEnum):
-    """The audit pillars — quality attributes aligned to team ownership.
+    """The audit pillars aligned to the source checklist."""
 
-    Six scored pillars, each with a clear owner (Security team, Governance/
-    Compliance, DevOps/SRE, Performance engineers, FinOps, Data engineers).
-
-    ``FOUNDATION`` is cross-cutting and internal: it holds informational results
-    (inventory, access errors) that describe the estate rather than judging it,
-    and is never scored — so it is deliberately excluded from :meth:`scored`.
-    """
-
-    SECURITY = "Security"
-    GOVERNANCE = "Governance & Compliance"
-    OPERATIONS = "Operations & Reliability"
-    PERFORMANCE = "Performance & Capacity"
-    COST = "Cost & Resource Optimization"
-    DATA = "Data Management & Quality"
+    ARCHITECTURE = "Architecture & Design"
+    DATA_INTEGRATION = "Data Integration & Ingestion"
+    DATA_PROCESSING = "Data Processing & Transformation"
+    DATA_MODELING = "Data Modeling & Storage"
+    DATA_QUALITY = "Data Quality Framework"
+    SECURITY_ACCESS = "Security & Access Control"
+    COMPLIANCE = "Compliance & Regulatory"
+    DATA_GOVERNANCE = "Data Governance"
+    RELIABILITY = "Reliability & Resilience"
+    MONITORING = "Monitoring & Observability"
+    DEVOPS = "DevOps & Deployment"
+    COST_MANAGEMENT = "Cost Management & Capacity"
+    DOCUMENTATION = "Documentation & Knowledge Mgmt"
     FOUNDATION = "Foundation"
 
     @classmethod
     def scored(cls) -> list[Pillar]:
         """The pillars that appear on the scorecard, in report order."""
-        return [cls.SECURITY, cls.GOVERNANCE, cls.OPERATIONS,
-                cls.PERFORMANCE, cls.COST, cls.DATA]
+        return [
+            cls.ARCHITECTURE,
+            cls.DATA_INTEGRATION,
+            cls.DATA_PROCESSING,
+            cls.DATA_MODELING,
+            cls.DATA_QUALITY,
+            cls.SECURITY_ACCESS,
+            cls.COMPLIANCE,
+            cls.DATA_GOVERNANCE,
+            cls.RELIABILITY,
+            cls.MONITORING,
+            cls.DEVOPS,
+            cls.COST_MANAGEMENT,
+            cls.DOCUMENTATION,
+        ]
+
+    @classmethod
+    def for_checklist_ref(cls, ref: str, fallback: Pillar) -> Pillar:
+        """Return the updated checklist pillar for ``ref`` when it is mapped."""
+        if ref in _UNMAPPED_CHECKLIST_REFS:
+            return fallback
+        if ref in _CHECKLIST_REF_PILLARS:
+            return _CHECKLIST_REF_PILLARS[ref]
+
+        parts = ref.split(".")
+        section = ".".join(parts[:2]) if parts and parts[0] == "14" else parts[0]
+        return _CHECKLIST_SECTION_PILLARS.get(section, fallback)
+
+
+_CHECKLIST_SECTION_PILLARS: dict[str, Pillar] = {
+    "1": Pillar.ARCHITECTURE,
+    "2": Pillar.DATA_INTEGRATION,
+    "3": Pillar.DATA_PROCESSING,
+    "4": Pillar.DATA_MODELING,
+    "5": Pillar.DATA_QUALITY,
+    "6": Pillar.SECURITY_ACCESS,
+    "7": Pillar.COMPLIANCE,
+    "8": Pillar.DATA_GOVERNANCE,
+    "9": Pillar.RELIABILITY,
+    "10": Pillar.MONITORING,
+    "11": Pillar.DEVOPS,
+    "12": Pillar.COST_MANAGEMENT,
+    "14.1": Pillar.ARCHITECTURE,
+    "14.2": Pillar.DATA_PROCESSING,
+    "14.3": Pillar.ARCHITECTURE,
+    "14.4": Pillar.SECURITY_ACCESS,
+    "14.5": Pillar.DATA_INTEGRATION,
+}
+
+_CHECKLIST_REF_PILLARS: dict[str, Pillar] = {
+    "IMPL-01": Pillar.SECURITY_ACCESS,
+    "IMPL-02": Pillar.SECURITY_ACCESS,
+    "IMPL-04": Pillar.SECURITY_ACCESS,
+    "IMPL-06": Pillar.SECURITY_ACCESS,
+    "IMPL-15": Pillar.COST_MANAGEMENT,
+    "IMPL-20": Pillar.ARCHITECTURE,
+    "IMPL-23": Pillar.DATA_INTEGRATION,
+    "IMPL-24": Pillar.ARCHITECTURE,
+    "14.5.3": Pillar.MONITORING,
+    "14.5.4": Pillar.DEVOPS,
+}
+
+# All registered refs are now mapped to the updated checklist taxonomy. Add a
+# ref here to hold it on its declared pillar when the checklist omits it.
+_UNMAPPED_CHECKLIST_REFS: set[str] = set()
 
 
 class Layer(StrEnum):
@@ -142,6 +205,11 @@ class Scope(StrEnum):
     SEMANTIC_MODEL = "semantic_model"
     REPORT = "report"
     EVENTHOUSE = "eventhouse"
+    #: A cross-workspace comparison spanning a whole project group. Not dispatched
+    #: per object like the others; a group check runs once per group over its
+    #: members' contexts. Kept last so the per-workspace dispatch order is
+    #: unchanged.
+    GROUP = "group"
 
 
 class Resource(StrEnum):
@@ -159,9 +227,53 @@ class Resource(StrEnum):
     GIT = "git"
     PIPELINE_DEFINITIONS = "pipelineDefinitions"
     NOTEBOOK_DEFINITIONS = "notebookDefinitions"
+    ENVIRONMENT_DEFINITIONS = "environmentDefinitions"
     TABLE_SCHEMAS = "tableSchemas"
+    #: Column names and types, read over TDS from the SQL analytics endpoint - the
+    #: Fabric REST API does not expose them. Separate from TABLE_SCHEMAS so a run
+    #: whose selected checks never look at a column pays no SQL round trip.
+    TABLE_COLUMNS = "tableColumns"
+    #: Warehouse row-level-security policies (``sys.security_policies``), likewise
+    #: only readable over the SQL analytics endpoint.
+    WAREHOUSE_SECURITY = "warehouseSecurity"
+    #: Per-Warehouse SQL audit *configuration* — state, action groups and
+    #: retention — from
+    #: ``…/warehouses/{id}/settings/sqlAudit``. Plain Fabric REST: it needs the
+    #: Audit permission on the Warehouse item, **not** tenant-admin. Only the
+    #: configuration is read; audit *rows* (``sys.fn_get_audit_file_v2``) are
+    #: runtime data and are deliberately never fetched.
+    WAREHOUSE_AUDIT = "warehouseAudit"
     SHORTCUTS = "shortcuts"
     SEMANTIC_MODEL_DEFINITIONS = "semanticModelDefinitions"
+    #: Per-semantic-model *refresh schedule configuration* — enabled, days/times
+    #: and ``notifyOption`` — from the Power BI Datasets API
+    #: (``…/datasets/{id}/refreshSchedule``). An ordinary delegated read on the
+    #: Power BI token audience, **not** tenant-admin; without a Power BI token it
+    #: is unreadable and its checks report N/A. Only the configuration is read —
+    #: no refresh rows and no refresh history.
+    SEMANTIC_MODEL_REFRESH_SCHEDULE = "semanticModelRefreshSchedule"
+    CONNECTIONS = "connections"
+    #: Report → semantic-model bindings, from the Power BI *Get Reports In Group*
+    #: API (``/groups/{id}/reports``). Each row carries the report's ``datasetId``,
+    #: which is the only readable evidence of which model a report is built on.
+    #: An ordinary delegated ``Report.Read.All`` — **not** tenant-admin; without a
+    #: Power BI token it is unreadable and its checks report N/A. Report
+    #: definitions and pages are deliberately never fetched.
+    REPORTS = "reports"
+    #: Per-item run/refresh recency, read from the job-scheduler history
+    #: (``…/items/{id}/jobs/instances``) — the List Items API carries no
+    #: timestamp, so this is a one-call-per-runnable-item enrichment.
+    ITEM_RUN_HISTORY = "itemRunHistory"
+    #: Aggregated OneLake Files-section listing per Lakehouse, read through the
+    #: ADLS Gen2 List Path API using a Storage-audience token. The provider stores
+    #: only bounded counts/buckets, never individual file paths.
+    LAKEHOUSE_FILES = "lakehouseFiles"
+    #: Per-Data-Activator (Reflex) rule configuration, parsed from the item's
+    #: ``ReflexEntities.json`` definition via ``getDefinition``. Only bounded
+    #: counts are kept (rules / active rules / sources / actions), never the rule
+    #: bodies. Needs the ``Item.ReadWrite`` scope getDefinition requires; without
+    #: it the definition is unreadable and the trigger-depth check reports N/A.
+    ACTIVATOR_DEFINITIONS = "activatorDefinitions"
 
 
 class Status(StrEnum):

@@ -12,7 +12,7 @@ from __future__ import annotations
 from auditfast.clients.live import LiveFabricProvider
 from auditfast.core.check.helpers import binary
 from auditfast.core.check.registry import CheckRegistry, check
-from auditfast.core.engine import READ_INCOMPLETE_CHECK_ID, run_audit
+from auditfast.core.engine import READ_INCOMPLETE_CHECK_ID, read_incomplete_result, run_audit
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Status
 from auditfast.core.models import Item, WorkspaceContext
 from auditfast.services.context_store import (
@@ -76,10 +76,21 @@ def test_partial_failure_keeps_reads_but_flags_the_gap():
     LiveFabricProvider._record_failures(
         ctx, Resource.NOTEBOOK_DEFINITIONS, attempted=138, read=96, forbidden=42, transient=0)
     assert ctx.read_failures["notebookDefinitions"] == {
-        "attempted": 138, "read": 96, "failed": 42, "forbidden": 42, "transient": 0}
+        "attempted": 138, "read": 96, "failed": 42,
+        "forbidden": 42, "transient": 0, "empty": 0}
     # some read — the resource is NOT marked fully unavailable
     assert Resource.NOTEBOOK_DEFINITIONS not in ctx.unavailable
     assert ctx.is_complete is False
+
+
+def test_unusable_definitions_are_reported_but_stay_cacheable():
+    """A definition that came back empty is a real gap a re-crawl cannot fix."""
+    ctx = WorkspaceContext(id="w")
+    LiveFabricProvider._record_failures(
+        ctx, Resource.SEMANTIC_MODEL_DEFINITIONS,
+        attempted=414, read=413, forbidden=0, transient=0, empty=1)
+    assert ctx.read_failures["semanticModelDefinitions"]["empty"] == 1
+    assert ctx.is_complete is True
 
 
 def test_total_failure_marks_the_resource_unavailable():
@@ -130,7 +141,7 @@ def test_engine_emits_a_read_incomplete_warning():
 
     reg = CheckRegistry()
 
-    @check(id="NB-X", ref="9.9", title="nb", pillar=Pillar.PERFORMANCE,
+    @check(id="NB-X", ref="9.9", title="nb", pillar=Pillar.DATA_PROCESSING,
            scope=Scope.NOTEBOOK, requires=[Resource.NOTEBOOK_DEFINITIONS], registry=reg)
     def _nb(c):  # pragma: no cover - not reached when definitions are absent
         return binary(True, "ok")
@@ -143,6 +154,32 @@ def test_engine_emits_a_read_incomplete_warning():
     assert warnings[0].status is Status.NA  # a read we could not make is not a failure
     nb = next(r for r in results if r.check_id == "NB-X")
     assert "138 of 138" in nb.evidence and "could not be read" in nb.evidence
+
+
+def test_read_incomplete_warning_names_affected_artifacts():
+    ctx = WorkspaceContext(id="w1", display_name="WS", layer=Layer.REPORTING)
+    ctx.read_failures["semanticModelDefinitions"] = {
+        "attempted": 2,
+        "read": 1,
+        "failed": 1,
+        "forbidden": 1,
+        "transient": 0,
+        "empty": 0,
+        "artifacts": [{
+            "id": "model-42",
+            "name": "Finance Model",
+            "failure": "forbidden",
+            "reason": "HTTP 403",
+        }],
+    }
+
+    warning = read_incomplete_result(
+        ctx,
+        "semanticModelDefinitions",
+        ctx.read_failures["semanticModelDefinitions"],
+    )
+
+    assert "Finance Model (model-42) [forbidden: HTTP 403]" in warning.evidence
 
 
 # -- caching never serves an incomplete snapshot ------------------------------

@@ -1,5 +1,5 @@
 ---
-description: "End-to-end check creator: give it a plain-language best-practice point and it writes the @check function, remediation text, updates pinned test counts, and validates — all in one shot. No external research step needed."
+description: "End-to-end check creator: give it a plain-language best-practice point and it dedups it against the registry, takes the ref from the checklist SOT, confirms the data is fetchable, writes the @check function and remediation text, updates pinned test counts, and validates — all in one shot."
 name: "Check Implementer"
 tools: [read, search, edit, execute]
 user-invocable: true
@@ -22,11 +22,79 @@ When the user gives you a best-practice point (e.g. "notebooks should not use SE
 # PHASE 1 — DEDUP CHECK
 # ═══════════════════════════════════════════════════════════════════
 
-Before writing anything, search the existing checks to avoid duplicates:
+Before writing anything, prove no existing check already answers this point.
 
-1. Run: `grep_search` for keywords from the user's request inside `backend/src/auditfast/core/check/` to find if a similar check already exists.
-2. If a check with overlapping logic exists, **STOP** and tell the user: "This is already covered by check `<ID>` — `<title>`."
-3. Only proceed if no existing check covers the same thing.
+Keyword grep alone is **not enough**: the same requirement is routinely phrased
+differently. "Orphan detection", "referential integrity" and "FK values resolve to
+dimension rows" are three names for overlapping work, and no shared keyword links
+them. Do all three steps:
+
+1. **Semantic match (primary).** Run the deterministic matcher that ranks a
+   plain-language point against the *whole* registry — this is exactly the
+   "different phrase, same meaning" problem it was built for:
+   ```powershell
+   cd backend
+   ..\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0,'src'); from auditfast.core.check import REGISTRY; from auditfast.ai.matching import match_point; [print(f'{m.confidence:.2f}  {m.spec.ref:<8} {m.spec.id:<22} {m.spec.title}  <- {m.reason}') for m in match_point('<THE POINT>', REGISTRY, limit=10)]"
+   ```
+   (Equivalently: `POST /api/v1/checklist/assess`, or the MCP `list_checks` /
+   `describe_check` tools.) Read all 10 — not just the top 1.
+2. **Concept grep (secondary).** Grep `backend/src/auditfast/core/check/` for
+   *synonyms* of the concept, not the user's exact words. For a data-quality point
+   also try: reconcil, integrity, orphan, unmatched, duplicate, unique, dedup,
+   grain, anti-join, count, validate, schema, cast.
+3. **Read the near misses.** For every candidate scored highly, open the function
+   and compare the **gate** (what makes it N/A) against the **detector** (what makes
+   it pass). Two checks may legitimately coexist when their gates differ —
+   `NB-FACT-DIM-RI` gates on dimensional work where `NB-FK-INTEGRITY` accepts any
+   join — but only if that narrowing is real.
+
+**Decide:**
+- **Same rule, same gate** → STOP. Tell the user: "Already covered by `<ID>` —
+  `<title>` (ref `<ref>`)."
+- **Overlapping but genuinely narrower** → proceed, and say so in the docstring:
+  name the sibling check *and its current ref*, and state the narrowing gate.
+- **No overlap** → proceed.
+
+> A shared detector means one line of code scores several checks. That is not
+> independent evidence and a reviewer will call it out. If your new check would
+> reuse an existing detector unchanged, that is a strong signal it is a duplicate.
+
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 1b — IS THE DATA FETCHABLE?
+# ═══════════════════════════════════════════════════════════════════
+
+PHASE 0 established whether the data is already in `CheckContext`. If it is, go to
+PHASE 2. If it is **not**, do not stop yet — answer these three in order and record
+the answer, because "nobody looked" and "no API exists" are very different findings:
+
+1. **Already fetched, just unparsed?** The provider stores a *parsed* projection,
+   not the raw payload. Check `fabric-skills/common/ITEM-DEFINITIONS-CORE.md` and
+   the relevant parser (`clients/tmsl.py`, `_notebook.py`, `_pipeline.py`).
+   Example: semantic-model partition `mode` and `refreshPolicy` are in the TMSL but
+   `parse_tmsl` drops them. Fix = extend the parser (~10 lines) **plus a re-crawl**,
+   because existing KB snapshots will not contain the new field.
+2. **Is there a Fabric REST endpoint?** Search `fabric-skills/common/COMMON-CORE.md`
+   and the per-surface `*-CORE.md` files. Type-specific list endpoints return
+   properties the generic `/items` list does not — e.g.
+   `GET /workspaces/{id}/lakehouses` returns
+   `properties.sqlEndpointProperties.connectionString` and
+   `GET /workspaces/{id}/warehouses` returns `connectionString`. Fix = extend
+   `clients/live.py` and add a `Resource` member.
+3. **Does it need a transport we do not have?** Some data is not in the REST API at
+   all. Column schemas and Warehouse security policies live only behind the **SQL
+   analytics endpoint** (TDS 1433, Entra token audience
+   `https://database.windows.net/.default`, `pyodbc`). The endpoint is *discoverable*
+   via step 2, so this never means asking the client for a connection string — but
+   it does mean a new transport and an open outbound port.
+
+**Then decide:**
+- Available now → `automation=Automation.AUTOMATED`.
+- Reachable with a parser/provider change → tell the user what the change costs and
+  let them choose before you write it.
+- Genuinely unreachable (tenant-admin API, external system, human process) →
+  propose `automation=Automation.ROADMAP` and stop.
+
+**Never** write a check that returns N/A merely because nobody looked for the data.
 
 # ═══════════════════════════════════════════════════════════════════
 # PHASE 2 — DETERMINE CHECK PARAMETERS
@@ -111,21 +179,45 @@ Pre-built layer tuples (import from the shared helper):
 | Report      | `R-`    | *(reserved)*          |
 
 # ═══════════════════════════════════════════════════════════════════
-# PHASE 3 — DETERMINE THE REF NUMBER
+# PHASE 3 — TAKE THE REF FROM THE SOT (NEVER INVENT ONE)
 # ═══════════════════════════════════════════════════════════════════
 
-**Before assigning a ref:**
-1. Read `backend/config/remediation.yaml` to see ALL existing refs.
-2. Find the highest ref in the relevant range and increment by 1.
+> **The checklist Excel/CSV is the source of truth for refs. A ref is looked up,
+> never generated.** Incrementing "the next free number" produces refs that exist
+> in no checklist, and collides the moment two people author in parallel. The
+> registry already carries duplicate refs (`1.1.2`, `5.4.1`, `9.1.3` are each on
+> two checks) from exactly that mistake.
 
-Ref ranges by topic:
+1. **Find the point in the SOT.** Match the user's plain-language point to a row of
+   the checklist workbook (or the CSV under `intake/`, when one is committed). Take
+   its **ref, pillar, layer and artifact scope** from that row.
+2. **Cross-check the SOT against your PHASE 2 choices.** The SOT's *Pillar* and
+   *Layer* columns win over your inference. If the SOT's **Artifacts** column names
+   objects your `scope=`/`requires=` do not cover (e.g. it says
+   `Notebook; Lakehouse` and you only read notebook code), say so explicitly — the
+   check is then *partially* implementing the point, and the user must know.
+3. **Verify the ref is free.** Grep the registry:
+   ```powershell
+   cd backend
+   ..\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0,'src'); from auditfast.core.check import REGISTRY; r='<REF>'; print([c.id for c in REGISTRY if c.ref==r] or 'free')"
+   ```
+   If it is taken, **STOP** — either it is the same point (a dedup miss, go back to
+   PHASE 1) or the SOT has two rows sharing a ref (a SOT bug — report it).
+4. **If the point is not in the SOT at all → STOP and ask the user.** Do not invent
+   a ref. Either the point belongs to a checklist row you have not found, or the SOT
+   needs a new row — and that is the user's decision, not yours.
+
+**Also re-check when you touch a ref:** a ref renumbering leaves stale
+cross-references in docstrings. If a docstring says "narrower than `X` (ref N)",
+confirm N is still `X`'s ref before you copy the pattern.
+
+Ref ranges by topic (orientation only — these do **not** authorise inventing a ref):
 - `1.x` — foundation / workspace
 - `2.1.x` — pipeline authoring · `2.2.x` — load patterns · `2.4.x` — reliability · `2.6.x` — copy
 - `3.1.x` — notebook authoring · `3.2.x` — Spark performance · `3.3.x` — Delta · `3.4.x` — Spark config · `3.5.x` — Spark tuning
-- `4.x` — tables / model
+- `4.x` — tables / model · `5.x` — data quality
 - `6.1.x` — security access · `6.2.x` — labels · `6.4.x` — secrets
-- `11.x` — ops (git/deploy)
-- `12.x` — cost
+- `11.x` — ops (git/deploy) · `12.x` — cost · `14.x` — semantic model / reporting
 
 # ═══════════════════════════════════════════════════════════════════
 # PHASE 4 — CONTEXT API (what you can read inside a check)
@@ -435,24 +527,49 @@ Add ONE line to `backend/config/remediation.yaml` keyed by the `ref` you assigne
 # PHASE 9 — UPDATE PINNED TEST COUNTS
 # ═══════════════════════════════════════════════════════════════════
 
-Adding ONE automated check requires updating these pinned values.
-**Read each file first** to get the CURRENT value, then increment.
+> **Run the suite, read the reported number, write that number.** Do not compute
+> pins by arithmetic. "+1 per check" is wrong the moment a check returns N/A for
+> some objects, emits several verdicts, or is layer-gated out of a fixture
+> workspace — and a wrong pin is indistinguishable from a real regression.
 
-### For an `automated` check (automation=Automation.AUTOMATED):
-1. `backend/tests/test_api.py` — find `checks_registered == <N>` → change to `<N+1>`
-2. `backend/tests/conftest.py` — find `EXPECTED_SCORED_CHECKS = <N>` → change to `<N+1>`
-3. `backend/tests/conftest.py` — find `EXPECTED_RESULT_ROWS = <N>` → increment by the number of objects in the fixture that match this scope (for notebook checks: count notebooks in fixture; for pipeline: count pipelines; for workspace: count workspaces)
-4. `backend/tests/conftest.py` — `EXPECTED_OVERALL` → DO NOT change this yourself. Run tests first — the test failure will tell you the new value.
-5. `backend/tests/test_engine.py` — find the scope-specific count:
-   - Workspace: `len([s for s in evaluated if s.scope is Scope.WORKSPACE]) == <N>` → `<N+1>`
-   - Pipeline: `len([s for s in evaluated if s.scope is Scope.PIPELINE]) == <N>` → `<N+1>`
-   - Notebook: `len([s for s in evaluated if s.scope is Scope.NOTEBOOK]) == <N>` → `<N+1>`
-6. `backend/tests/test_engine.py` — find `len(evaluated) == <N>` → `<N+1>`
+**The procedure:**
 
-### For a `roadmap`/`manual` check:
-1. `backend/tests/test_api.py` — `checks_registered == <N>` → `<N+1>`
-2. `backend/tests/conftest.py` — `EXPECTED_RESULT_ROWS` → increment appropriately
-3. DO NOT change `EXPECTED_SCORED_CHECKS` or `EXPECTED_OVERALL` (roadmap checks are never scored)
+1. Run `..\.venv\Scripts\python.exe -m pytest -q` and let the parity tests fail.
+2. Each failure prints `assert <actual> == <pinned>`. Write `<actual>` into the pin.
+3. Re-run. Repeat until green — a test that asserts several counts stops at the
+   first one, so it can take two or three passes.
+4. Sanity-check the direction of every change. A count that moved the *opposite*
+   way from what your check does is a bug in the check, not a stale pin. Do not
+   paper over it.
+
+**The pins, and where they live:**
+
+| Pin | File |
+|---|---|
+| `checks_registered == N` | `backend/tests/test_api.py` |
+| `EXPECTED_OVERALL` | `backend/tests/conftest.py` |
+| `EXPECTED_SCORED_CHECKS` | `backend/tests/conftest.py` (= PASS + PARTIAL + FAIL) |
+| `EXPECTED_RESULT_ROWS` | `backend/tests/conftest.py` (every row, scored or not) |
+| `Status.PASS / PARTIAL / FAIL / NA / INFO` counts | `backend/tests/test_engine.py` |
+| `len(evaluated)` and `before ==` | `backend/tests/test_engine.py` |
+| per-scope counts (`Scope.WORKSPACE` / `PIPELINE` / `NOTEBOOK`) | `backend/tests/test_engine.py` |
+
+The identity `PASS + PARTIAL + FAIL + NA + INFO == EXPECTED_RESULT_ROWS` must hold —
+use it to check you have not mistyped one.
+
+To read every current value in one shot instead of iterating:
+
+```powershell
+cd backend
+..\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0,'.'); from auditfast.core.check.registry import REGISTRY; from auditfast.core.engine import run_audit; from auditfast.core.scoring import aggregate; from auditfast.core.enums import Automation, Scope, Status; from tests.conftest import FIXTURE_SETTINGS, FIXTURE_TARGETS; from tests.fixtures.provider import FIXTURE_FILE, RecordedProvider; r=run_audit(RecordedProvider(FIXTURE_FILE), FIXTURE_TARGETS, FIXTURE_SETTINGS); a=aggregate(r); e=[s for s in REGISTRY if s.automation is Automation.AUTOMATED]; print('OVERALL', repr(a['overall'])); print('SCORED', a['total_scored'], 'ROWS', len(r)); print({s.name: a['counts'][s] for s in Status}); print('evaluated', len(e), {sc.name: len([s for s in e if s.scope is sc]) for sc in (Scope.WORKSPACE, Scope.PIPELINE, Scope.NOTEBOOK)})"
+```
+
+**A roadmap/manual check** is never scored, so it moves `checks_registered` and
+`EXPECTED_RESULT_ROWS` only — `EXPECTED_SCORED_CHECKS` and `EXPECTED_OVERALL` stay.
+
+**If a pin moved and your check did not cause it**, say so rather than silently
+rebasing it: the pins are shared with everyone else's in-flight checks, and quietly
+absorbing someone else's drift hides their regression.
 
 # ═══════════════════════════════════════════════════════════════════
 # PHASE 10 — VALIDATE
@@ -485,12 +602,16 @@ If pytest fails because `EXPECTED_OVERALL` changed:
 ```
 USER GIVES: "Notebooks should not use SELECT *"
   │
-  ├─ PHASE 1: grep existing checks for "SELECT" / "select_star" → no dup
-  ├─ PHASE 2: scope=NOTEBOOK, pillar=PERFORMANCE, requires=NOTEBOOK_DEFINITIONS
-  ├─ PHASE 3: read remediation.yaml → next ref in 3.5.x range
-  ├─ PHASE 7: write @check in performance_capacity/data_prep/automated.py
-  ├─ PHASE 8: add ref to remediation.yaml
-  ├─ PHASE 9: update 4 test files with incremented counts
+  ├─ PHASE 1:  semantic match against the whole registry + concept grep
+  │            ("select", "projection", "column pruning") → read top 10 → no dup
+  ├─ PHASE 1b: data already in ctx.obj (notebook definition) → AUTOMATED
+  ├─ PHASE 2:  scope=NOTEBOOK, pillar=PERFORMANCE, requires=NOTEBOOK_DEFINITIONS
+  ├─ PHASE 3:  look the point up in the checklist SOT → take its ref, pillar,
+  │            layer and artifact scope → confirm the ref is free in REGISTRY
+  ├─ PHASE 7:  write @check in performance_capacity/data_prep/automated.py,
+  │            reading code with executable_code() so comments cannot satisfy it
+  ├─ PHASE 8:  add that ref to remediation.yaml
+  ├─ PHASE 9:  update pinned test counts with the values the run reports
   └─ PHASE 10: run validate_check, pytest, ruff → all green → DONE
 ```
 
@@ -501,9 +622,37 @@ USER GIVES: "Notebooks should not use SELECT *"
 1. **NEVER invent a `ctx.workspace` field** not listed in PHASE 4. If you need data not there, check `fabric-skills/common/ITEM-DEFINITIONS-CORE.md` to see if the raw definition contains it. If it does, extend the parser (e.g. `parse_tmsl` in `clients/tmsl.py`). If it truly doesn't exist in any Fabric API, tell the user and suggest a `roadmap` attestation.
 2. **NEVER invent a `Resource` enum value.** Only the 9 values in PHASE 2 exist.
 3. **NEVER invent Item/RoleAssignment fields.** Only the fields listed in PHASE 4 exist.
-4. **ALWAYS read the target file before editing** — check what imports already exist.
-5. **ALWAYS read `remediation.yaml` before adding a ref** — check for conflicts.
-6. **ALWAYS read the test files before updating counts** — get the current values.
-7. **ALWAYS run the validation commands** — do not skip or assume they pass.
-8. **If unsure about anything, read the actual source file** rather than guessing.
-9. **If the data is in the raw definition but not parsed** — extend the relevant parser (`tmsl.py`, notebook/pipeline `_definition` methods in `clients/live.py`) and add the field to the fixture. Do NOT tell the user it's impossible.
+4. **NEVER invent a `ref`.** It comes from the checklist SOT (PHASE 3). If the point is not in the SOT, stop and ask.
+5. **ALWAYS read the target file before editing** — check what imports already exist.
+6. **ALWAYS read `remediation.yaml` before adding a ref** — check for conflicts.
+7. **ALWAYS read the test files before updating counts** — get the current values.
+8. **ALWAYS run the validation commands** — do not skip or assume they pass.
+9. **NEVER predict a pinned count.** Run the suite, read the number the failure reports, then write it. Arithmetic on counts is a guess.
+10. **If unsure about anything, read the actual source file** rather than guessing.
+11. **If the data is in the raw definition but not parsed** — extend the relevant parser (`tmsl.py`, notebook/pipeline `_definition` methods in `clients/live.py`) and add the field to the fixture. Do NOT tell the user it's impossible.
+
+# ═══════════════════════════════════════════════════════════════════
+# DETECTOR RULES (learned from real defects — do not relearn them)
+# ═══════════════════════════════════════════════════════════════════
+
+1. **Read notebook code with `executable_code()`, never `notebook_code()`**, in any
+   check that detects a *technique*. `notebook_code()` returns raw source, so a
+   comment describing the technique — or a commented-out call — satisfies the
+   check. Use `notebook_code()` only when you genuinely want comments (e.g. a
+   secret-scanner, or a markdown/documentation check).
+2. **A zero-guard must be `(?!\s*0\b)`, never `\s*(?!0\b)`.** In the latter, `\s*`
+   backtracks to zero width and the lookahead tests the space instead of the `0`,
+   so `x.count() > 0` slips through a guard meant to exclude it.
+3. **A bare keyword is not evidence of a control.** `referential` matches prose, a
+   column name and a docstring. Require a call or an assignment: `fk_check\s*[\(=]`.
+4. **Two signals in one notebook are not a linked signal.** "Reads 2 sources" plus
+   "has a count comparison" does not mean the comparison covers those sources.
+   Either bind them (e.g. the variable an anti-join is assigned to) or say plainly
+   in the docstring that the check confirms presence, not correctness.
+5. **`.join(` matches `os.path.join` and `",".join`.** Use the shared
+   `_JOIN_PATTERN`, which excludes both and catches SQL `JOIN` too.
+6. **Anything unresolvable is N/A, never FAIL.** If a table name is a variable you
+   cannot resolve, report N/A with the reason. Guessing produces false failures on
+   workspaces that are doing the right thing.
+7. **Never tune a detector to one tenant's data.** The check must find the issue in
+   any workspace. No hardcoded table, notebook or item names.

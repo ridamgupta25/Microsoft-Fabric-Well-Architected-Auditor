@@ -62,15 +62,15 @@ def test_root_returns_json_not_html(client):
 
 def test_catalog_lists_pillars_and_layers(client):
     pillars = client.get("/api/v1/catalog/pillars").json()
-    assert {p["name"] for p in pillars} >= {"Security", "Operations & Reliability"}
+    assert {p["name"] for p in pillars} >= {"Security & Access Control", "DevOps & Deployment"}
     layers = client.get("/api/v1/catalog/layers").json()
     assert {layer["name"] for layer in layers} >= {"Data Prep", "Data Storage"}
 
 
 def test_catalog_filters_by_pillar(client):
-    rows = client.get("/api/v1/catalog/checks", params={"pillar": "Security"}).json()
+    rows = client.get("/api/v1/catalog/checks", params={"pillar": "Security & Access Control"}).json()
     assert rows
-    assert {r["pillar"] for r in rows} == {"Security"}
+    assert {r["pillar"] for r in rows} == {"Security & Access Control"}
 
 
 def test_catalog_describes_one_check(client):
@@ -127,7 +127,16 @@ def test_report_endpoint_returns_the_full_scorecard(client):
     assert report["overall"] == EXPECTED_OVERALL
     assert report["total_scored"] == EXPECTED_SCORED_CHECKS
     assert len(report["results"]) == EXPECTED_RESULT_ROWS
-    assert report["by_pillar"]["Governance & Compliance"]["pct"] is None
+    # "Not assessed" must survive the API boundary as null rather than 0 — the
+    # two mean different things to a reader. Asserted over whichever pillars
+    # actually scored nothing, because naming one makes the test a hostage to
+    # coverage (this previously named Governance & Compliance and broke when
+    # that pillar gained its first automated check).
+    for pillar, facts in report["by_pillar"].items():
+        if facts["count"] == 0:
+            assert facts["pct"] is None, f"{pillar} scored nothing but reports a percentage"
+        else:
+            assert facts["pct"] is not None, f"{pillar} scored checks but reports no percentage"
 
 
 def test_report_includes_the_pillar_by_layer_matrix(client):
@@ -136,19 +145,17 @@ def test_report_includes_the_pillar_by_layer_matrix(client):
 
     report = client.get(f"/api/v1/reports/{audit_id}").json()
     assert set(report["layers"]) == {"Data Prep", "Data Storage", "Data Operations"}
-    assert report["matrix"]["Security"]["Data Prep"] is not None
+    assert report["matrix"]["Security & Access Control"]["Data Prep"] is not None
 
 
 def test_pillar_selection_narrows_the_report(client):
-    audit_id = _submit(client, pillars=["Security"])
+    audit_id = _submit(client, pillars=["Security & Access Control"])
     _wait_for_audit(client, audit_id)
 
     report = client.get(f"/api/v1/reports/{audit_id}").json()
-    # Scored pillars narrow to the selection; Foundation is always-on context
-    # (item inventory) so the report's inventory section is never empty.
+    # Selecting one pillar restricts the scored results to that pillar only.
     scored_pillars = {r["pillar"] for r in report["results"] if r["pillar"] != "Foundation"}
-    assert scored_pillars == {"Security"}
-    assert any(r["pillar"] == "Foundation" for r in report["results"])
+    assert scored_pillars == {"Security & Access Control"}
 
 
 def test_unreadable_workspace_is_an_error_not_a_failing_check(client):

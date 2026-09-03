@@ -21,12 +21,16 @@ from ..core.check.registry import REGISTRY
 from ..core.engine import READ_INCOMPLETE_CHECK_ID
 from ..core.engine import run_audit as run_engine
 from ..core.enums import Layer, Pillar
-from ..core.models import CheckResult
+from ..core.models import CheckResult, WorkspaceContext
 from ..core.scoring import aggregate
 from .project import ProjectConfig, load_project, load_remediation
 
 #: Check id used for workspaces that could not be read at all.
 ACCESS_CHECK_ID = "WS-ACCESS"
+
+#: Upper bound on snapshots accepted inline with one knowledge-base run, so an
+#: oversized request cannot exhaust memory. One snapshot per audited workspace.
+_MAX_INLINE_SNAPSHOTS = 100
 
 
 class AuditError(RuntimeError):
@@ -45,25 +49,60 @@ class AuditRun:
     #: Knowledge-base provenance: whether this report was served from the disk
     #: cache and whether a fresher live crawl is being (or should be) fetched.
     kb: dict = field(default_factory=dict)
+    #: Cross-workspace project groups, purely for display. Built from the
+    #: request's workspace selections; never influences targets or scoring, so an
+    #: isolated-only run leaves this empty and behaves exactly as before.
+    groups: list[dict] = field(default_factory=list)
+    #: True when the roll-up was environment-weighted (opt-in). Display only —
+    #: the per-check and per-workspace numbers are unchanged either way.
+    weighted_by_environment: bool = False
 
 
 # -- provider construction ----------------------------------------------------
 
 def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: bool = False,
-                   token_refresher=None):
+                   token_refresher=None, powerbi_token: str | None = None,
+                   sql_token: str | None = None, storage_token: str | None = None,
+                   sql_token_refresher=None, source: str = "live",
+                   snapshots: Sequence[dict] | None = None):
     """Create the provider for a run.
 
-    Every run reads the live tenant, but through the on-disk **knowledge base**:
-    the returned :class:`CachingProvider` serves each workspace from its cached
-    snapshot and calls Fabric only on a cache miss or once the snapshot is past
-    its TTL. ``refresh=True`` forces a fresh live crawl (rebuilding the KB).
-    Caching can be turned off entirely with ``AUDITFAST_CACHE_ENABLED=false``, in
-    which case the raw live provider is returned.
+    With ``source="live"`` (the default) every run reads the live tenant, but
+    through the on-disk **knowledge base**: the returned :class:`CachingProvider`
+    serves each workspace from its cached snapshot and calls Fabric only on a
+    cache miss or once the snapshot is past its TTL. ``refresh=True`` forces a
+    fresh live crawl (rebuilding the KB). Caching can be turned off entirely with
+    ``AUDITFAST_CACHE_ENABLED=false``, in which case the raw live provider is
+    returned.
+
+    With ``source="kb"`` the run is served entirely from saved snapshots — the
+    permanent archive plus any ``snapshots`` uploaded with the request — and no
+    token is needed, because not one Fabric call is made. A frozen snapshot makes
+    a replay the most reproducible run there is.
+
+    ``powerbi_token`` is an optional Power BI-audience token used only to read
+    semantic-model refresh recency; without it that one signal stays unknown.
+
+    ``sql_token`` is an optional SQL-analytics-endpoint token used to read column
+    schemas and Warehouse RLS policies, which the Fabric REST API does not expose.
+    Without it - or with ``AUDITFAST_SQL_ENDPOINT_ENABLED=false``, or with port
+    1433 blocked - those reads are skipped and the column-level checks report N/A,
+    exactly as they did before the endpoint was wired in.
+
+    ``storage_token`` is an optional Storage-audience token used only for OneLake
+    ADLS Gen2 Files listings. Without it, file-layout checks report N/A.
     """
+    settings = get_settings()
+    if source == "kb":
+        return _build_snapshot_provider(settings, snapshots)
     if not token:
         raise AuditError("A sign-in token is required to run an audit.")
-    live = LiveFabricProvider(token, token_refresher=token_refresher)
-    settings = get_settings()
+    live = LiveFabricProvider(token, timeout=settings.fabric_api_timeout_seconds,
+                              token_refresher=token_refresher,
+                              powerbi_token=powerbi_token,
+                              sql_token=sql_token if settings.sql_endpoint_enabled else None,
+                              storage_token=storage_token,
+                              sql_token_refresher=sql_token_refresher)
     provider = live
     if settings.cache_enabled:
         from .context_store import CachingProvider, ContextStore
@@ -87,22 +126,105 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
     return provider
 
 
-def _resolve_pillars(names: Iterable[str] | None) -> list[Pillar] | None:
-    """Map pillar names from an API/CLI caller onto enum members.
+def _build_snapshot_provider(settings, snapshots: Sequence[dict] | None):
+    """A replay provider over the saved KB archive plus any uploaded snapshots."""
+    from .context_store import KBArchive, SnapshotProvider
 
-    Foundation is cross-cutting, informational context (item inventory, access
-    errors, crawl-completeness) — never scored, but always reported. It is kept
-    in every run even when the caller selects a subset of the scored pillars, so
-    the report's Workspace Inventory section is never silently empty.
+    archive = KBArchive(settings.resolve(settings.kb_archive_dir))
+    uploaded = _parse_inline_snapshots(snapshots)
+    rows = archive.index()
+    known = {row["id"] for row in rows}
+    # An uploaded workspace the archive has never seen still belongs in the run.
+    for ws_id, ctx in uploaded.items():
+        if ws_id not in known:
+            rows.append(_row_for_context(ctx))
+    return SnapshotProvider(uploaded=uploaded, archive=archive, rows=rows)
+
+
+def _parse_inline_snapshots(snapshots: Sequence[dict] | None) -> dict[str, WorkspaceContext]:
+    """Validate and index snapshots supplied inline with a KB run request."""
+    items = list(snapshots or [])
+    if len(items) > _MAX_INLINE_SNAPSHOTS:
+        raise AuditError(
+            f"Too many uploaded snapshots ({len(items)}); the limit is "
+            f"{_MAX_INLINE_SNAPSHOTS} per run."
+        )
+    contexts: dict[str, WorkspaceContext] = {}
+    for raw in items:
+        ctx = _snapshot_to_context(raw)
+        contexts[ctx.id] = ctx
+    return contexts
+
+
+def _snapshot_to_context(raw: dict) -> WorkspaceContext:
+    """Turn one uploaded/saved snapshot dict into a :class:`WorkspaceContext`.
+
+    Untrusted input: this only ever *reads* the payload into the normalized model
+    (the engine is a pure function of it, so no code can execute), but it still
+    validates the shape and rejects anything that is not a workspace so a bad
+    upload fails fast with a clear message instead of a confusing later error.
     """
+    if not isinstance(raw, dict):
+        raise AuditError("A KB snapshot must be a JSON object.")
+    # The permanent archive stores the context at the top level; the TTL cache
+    # wraps it under "context". Accept either so a file copied from either store
+    # (or a report the tool itself produced) loads without hand-editing.
+    inner = raw.get("context")
+    data = inner if isinstance(inner, dict) else raw
+    try:
+        ctx = WorkspaceContext.from_dict(data)
+    except Exception as exc:  # noqa: BLE001 - any shape error is a bad upload
+        raise AuditError(f"That file is not a valid workspace snapshot: {exc}") from exc
+    if not ctx.id:
+        raise AuditError("That snapshot is missing a workspace id.")
+    return ctx
+
+
+def _row_for_context(ctx: WorkspaceContext) -> dict:
+    """Display metadata for a snapshot the archive has not indexed."""
+    return {
+        "id": ctx.id,
+        "name": ctx.display_name or ctx.id,
+        "role": ctx.layer.value,
+        "layer": ctx.layer.value,
+        "items": len(ctx.items),
+        "pipelines": len(ctx.pipelines),
+        "complete": ctx.is_complete,
+        "captured_at": "",
+    }
+
+
+def list_kb_workspaces() -> list[dict]:
+    """Workspaces available to replay from the saved knowledge-base archive.
+
+    No token, no Fabric call — just what has already been crawled to disk. This
+    is the picker behind the "Saved KB" audit source.
+    """
+    from .context_store import KBArchive
+
+    settings = get_settings()
+    return KBArchive(settings.resolve(settings.kb_archive_dir)).index()
+
+
+def validate_snapshot(payload: dict) -> dict:
+    """Validate one uploaded KB file and echo it back normalized.
+
+    Returns ``{"workspace": <display row>, "snapshot": <normalized dict>}``. The
+    caller holds the normalized snapshot and submits it with a ``source="kb"``
+    audit; re-normalizing here means the run reads exactly what was validated.
+    """
+    ctx = _snapshot_to_context(payload)
+    return {"workspace": _row_for_context(ctx), "snapshot": ctx.to_dict()}
+
+
+def _resolve_pillars(names: Iterable[str] | None) -> list[Pillar] | None:
+    """Map pillar names from an API/CLI caller onto enum members."""
     if not names:
         return None
     wanted = {str(n).strip().lower() for n in names if str(n).strip()}
     if not wanted:
         return None
     resolved = [p for p in Pillar if p.value.lower() in wanted]
-    if Pillar.FOUNDATION not in resolved:
-        resolved.append(Pillar.FOUNDATION)
     return resolved
 
 
@@ -129,6 +251,90 @@ def _resolve_targets(
     declared = {ws_id: layer for ws_id, layer in config.targets}
     # Preserve caller order, and default a workspace the project never declared.
     return [(ws_id, declared.get(ws_id, Layer.MIXED)) for ws_id in wanted]
+
+
+def _resolve_groups(
+    workspaces: Sequence[dict] | Sequence[str] | None,
+) -> list[dict]:
+    """Extract cross-workspace project groups from the request selections.
+
+    Display metadata only — it never changes which workspaces are audited or how
+    they score. A selection without a ``group`` is an isolated workspace and is
+    omitted, so an isolated-only run yields an empty list.
+    """
+    if not workspaces or not isinstance(workspaces[0], dict):
+        return []
+    grouped: dict[str, list[dict]] = {}
+    for entry in workspaces:  # type: ignore[union-attr]
+        name = str(entry.get("group") or "").strip()
+        if not name or not entry.get("id"):
+            continue
+        grouped.setdefault(name, []).append({
+            "id": entry["id"],
+            "name": entry.get("name") or entry["id"],
+            "role": entry.get("role") or entry.get("layer") or "Mixed",
+            "environment_level": entry.get("environment_level"),
+        })
+    return [
+        {
+            "name": name,
+            "workspaces": sorted(
+                members,
+                key=lambda member: (member.get("environment_level") or 0),
+            ),
+        }
+        for name, members in grouped.items()
+    ]
+
+
+def _resolve_weights(
+    workspaces: Sequence[dict] | Sequence[str] | None,
+    enabled: bool,
+) -> dict[str, float] | None:
+    """Map each workspace id to its environment weight (level 1..10 == weight).
+
+    Returns ``None`` when weighting is off or no levels were given, so the engine
+    runs its plain unweighted mean — identical to today. A workspace without a
+    level defaults to weight 1.0, so an isolated workspace is never up- or
+    down-weighted.
+    """
+    if not enabled or not workspaces or not isinstance(workspaces[0], dict):
+        return None
+    weights: dict[str, float] = {}
+    for entry in workspaces:  # type: ignore[union-attr]
+        ws_id = entry.get("id")
+        level = entry.get("environment_level")
+        if ws_id and isinstance(level, (int, float)) and level > 0:
+            weights[ws_id] = float(level)
+    return weights or None
+
+
+def _resolve_group_targets(
+    workspaces: Sequence[dict] | Sequence[str] | None,
+) -> list[tuple[str, tuple[tuple[str, Layer, int], ...]]]:
+    """Build the engine's group targets from the request's grouped selections.
+
+    Each is ``(group_name, ((workspace_id, layer, level), ...))``. Only groups
+    with two or more members are worth a cross-workspace comparison; a lone
+    grouped workspace yields nothing here (it is still audited individually).
+    """
+    if not workspaces or not isinstance(workspaces[0], dict):
+        return []
+    grouped: dict[str, list[tuple[str, Layer, int]]] = {}
+    for entry in workspaces:  # type: ignore[union-attr]
+        name = str(entry.get("group") or "").strip()
+        ws_id = entry.get("id")
+        if not name or not ws_id:
+            continue
+        layer = Layer.parse(entry.get("role") or entry.get("layer"))
+        level = entry.get("environment_level")
+        level = int(level) if isinstance(level, (int, float)) and level > 0 else 1
+        grouped.setdefault(name, []).append((ws_id, layer, level))
+    return [
+        (name, tuple(members))
+        for name, members in grouped.items()
+        if len(members) >= 2
+    ]
 
 
 # -- listing ------------------------------------------------------------------
@@ -201,36 +407,113 @@ def run_audit(
     on_progress: Callable[[dict], None] | None = None,
     refresh: bool = False,
     token_refresher=None,
+    powerbi_token: str | None = None,
+    sql_token: str | None = None,
+    storage_token: str | None = None,
+    sql_token_refresher=None,
+    weight_by_environment: bool = False,
+    external_checks_csv: str | Path | None = None,
+    source: str = "live",
+    snapshots: Sequence[dict] | None = None,
 ) -> AuditRun:
     """Run an audit and, when ``out_dir`` is given, write the report files.
 
     ``on_progress``, if given, receives a partial report dict after each
     workspace — so a caller can surface results before the whole run finishes.
 
-    The run is served from the on-disk knowledge base; pass ``refresh=True`` to
-    force a fresh live crawl and rebuild the KB.
+    With ``source="live"`` the run is served from the on-disk knowledge base;
+    pass ``refresh=True`` to force a fresh live crawl and rebuild the KB. With
+    ``source="kb"`` the run reads only saved snapshots — the archive plus any
+    ``snapshots`` uploaded with the request — and needs no token.
+
+    ``external_checks_csv``, if given, loads additional check results from a CSV
+    file (e.g., AdminChecks.csv) and merges them with the automated results.
+    Raises AuditError if the CSV is invalid.
     """
     config = load_project(project_path)
-    provider = build_provider(config, token, refresh=refresh, token_refresher=token_refresher)
+    provider = build_provider(config, token, refresh=refresh, token_refresher=token_refresher,
+                              powerbi_token=powerbi_token, sql_token=sql_token,
+                              storage_token=storage_token,
+                              sql_token_refresher=sql_token_refresher,
+                              source=source, snapshots=snapshots)
+    targets = _resolve_targets(config, workspaces)
+    groups = _resolve_groups(workspaces)
+    weights = _resolve_weights(workspaces, weight_by_environment)
+    group_targets = _resolve_group_targets(workspaces)
     remediation: RemediationBook = load_remediation(config)
 
     def _progress(partial: list[CheckResult]) -> None:
-        report = to_json(_build_run(config.name, partial))
+        run = _build_run(config.name, partial)
+        run.groups = groups
+        run.weighted_by_environment = bool(weights)
+        report = to_json(run)
         report["partial"] = True
         on_progress(report)  # type: ignore[misc]
 
     raw_results = run_engine(
         provider,
-        _resolve_targets(config, workspaces),
+        targets,
         config.settings,
         pillars=_resolve_pillars(pillars),
         remediation=remediation,
         on_progress=_progress if on_progress else None,
+        weights=weights,
+        groups=group_targets,
     )
 
-    run = _build_run(config.name, raw_results)
+    # Merge external checks if provided
+    if external_checks_csv:
+        from .external_checks_service import ExternalCheckError, load_external_checks
+
+        try:
+            # Strip surrounding whitespace and stray quotes (Windows "Copy as path"
+            # wraps the path in double quotes, which would otherwise be taken literally).
+            raw_csv = str(external_checks_csv).strip().strip('"').strip("'").strip()
+
+            # Resolve CSV path: if relative, resolve it relative to project root (parent of config dir)
+            csv_path = Path(raw_csv)
+            if not csv_path.is_absolute():
+                # Try relative to project root first (parent of config.yaml directory)
+                project_root = Path(config.path).parent
+                candidate = project_root / csv_path
+                if candidate.exists():
+                    csv_path = candidate
+                # Otherwise fall back to cwd (current working directory)
+
+            target_ws_ids = {ws_id for ws_id, _ in targets}
+            external_results, warnings = load_external_checks(
+                csv_path,
+                target_workspaces=target_ws_ids,
+            )
+
+            if warnings:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    f"Loaded external checks with {len(warnings)} warning(s):\n" +
+                    "\n".join(f"  - {w}" for w in warnings)
+                )
+
+            # Merge: workspace-agnostic (external checks added regardless of workspace)
+            # Simply append external checks to automated results without requiring workspace
+            # match. This allows external checks from different workspaces to contribute to
+            # the overall audit score. External checks keep their original workspace from CSV.
+            merged_results = raw_results + external_results
+
+        except ExternalCheckError as e:
+            raise AuditError(f"Cannot load external checks: {e}") from e
+    else:
+        merged_results = raw_results
+
+    run = _build_run(config.name, merged_results)
+    run.groups = groups
+    run.weighted_by_environment = bool(weights)
     served = bool(getattr(provider, "served_from_cache", False))
-    run.kb = {"served_from_cache": served, "refreshing": served and not refresh}
+    run.kb = {
+        "source": source,
+        "served_from_cache": served,
+        "refreshing": served and not refresh and source == "live",
+    }
     if out_dir:
         run.files = write_reports(run, out_dir)
     return run
@@ -300,7 +583,13 @@ def write_reports(run: AuditRun, out_dir: str | Path) -> dict[str, str]:
         build_markdown(run.project_name, run.aggregate, run.results, run.errors),
         encoding="utf-8",
     )
-    build_excel(str(excel_path), run.project_name, run.aggregate, run.results)
+    build_excel(
+        str(excel_path),
+        run.project_name,
+        run.aggregate,
+        run.results,
+        run.errors,
+    )
     return {"markdown": str(markdown_path), "excel": str(excel_path)}
 
 
@@ -318,6 +607,8 @@ def to_json(run: AuditRun) -> dict:
         "counts": agg.get("counts", {}),
         "total_scored": agg.get("total_scored", 0),
         "results": [r.to_dict() for r in run.results],
+        "groups": run.groups,
+        "weighted_by_environment": run.weighted_by_environment,
         "kb": run.kb,
         "errors": [
             {

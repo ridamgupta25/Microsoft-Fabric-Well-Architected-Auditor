@@ -202,7 +202,8 @@ for you to complete sign-in in a browser, then runs. There is no `--mock` /
 `--live` flag — every run is live.
 
 Reports are written to `backend/output/`:
-`audit-report.md` and `audit-report.xlsx` (Scorecard / Checks / Risk Register).
+`audit-report.md` and `audit-report.xlsx`. Both follow the stakeholder flow
+Summary → Area Detail → Checklist → Findings → Risk Register → Invent.
 
 ---
 
@@ -327,6 +328,7 @@ All optional — every setting has a working default. Prefix is `AUDITFAST_`.
 | `AUDITFAST_LOG_LEVEL` | `INFO` | Logging verbosity |
 | `AUDITFAST_LOG_JSON` | `false` | Structured JSON logs — enable when hosted |
 | `AUDITFAST_CORS_ORIGINS` | `["http://localhost:5173"]` | Origins allowed to call the API |
+| `AUDITFAST_FABRIC_API_TIMEOUT_SECONDS` | `180` | Fabric HTTP and getDefinition polling timeout |
 
 Frontend (see [`frontend/.env.example`](../frontend/.env.example)):
 

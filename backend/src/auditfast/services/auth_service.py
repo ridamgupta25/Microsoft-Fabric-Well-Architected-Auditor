@@ -39,6 +39,15 @@ _DEFAULT_FABRIC_SCOPES = [
 # just their email when no app registration is available.
 _AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
 _POWERBI_DEFAULT_SCOPE = ["https://analysis.windows.net/powerbi/api/.default"]
+#: The SQL analytics endpoint (TDS, port 1433). A third audience alongside Fabric
+#: and Power BI: Fabric REST *discovers* the endpoint, TDS *reads* it. The Azure
+#: CLI public client is pre-authorized for it, so the SQL token comes silently
+#: from the refresh token minted at sign-in - the user is never prompted twice.
+_SQL_DEFAULT_SCOPE = ["https://database.windows.net/.default"]
+#: OneLake Files listing is the ADLS Gen2 API and therefore uses the Storage
+#: audience, separate from Fabric REST, SQL and Power BI. It is acquired silently
+#: from the same signed-in session and never prompts mid-audit.
+_STORAGE_DEFAULT_SCOPE = ["https://storage.azure.com/.default"]
 #: The Fabric API, requested as .default so the built-in Azure CLI client's full
 #: set of pre-authorized Fabric permissions (including the item read/write needed
 #: for getDefinition) is included. Power BI .default did not carry them.
@@ -90,6 +99,120 @@ def token_for(session_id: str | None) -> str | None:
     """Return the access token for a completed session, or ``None``."""
     sess = _SESSIONS.get(session_id or "")
     return sess["result"] if sess else None
+
+
+def powerbi_token_for(session_id: str | None) -> str | None:
+    """Mint a Power BI-audience token for a signed-in session, or ``None``.
+
+    Semantic-model refresh history lives only on the Power BI Datasets API
+    (audience ``https://analysis.windows.net/powerbi/api``) — a different
+    audience from the Fabric token the crawl uses. This acquires that token
+    *silently* from the session's existing MSAL cache, or, for an az-cli
+    session, by re-invoking ``az`` for the Power BI resource. It never prompts;
+    on any failure it returns ``None`` and the crawl simply leaves semantic-model
+    recency unknown rather than guessing.
+    """
+    sess = _SESSIONS.get(session_id or "")
+    if not sess:
+        return None
+    app = sess.get("_msal_app")
+    account = sess.get("_msal_account")
+    if app and account:
+        try:
+            res = app.acquire_token_silent(_POWERBI_DEFAULT_SCOPE, account=account)
+            if res and "access_token" in res:
+                return res["access_token"]
+        except Exception:
+            pass
+    if sess.get("_azcli"):
+        return _azcli_powerbi_token()
+    return None
+
+
+def _azcli_powerbi_token() -> str | None:
+    """Get a Power BI-audience token from an existing ``az login``, or ``None``."""
+    return _azcli_token("https://analysis.windows.net/powerbi/api")
+
+
+def sql_token_for(session_id: str | None) -> str | None:
+    """Mint a SQL-analytics-endpoint token for a signed-in session, or ``None``.
+
+    Lakehouse/Warehouse column schemas and Warehouse security policies are not in
+    the Fabric REST API at all - they are only readable over TDS against the SQL
+    analytics endpoint, whose audience is ``https://database.windows.net``. The
+    endpoint address itself *is* discoverable over REST, so the user is never
+    asked for a connection string.
+
+    Acquired *silently* from the session's existing MSAL refresh token (the Azure
+    CLI public client is pre-authorized for this resource), so one sign-in covers
+    Fabric, Power BI and SQL. It never prompts; on any failure it returns ``None``
+    and the crawl leaves column schemas empty rather than guessing - exactly the
+    behaviour before the SQL endpoint existed.
+    """
+    sess = _SESSIONS.get(session_id or "")
+    if not sess:
+        return None
+    app = sess.get("_msal_app")
+    account = sess.get("_msal_account")
+    if app and account:
+        try:
+            res = app.acquire_token_silent(_SQL_DEFAULT_SCOPE, account=account)
+            if res and "access_token" in res:
+                return res["access_token"]
+        except Exception:
+            pass
+    if sess.get("_azcli"):
+        return _azcli_token("https://database.windows.net")
+    return None
+
+
+def storage_token_for(session_id: str | None) -> str | None:
+    """Mint a Storage-audience token for OneLake ADLS Gen2 reads, or ``None``.
+
+    OneLake exposes Fabric item storage through the ADLS Gen2 APIs
+    (``https://onelake.dfs.fabric.microsoft.com``), whose token audience is
+    ``https://storage.azure.com``. The token is acquired silently from the same
+    session used for Fabric REST; when unavailable, the provider marks
+    ``Resource.LAKEHOUSE_FILES`` unreadable so checks report N/A rather than
+    guessing.
+    """
+    sess = _SESSIONS.get(session_id or "")
+    if not sess:
+        return None
+    app = sess.get("_msal_app")
+    account = sess.get("_msal_account")
+    if app and account:
+        try:
+            res = app.acquire_token_silent(_STORAGE_DEFAULT_SCOPE, account=account)
+            if res and "access_token" in res:
+                return res["access_token"]
+        except Exception:
+            pass
+    if sess.get("_azcli"):
+        return _azcli_token("https://storage.azure.com")
+    return None
+
+
+def _azcli_token(resource: str) -> str | None:
+    """Get a token for ``resource`` from an existing ``az login``, or ``None``."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("az"):
+        return None
+    try:
+        out = subprocess.run(
+            ["az", "account", "get-access-token", "--resource", resource,
+             "--output", "json"],
+            capture_output=True, text=True, timeout=90)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        return json.loads(out.stdout).get("accessToken")
+    except Exception:
+        return None
 
 
 def make_token_refresher(session_id: str | None):

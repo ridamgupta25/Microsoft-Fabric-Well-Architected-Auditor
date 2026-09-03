@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -28,10 +29,27 @@ class WorkspaceSelection(BaseModel):
                     "Data Operations | Reporting / Semantic | Mixed.",
     )
     name: str | None = None
+    #: Cross-workspace grouping. Both are optional and purely additive: an
+    #: isolated workspace sends neither, so its audit is byte-for-byte unchanged.
+    group: str | None = Field(
+        default=None,
+        description="Project group name this workspace belongs to (cross-workspace). "
+                    "Null for an isolated workspace.",
+    )
+    environment_level: int | None = Field(
+        default=None, ge=1, le=10,
+        description="Environment position within its group: 1 = dev / least "
+                    "critical, 10 = prod / most critical. Null when ungrouped.",
+    )
 
 
 class AuditRequest(BaseModel):
-    """A request to run an audit. Always reads the live tenant."""
+    """A request to run an audit.
+
+    ``source`` chooses where the workspace data comes from: ``"live"`` crawls the
+    tenant (requires a completed sign-in), while ``"kb"`` replays saved snapshots
+    — the on-disk archive plus any uploaded ``snapshots`` — with no token.
+    """
 
     project: str | None = Field(
         default=None, description="Project YAML path. Defaults to the server's project."
@@ -46,8 +64,30 @@ class AuditRequest(BaseModel):
     )
     auth_session: str | None = Field(
         default=None,
-        description="Completed sign-in session id. Required — omitting it, or "
-                    "supplying an expired one, fails with 401.",
+        description="Completed sign-in session id. Required for source='live'; "
+                    "ignored for source='kb'.",
+    )
+    source: Literal["live", "kb"] = Field(
+        default="live",
+        description="'live' crawls the tenant; 'kb' replays saved/uploaded snapshots.",
+    )
+    snapshots: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="For source='kb': uploaded workspace snapshots to audit "
+                    "alongside (or instead of) the saved archive.",
+    )
+    weight_by_environment: bool = Field(
+        default=False,
+        description="Opt-in cross-workspace scoring: weight each workspace's checks "
+                    "by its environment level (1..10) in the overall/pillar/layer "
+                    "roll-ups. Off = today's unweighted mean. Per-workspace scores "
+                    "are unchanged either way.",
+    )
+    external_checks_csv: str | None = Field(
+        default=None,
+        description="Path to external checks CSV file (e.g., AdminChecks.csv). "
+                    "If provided, these checks are merged with automated results. "
+                    "External checks override automated checks with the same id.",
     )
 
     model_config = {
@@ -56,6 +96,8 @@ class AuditRequest(BaseModel):
                 "pillars": ["Security", "Reliability"],
                 "workspaces": [{"id": "ws-prep-01", "role": "Data Prep"}],
                 "auth_session": "3f2a9c14",
+                "external_checks_csv": "/shared/audits/AdminChecks.csv",
+                "source": "live",
             }
         }
     }
@@ -100,6 +142,11 @@ class CheckResultOut(BaseModel):
     weight: float
     scored: bool
     common: bool = Field(description="True for checks that apply to every project.")
+    validated: bool = Field(
+        default=False,
+        description="True once the check has completed Phase 1 validation; False "
+        "while it is still pending validation for the next phase.",
+    )
 
 
 class WorkspaceError(BaseModel):
@@ -122,6 +169,33 @@ class WorkspaceScore(BaseModel):
     pct: float | None
     count: int
     by_pillar: dict[str, float | None]
+
+
+class GroupMember(BaseModel):
+    """One workspace inside a project group, with its environment position."""
+
+    id: str
+    name: str | None = None
+    role: str | None = None
+    environment_level: int | None = None
+
+
+class WorkspaceGroup(BaseModel):
+    """A project group spanning several workspaces (cross-workspace)."""
+
+    name: str
+    workspaces: list[GroupMember] = Field(default_factory=list)
+
+
+class KBProvenance(BaseModel):
+    """Where a run's data came from — live crawl, cache, or saved KB replay."""
+
+    source: Literal["live", "kb"] = "live"
+    served_from_cache: bool = False
+    refreshing: bool = Field(
+        default=False,
+        description="A cached live run is being refreshed by a background crawl.",
+    )
 
 
 class AuditReport(BaseModel):
@@ -147,12 +221,24 @@ class AuditReport(BaseModel):
     counts: dict[str, int]
     total_scored: int
     results: list[CheckResultOut]
+    groups: list[WorkspaceGroup] = Field(
+        default_factory=list,
+        description="Project workspace groups (cross-workspace). Empty for an "
+                    "isolated-only run; display metadata only, never affects scoring.",
+    )
+    weighted_by_environment: bool = Field(
+        default=False,
+        description="True when the overall/pillar/layer roll-ups were weighted by "
+                    "environment level. Per-workspace scores are unaffected.",
+    )
     errors: list[WorkspaceError] = Field(default_factory=list)
     files: dict[str, str] = Field(
         default_factory=dict, description="Generated report file names."
     )
-
-
+    kb: KBProvenance = Field(
+        default_factory=KBProvenance,
+        description="Provenance of the run's data (live, cache, or saved KB).",
+    )
 class QuestionnaireItem(BaseModel):
     """One interactive, self-assessed checklist point for a run."""
 
@@ -248,3 +334,16 @@ class WorkspaceOut(BaseModel):
     layer: str = ""
     items: int | None = None
     pipelines: int | None = None
+    #: Set for saved-KB workspaces: whether the archived crawl was complete, and
+    #: when it was captured. ``None`` for live/declared workspaces.
+    complete: bool | None = None
+    captured_at: str | None = None
+
+
+class KBUploadResponse(BaseModel):
+    """The result of validating one uploaded knowledge-base file."""
+
+    workspace: WorkspaceOut = Field(description="Display metadata for the picker.")
+    snapshot: dict[str, Any] = Field(
+        description="The normalized snapshot to resubmit with a source='kb' audit."
+    )

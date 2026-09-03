@@ -44,9 +44,9 @@ FIXTURE_SETTINGS = {
 #: The overall score the recorded tenant must produce. Pinned to the value the
 #: engine returns for the fixture, so any change to a check, a band, or the
 #: roll-up fails loudly here.
-EXPECTED_OVERALL = 52.33333333333333
-EXPECTED_SCORED_CHECKS = 100
-EXPECTED_RESULT_ROWS = 223
+EXPECTED_OVERALL = 49.57805907172996
+EXPECTED_SCORED_CHECKS = 158
+EXPECTED_RESULT_ROWS = 370
 
 #: A session id the auth-service patch below always resolves to a token.
 #: Anything else — including a missing session — resolves to no token, so
@@ -91,7 +91,11 @@ def client(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     def fake_token_for(session_id: str | None) -> str | None:
         return FAKE_TOKEN if session_id == AUTHENTICATED_SESSION else None
 
-    def fake_build_provider(config, token=None, *, refresh=False, token_refresher=None):
+    def fake_build_provider(config, token=None, *, refresh=False, token_refresher=None,
+                            powerbi_token=None, sql_token=None, storage_token=None,
+                            sql_token_refresher=None, **_kwargs):
+        # ``**_kwargs`` keeps this double from breaking every API test whenever a
+        # new optional credential is threaded through the real build_provider.
         return RecordedProvider(FIXTURE_FILE)
 
     monkeypatch.setattr(auth_service, "token_for", fake_token_for)

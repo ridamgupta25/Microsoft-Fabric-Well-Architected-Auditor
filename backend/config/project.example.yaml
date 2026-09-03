@@ -8,6 +8,11 @@ project:
   pipeline_naming_convention: '^PL_[A-Za-z0-9_]+$'             # e.g. PL_Bronze_Load
   orphan_days: 90
   max_admins: 2
+  minimum_spark_version: "3.5"
+  minimum_spark_core_efficiency: 0.5
+  maximum_spark_idle_ratio: 0.3
+  heavy_shuffle_bytes: 1073741824
+  long_running_notebook_ms: 300000
 
 remediation: "config/remediation.yaml"
 

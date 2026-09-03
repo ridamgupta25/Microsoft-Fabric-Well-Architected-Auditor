@@ -59,6 +59,47 @@ add a targeted case, or run one check against the fixture:
 Green pytest + green ruff + registry count matching the pinned value = **go**.
 Anything red = **no-go**; fix the check, do not touch the harness.
 
+---
+
+# Harness — verify a generated audit report
+
+[`replay_audit.py`](replay_audit.py) answers a different question: **does the
+report in `output/` actually follow from the data that was captured?**
+
+```powershell
+..\.venv\Scripts\python.exe ..\.github\harness\replay_audit.py
+```
+
+Scoring is a pure function of the crawled `WorkspaceContext`, so the report must
+be exactly reproducible from the `workspace.json` archived for the same run. The
+script re-runs the real engine over that snapshot and diffs every recomputed
+verdict against the reported row — check id, object, status, score, and the
+evidence string. Exit code is 0 only when every row matches.
+
+Add `--project <path>` when the audit ran with a project file other than the
+default: its thresholds and naming regexes must match, or checks will differ for
+a legitimate reason.
+
+**Reading its output:**
+- `OK N of N reported rows reproduced exactly` then `GO` — the report is faithful
+  to the snapshot and the checks are deterministic.
+- `FAIL <check> @ <ws>/<obj>` with a status/score/evidence diff — the report does
+  not follow from the snapshot. Most often the API server was not restarted after
+  a code change (`auditfast serve` does not hot-reload, so the report came from
+  older check code than the working tree). Other causes: the report and the
+  newest snapshot are from different runs, or a genuinely non-deterministic
+  check — which is a defect.
+- `FAIL in report but not reproducible` — a reported row the replay never
+  produced; the report predates the snapshot, or the check was removed/renamed.
+- `WARN produced by replay but absent from the report` — the audit likely ran
+  with a pillar filter, or the check is new since the report was written. Warns
+  rather than fails, because neither makes the reported rows wrong.
+
+**What a clean replay does *not* prove:** that the snapshot is a complete view of
+the tenant — read `complete`, `unavailable`, and `read_failures` in the snapshot's
+`summary.json` for that — or that a check's rule is the *right* rule. Those stay
+human judgement, which is what the `check-reviewer` agent adds on top.
+
 ## 6. Test on a real workspace (needs a tenant)
 The offline harness proves the check is *wired correctly*; to see its live
 verdict, run it against one workspace with a Fabric token — this is the "test on

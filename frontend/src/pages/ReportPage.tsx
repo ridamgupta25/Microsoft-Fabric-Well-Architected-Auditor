@@ -12,6 +12,14 @@ import { useAsync } from "@/hooks/useAsync";
 import { getAudit, reportDownloadUrl } from "@/services/auditService";
 import { formatPercent, ratingFor } from "@/utils/format";
 
+/** Human label for an environment position (1 = dev .. 10 = prod). */
+function environmentLabel(level: number): string {
+  if (level <= 3) return "Development";
+  if (level <= 6) return "Test / staging";
+  if (level <= 8) return "Pre-production";
+  return "Production";
+}
+
 export function ReportPage() {
   const { auditId = "" } = useParams();
   const { data: job, loading, error, reload } = useAsync(
@@ -55,6 +63,25 @@ export function ReportPage() {
 
   const rating = ratingFor(report.overall);
 
+  // Correlate group members (sent as name/id) to the by-workspace scores, which
+  // are keyed by display name. Members that match claim their row; everything
+  // left over is shown as isolated. Purely for display — no score is computed here.
+  const groups = report.groups ?? [];
+  const scoreKeyFor = (member: { id: string; name?: string | null }): string | null => {
+    if (member.name && report.by_workspace[member.name]) return member.name;
+    if (report.by_workspace[member.id]) return member.id;
+    return null;
+  };
+  const groupedKeys = new Set<string>();
+  for (const group of groups)
+    for (const member of group.workspaces) {
+      const key = scoreKeyFor(member);
+      if (key) groupedKeys.add(key);
+    }
+  const isolatedRows = Object.entries(report.by_workspace).filter(
+    ([name]) => !groupedKeys.has(name),
+  );
+
   return (
     <div className="space-y-6">
       <div>
@@ -91,11 +118,11 @@ export function ReportPage() {
         <section className="rounded-md border border-orange-200 bg-orange-50 p-4 dark:border-orange-900 dark:bg-orange-950">
           <h2 className="flex items-center gap-2 text-base font-semibold text-orange-900 dark:text-orange-300">
             <span aria-hidden="true">⚠</span>
-            Workspaces Requiring Additional Access ({report.errors.length})
+            Audit Read Limitations ({report.errors.length})
           </h2>
           <p className="mt-1 text-xs text-orange-700 dark:text-orange-400">
-            These were skipped and are excluded from the scores below. Grant at least Viewer
-            access, then re-run the audit.
+            These resources or artifacts could not be assessed and are excluded from the scores below.
+            Review the recorded cause and remediation, then run a live audit again.
           </p>
           <div className="mt-3 scroll-x">
             <table className="table-base">
@@ -108,8 +135,8 @@ export function ReportPage() {
                 </tr>
               </thead>
               <tbody>
-                {report.errors.map((item) => (
-                  <tr key={item.workspace}>
+                {report.errors.map((item, index) => (
+                  <tr key={`${item.workspace}-${index}`}>
                     <td className="font-medium">{item.workspace}</td>
                     <td>
                       <span className="badge bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200">
@@ -118,7 +145,7 @@ export function ReportPage() {
                     </td>
                     <td className="min-w-[16rem]">{item.message}</td>
                     <td className="min-w-[16rem] text-orange-800 dark:text-orange-300">
-                      {item.recommendation || "Ask an admin for access, then re-run."}
+                      {item.recommendation || "Review the recorded cause, then run a live audit again."}
                     </td>
                   </tr>
                 ))}
@@ -139,6 +166,11 @@ export function ReportPage() {
               {report.counts.PASS ?? 0} pass · {report.counts.PARTIAL ?? 0} partial ·{" "}
               {report.counts.FAIL ?? 0} fail · {report.total_scored} scored
             </p>
+            {report.weighted_by_environment && (
+              <p className="mt-1 inline-flex items-center gap-1 rounded bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-800 dark:bg-blue-950 dark:text-blue-300">
+                Environment-weighted — production workspaces count more toward this score
+              </p>
+            )}
           </div>
           <div className="flex items-center gap-2">
             <span className={`badge ${rating.bgClass}`}>{rating.label}</span>
@@ -179,28 +211,122 @@ export function ReportPage() {
       </Section>
 
       <Section title="Per-workspace breakdown">
-        <div className="card scroll-x">
-          <table className="table-base">
-            <thead>
-              <tr>
-                <th scope="col">Workspace</th>
-                <th scope="col">Layer role</th>
-                <th scope="col">Checks</th>
-                <th scope="col" className="min-w-[12rem]">Score</th>
-              </tr>
-            </thead>
-            <tbody>
-              {Object.entries(report.by_workspace).map(([name, score]) => (
-                <tr key={name}>
-                  <td className="font-medium">{name}</td>
-                  <td><span className="badge bg-slate-100 dark:bg-slate-800">{score.layer}</span></td>
-                  <td>{score.count}</td>
-                  <td><ScoreBar pct={score.pct} /></td>
+        {groups.length === 0 ? (
+          <div className="card scroll-x">
+            <table className="table-base">
+              <thead>
+                <tr>
+                  <th scope="col">Workspace</th>
+                  <th scope="col">Layer role</th>
+                  <th scope="col">Checks</th>
+                  <th scope="col" className="min-w-[12rem]">Score</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {Object.entries(report.by_workspace).map(([name, score]) => (
+                  <tr key={name}>
+                    <td className="font-medium">{name}</td>
+                    <td><span className="badge bg-slate-100 dark:bg-slate-800">{score.layer}</span></td>
+                    <td>{score.count}</td>
+                    <td><ScoreBar pct={score.pct} /></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {groups.map((group) => (
+              <div key={group.name} className="card p-0">
+                <div className="border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+                  <h3 className="font-semibold">{group.name}</h3>
+                  <p className="text-xs text-slate-500">
+                    Project group · {group.workspaces.length} workspaces
+                  </p>
+                </div>
+                <div className="scroll-x">
+                  <table className="table-base">
+                    <thead>
+                      <tr>
+                        <th scope="col">Workspace</th>
+                        <th scope="col">Environment</th>
+                        <th scope="col">Layer role</th>
+                        <th scope="col">Checks</th>
+                        <th scope="col" className="min-w-[12rem]">Score</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {group.workspaces.map((member) => {
+                        const key = scoreKeyFor(member);
+                        const score = key ? report.by_workspace[key] : undefined;
+                        return (
+                          <tr key={member.id}>
+                            <td className="font-medium">{member.name ?? member.id}</td>
+                            <td>
+                              {member.environment_level != null ? (
+                                <span className="badge bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300">
+                                  {member.environment_level} · {environmentLabel(member.environment_level)}
+                                </span>
+                              ) : (
+                                "—"
+                              )}
+                            </td>
+                            <td>
+                              {score ? (
+                                <span className="badge bg-slate-100 dark:bg-slate-800">{score.layer}</span>
+                              ) : (
+                                "—"
+                              )}
+                            </td>
+                            <td>{score ? score.count : "—"}</td>
+                            <td>
+                              {score ? (
+                                <ScoreBar pct={score.pct} />
+                              ) : (
+                                <span className="text-xs text-slate-400">Not in this run</span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ))}
+
+            {isolatedRows.length > 0 && (
+              <div className="card p-0">
+                <div className="border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+                  <h3 className="font-semibold">Isolated workspaces</h3>
+                  <p className="text-xs text-slate-500">Not assigned to a project group.</p>
+                </div>
+                <div className="scroll-x">
+                  <table className="table-base">
+                    <thead>
+                      <tr>
+                        <th scope="col">Workspace</th>
+                        <th scope="col">Layer role</th>
+                        <th scope="col">Checks</th>
+                        <th scope="col" className="min-w-[12rem]">Score</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {isolatedRows.map(([name, score]) => (
+                        <tr key={name}>
+                          <td className="font-medium">{name}</td>
+                          <td><span className="badge bg-slate-100 dark:bg-slate-800">{score.layer}</span></td>
+                          <td>{score.count}</td>
+                          <td><ScoreBar pct={score.pct} /></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </Section>
 
       <Section

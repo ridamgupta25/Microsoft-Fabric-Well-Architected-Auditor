@@ -132,7 +132,7 @@ report for every applicable workspace.
    becomes empty, delete the file.
 2. **Automated only:** optionally remove its `ref` line from
    `backend/config/remediation.yaml` (leaving it is harmless).
-3. **Restart the API** and **re-pin the tests** (see §6) — counts go **down**.
+3. **Restart the API** and **re-pin the tests** (see §7) — counts go **down**.
 
 > To remove an auto-generated **`roadmap`** point instead, see
 > [checks.md § Promoting](checks.md#5-promoting-a-roadmap-point-to-automated) —
@@ -140,7 +140,65 @@ report for every applicable workspace.
 
 ---
 
-## 4. Run automated only, or include the self-assessed questionnaire
+## 4. Mark a check as **validated** (the Phase 1 / next-phase flag)
+
+Every check carries a **validation flag**: a check is **Validated** once its
+checklist point has been reviewed against real workspace data, or **Pending
+validation** while it is still registered but awaiting review in the next phase.
+The flag is for *your* confidence signalling — it does **not** change any score.
+
+### The one place to edit
+
+There is a single source of truth:
+[`backend/src/auditfast/core/validation.py`](../backend/src/auditfast/core/validation.py).
+It holds the **validated checklist** — a mapping of **checklist ref id → checklist
+item**. Add a line, keyed by the point's **ref**, to mark the matching check(s)
+**Validated**; delete the line to send them back to **Pending validation**. The
+flag then updates **automatically and everywhere at once**:
+
+- the **Catalog** page and `GET /api/v1/catalog/checks` (a *Validation* column),
+- the audit **report in the UI** (a *Validation* column + filter on the Findings
+  table),
+- the downloaded **Excel** report (a *Validation* column on the consolidated
+  `Checklist` sheet + a *Coverage and Validation* block on `Summary`),
+- the **Markdown** report (the same checklist column and executive-level
+  coverage block).
+
+```python
+# backend/src/auditfast/core/validation.py
+VALIDATED_CHECKLIST: dict[str, str] = {
+    "2.4.1":  "All pipeline activities have appropriate retry policies configured",
+    "13.3.1": "Workspace is assigned to a Fabric capacity [WS-CAPACITY]",
+    # ...add a "<ref>": "<checklist item>" line to validate a point; delete it
+    #    to send the matching check(s) back to "Pending validation".
+}
+```
+
+### Find a point's ref
+
+Use the **Ref** column of any report or the Catalog page, or list them:
+
+```powershell
+..\.venv\Scripts\python.exe -m auditfast checks          # id + ref for every check
+# or GET /api/v1/catalog/checks
+```
+
+> **Keyed by ref (the checklist ref id).** Add a checklist item with its ref and
+> the matching check shows as *Validated*; leave it out and the check stays
+> *Pending*. Several checks can share one ref (e.g. a pipeline and a notebook
+> variant of the same point) — adding that ref validates **all** of them, which
+> is usually what you want. A typo (a ref that is not a real check's ref) is
+> caught by `backend/tests/test_validation.py`, not shipped silently. Editing this
+> checklist does **not** change scores, counts, or rows, so there is **nothing to
+> re-pin** (see §7).
+
+> **Seeing the change.** Restart the API (`auditfast serve` does not hot-reload)
+> for the Catalog and UI, and **re-run the audit** to regenerate the Excel /
+> Markdown reports — already-saved report files do not update retroactively.
+
+---
+
+## 5. Run automated only, or include the self-assessed questionnaire
 
 The automated score is **always** computed from automated checks only — the audit
 engine skips interactive checks entirely. Interactive points are a **separate,
@@ -191,7 +249,7 @@ unless you truly never want them.
 
 ---
 
-## 5. Narrow a run to specific pillars
+## 6. Narrow a run to specific pillars
 
 Deselecting a pillar skips **all** its checks (automated *and* interactive) and
 even its Fabric calls.
@@ -209,7 +267,7 @@ To review coverage without running anything:
 
 ---
 
-## 6. After ANY change — do these three things
+## 7. After ANY change — do these three things
 
 1. **Restart the API server.** `auditfast serve` does **not** hot-reload; a running
    server keeps the old checks until restarted. (The frontend hot-reloads on its
@@ -240,6 +298,7 @@ To review coverage without running anything:
    | **Any** check added/removed | Nothing for `checks_registered` — `backend/tests/test_api.py` asserts `== len(REGISTRY)`, which self-adjusts |
    | An **automated** check | the automated count `== 64` in `backend/tests/test_engine.py`; `EXPECTED_OVERALL`, `EXPECTED_SCORED_CHECKS`, `EXPECTED_RESULT_ROWS` in `backend/tests/conftest.py` (the score/row counts shift) |
    | An **interactive** check | the interactive count `== 0` in `backend/tests/test_engine.py` (the automated score is **unchanged** — the engine skips it) |
+   | The **validation flag** (`core/validation.py`) | **Nothing** — `backend/tests/test_validation.py` only checks the refs exist; scores/counts/rows are unaffected |
 
    Then lint: `..\.venv\Scripts\python.exe -m ruff check src`.
 
@@ -252,6 +311,7 @@ To review coverage without running anything:
 | Add automated check | new `@check` in `automated.py` + remediation ref → restart → re-pin |
 | Add self-assessed check | new `questionnaire_check` in `questionnaire.py` → restart → re-pin |
 | Remove a check | delete the function/call (+ optional remediation line) → restart → re-pin |
+| **Mark a check Validated / Pending** | add/remove its **ref** in `core/validation.py` `VALIDATED_CHECKLIST` — updates UI, Excel & Markdown automatically; no re-pin |
 | **Test automated only** | run via **CLI**, or in the **UI skip the questionnaire**, or via **API don't POST answers** |
 | Include self-assessed | answer the questionnaire in the UI, or `POST /audit/{id}/answers` |
 | Only some pillars | untick pillars (UI) · `--pillars` (CLI) · `"pillars": [...]` (API) |

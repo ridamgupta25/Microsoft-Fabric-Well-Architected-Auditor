@@ -1,9 +1,10 @@
 /**
  * Submit an audit: pick workspaces and pillars, then watch it run.
  *
- * Always audits the live tenant. Workspaces are only ever fetched once the user
- * has a real sign-in session — there is no sample/fixture data shown here, so
- * what you see on this page is always what your account can actually reach.
+ * Two data sources are offered. **Live** audits the signed-in tenant. **Saved
+ * KB** replays snapshots already crawled to disk — no sign-in — and also accepts
+ * a workspace snapshot uploaded as JSON. What you see under Live is always what
+ * your account can actually reach; there is no sample/fixture data.
  *
  * Submission is fire-and-poll, so the page shows live status while the backend
  * works rather than freezing on a long request.
@@ -16,25 +17,49 @@ import { ErrorBanner, Section, Spinner } from "@/components/ui";
 import { useAuditContext } from "@/context/AuditContext";
 import { useAsync } from "@/hooks/useAsync";
 import {
+  listKbWorkspaces,
   listLiveWorkspaces,
   pollAudit,
   submitAudit,
   submitAuditAnswers,
+  uploadKbSnapshot,
 } from "@/services/auditService";
 import { listLayers, listPillars } from "@/services/catalogService";
-import type { AuditJob, Workspace } from "@/types/api";
+import type { AuditJob, AuditSource, Workspace } from "@/types/api";
 
 const TERMINAL_STATUSES = new Set<AuditJob["status"]>(["succeeded", "failed"]);
+
+interface WorkspaceGroup {
+  id: string;
+  name: string;
+  members: Record<string, number>;
+}
+
+const environmentLabel = (level: number) => {
+  if (level <= 3) return "Development";
+  if (level <= 6) return "Test / staging";
+  if (level <= 8) return "Pre-production";
+  return "Production";
+};
 
 export function RunAuditPage() {
   const navigate = useNavigate();
   const { session, isSignedIn, setLastAuditId, setReport } = useAuditContext();
 
-  // Only fetch once there is a real session — never fall back to sample data.
+  // Live reads the signed-in tenant; KB replays saved/uploaded snapshots offline.
+  const [source, setSource] = useState<AuditSource>("live");
+
+  // Live workspaces need a session; saved-KB workspaces come from disk with no
+  // sign-in. Either way this is the only source of the queue — never sample data.
   const workspaces = useAsync(
-    () => (session ? listLiveWorkspaces(session) : Promise.resolve([])),
-    [session],
-    isSignedIn,
+    () =>
+      source === "kb"
+        ? listKbWorkspaces()
+        : session
+          ? listLiveWorkspaces(session)
+          : Promise.resolve([]),
+    [source, session],
+    source === "kb" || isSignedIn,
   );
   const pillars = useAsync(() => listPillars(), []);
   const layers = useAsync(() => listLayers(), []);
@@ -43,9 +68,22 @@ export function RunAuditPage() {
   const [roles, setRoles] = useState<Record<string, string>>({});
   const [manual, setManual] = useState<Workspace[]>([]);
   const [removed, setRemoved] = useState<Record<string, boolean>>({});
+  // Uploaded KB snapshots, keyed by workspace id. A `kb` run carries these
+  // inline; archived workspaces are loaded from disk by id and need no entry.
+  const [snapshots, setSnapshots] = useState<Record<string, Record<string, unknown>>>({});
+  const [uploading, setUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [newWsId, setNewWsId] = useState("");
   const [newWsRole, setNewWsRole] = useState("Mixed");
+  const [groups, setGroups] = useState<WorkspaceGroup[]>([]);
+  const [showGroupBuilder, setShowGroupBuilder] = useState(false);
+  const [showGroupHelp, setShowGroupHelp] = useState(false);
+  const [groupName, setGroupName] = useState("");
+  const [groupMembers, setGroupMembers] = useState<Record<string, number>>({});
+  //: Opt-in cross-workspace scoring — weight each workspace by its env level.
+  const [weightByEnv, setWeightByEnv] = useState(false);
   const [chosenPillars, setChosenPillars] = useState<Record<string, boolean>>({});
+  const [externalChecksPath, setExternalChecksPath] = useState<string>("");
   const [job, setJob] = useState<AuditJob | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -71,6 +109,25 @@ export function RunAuditPage() {
     }
     return [...map.values()];
   }, [workspaces.data, manual, removed]);
+
+  const groupedWorkspaceIds = useMemo(
+    () => new Set(groups.flatMap((group) => Object.keys(group.members))),
+    [groups],
+  );
+
+  const isolatedWorkspaces = useMemo(
+    () => allWorkspaces.filter((workspace) => !groupedWorkspaceIds.has(workspace.id)),
+    [allWorkspaces, groupedWorkspaceIds],
+  );
+
+  // Workspace id -> its project group and environment position, for submission.
+  const memberGroup = useMemo(() => {
+    const map = new Map<string, { group: string; level: number }>();
+    for (const group of groups)
+      for (const [workspaceId, level] of Object.entries(group.members))
+        map.set(workspaceId, { group: group.name, level });
+    return map;
+  }, [groups]);
 
   // Select every workspace by default — auditing everything you can see is the
   // common case — while preserving choices the user has already made.
@@ -100,8 +157,8 @@ export function RunAuditPage() {
 
   const submitFor = useCallback(
     async (specs: { id: string; role: string }[]) => {
-      if (!isSignedIn || !session) {
-        setError("Connect to Fabric before running an audit.");
+      if (source === "live" && (!isSignedIn || !session)) {
+        setError("Connect to Fabric before running a live audit.");
         return;
       }
       const chosen = Object.entries(chosenPillars)
@@ -129,10 +186,19 @@ export function RunAuditPage() {
       abortRef.current = controller;
 
       try {
+        // A KB run carries only the snapshots that were uploaded; workspaces
+        // picked from the saved archive are loaded on the server by id.
+        const uploaded = specs
+          .map((spec) => snapshots[spec.id])
+          .filter((snap): snap is Record<string, unknown> => Boolean(snap));
         const accepted = await submitAudit({
           pillars: chosen,
           workspaces: specs,
-          auth_session: session,
+          weight_by_environment: weightByEnv,
+          external_checks_csv: externalChecksPath || null,
+          auth_session: source === "kb" ? undefined : session,
+          source,
+          snapshots: source === "kb" ? uploaded : undefined,
         });
         setLastAuditId(accepted.audit_id);
         setAuditId(accepted.audit_id);
@@ -152,12 +218,22 @@ export function RunAuditPage() {
         setSubmitting(false);
       }
     },
-    [chosenPillars, isSignedIn, session, setLastAuditId],
+    [chosenPillars, isSignedIn, session, source, snapshots, setLastAuditId, weightByEnv, externalChecksPath],
   );
-
   const specsFor = useCallback(
-    (list: Workspace[]) => list.map((w) => ({ id: w.id, role: roles[w.id] ?? w.role ?? "Mixed" })),
-    [roles],
+    (list: Workspace[]) =>
+      list.map((w) => {
+        const membership = memberGroup.get(w.id);
+        return {
+          id: w.id,
+          role: roles[w.id] ?? w.role ?? "Mixed",
+          name: w.name,
+          ...(membership
+            ? { group: membership.group, environment_level: membership.level }
+            : {}),
+        };
+      }),
+    [roles, memberGroup],
   );
 
   const run = useCallback(
@@ -252,22 +328,123 @@ export function RunAuditPage() {
       delete next[id];
       return next;
     });
+    setSnapshots((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
   };
 
-  if (!isSignedIn) {
+  const toggleGroupMember = (id: string) => {
+    setGroupMembers((prev) => {
+      const next = { ...prev };
+      if (id in next) delete next[id];
+      else next[id] = 1;
+      return next;
+    });
+  };
+
+  const addGroup = () => {
+    const name = groupName.trim();
+    if (!name || Object.keys(groupMembers).length === 0) return;
+    setGroups((prev) => [
+      ...prev,
+      { id: crypto.randomUUID(), name, members: groupMembers },
+    ]);
+    setGroupName("");
+    setGroupMembers({});
+    setShowGroupBuilder(false);
+  };
+
+  const removeGroup = (id: string) => {
+    setGroups((prev) => prev.filter((group) => group.id !== id));
+  };
+
+  // Read one or more uploaded workspace snapshot files, validate each against
+  // the server (which normalizes it), and add it to the queue. Untrusted input:
+  // the server rejects anything that is not a workspace snapshot.
+  const handleUpload = useCallback(async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    setUploading(true);
+    setError(null);
+    try {
+      for (const file of Array.from(files)) {
+        const text = await file.text();
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          throw new Error(`${file.name} is not valid JSON.`);
+        }
+        const { workspace, snapshot } = await uploadKbSnapshot(parsed);
+        setSnapshots((prev) => ({ ...prev, [workspace.id]: snapshot }));
+        setManual((prev) =>
+          prev.some((w) => w.id === workspace.id)
+            ? prev.map((w) => (w.id === workspace.id ? workspace : w))
+            : [...prev, workspace],
+        );
+        setRoles((prev) => ({ ...prev, [workspace.id]: workspace.role || "Mixed" }));
+        setSelected((prev) => ({ ...prev, [workspace.id]: true }));
+        setRemoved((prev) => {
+          const next = { ...prev };
+          delete next[workspace.id];
+          return next;
+        });
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }, []);
+
+  // The source picker is shown in both the signed-out gate and the main view,
+  // so a user with no session can still switch to the offline saved-KB source.
+  const sourceToggle = (
+    <Section
+      title="Audit source"
+      description="Audit the live Fabric tenant you sign in to, or replay a workspace already saved to the knowledge base — no sign-in needed."
+    >
+      <div className="flex flex-wrap gap-2">
+        <button
+          type="button"
+          className={source === "live" ? "btn-primary" : "btn-secondary"}
+          onClick={() => setSource("live")}
+          aria-pressed={source === "live"}
+        >
+          Live tenant
+        </button>
+        <button
+          type="button"
+          className={source === "kb" ? "btn-primary" : "btn-secondary"}
+          onClick={() => setSource("kb")}
+          aria-pressed={source === "kb"}
+        >
+          Saved KB (offline)
+        </button>
+      </div>
+    </Section>
+  );
+
+  if (source === "live" && !isSignedIn) {
     return (
-      <div className="card flex flex-col items-center gap-3 py-12 text-center">
-        <div className="rounded-full bg-orange-100 p-3 dark:bg-orange-950">
-          <span className="block h-2.5 w-2.5 rounded-full bg-orange-500" aria-hidden="true" />
+      <div className="space-y-6">
+        {sourceToggle}
+        <div className="card flex flex-col items-center gap-3 py-12 text-center">
+          <div className="rounded-full bg-orange-100 p-3 dark:bg-orange-950">
+            <span className="block h-2.5 w-2.5 rounded-full bg-orange-500" aria-hidden="true" />
+          </div>
+          <h2 className="text-lg font-semibold">Connect to Microsoft Fabric</h2>
+          <p className="max-w-md text-sm text-slate-600 dark:text-slate-400">
+            Sign in to see the workspaces you have access to, then choose which ones to audit.
+            Read-only — the tool never writes to your tenant. Or switch to{" "}
+            <strong>Saved KB</strong> above to replay a workspace offline.
+          </p>
+          <Link to="/sign-in" className="btn-primary mt-2">
+            Connect to Fabric
+          </Link>
         </div>
-        <h2 className="text-lg font-semibold">Connect to Microsoft Fabric</h2>
-        <p className="max-w-md text-sm text-slate-600 dark:text-slate-400">
-          Sign in to see the workspaces you have access to, then choose which ones to audit.
-          Read-only — the tool never writes to your tenant.
-        </p>
-        <Link to="/sign-in" className="btn-primary mt-2">
-          Connect to Fabric
-        </Link>
       </div>
     );
   }
@@ -355,9 +532,15 @@ export function RunAuditPage() {
     <div className="space-y-6">
       {error && <ErrorBanner message={error} />}
 
+      {sourceToggle}
+
       <Section
         title="Workspaces"
-        description="Every workspace your account can see. Each is audited in the context of the layer role you assign it."
+        description={
+          source === "kb"
+            ? "Workspaces already saved to the knowledge base. Pick any to replay offline, or upload a workspace snapshot below."
+            : "Organize related environments as projects, or audit standalone workspaces independently."
+        }
         actions={
           <div className="flex gap-2">
             <button type="button" className="btn-secondary" onClick={() => selectAll(true)}>
@@ -374,6 +557,242 @@ export function RunAuditPage() {
           <ErrorBanner message={workspaces.error} onRetry={workspaces.reload} />
         )}
 
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            className="btn-primary"
+            onClick={() => setShowGroupBuilder((value) => !value)}
+            disabled={isolatedWorkspaces.length === 0}
+          >
+            <span aria-hidden="true">＋</span> Add project workspace
+          </button>
+          <div className="relative">
+            <button
+              type="button"
+              className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-300 text-sm font-semibold text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+              aria-label="About project workspaces"
+              aria-expanded={showGroupHelp}
+              onClick={() => setShowGroupHelp((value) => !value)}
+            >
+              ?
+            </button>
+            {showGroupHelp && (
+              <div className="fixed inset-x-4 top-1/2 z-20 w-auto -translate-y-1/2 rounded-md border border-slate-200 bg-white p-4 text-sm shadow-lg sm:absolute sm:inset-x-auto sm:left-0 sm:top-11 sm:w-80 sm:translate-y-0 dark:border-slate-700 dark:bg-slate-900">
+                <p className="font-semibold">Project workspace groups</p>
+                <p className="mt-1 text-slate-600 dark:text-slate-400">
+                  Group the workspaces that represent one solution across environments. A
+                  workspace can belong to only one group and is removed from the isolated
+                  list, preventing it from being audited twice.
+                </p>
+                <p className="mt-2 text-slate-600 dark:text-slate-400">
+                  Environment position is flexible: 1 is development or least critical;
+                  10 is production or most critical. Use the values between them for QA,
+                  staging, UAT, pre-production, or your own lifecycle.
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {showGroupBuilder && (
+          <div className="rounded-md border border-blue-200 bg-blue-50/60 p-4 dark:border-blue-900 dark:bg-blue-950/30">
+            <div className="flex flex-wrap items-end gap-3">
+              <div className="min-w-64 flex-1">
+                <label htmlFor="group-name" className="mb-1 block text-xs font-medium text-slate-600 dark:text-slate-300">
+                  Project name
+                </label>
+                <input
+                  id="group-name"
+                  className="input"
+                  placeholder="e.g. Customer Insights Platform"
+                  value={groupName}
+                  onChange={(event) => setGroupName(event.target.value)}
+                />
+              </div>
+              <button type="button" className="btn-secondary" onClick={() => setShowGroupBuilder(false)}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn-primary"
+                onClick={addGroup}
+                disabled={!groupName.trim() || Object.keys(groupMembers).length === 0}
+              >
+                Create project
+              </button>
+            </div>
+            <div className="mt-4 scroll-x rounded-md border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-950">
+              <table className="table-base">
+                <thead>
+                  <tr>
+                    <th scope="col" className="w-10">Add</th>
+                    <th scope="col">Workspace</th>
+                    <th scope="col">Environment position</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {isolatedWorkspaces.map((workspace) => (
+                    <tr key={workspace.id}>
+                      <td>
+                        <input
+                          type="checkbox"
+                          checked={workspace.id in groupMembers}
+                          onChange={() => toggleGroupMember(workspace.id)}
+                          aria-label={`Add ${workspace.name} to project`}
+                        />
+                      </td>
+                      <td>
+                        <div className="font-medium">{workspace.name}</div>
+                        <div className="font-mono text-xs text-slate-500">{workspace.id}</div>
+                      </td>
+                      <td>
+                        <div className="flex min-w-72 items-center gap-3">
+                          <input
+                            type="range"
+                            min="1"
+                            max="10"
+                            value={groupMembers[workspace.id] ?? 1}
+                            disabled={!(workspace.id in groupMembers)}
+                            onChange={(event) => setGroupMembers((prev) => ({
+                              ...prev,
+                              [workspace.id]: Number(event.target.value),
+                            }))}
+                            className="w-36 accent-blue-600"
+                            aria-label={`Environment position for ${workspace.name}`}
+                          />
+                          <span className="w-32 text-sm">
+                            <strong>{groupMembers[workspace.id] ?? 1}</strong>
+                            <span className="ml-2 text-slate-500">
+                              {environmentLabel(groupMembers[workspace.id] ?? 1)}
+                            </span>
+                          </span>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        <div className="space-y-3">
+          <div>
+            <h3 className="font-semibold">Grouped workspaces</h3>
+            <p className="text-sm text-slate-500">Projects spanning multiple lifecycle environments.</p>
+          </div>
+          {groups.length === 0 ? (
+            <div className="rounded-md border border-dashed border-slate-300 px-4 py-5 text-sm text-slate-500 dark:border-slate-700">
+              No project workspaces created yet.
+            </div>
+          ) : (
+            groups.map((group) => (
+              <div key={group.id} className="card p-0">
+                <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+                  <div>
+                    <h4 className="font-semibold">{group.name}</h4>
+                    <p className="text-xs text-slate-500">{Object.keys(group.members).length} workspaces</p>
+                  </div>
+                  <button
+                    type="button"
+                    className="text-sm font-medium text-red-600 hover:underline dark:text-red-400"
+                    onClick={() => removeGroup(group.id)}
+                    title="Remove the group and return its members to isolated workspaces"
+                  >
+                    Remove group
+                  </button>
+                </div>
+                <div className="scroll-x">
+                  <table className="table-base">
+                    <thead>
+                      <tr>
+                        <th scope="col" className="w-10">Audit</th>
+                        <th scope="col">Workspace</th>
+                        <th scope="col">Environment</th>
+                        <th scope="col">Layer role</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.entries(group.members)
+                        .sort(([, left], [, right]) => left - right)
+                        .map(([workspaceId, level]) => {
+                          const workspace = allWorkspaces.find((item) => item.id === workspaceId);
+                          if (!workspace) return null;
+                          return (
+                            <tr key={workspace.id}>
+                              <td>
+                                <input
+                                  type="checkbox"
+                                  checked={selected[workspace.id] ?? false}
+                                  onChange={(event) => setSelected((prev) => ({
+                                    ...prev,
+                                    [workspace.id]: event.target.checked,
+                                  }))}
+                                  aria-label={`Audit ${workspace.name}`}
+                                />
+                              </td>
+                              <td>
+                                <div className="font-medium">{workspace.name}</div>
+                                <div className="font-mono text-xs text-slate-500">{workspace.id}</div>
+                              </td>
+                              <td>
+                                <span className="badge bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300">
+                                  {level} · {environmentLabel(level)}
+                                </span>
+                              </td>
+                              <td>
+                                <select
+                                  value={roles[workspace.id] ?? "Mixed"}
+                                  onChange={(event) => setRoles((prev) => ({
+                                    ...prev,
+                                    [workspace.id]: event.target.value,
+                                  }))}
+                                  className="input w-auto py-1 text-sm"
+                                  aria-label={`Layer role for ${workspace.name}`}
+                                >
+                                  {(layers.data ?? []).map((layer) => (
+                                    <option key={layer.name} value={layer.name}>{layer.name}</option>
+                                  ))}
+                                </select>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+
+        {source === "kb" && (
+          <div className="card flex flex-wrap items-end gap-2">
+            <div className="flex-1">
+              <label
+                htmlFor="upload-kb"
+                className="mb-1 block text-xs font-medium text-slate-500"
+              >
+                Upload a workspace snapshot (JSON)
+              </label>
+              <input
+                id="upload-kb"
+                ref={fileInputRef}
+                type="file"
+                accept="application/json,.json"
+                multiple
+                className="input"
+                onChange={(event) => handleUpload(event.target.files)}
+                disabled={uploading}
+              />
+            </div>
+            {uploading && <Spinner label="Validating…" />}
+            <p className="w-full text-xs text-slate-500">
+              Accepts a snapshot exported by this tool (the workspace.json from the KB
+              archive, or the TTL cache shape). It is validated but never trusted.
+            </p>
+          </div>
+        )}
         {/* Add a workspace by name or id — for one that is not listed, or to
             build a specific audit queue by hand. */}
         <div className="card flex flex-wrap items-end gap-2">
@@ -422,19 +841,33 @@ export function RunAuditPage() {
 
         {allWorkspaces.length === 0 && !workspaces.loading && (
           <div className="card text-sm text-slate-600 dark:text-slate-400">
-            No workspaces are visible to the signed-in account. Add one above, confirm you
-            have at least Viewer access, or check{" "}
-            <Link to="/sign-in" className="font-medium underline">
-              access diagnostics
-            </Link>
-            .
+            {source === "kb" ? (
+              <>
+                No workspaces have been saved to the knowledge base yet. Upload a snapshot
+                above, or run a live audit once to populate the archive.
+              </>
+            ) : (
+              <>
+                No workspaces are visible to the signed-in account. Add one above, confirm you
+                have at least Viewer access, or check{" "}
+                <Link to="/sign-in" className="font-medium underline">
+                  access diagnostics
+                </Link>
+                .
+              </>
+            )}
           </div>
         )}
         {allWorkspaces.length > 0 && (
+          <div className="space-y-3">
+            <div>
+              <h3 className="font-semibold">Isolated workspaces</h3>
+              <p className="text-sm text-slate-500">Standalone workspaces not assigned to a project.</p>
+            </div>
           <div className="card scroll-x">
             <p className="mb-2 text-sm text-slate-500">
-              {allWorkspaces.filter((w) => selected[w.id]).length} of {allWorkspaces.length}{" "}
-              selected for this audit.
+              {isolatedWorkspaces.filter((workspace) => selected[workspace.id]).length} of{" "}
+              {isolatedWorkspaces.length} isolated workspaces selected.
             </p>
             <table className="table-base">
               <thead>
@@ -450,7 +883,7 @@ export function RunAuditPage() {
                 </tr>
               </thead>
               <tbody>
-                {allWorkspaces.map((workspace) => (
+                {isolatedWorkspaces.map((workspace) => (
                   <tr key={workspace.id}>
                     <td>
                       <input
@@ -506,6 +939,12 @@ export function RunAuditPage() {
               </tbody>
             </table>
           </div>
+          {isolatedWorkspaces.length === 0 && (
+            <div className="rounded-md border border-dashed border-slate-300 px-4 py-5 text-sm text-slate-500 dark:border-slate-700">
+              Every workspace is assigned to a project group.
+            </div>
+          )}
+          </div>
         )}
       </Section>
 
@@ -541,6 +980,47 @@ export function RunAuditPage() {
           ))}
         </div>
       </Section>
+
+      {groups.length > 0 && (
+        <label className="card flex cursor-pointer items-start gap-3">
+          <input
+            type="checkbox"
+            className="mt-1"
+            checked={weightByEnv}
+            onChange={(event) => setWeightByEnv(event.target.checked)}
+          />
+          <span>
+            <span className="block font-medium">Weight score by environment</span>
+            <span className="text-xs text-slate-500">
+              Grouped workspaces count toward the overall score by their environment
+              level (1–10): production weighs more than development. Off = every
+              workspace counts equally. Per-workspace scores are unaffected.
+            </span>
+          </span>
+        </label>
+      )}
+
+      <div className="card space-y-2">
+        <label htmlFor="external-checks" className="block">
+          <span className="text-sm font-medium">External checks (optional)</span>
+          <span className="text-xs text-slate-500">
+            Path to a CSV file with admin-verified checks (e.g., AdminChecks.csv). These will be merged with automated results and override any checks with the same ID.
+          </span>
+        </label>
+        <input
+          id="external-checks"
+          type="text"
+          className="input"
+          placeholder="e.g., /shared/audits/AdminChecks.csv or ./AdminChecks.csv"
+          value={externalChecksPath}
+          onChange={(event) => setExternalChecksPath(event.target.value)}
+        />
+        {externalChecksPath && (
+          <p className="text-xs text-slate-500">
+            Will load: <span className="font-mono">{externalChecksPath}</span>
+          </p>
+        )}
+      </div>
 
       <div className="flex flex-wrap items-center gap-3">
         <button
