@@ -176,6 +176,15 @@ export function ReportPage() {
           <div className="flex items-center gap-2">
             <span className={`badge ${rating.bgClass}`}>{rating.label}</span>
             <a
+              className="btn-primary"
+              href={reportDownloadUrl(auditId, "html")}
+              target="_blank"
+              rel="noreferrer"
+              title="Interactive readout — opens in a new tab, works offline"
+            >
+              HTML Readout
+            </a>
+            <a
               className="btn-secondary"
               href={reportDownloadUrl(auditId, "markdown")}
               target="_blank"
