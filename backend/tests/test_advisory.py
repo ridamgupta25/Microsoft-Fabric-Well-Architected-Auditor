@@ -101,8 +101,12 @@ def test_separate_advisory_report_files_are_generated_and_downloadable(client):
 
     assert report["files"].get("advisory_excel") == "advisory-report.xlsx"
     assert report["files"].get("advisory_markdown") == "advisory-report.md"
+    assert report["files"].get("advisory_html") == "advisory-report.html"
 
     excel = client.get(f"/api/v1/reports/{audit_id}/download/advisory-excel")
     assert excel.status_code == 200
     markdown = client.get(f"/api/v1/reports/{audit_id}/download/advisory-markdown")
     assert markdown.status_code == 200
+    page = client.get(f"/api/v1/reports/{audit_id}/download/advisory-html")
+    assert page.status_code == 200
+    assert page.headers["content-type"].startswith("text/html")

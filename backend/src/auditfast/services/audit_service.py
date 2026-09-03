@@ -814,8 +814,9 @@ def _ai_judge_advisory(results, contexts):
 # -- output -------------------------------------------------------------------
 
 def write_reports(run: AuditRun, out_dir: str | Path) -> dict[str, str]:
-    """Write the Markdown and Excel reports; return their paths."""
+    """Write the Markdown, Excel and HTML reports; return their paths."""
     from ..reporting.excel import build_excel
+    from ..reporting.html import build_html
     from ..reporting.markdown import build_markdown
 
     directory = Path(out_dir)
@@ -823,6 +824,7 @@ def write_reports(run: AuditRun, out_dir: str | Path) -> dict[str, str]:
 
     markdown_path = directory / "audit-report.md"
     excel_path = directory / "audit-report.xlsx"
+    html_path = directory / "audit-report.html"
 
     markdown_path.write_text(
         build_markdown(run.project_name, run.aggregate, run.results, run.errors),
@@ -835,7 +837,15 @@ def write_reports(run: AuditRun, out_dir: str | Path) -> dict[str, str]:
         run.results,
         run.errors,
     )
-    return {"markdown": str(markdown_path), "excel": str(excel_path)}
+    html_path.write_text(
+        build_html(run.project_name, run.aggregate, run.results, run.errors),
+        encoding="utf-8",
+    )
+    return {
+        "markdown": str(markdown_path),
+        "excel": str(excel_path),
+        "html": str(html_path),
+    }
 
 
 def write_advisory_reports(run: AuditRun, out_dir: str | Path) -> dict[str, str]:
@@ -848,6 +858,7 @@ def write_advisory_reports(run: AuditRun, out_dir: str | Path) -> dict[str, str]
     if not run.advisory_results:
         return {}
     from ..reporting.excel import build_excel
+    from ..reporting.html import build_html
     from ..reporting.markdown import build_markdown
 
     directory = Path(out_dir)
@@ -855,6 +866,7 @@ def write_advisory_reports(run: AuditRun, out_dir: str | Path) -> dict[str, str]
     advisory_name = f"{run.project_name} - Advisory (non-deterministic)"
     advisory_md = directory / "advisory-report.md"
     advisory_xlsx = directory / "advisory-report.xlsx"
+    advisory_html = directory / "advisory-report.html"
     advisory_md.write_text(
         build_markdown(
             advisory_name,
@@ -871,9 +883,19 @@ def write_advisory_reports(run: AuditRun, out_dir: str | Path) -> dict[str, str]
         run.advisory_results,
         run.errors,
     )
+    advisory_html.write_text(
+        build_html(
+            advisory_name,
+            run.advisory_aggregate,
+            run.advisory_results,
+            run.errors,
+        ),
+        encoding="utf-8",
+    )
     return {
         "advisory_markdown": str(advisory_md),
         "advisory_excel": str(advisory_xlsx),
+        "advisory_html": str(advisory_html),
     }
 
 

@@ -69,6 +69,7 @@ def cmd_run(args) -> int:
         print(f"Run dir: {run.out_dir}")
     print(f"Report : {run.files.get('markdown')}")
     print(f"Excel  : {run.files.get('excel')}")
+    print(f"HTML   : {run.files.get('html')}")
     return EXIT_OK
 
 
