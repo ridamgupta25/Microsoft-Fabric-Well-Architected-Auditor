@@ -154,6 +154,37 @@ def test_excel_matches_sql_report_flow_and_risk_register(tmp_path):
     assert 10 <= workbook["Checklist"].column_dimensions["A"].width <= 60
 
 
+def test_excel_inventory_includes_named_read_limitations(tmp_path):
+    results = _sample_results()
+    results.append(
+        _result(
+            check_id="WS-READ-INCOMPLETE",
+            ref="-",
+            title="Incomplete crawl — data could not be read",
+            pillar=Pillar.ARCHITECTURE,
+            status=Status.NA,
+            score=None,
+            obj="semantic model definitions",
+            evidence=(
+                "1 of 2 semantic model definitions could not be read. "
+                "Affected artifacts: Finance Model (model-42) [forbidden: HTTP 403]."
+            ),
+        )
+    )
+    output = tmp_path / "read-limitations.xlsx"
+
+    build_excel(str(output), "Fabric Project", aggregate(results), results)
+
+    workbook = load_workbook(output, read_only=True, data_only=True)
+    inventory = workbook["Invent"]
+    headers = {
+        inventory.cell(row=1, column=column).value: column
+        for column in range(1, inventory.max_column + 1)
+    }
+    limitation = inventory.cell(row=2, column=headers["Read Limitations"]).value
+    assert "Finance Model (model-42) [forbidden: HTTP 403]" in limitation
+
+
 def test_markdown_matches_sql_section_hierarchy():
     results = _sample_results()
 

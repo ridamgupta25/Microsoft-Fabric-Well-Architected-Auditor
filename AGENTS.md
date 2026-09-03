@@ -106,7 +106,9 @@ auditfast-core/
     config/                    project.example.yaml, remediation.yaml
     kb-cache/                  On-disk KB cache — one snapshot per workspace, TTL'd (git-ignored)
     Fabric workspace kb/       Permanent, timestamped KB archive — one dated folder per run (git-ignored)
-    output/                    Generated audit-report.md / .xlsx
+    output/                    One directory per run: <workspace>_<timestamp>/
+                               holding audit-report.*, advisory-report.*, jobs/
+                               and advisory-judged/
   frontend/                    React 18 + TypeScript + Vite + Tailwind + Axios (separate deployable)
     src/{pages,components,services,hooks,context,types}/   (pages include ChecklistPage)
   .github/                     Agentic authoring layer: agents/ skills/ instructions/ harness/ mcp/ (§11)
@@ -369,7 +371,7 @@ cd backend
 | Checklist intake | `POST /api/v1/checklist/assess` + the Checklist page dedup a point vs the registry and draft a proposal; the `.github/` agents author + test new checks (§11). Never mutates the registry. |
 | Job store | In-memory — history dies with the process, not shared across replicas. |
 | Auth sessions | Process-local — breaks under multi-worker/replica. |
-| Report files | Fixed filename on local disk — concurrent audits overwrite. |
+| Report files | One timestamped directory per run — `output/<workspace>_<stamp>/` — so concurrent or repeated audits no longer overwrite each other. |
 | Check weights | All 1.0 — roll-up is effectively unweighted (mechanism exists, untuned). |
 | AI advisory | Optional (`AUDITFAST_AI_ENABLED`, off by default); enriches the checklist advisory only. **Never in the scoring path** — scoring stays reproducible. |
 | Poll timeout | The frontend polls with **no client-side timeout** — a hung/slow backend crawl spins; rely on the KB + background refresh. |

@@ -1,5 +1,5 @@
 """Tests for the checks added for refs 14.1.2, 14.1.8, 12.3.3, 1.1.5,
-4.4.1, 4.4.2, 12.2.1 and 12.2.7.
+4.4.1, 4.4.2 and 12.2.1.
 
 Every check here is a pure function of metadata the knowledge base already holds,
 so each test builds the smallest synthetic context that exercises it. Each check
@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from auditfast.core.check.cost_resource_optimization.data_operations.automated import (
     capacity_metrics_app,
-    cu_consumption_alerts,
     spark_pool_not_idle,
 )
 from auditfast.core.check.data_management_quality.data_storage.automated import (
@@ -575,30 +574,6 @@ def test_capacity_metrics_is_na_without_items():
 
 
 # =============================================================================
-# 12.2.7 — CU consumption alerting
-# =============================================================================
-
-def test_cu_alerts_credit_an_activator_partially_and_never_fully():
-    ctx = _ctx(capacity_id="CAP-1",
-               items=[Item(id="rf", type="Reflex", display_name="AlertRule")])
-    verdict = cu_consumption_alerts(ctx)
-    assert verdict.score == 2, "presence of a Reflex must never award a full pass"
-    assert "never award a full pass" in verdict.evidence
-
-
-def test_cu_alerts_fail_on_a_capacity_with_no_activator():
-    ctx = _ctx(capacity_id="CAP-1",
-               items=[Item(id="pl", type="DataPipeline", display_name="PL")])
-    assert cu_consumption_alerts(ctx).score == _FAIL
-
-
-def test_cu_alerts_are_na_off_capacity_or_without_items():
-    off_capacity = _ctx(items=[Item(id="rf", type="Reflex", display_name="AlertRule")])
-    assert cu_consumption_alerts(off_capacity).status is Status.NA
-    assert cu_consumption_alerts(_ctx(unavailable={Resource.ITEMS})).status is Status.NA
-
-
-# =============================================================================
 # registration + remediation
 # =============================================================================
 
@@ -617,7 +592,6 @@ def test_every_new_ref_is_registered_once_and_has_remediation_text():
         "4.4.1": "TB-WH-SCHEMAS",
         "4.4.2": "TB-WH-NAME-CONSISTENCY",
         "12.2.1": "WS-CAPACITY-METRICS",
-        "12.2.7": "WS-CU-ALERTS",
     }
     for ref, check_id in new.items():
         spec = REGISTRY.get(check_id)

@@ -14,8 +14,43 @@ runtime error.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from ...config.settings import get_settings
 from .ai_config import AiConfig
+
+
+@dataclass(frozen=True)
+class Credentials:
+    """One caller's model credentials, supplied per request.
+
+    Exists so a user can bring their own key without it being written anywhere.
+    Mutating the global settings would be the obvious shortcut and is the wrong
+    one: settings are process-wide, so two concurrent requests would overwrite
+    each other's key, and whichever landed last would bill the wrong account.
+    Passing the credential down the call instead keeps it on the stack, alive
+    only for the request that supplied it.
+
+    Never log, persist, or echo one of these back to a client.
+    """
+
+    provider: str = "azure"
+    api_key: str | None = None
+    endpoint: str | None = None
+    deployment: str | None = None
+    base_url: str | None = None
+    model: str | None = None
+
+    def is_usable(self) -> bool:
+        if not self.api_key:
+            return False
+        if self.provider == "openai":
+            return bool(self.base_url and self.model)
+        return bool(self.endpoint and self.deployment)
+
+    def __repr__(self) -> str:  # pragma: no cover - guards accidental logging
+        held = "set" if self.api_key else "unset"
+        return f"Credentials(provider={self.provider!r}, api_key=<{held}>)"
 
 
 def is_enabled(ai: AiConfig | None = None) -> bool:
@@ -39,21 +74,35 @@ def is_enabled(ai: AiConfig | None = None) -> bool:
 
 
 def complete(
-    system: str, user: str, *, max_tokens: int = 700, ai: AiConfig | None = None
+    system: str,
+    user: str,
+    *,
+    max_tokens: int = 700,
+    ai: AiConfig | None = None,
+    credentials: Credentials | None = None,
 ) -> str | None:
     """Single chat completion, or ``None`` if AI is off or anything fails.
 
-    Uses the per-request ``ai`` config when supplied (the user's own key), else
-    the process-wide ``settings``. Deliberately swallows every error into
-    ``None``: a model outage or a missing dependency must degrade to the
-    deterministic fallback rather than break the request.
+    Two per-request key carriers are supported: ``ai`` (an :class:`AiConfig`,
+    used by the custom-checks pipeline) and ``credentials`` (a
+    :class:`Credentials`, used by advisory judging). Either overrides the
+    configured provider for this call only; when both are ``None`` the
+    process-wide ``settings`` are used.
+
+    Deliberately swallows every error into ``None``: a model outage or a missing
+    dependency must degrade to the deterministic fallback rather than break the
+    request.
     """
-    # Call the no-arg form when there is no per-request config so existing
-    # zero-arg test doubles for ``is_enabled`` keep working.
-    if not (is_enabled(ai) if ai is not None else is_enabled()):
+    if credentials is not None:
+        if not credentials.is_usable():
+            return None
+    elif not (is_enabled(ai) if ai is not None else is_enabled()):
         return None
     try:  # pragma: no cover - exercised only when a live model is configured
-        client, model = _client_for(ai)
+        if credentials is not None:
+            client, model = _client_from_credentials(credentials)
+        else:
+            client, model = _client_for(ai)
         response = client.chat.completions.create(
             model=model,  # type: ignore[arg-type]
             messages=[
@@ -103,6 +152,23 @@ def _client_for(ai: AiConfig | None):  # pragma: no cover - needs a live SDK/mod
         settings.azure_openai_deployment,
     )
 
+
+def _client_from_credentials(credentials: Credentials):  # pragma: no cover - needs a live SDK/model
+    """Build the OpenAI/Azure client + model name from per-request ``credentials``."""
+    if credentials.provider == "openai":
+        from openai import OpenAI
+
+        return OpenAI(base_url=credentials.base_url, api_key=credentials.api_key), credentials.model
+    from openai import AzureOpenAI
+
+    return (
+        AzureOpenAI(
+            azure_endpoint=credentials.endpoint,  # type: ignore[arg-type]
+            api_key=credentials.api_key,
+            api_version="2024-06-01",
+        ),
+        credentials.deployment,
+    )
 
 
 _ADVISORY_SYSTEM = (

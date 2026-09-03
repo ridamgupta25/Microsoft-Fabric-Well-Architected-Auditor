@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
 
 from auditfast.core.check._notebook import (
     NOTEBOOK_LAYERS,
@@ -355,10 +356,32 @@ def nb_structure(ctx: CheckContext) -> Verdict:
     layers=NOTEBOOK_LAYERS, requires=[Resource.NOTEBOOK_DEFINITIONS], required=False,
 )
 def nb_markdown(ctx: CheckContext) -> Verdict:
-    """At least one markdown cell documents what the notebook does."""
-    md = markdown_sources(ctx.obj)
+    """At least one markdown cell documents what the notebook does.
+
+    Three things this must not do, each found on a real estate:
+
+    * **Fail a notebook it could not read.** ``markdown_sources`` returns ``[]``
+      for a missing definition exactly as it does for a notebook with no
+      markdown, so an unreadable notebook was scored 0 with the evidence "the
+      logic is undocumented" - a claim about a notebook nobody had seen.
+    * **Fail an empty notebook.** A stub carrying only Fabric's own "Type here
+      in the cell editor" placeholder has no logic *to* document, so a finding
+      about its documentation is a finding about nothing. 28 of 132 notebooks
+      on one estate were these.
+    * **Pass a blank markdown cell.** An empty cell yields ``[""]``, and a list
+      holding an empty string is truthy, so a notebook whose only markdown cell
+      was empty scored full marks.
+    """
+    cells = (ctx.obj or {}).get("cells")
+    if not cells:
+        return not_applicable("Notebook definition could not be read from Fabric")
+
+    if not notebook_code(ctx.obj).strip():
+        return not_applicable("Notebook has no code, so there is no logic to document")
+
+    md = [source for source in markdown_sources(ctx.obj) if source.strip()]
     return binary(bool(md), f"{len(md)} markdown documentation cell(s)" if md
-                  else "No markdown cells — the logic is undocumented")
+                  else "No markdown cells - the logic is undocumented")
 
 
 @check(
@@ -544,6 +567,39 @@ _LOAD_MODE = re.compile(r"load_?type|load_?mode|is_?initial|full_?load|increment
 #: rather than by an in-pipeline parameter or branch.
 _FULL_LOAD_NAME = re.compile(r"full[_ ]?load", re.IGNORECASE)
 _LOAD_MODE_NAME = re.compile(r"full[_ ]?load|incr\w*load|incremental|initial[_ ]?load", re.IGNORECASE)
+
+
+def _expression_strings(node) -> Iterator[str]:
+    """Every string anywhere inside ``node``, however deeply nested."""
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for value in node.values():
+            yield from _expression_strings(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _expression_strings(value)
+
+
+def _mode_driven_by_expression(activities) -> bool:
+    """True when an activity *expression* selects the load mode.
+
+    A pipeline can separate first-load from incremental without a load-mode
+    parameter or an If/Switch: a ForEach over a control table reads the mode per
+    row and the Copy's own source SQL branches on it -
+    ``@if(equals(item().load_type,'full'), ...)``. Reading only parameter names
+    and branch activities missed that entirely; on one estate it was 7 pipelines
+    failed for a separation they plainly had.
+
+    Restricted to strings carrying ``@``, so this fires on a Fabric expression
+    and not on a source column that happens to be called ``incremental_flag``.
+    """
+    return any(
+        "@" in value and _LOAD_MODE.search(value)
+        for act in activities
+        for value in _expression_strings(act.get("typeProperties") or {})
+    )
+
 _LATE_ARRIVAL = re.compile(
     r"late[_ -]?arriv|out[_ -]?of[_ -]?order|event[_ -]?time|watermark|lookback|"
     r"sequence[_ -]?(?:number|no|id)|version[_ -]?(?:number|no|id)|effective[_ -]?date",
@@ -670,9 +726,15 @@ def pl_load_mode(ctx: CheckContext) -> Verdict:
         and _LOAD_MODE.search(json.dumps(a))
         for a in acts
     )
-    ok = param_mode or branch
+    expression = _mode_driven_by_expression(acts)
+    ok = param_mode or branch or expression
+    if ok and expression and not (param_mode or branch):
+        return binary(True, "Load mode is selected inside an activity expression — the "
+                            "mode is read per row (e.g. from a control table) and the "
+                            "load branches on it")
     return binary(ok, "Load mode is parameterized / branched (initial vs incremental)" if ok
-                  else "No initial-vs-incremental separation (load-mode parameter or branch) found")
+                  else "No initial-vs-incremental separation (load-mode parameter, branch "
+                       "or expression) found")
 
 
 # -- data quality framework checks (3.6.x) ------------------------------------
@@ -4007,7 +4069,20 @@ _DQ_HANDROLLED = re.compile(
 
 #: An explicit assertion about the data is itself both the evaluation and the
 #: halt, so it is recognised separately.
-_DQ_ASSERTION = re.compile(r"^\s*assert\s+\w", re.MULTILINE)
+#: An assertion *about data*. A bare ``assert`` is not enough: it is also the
+#: first alternative of ``_DQ_HARD_STOP``, so any top-level assert would be both
+#: the sole trigger for this check and an automatic 3 - ``assert
+#: os.path.exists(path)`` scoring "DQ failures halt pipeline progression". The
+#: line must therefore reference something derived from the data.
+_DQ_ASSERTION = re.compile(
+    r"^\s*assert\s+[^\n]*?(?:"
+    r"\.\s*(?:count|isEmpty|distinct|filter|where|dropDuplicates|na)\s*\(|"
+    r"\blen\s*\(|"
+    r"\b(?:null|nulls|nan|dup|dupe|duplicate|invalid|bad|missing|orphan|"
+    r"mismatch|row|rows|record|records|count|cnt|total)\b"
+    r")",
+    re.MULTILINE | re.IGNORECASE,
+)
 #: The notebook stops. ``raise``/``assert``/``sys.exit`` fail the notebook, and
 #: therefore the pipeline activity that ran it.
 _DQ_HARD_STOP = re.compile(
@@ -4068,6 +4143,12 @@ def notebook_dq_failure_halts_run(ctx: CheckContext) -> Verdict:
     """
     if not ctx.workspace.has(Resource.NOTEBOOK_DEFINITIONS):
         return not_applicable("Notebook definitions could not be read from Fabric")
+    if not (ctx.obj or {}).get("cells"):
+        # Reading nothing and reporting "no evaluation exists" are different
+        # claims. The N/A below is a finding about the notebook; this one is a
+        # finding about the crawl, and conflating them attributes an absence to
+        # a notebook nobody could see.
+        return not_applicable("This notebook's definition could not be read")
     code = executable_code(ctx.obj)
 
     framework = _DQ_FRAMEWORK.search(code)

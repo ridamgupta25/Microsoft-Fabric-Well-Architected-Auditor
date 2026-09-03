@@ -12,7 +12,7 @@ from __future__ import annotations
 from auditfast.clients.live import LiveFabricProvider
 from auditfast.core.check.helpers import binary
 from auditfast.core.check.registry import CheckRegistry, check
-from auditfast.core.engine import READ_INCOMPLETE_CHECK_ID, run_audit
+from auditfast.core.engine import READ_INCOMPLETE_CHECK_ID, read_incomplete_result, run_audit
 from auditfast.core.enums import Layer, Pillar, Resource, Scope, Status
 from auditfast.core.models import Item, WorkspaceContext
 from auditfast.services.context_store import (
@@ -154,6 +154,32 @@ def test_engine_emits_a_read_incomplete_warning():
     assert warnings[0].status is Status.NA  # a read we could not make is not a failure
     nb = next(r for r in results if r.check_id == "NB-X")
     assert "138 of 138" in nb.evidence and "could not be read" in nb.evidence
+
+
+def test_read_incomplete_warning_names_affected_artifacts():
+    ctx = WorkspaceContext(id="w1", display_name="WS", layer=Layer.REPORTING)
+    ctx.read_failures["semanticModelDefinitions"] = {
+        "attempted": 2,
+        "read": 1,
+        "failed": 1,
+        "forbidden": 1,
+        "transient": 0,
+        "empty": 0,
+        "artifacts": [{
+            "id": "model-42",
+            "name": "Finance Model",
+            "failure": "forbidden",
+            "reason": "HTTP 403",
+        }],
+    }
+
+    warning = read_incomplete_result(
+        ctx,
+        "semanticModelDefinitions",
+        ctx.read_failures["semanticModelDefinitions"],
+    )
+
+    assert "Finance Model (model-42) [forbidden: HTTP 403]" in warning.evidence
 
 
 # -- caching never serves an incomplete snapshot ------------------------------

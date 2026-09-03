@@ -10,6 +10,9 @@ cheap to add.
 """
 from __future__ import annotations
 
+import logging
+import threading
+import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,6 +28,8 @@ from ..core.enums import Layer, Pillar
 from ..core.models import CheckResult, WorkspaceContext
 from ..core.scoring import aggregate
 from .project import ProjectConfig, load_project, load_remediation
+
+log = logging.getLogger(__name__)
 
 #: Check id used for workspaces that could not be read at all.
 ACCESS_CHECK_ID = "WS-ACCESS"
@@ -61,6 +66,10 @@ class AuditRun:
     #: True when the roll-up was environment-weighted (opt-in). Display only —
     #: the per-check and per-workspace numbers are unchanged either way.
     weighted_by_environment: bool = False
+    #: The per-run directory everything was written to. Recorded so a later step
+    #: — advisory judging especially — can find this run's files instead of
+    #: guessing at the newest thing in the output folder.
+    out_dir: str | None = None
 
 
 # -- provider construction ----------------------------------------------------
@@ -102,7 +111,8 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
         return _build_snapshot_provider(settings, snapshots)
     if not token:
         raise AuditError("A sign-in token is required to run an audit.")
-    live = LiveFabricProvider(token, token_refresher=token_refresher,
+    live = LiveFabricProvider(token, timeout=settings.fabric_api_timeout_seconds,
+                              token_refresher=token_refresher,
                               powerbi_token=powerbi_token,
                               sql_token=sql_token if settings.sql_endpoint_enabled else None,
                               storage_token=storage_token,
@@ -128,6 +138,42 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
         archive = KBArchive(settings.resolve(settings.kb_archive_dir))
         provider = ArchivingProvider(provider, archive)
     return provider
+
+
+class _RunScopedProvider:
+    """Memoizes each workspace's context for one audit run.
+
+    The audit fetches every workspace up to three times in a run - once for the
+    deterministic crawl, once for the advisory checks, once for the advisory
+    contexts. When a snapshot is *incomplete* (a SQL endpoint on a blocked port,
+    a throttled Power BI read, a failed getDefinition) the ``CachingProvider``
+    refuses to serve it and re-crawls live *every* time, so an estate that
+    crawls in 20 minutes can spend two more hours re-crawling for the advisory
+    stage. Memoizing by workspace id for the life of one run collapses those
+    repeat fetches to one: the live crawl always fetches every resource, so the
+    first context is complete for every later stage, and every stage then judges
+    exactly the same evidence.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._contexts: dict[str, WorkspaceContext] = {}
+        self._lock = threading.Lock()
+
+    def fetch(self, workspace_id, *args, **kwargs):
+        with self._lock:
+            ctx = self._contexts.get(workspace_id)
+        if ctx is not None:
+            return ctx
+        ctx = self._inner.fetch(workspace_id, *args, **kwargs)
+        with self._lock:
+            self._contexts[workspace_id] = ctx
+        return ctx
+
+    def __getattr__(self, name):
+        # Delegate everything else (list_workspaces, probe, served_from_cache,
+        # force_refresh) to the wrapped provider.
+        return getattr(self._inner, name)
 
 
 def _build_snapshot_provider(settings, snapshots: Sequence[dict] | None):
@@ -425,6 +471,7 @@ def run_audit(
     external_checks_csv: str | Path | None = None,
     source: str = "live",
     snapshots: Sequence[dict] | None = None,
+    run_dir: str | Path | None = None,
 ) -> AuditRun:
     """Run an audit and, when ``out_dir`` is given, write the report files.
 
@@ -441,11 +488,35 @@ def run_audit(
     Raises AuditError if the CSV is invalid.
     """
     config = load_project(project_path)
+    # One directory per run. Writing straight into `out_dir` meant auditing a
+    # second workspace destroyed the first one's report, and re-auditing the
+    # same workspace destroyed the run you were comparing against.
+    #
+    # `run_dir` overrides that and writes into an existing one. The KB refresh
+    # needs it: it re-crawls the SAME audit and replaces its report, so a second
+    # directory would leave the newest folder empty for the minutes the crawl
+    # takes - and `latest_run_dir` would then hand that empty run to scoring.
+    #
+    # A run directory has to exist before the crawl can write into it, so a run
+    # that fails partway leaves an empty one behind. Clear those first: an empty
+    # folder reads as "this audit found nothing", which is a very different
+    # claim from "this audit never finished".
+    if run_dir:
+        out_dir = Path(run_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+    elif out_dir:
+        from .run_output import new_run_dir, prune_empty_runs, run_label
+
+        prune_empty_runs(out_dir)
+        out_dir = new_run_dir(out_dir, run_label(config.name, workspaces))
     provider = build_provider(config, token, refresh=refresh, token_refresher=token_refresher,
                               powerbi_token=powerbi_token, sql_token=sql_token,
                               storage_token=storage_token,
                               sql_token_refresher=sql_token_refresher,
                               source=source, snapshots=snapshots)
+    # One fetch per workspace for the whole run: the advisory stage reuses the
+    # crawl's context instead of re-crawling an incomplete snapshot three times.
+    provider = _RunScopedProvider(provider)
     targets = _resolve_targets(config, workspaces)
     groups = _resolve_groups(workspaces)
     weights = _resolve_weights(workspaces, weight_by_environment)
@@ -462,7 +533,11 @@ def run_audit(
 
     deterministic_registry, advisory_registry = _split_registries()
 
+    # Phase timings so a slow run can be split into crawl vs advisory export.
+    _phase = {"crawl": 0.0, "advisory_contexts": 0.0, "advisory_export": 0.0}
+
     # Stage 1 -- the deterministic audit. This crawl is what builds the KB.
+    _t = time.monotonic()
     raw_results = run_engine(
         provider,
         targets,
@@ -474,6 +549,7 @@ def run_audit(
         weights=weights,
         groups=group_targets,
     )
+    _phase["crawl"] = time.monotonic() - _t
 
     # Merge external checks if provided
     if external_checks_csv:
@@ -529,6 +605,7 @@ def run_audit(
         "refreshing": served and not refresh and source == "live",
     }
     if out_dir:
+        run.out_dir = str(out_dir)
         run.files.update(write_reports(run, out_dir))
 
     # Stage 2 -- advisory (non-deterministic) checks, evaluated *after* the audit
@@ -546,17 +623,91 @@ def run_audit(
     )
     error_ids = {ACCESS_CHECK_ID, READ_INCOMPLETE_CHECK_ID}
     advisory_results = [r for r in advisory_raw if r.check_id not in error_ids]
+    # Gathered once and shared by both judging routes: each call re-fetches every
+    # workspace and rebuilds its WorkspaceContext, and the two routes must ground
+    # a verdict in exactly the same evidence anyway.
+    _t = time.monotonic()
+    contexts = (
+        _advisory_contexts(provider, targets, advisory_registry)
+        if advisory_results else {}
+    )
+    _phase["advisory_contexts"] = time.monotonic() - _t
     # AI re-judges the advisory checks against the knowledge base for a more
     # accurate verdict. When AI is off (the default) this is a no-op and the
     # deterministic verdicts are kept unchanged.
-    advisory_results = _ai_judge_advisory(
-        advisory_results, provider, targets, advisory_registry
-    )
+    advisory_results = _ai_judge_advisory(advisory_results, contexts)
     run.advisory_results = advisory_results
     run.advisory_aggregate = aggregate(advisory_results)
     if out_dir:
         run.files.update(write_advisory_reports(run, out_dir))
+        # The offline judging bundle is written whether or not a model is
+        # configured: it is the route for reviewers who have no server-side key,
+        # and it costs one small file. It never affects this run's numbers.
+        _t = time.monotonic()
+        run.files.update(_write_advisory_bundle(advisory_results, contexts, out_dir))
+        _phase["advisory_export"] = time.monotonic() - _t
+    log.info(
+        "audit phases (seconds): crawl=%.1f advisory_contexts=%.1f advisory_export=%.1f",
+        _phase["crawl"], _phase["advisory_contexts"], _phase["advisory_export"],
+    )
     return run
+
+
+def _write_advisory_bundle(results, contexts, out_dir) -> dict:
+    """Write the offline judging artefacts; never fatal to an audit.
+
+    Two things go out, because the judging design is mid-transition:
+
+    * **Jobs** - one per check that has a judging guide. The reader labels every
+      object and code computes the score, which is where this is heading.
+    * **The themed bundle** - the older finding-level export, still covering the
+      refs that have no guide yet.
+
+    A check appears in exactly one of them, so nothing is judged twice and
+    nothing is lost while guides are written one at a time.
+    """
+    if not results:
+        return {}
+    files: dict[str, str] = {}
+    try:
+        from ..ai.jobs import write_jobs
+        from ..core.judging import guide_for
+
+        by_check: dict[str, list] = {}
+        for result in results:
+            by_check.setdefault(result.check_id, []).append(result)
+
+        guided = {cid: rows for cid, rows in by_check.items() if guide_for(cid)}
+        if guided:
+            files.update(write_jobs(guided, contexts, Path(out_dir)))
+    except Exception:  # noqa: BLE001 - an export must never break the audit
+        logging.getLogger(__name__).warning(
+            "advisory: could not write the judging jobs", exc_info=True
+        )
+
+    try:
+        from ..ai.advisory_bundle import build_bundle, write_bundle, write_themed_bundles
+        from ..core.judging import guide_for
+
+        remaining = [r for r in results if not guide_for(r.check_id)]
+        if remaining:
+            # Built once and shared: each record embeds up to 24 KB of evidence,
+            # so letting both writers derive their own costs a second full pass
+            # over every finding and a second copy of the same payload.
+            records = build_bundle(remaining, contexts)
+            files["advisory_bundle"] = str(
+                write_bundle(remaining, contexts, Path(out_dir), records=records)
+            )
+            files.update(
+                write_themed_bundles(remaining, contexts, Path(out_dir), records=records)
+            )
+    except Exception:  # noqa: BLE001 - an export must never break the audit
+        # Logged rather than swallowed: silence makes a total failure of this
+        # feature indistinguishable from "there were no advisory findings".
+        logging.getLogger(__name__).warning(
+            "advisory: could not write the judging bundle", exc_info=True
+        )
+    return files
 
 
 def run_check(
@@ -623,20 +774,13 @@ def _split_registries():
     return deterministic, advisory
 
 
-def _ai_judge_advisory(results, provider, targets, advisory_registry):
-    """Re-judge advisory results with AI grounded in the KB; no-op when AI is off.
+def _advisory_contexts(provider, targets, advisory_registry) -> dict:
+    """Each workspace's cached KB context, keyed by workspace name.
 
-    Gathers each workspace's cached knowledge-base context (no second crawl) and
-    hands it to :mod:`auditfast.ai.advisory`, which rewrites the verdicts. Any
-    failure or a disabled model leaves the deterministic verdicts untouched.
+    Served from the cache the deterministic stage already filled, so this costs
+    no second crawl. Shared by both judging routes - the API path and the offline
+    bundle - so they ground a verdict in exactly the same evidence.
     """
-    if not results:
-        return results
-    from ..ai import advisory as ai_advisory
-    from ..ai import orchestrator as ai_orchestrator
-
-    if not ai_orchestrator.is_enabled():
-        return results
     contexts: dict[str, WorkspaceContext] = {}
     for workspace_id, layer in targets:
         specs = [s for s in advisory_registry.select(layer=layer) if not s.manual]
@@ -647,6 +791,23 @@ def _ai_judge_advisory(results, provider, targets, advisory_registry):
         except Exception:  # noqa: BLE001 - context is best-effort, never fatal
             continue
         contexts[ctx.name] = ctx
+    return contexts
+
+
+def _ai_judge_advisory(results, contexts):
+    """Re-judge advisory results with AI grounded in the KB; no-op when AI is off.
+
+    ``contexts`` is the already-gathered per-workspace KB slice, so this costs no
+    fetch of its own. Any failure or a disabled model leaves the deterministic
+    verdicts untouched.
+    """
+    if not results:
+        return results
+    from ..ai import advisory as ai_advisory
+    from ..ai import orchestrator as ai_orchestrator
+
+    if not ai_orchestrator.is_enabled():
+        return results
     return ai_advisory.evaluate(results, contexts)
 
 

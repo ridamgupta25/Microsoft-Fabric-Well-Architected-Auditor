@@ -492,6 +492,46 @@ export interface AuditJob {
   questionnaire: QuestionnaireItem[];
   /** True once the reviewer's questionnaire answers have been recorded. */
   answers_submitted: boolean;
+  /**
+   * Advisory judging runs after the audit, on request. `null`/absent means it
+   * has never been asked for — which is what gates the button.
+   */
+  advisory_status?: JobStatus | null;
+}
+
+/** Which model to judge with. The key is used for one run and never stored. */
+export interface AdvisoryRunRequest {
+  provider: "azure" | "openai";
+  api_key?: string | null;
+  /** Azure only. */
+  endpoint?: string | null;
+  /** Azure only. */
+  deployment?: string | null;
+  /** OpenAI-compatible gateways only. */
+  base_url?: string | null;
+  /** OpenAI-compatible gateways only. */
+  model?: string | null;
+}
+
+/** Counts and file paths from one advisory judging run. */
+export interface AdvisorySummary {
+  checks_total: number;
+  checks_labelled: number;
+  checks_judged: number;
+  findings_judged: number;
+  findings_left_to_rules: number;
+  objects_labelled: number;
+  objects_undetermined: number;
+  findings_changed: number;
+  findings_agreed: number;
+  files: Record<string, string>;
+}
+
+export interface AdvisoryRun {
+  audit_id: string;
+  advisory_status?: JobStatus | null;
+  advisory_error?: string | null;
+  summary?: AdvisorySummary | null;
 }
 
 export interface AuditJobSummary {

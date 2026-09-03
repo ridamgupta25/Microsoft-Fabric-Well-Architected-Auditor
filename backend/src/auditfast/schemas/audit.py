@@ -309,6 +309,62 @@ class AuditAnswersRequest(BaseModel):
     }
 
 
+class AdvisoryRunRequest(BaseModel):
+    """Credentials for one advisory judging run.
+
+    The key is used for this run and then discarded. It is never written to the
+    job store, never logged, and never returned by any endpoint - a reviewer
+    brings their own model without the server taking custody of it.
+
+    Omit every field to use the server's configured provider, if there is one.
+    """
+
+    provider: Literal["azure", "openai"] = Field(
+        default="azure",
+        description="'azure' for Azure OpenAI, 'openai' for any OpenAI-compatible gateway.",
+    )
+    api_key: str | None = Field(
+        default=None,
+        description="Model API key. Used for this run only and never stored.",
+    )
+    endpoint: str | None = Field(
+        default=None, description="Azure OpenAI endpoint, e.g. https://x.openai.azure.com"
+    )
+    deployment: str | None = Field(
+        default=None, description="Azure OpenAI deployment name."
+    )
+    base_url: str | None = Field(
+        default=None, description="OpenAI-compatible gateway base URL, e.g. https://.../v1"
+    )
+    model: str | None = Field(default=None, description="Model name, for the openai provider.")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "provider": "azure",
+                "api_key": "<your key>",
+                "endpoint": "https://my-resource.openai.azure.com",
+                "deployment": "gpt-4o",
+            }
+        }
+    }
+
+
+class AdvisoryRunOut(BaseModel):
+    """State of a run's advisory judging."""
+
+    audit_id: str
+    advisory_status: JobStatus | None = Field(
+        default=None,
+        description="None when advisory judging has never been requested for this audit.",
+    )
+    advisory_error: str | None = None
+    summary: dict[str, Any] | None = Field(
+        default=None,
+        description="Counts and written report paths, once judging has finished.",
+    )
+
+
 class AuditJobOut(BaseModel):
     """Status of a submitted audit, with the report once it has finished."""
 
@@ -328,6 +384,11 @@ class AuditJobOut(BaseModel):
     answers_submitted: bool = Field(
         default=False,
         description="True once the reviewer's questionnaire answers have been recorded.",
+    )
+    advisory_status: JobStatus | None = Field(
+        default=None,
+        description="Advisory judging is a separate step run after the audit; None "
+        "until it is requested.",
     )
 
 

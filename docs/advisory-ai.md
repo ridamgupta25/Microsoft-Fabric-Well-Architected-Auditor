@@ -140,7 +140,9 @@ AUDITFAST_OPENAI_API_KEY=sk-...
   advisory results exist).
 - **API** — `GET /api/v1/reports/{audit_id}/download/advisory-excel`
   (also `advisory-markdown`).
-- **Disk** — `backend/output/advisory-report.xlsx`.
+- **Disk** — `backend/output/<workspace>_<timestamp>/advisory-report.xlsx`. Every
+  audit writes its own timestamped directory, so an earlier run is still there to
+  compare against.
 
 **Confirm the AI ran:** open the Excel — AI-graded rows have evidence starting
 with `[AI - … confidence]`. Plain deterministic evidence means AI fell back or
