@@ -265,8 +265,8 @@ class AuditRunner:
                 report: dict[str, Any] = audit_service.to_json(run)
                 report["audit_id"] = job.id
                 report = self._merge_answers(job, report)
-                report = self._attach_custom_checks(job, report)
                 job.out_dir = run.out_dir
+                report = self._attach_custom_checks(job, report)
                 job.mark_succeeded(report)
                 logger.info(
                     "audit finished",
@@ -362,9 +362,9 @@ class AuditRunner:
                 report = audit_service.to_json(run)
                 report["audit_id"] = job.id
                 report = self._merge_answers(job, report)
+                job.out_dir = run.out_dir or job.out_dir
                 report = self._attach_custom_checks(job, report)
                 job.report = report
-                job.out_dir = run.out_dir or job.out_dir
                 await self._repository.update(job)
                 logger.info(
                     "audit knowledge base refreshed",
@@ -431,9 +431,33 @@ class AuditRunner:
             section = custom_checks_service.approved_checks_report(ws_ids or None)
             if section and section.get("checks"):
                 report["custom_checks"] = section
+                self._append_custom_checks_excel(job, section)
         except Exception:  # noqa: BLE001 - additive extra, never fatal to the audit
             logger.exception("failed to attach custom checks", extra={"audit_id": job.id})
         return report
+
+    def _append_custom_checks_excel(self, job: AuditJob, section: dict) -> None:
+        """Fold custom checks into the already-written Excel as an extra sheet.
+
+        The deterministic workbook is written before custom checks exist, so the
+        sheet is appended here. A failure must never fail the audit.
+        """
+        out_dir = job.out_dir
+        if not out_dir:
+            return
+        from pathlib import Path
+
+        from ..reporting.excel import append_custom_checks_sheet
+
+        xlsx_path = Path(out_dir) / "audit-report.xlsx"
+        if not xlsx_path.exists():
+            return
+        try:
+            append_custom_checks_sheet(str(xlsx_path), section)
+        except Exception:  # noqa: BLE001 - additive extra, never fatal to the audit
+            logger.exception(
+                "failed to append custom checks to excel", extra={"audit_id": job.id}
+            )
 
     # -- reading --------------------------------------------------------------
     async def get(self, job_id: str, organization_id: str | None = None) -> AuditJob | None:

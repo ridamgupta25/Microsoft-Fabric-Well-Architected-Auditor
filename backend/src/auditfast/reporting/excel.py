@@ -913,3 +913,100 @@ def build_excel(
         auto_fit_columns(sheet, max_width=max_width)
 
     wb.save(path)
+
+
+def append_custom_checks_sheet(xlsx_path: str, section: dict) -> bool:
+    """Add a styled "Custom Checks" sheet to an already-written workbook.
+
+    Custom checks are computed after the deterministic Excel is written, so they
+    are folded in here by re-opening the file. Returns True when a sheet was
+    written, False when there is nothing to add. Never raises for empty input.
+    """
+    from openpyxl import load_workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
+    checks = (section or {}).get("checks") or []
+    if not checks:
+        return False
+
+    dark_blue = "1F4E78"
+    medium_blue = "305496"
+    white = "FFFFFF"
+    pass_fill = PatternFill("solid", fgColor="C6EFCE")
+    partial_fill = PatternFill("solid", fgColor="FFEB9C")
+    fail_fill = PatternFill("solid", fgColor="FFC7CE")
+    banded_fill = PatternFill("solid", fgColor="F7F9FC")
+    thin_gray = Side(style="thin", color="D9E1F2")
+
+    status_fills = {
+        "pass": pass_fill,
+        "compliant": pass_fill,
+        "partial": partial_fill,
+        "warn": partial_fill,
+        "fail": fail_fill,
+        "non-compliant": fail_fill,
+    }
+
+    wb = load_workbook(xlsx_path)
+    used = {name.casefold() for name in wb.sheetnames}
+    ws = wb.create_sheet(_safe_sheet_name("Custom Checks", used))
+    ws.sheet_view.showGridLines = False
+
+    ws["A1"] = "Custom Checks (0-100, separate from the deterministic scorecard)"
+    ws.merge_cells("A1:E1")
+    ws["A1"].font = Font(bold=True, size=16, color=white)
+    ws["A1"].fill = PatternFill("solid", fgColor=dark_blue)
+    ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
+
+    workspaces = (section or {}).get("workspaces", 0)
+    ws["A2"] = f"Evaluated across {workspaces} workspace(s)"
+    ws.merge_cells("A2:E2")
+    ws["A2"].font = Font(italic=True)
+
+    headers = ["Check", "Status", "Score", "Evidence", "Recommendation"]
+    header_row = 3
+    for column, value in enumerate(headers, start=1):
+        cell = ws.cell(row=header_row, column=column, value=value)
+        cell.font = Font(bold=True, color=white)
+        cell.fill = PatternFill("solid", fgColor=medium_blue)
+        cell.alignment = Alignment(vertical="center", wrap_text=True)
+        cell.border = Border(bottom=thin_gray)
+
+    row = header_row
+    for check in checks:
+        row += 1
+        prompt = check.get("prompt") or check.get("check_id") or "(unnamed check)"
+        status = check.get("status") or ""
+        score = check.get("score")
+        evidence = "; ".join(str(item) for item in (check.get("findings") or []))
+        recommendation = "; ".join(
+            str(item) for item in (check.get("recommendations") or [])
+        )
+        ws.cell(row=row, column=1, value=prompt)
+        status_cell = ws.cell(row=row, column=2, value=status)
+        score_cell = ws.cell(row=row, column=3, value=score)
+        if isinstance(score, (int, float)):
+            score_cell.number_format = "0"
+        ws.cell(row=row, column=4, value=evidence)
+        ws.cell(row=row, column=5, value=recommendation)
+
+        fill = status_fills.get(str(status).strip().casefold())
+        if fill is not None:
+            status_cell.fill = fill
+        elif row % 2 == 0:
+            for column in range(1, len(headers) + 1):
+                ws.cell(row=row, column=column).fill = banded_fill
+
+    ws.freeze_panes = f"A{header_row + 1}"
+    for column, width in {"A": 60, "B": 16, "C": 10, "D": 70, "E": 70}.items():
+        ws.column_dimensions[column].width = width
+    for sheet_row in ws.iter_rows(min_row=header_row):
+        for cell in sheet_row:
+            cell.alignment = Alignment(
+                vertical="top",
+                wrap_text=True,
+                horizontal=cell.alignment.horizontal,
+            )
+
+    wb.save(xlsx_path)
+    return True
