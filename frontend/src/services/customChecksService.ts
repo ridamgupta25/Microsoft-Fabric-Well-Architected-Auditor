@@ -16,7 +16,10 @@ import type {
 export async function runCustomChecks(
   request: CustomChecksRequest,
 ): Promise<CustomChecksResult> {
-  const { data } = await apiClient.post<CustomChecksResult>("/custom-checks", request);
+  // AI code-gen can take minutes on a slow gateway; override the default 60s.
+  const { data } = await apiClient.post<CustomChecksResult>("/custom-checks", request, {
+    timeout: 300_000,
+  });
   return data;
 }
 

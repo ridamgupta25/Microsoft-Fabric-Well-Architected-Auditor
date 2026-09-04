@@ -150,6 +150,21 @@ class SemanticRouter:
         self.store.index(_DEFAULT_CHECKS, items, version=version)
         return bool(items)
 
+    def _direction_check(self, prompt: str, matches) -> "IntentDecision | None":
+        """Ask the Intent Critic whether a keyword hit is the SAME direction.
+
+        A Stage-1 hit shares wording but may be the opposite intent ("enabled" vs
+        "disabled"). Returns the critic's decision, or ``None`` when no critic is
+        available (AI off) so the caller keeps the deterministic decision.
+        """
+        if not self.critic:
+            return None
+        candidates = [
+            Neighbor(id=m.spec.id, score=m.confidence, metadata={"title": m.spec.title})
+            for m in matches[: self.top_k]
+        ]
+        return self.critic(prompt, candidates)
+
     def route(self, check: CustomCheck) -> CustomCheck:
         """Run Node 2 on ``check`` in place; sets ``ROUTED_DEFAULT`` or leaves it."""
         prompt = check.raw_prompt
@@ -157,10 +172,25 @@ class SemanticRouter:
         # Stage 1 - deterministic matcher (always on).
         matches = match_point(prompt, self.registry)
         if matches and matches[0].confidence >= self.reuse_threshold:
-            top = matches[0]
-            return self._route_default(
-                check, top.spec.id, top.confidence, "deterministic", top.reason
-            )
+            # A keyword hit shares wording but may be the OPPOSITE intent
+            # ("enabled" vs "disabled"). When AI is on, confirm same direction with
+            # the Intent Critic before deduping; a rejection falls through to the
+            # semantic stage instead of wrongly reusing the default.
+            decision = self._direction_check(prompt, matches)
+            if decision is None:  # AI off / no critic -> keep deterministic decision
+                top = matches[0]
+                return self._route_default(
+                    check, top.spec.id, top.confidence, "deterministic", top.reason
+                )
+            if decision.is_match and decision.matched_id:
+                matched = next(
+                    (m for m in matches if m.spec.id == decision.matched_id), matches[0]
+                )
+                return self._route_default(
+                    check, matched.spec.id, matched.confidence,
+                    "deterministic+critic", decision.reasoning,
+                )
+            # Opposite direction / not a true duplicate -> continue to Stage 2.
 
         # Stage 2 - semantic retrieve (AI on).
         vector = self.embedder(prompt)

@@ -83,6 +83,10 @@ def run_custom_checks(
     ids = store.workspaces() if workspace_ids is None else list(workspace_ids)
     contexts = [ctx for wid in ids if (ctx := store.load(wid)) is not None]
 
+    # Let the gated live provider resolve ``{id}`` endpoints against this run.
+    if live_provider is not None and hasattr(live_provider, "bind_workspaces"):
+        live_provider.bind_workspaces(ids)
+
     # Cross-run memory: reuse validated generated code, skipping redundant LLM calls.
     memory = _memory()
     code_cache = memory.code_cache() if memory else None
