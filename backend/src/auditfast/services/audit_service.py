@@ -838,7 +838,7 @@ def write_reports(run: AuditRun, out_dir: str | Path) -> dict[str, str]:
         run.errors,
     )
     html_path.write_text(
-        build_html(run.project_name, run.aggregate, run.results, run.errors),
+        build_html(run.project_name, run.aggregate, run.results, run.errors, run.groups),
         encoding="utf-8",
     )
     return {
@@ -885,6 +885,9 @@ def write_advisory_reports(run: AuditRun, out_dir: str | Path) -> dict[str, str]
     )
     advisory_html.write_text(
         build_html(
+            # Deliberately no groups: the advisory report's heading has to keep
+            # its own "Advisory (non-deterministic)" marker, and a group name
+            # would take priority and hide it.
             advisory_name,
             run.advisory_aggregate,
             run.advisory_results,
