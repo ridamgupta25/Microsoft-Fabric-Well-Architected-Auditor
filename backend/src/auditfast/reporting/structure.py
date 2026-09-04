@@ -96,6 +96,120 @@ def _grouped_evidence(
     return _join(lines, max_items=12)
 
 
+#: Names for the checklist subsections the refs point at.
+#:
+#: Most are the checklist's own wording. The rest -- the subsections the
+#: checklist workbook does not name, marked ``(derived)`` below -- are read off
+#: the checks registered against them, and each summarises the whole subsection
+#: rather than its first check: 4.5 covers star schema, surrogate keys, SCD
+#: strategy, fact grain and referential integrity, so it is "Dimensional
+#: Modeling & Integrity" and not any one of those.
+#:
+#: A subsection nobody names is absent rather than guessed at, and its label
+#: degrades to the bare number.
+CHECKLIST_CATEGORIES = {
+    "1.1": "Solution Architecture",
+    "1.2": "Data Architecture",
+    "1.3": "Integration Architecture",
+    "1.4": "Semantic Model and Report Design",
+    "2.1": "Pipeline Design",
+    "2.2": "Incremental Load Strategy",
+    "2.3": "Source Change Data (I/U/D) Processing",
+    "2.4": "Error Handling & Retry",
+    "2.5": "Dataflows",
+    "2.6": "Pipeline Performance",
+    "2.7": "Semantic Model Refresh",
+    "3.1": "Spark Notebook Quality",
+    "3.2": "Spark Code Standards",
+    "3.3": "Delta Lake Best Practices",
+    "3.4": "Environment & Spark Pool Configuration",
+    "3.5": "Spark Performance & Optimization",
+    "3.6": "Warehouse Load Patterns",  # derived
+    "3.7": "Semantic Model Storage and Performance",
+    "4.1": "Lakehouse Design",
+    "4.2": "Table Design",
+    "4.3": "File Format & Organization",
+    "4.4": "Datamart & Dimensional Modeling",
+    "4.5": "Dimensional Modeling & Integrity",  # derived
+    "4.6": "Metadata DB & Audit Tables",  # derived
+    "4.7": "Endorsement and Certification",
+    "5.1": "DQ Framework & Governance",
+    "5.2": "Pre-Bronze & Bronze Layer Validation (Raw Data)",
+    "5.3": "Silver Layer Validation (Cleansed & Conformed)",
+    "5.4": "Gold Layer Validation (Consumption-Ready / Datamart)",
+    "5.5": "Data-Type-Specific Validation Rules",
+    "6.1": "Identity & Access Management",
+    "6.2": "Data Security",
+    "6.3": "Network Security",
+    "6.4": "Secrets & Credentials",
+    "6.5": "Report Consumer Security",
+    "7.1": "Regulatory Scope & Agreements",  # derived
+    "7.2": "SOX Compliance",
+    "7.3": "Privacy Governance & Data Lifecycle",  # derived
+    "7.4": "Data Access Auditing",  # derived
+    "8.1": "Data Lineage & Cataloging",
+    "8.2": "Data Ownership & Stewardship",
+    "8.3": "Technical Metadata Capture",  # derived
+    "9.1": "Error Recovery",
+    "9.2": "Disaster Recovery & Backup",
+    "9.3": "Idempotency & Data Integrity",
+    "9.4": "SLA Monitoring & Breach Alerting",  # derived
+    "10.1": "Pipeline & Job Monitoring",
+    "10.2": "Audit & Metadata Queryability",  # derived
+    "10.3": "Power BI Monitoring Dashboard",
+    "10.4": "Alerting & Incident Response",
+    "10.5": "Incident Response & Triggers",  # derived
+    "11.1": "Version Control",
+    "11.2": "CI/CD & Deployment Pipelines",
+    "11.3": "Environment Management",
+    "11.4": "Testing Strategy",
+    "11.5": "BI Deployment",
+    "12.1": "Capacity Planning",
+    "12.2": "Capacity Utilization",
+    "12.3": "Cost Optimization",
+    "13.1": "Solution Documentation",
+    "13.2": "Workspace Access Governance",  # derived
+    "13.3": "Capacity Assignment",  # derived
+    "13.4": "Pipeline Timeouts",  # derived
+    # Section 14 is the Power BI / semantic-model chapter. The reference readout
+    # numbers the same chapter 1.4 / 2.7 / 3.7 / 4.7 / 6.5 / 11.5, so three of
+    # these names are its wording for the same controls.
+    "14.1": "Semantic Model Design",  # derived
+    "14.2": "Semantic Model Storage and Performance",  # derived
+    "14.3": "Report Quality & Certification",  # derived
+    "14.4": "Report Consumer Security",  # derived
+    "14.5": "Semantic Model Refresh & Deployment",  # derived
+}
+
+
+def category_title(number: str) -> str:
+    """The name for a subsection number, or ``""`` when nothing names it."""
+    return CHECKLIST_CATEGORIES.get(number, "")
+
+
+def category_number(ref: str) -> str:
+    """The ``N.N`` checklist subsection a ref belongs to."""
+    parts = str(ref or "").split(".")
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+        return f"{parts[0]}.{parts[1]}"
+    return str(ref or "")
+
+
+def category_sort_key(number: str) -> tuple:
+    """Order ``1.2`` before ``1.10`` and both before ``2.1``."""
+    parts = str(number).split(".")
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+        return (0, int(parts[0]), int(parts[1]), "")
+    return (1, 0, 0, str(number))
+
+
+def category_label(ref: str) -> str:
+    """``1.1 - Solution Architecture``, or the bare number when nothing names it."""
+    number = category_number(ref)
+    name = category_title(number)
+    return f"{number} \u00b7 {name}" if name else (number or "-")
+
+
 def category_for(result: CheckResult) -> str:
     """Return a stable checklist-category label without inventing domain taxonomy."""
     parts = result.ref.split(".")
