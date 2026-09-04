@@ -50,6 +50,8 @@ export interface CustomChecksRequest {
   workspace_ids?: string[] | null;
   approved_check_ids?: string[] | null;
   ai?: AiConfigInput | null;
+  // Signed-in session id; lets the gated live fetch read fresh data from Fabric.
+  auth_session?: string | null;
 }
 
 /** The 0-100 result a generated custom check produces when run over the KB. */

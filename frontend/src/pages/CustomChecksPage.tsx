@@ -10,6 +10,7 @@ import { Link } from "react-router-dom";
 
 import { AiSettings } from "@/components/AiSettings";
 import { ErrorBanner, Section, Spinner } from "@/components/ui";
+import { useAuditContext } from "@/context/AuditContext";
 import { listKbWorkspaces } from "@/services/auditService";
 import { runCustomChecks } from "@/services/customChecksService";
 import type {
@@ -36,6 +37,7 @@ const STATUS_CLASS: Record<string, string> = {
 };
 
 export function CustomChecksPage() {
+  const { session } = useAuditContext();
   const [text, setText] = useState("");
   const [ai, setAi] = useState<AiConfigInput | null>(null);
   const [result, setResult] = useState<CustomChecksResult | null>(null);
@@ -86,6 +88,7 @@ export function CustomChecksPage() {
         workspace_ids: selectedWs.size > 0 ? [...selectedWs] : undefined,
         approved_check_ids: approvedIds,
         ai: ai ?? undefined,
+        auth_session: session ?? undefined,
       });
       setResult(data);
       if (!approvedIds) {

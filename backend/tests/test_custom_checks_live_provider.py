@@ -113,3 +113,63 @@ def test_build_live_provider_is_none_without_token(monkeypatch):
         ),
     )
     assert custom_checks_service.build_live_provider(None) is None
+
+
+# -- endpoint template resolution (GET-only, {id} substitution, /v1 de-dup) -----
+
+def test_resolve_single_workspace_template():
+    p = LiveFetchProvider(_getter({}), enabled=True)
+    p.bind_workspaces(["ws1"])
+    # strips the "GET " prefix, drops the leading /v1, substitutes {id}.
+    assert p._resolve_paths("GET /v1/workspaces/{id}/roleAssignments") == [
+        "/workspaces/ws1/roleAssignments"
+    ]
+
+
+def test_resolve_expands_one_path_per_workspace():
+    p = LiveFetchProvider(_getter({}), enabled=True)
+    p.bind_workspaces(["wsA", "wsB"])
+    assert p._resolve_paths("GET /v1/workspaces/{id}/reports") == [
+        "/workspaces/wsA/reports",
+        "/workspaces/wsB/reports",
+    ]
+
+
+def test_resolve_declines_per_item_and_non_get():
+    p = LiveFetchProvider(_getter({}), enabled=True)
+    p.bind_workspaces(["wsA"])
+    assert p._resolve_paths("GET /v1/workspaces/{id}/items/{id}/shortcuts") == []
+    assert p._resolve_paths("POST /v1/workspaces/{id}/x") == []
+
+
+def test_resolve_endpoint_without_id_needs_no_workspace():
+    p = LiveFetchProvider(_getter({}), enabled=True)
+    assert p._resolve_paths("GET /v1/deploymentPipelines") == ["/deploymentPipelines"]
+
+
+def test_multi_workspace_fetch_combines_value_lists():
+    getter = _getter(
+        {
+            "/workspaces/wsA/reports": {"value": [1, 2]},
+            "/workspaces/wsB/reports": {"value": [3]},
+        }
+    )
+    p = LiveFetchProvider(getter, enabled=True)
+    p.bind_workspaces(["wsA", "wsB"])
+    resp = p.fetch(_Plan("GET /v1/workspaces/{id}/reports"), "item_rest")
+    assert resp.status == 200
+    assert resp.body == {"value": [1, 2, 3]}  # every workspace's rows, concatenated
+
+
+def test_multi_workspace_fetch_counts_calls_against_budget():
+    getter = _getter(
+        {
+            "/workspaces/wsA/reports": {"value": [1]},
+            "/workspaces/wsB/reports": {"value": [2]},
+        }
+    )
+    p = LiveFetchProvider(getter, enabled=True, max_calls=1)
+    p.bind_workspaces(["wsA", "wsB"])
+    # The first workspace spends the only allowed call; the second trips the budget.
+    assert p.fetch(_Plan("GET /v1/workspaces/{id}/reports"), "item_rest").status == 429
+

@@ -26,6 +26,10 @@ log = logging.getLogger("auditfast.custom_checks")
 #: check's planned endpoint, which is path-screened before use.
 Getter = Callable[[str], "tuple[int | None, Any]"]
 
+#: HTTP verbs a catalog endpoint template may carry as a prefix. Only ``GET`` is
+#: ever resolved — the read-only guarantee refuses every other verb.
+_HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"})
+
 
 class LiveFetchProvider:
     """A read-only :class:`FetchProvider` that answers Node 3b from live Fabric."""
@@ -43,28 +47,88 @@ class LiveFetchProvider:
         self._max_calls = max_calls
         self._max_bytes = max_bytes
         self._calls = 0
+        #: Run workspace id(s), bound before the run so ``{id}`` templates resolve.
+        self._workspace_ids: list[str] = []
+
+    def bind_workspaces(self, workspace_ids) -> None:
+        """Record the run's workspace id(s) so ``{id}`` endpoints can resolve."""
+        self._workspace_ids = [str(w) for w in (workspace_ids or []) if w]
+
+    def _resolve_paths(self, endpoint: str | None) -> list[str]:
+        """Turn a catalog endpoint template into concrete, GET-only REST paths.
+
+        Strips the HTTP method prefix (only ``GET`` is ever resolved — the
+        read-only guarantee), drops a leading ``/v1`` (the getter's base URL
+        already carries it, so keeping it would 404 as ``/v1/v1``), and expands
+        the single workspace-level ``{id}`` into **one path per bound workspace**.
+        Per-item templates (more than one ``{id}``) cannot be resolved without an
+        item id, so they yield no paths and the updater's loop advances offline.
+        """
+        ep = (endpoint or "").strip()
+        if not ep:
+            return []
+        head, sep, rest = ep.partition(" ")
+        if sep and head in _HTTP_METHODS:
+            if head != "GET":
+                return []
+            ep = rest.strip()
+        for prefix in ("/v1/", "v1/"):
+            if ep.startswith(prefix):
+                ep = "/" + ep[len(prefix):]
+                break
+        placeholders = ep.count("{id}")
+        if placeholders == 0:
+            return [ep] if ep else []
+        if placeholders == 1 and self._workspace_ids:
+            return [ep.replace("{id}", ws) for ws in self._workspace_ids]
+        return []  # per-item (two {id}) or no bound workspace -> decline
+
+    @staticmethod
+    def _combine(bodies: list[Any]) -> Any:
+        """Combine one field fetched across several workspaces into one value.
+
+        Collection endpoints return ``{"value": [...]}``; their rows are
+        concatenated so the check sees every workspace's data. A single body is
+        returned unchanged (the common one-workspace case); any other shape is
+        wrapped as ``{"value": [...]}`` so nothing is lost.
+        """
+        if len(bodies) == 1:
+            return bodies[0]
+        if all(isinstance(b, dict) and isinstance(b.get("value"), list) for b in bodies):
+            merged: list[Any] = []
+            for b in bodies:
+                merged.extend(b["value"])
+            return {"value": merged}
+        return {"value": bodies}
 
     def fetch(self, plan, strategy) -> FetchResponse:  # noqa: D401 - protocol method
         # Only the item-level REST strategy is served live. Gate off, wrong
-        # strategy, or an unsafe/empty endpoint all behave as "not available"
+        # strategy, or an unsafe/unresolved endpoint all behave as "not available"
         # (404) so the updater's loop advances exactly as it does offline.
         if not self._enabled or strategy != "item_rest":
             return FetchResponse(404)
-        path = plan.endpoint or ""
-        if not path or not _is_safe_path(path):
+        paths = [p for p in self._resolve_paths(plan.endpoint) if _is_safe_path(p)]
+        if not paths:
             return FetchResponse(404)
-        self._calls += 1
-        if self._calls > self._max_calls:
-            log.warning("live fetch call budget exhausted", extra={"budget": self._max_calls})
-            return FetchResponse(429)
-        status, body = self._get(path)
-        if status == 200 and body is not None:
-            size = len(json.dumps(body, default=str).encode("utf-8"))
-            if size > self._max_bytes:
-                log.warning("live fetch response too large", extra={"path": path, "bytes": size})
-                return FetchResponse(200, None)  # oversize -> treated as metadata-unavailable
-            log.info("live fetch", extra={"path": path, "bytes": size, "call": self._calls})
-        return FetchResponse(status or 0, body=body)
+        bodies: list[Any] = []
+        last_status = 404
+        for path in paths:
+            self._calls += 1
+            if self._calls > self._max_calls:
+                log.warning("live fetch call budget exhausted", extra={"budget": self._max_calls})
+                return FetchResponse(429)
+            status, body = self._get(path)
+            last_status = status or 0
+            if status == 200 and body is not None:
+                size = len(json.dumps(body, default=str).encode("utf-8"))
+                if size > self._max_bytes:
+                    log.warning("live fetch response too large", extra={"path": path, "bytes": size})
+                    continue  # skip this workspace's oversize body, keep the rest
+                log.info("live fetch path=%s bytes=%s call=%s", path, size, self._calls)
+                bodies.append(body)
+        if not bodies:
+            return FetchResponse(last_status or 0)
+        return FetchResponse(200, body=self._combine(bodies))
 
 
 class ChainedFetchProvider:

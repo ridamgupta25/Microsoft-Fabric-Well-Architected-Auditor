@@ -73,6 +73,42 @@ def test_novel_prompt_is_unique_when_ai_off():
     assert check.lifecycle_status is LifecycleStatus.PENDING
 
 
+# -- Stage 1: direction gap (the Intent Critic guards keyword dedup) ------------
+
+def test_stage1_keyword_hit_rejected_by_critic_is_not_deduped():
+    # Same wording, opposite direction: keyword Stage 1 hits, but the critic says
+    # the intent differs -> the default must NOT be reused (the enabled/disabled trap).
+    registry = [_spec("PUB-1", "1.1", "Public network access is enabled")]
+
+    def critic(_prompt, _candidates):
+        return IntentDecision(False, None, "opposite direction")
+
+    router = SemanticRouter(
+        registry=registry, embedder=lambda _t: None, store=VectorStore(), critic=critic
+    )
+    check = router.route(_check("Ensure public network access is disabled"))
+    assert check.routing.is_duplicate is False
+    assert check.lifecycle_status is LifecycleStatus.PENDING
+
+
+def test_stage1_keyword_hit_confirmed_by_critic_routes_default():
+    # Same wording and same direction: the critic confirms, so it is reused.
+    registry = [_spec("PUB-1", "1.1", "Public network access is enabled")]
+
+    def critic(_prompt, _candidates):
+        return IntentDecision(True, "PUB-1", "same enable intent")
+
+    router = SemanticRouter(
+        registry=registry, embedder=lambda _t: None, store=VectorStore(), critic=critic
+    )
+    check = router.route(_check("Ensure public network access is enabled"))
+    assert check.routing.is_duplicate is True
+    assert check.routing.stage == "deterministic+critic"
+    assert check.routing.matched_default_id == "PUB-1"
+    assert check.lifecycle_status is LifecycleStatus.ROUTED_DEFAULT
+
+
+
 # -- Stage 3: LLM Intent Critic ------------------------------------------------
 
 def _synonym_router(critic):
