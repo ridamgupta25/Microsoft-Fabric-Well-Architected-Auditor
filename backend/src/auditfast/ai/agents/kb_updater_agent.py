@@ -90,6 +90,10 @@ class FetchResponse:
     status: int
     body: Any = None
     retry_after: float | None = None
+    #: Per-workspace bodies ``{workspace_id: body}`` when the fetch targeted
+    #: specific workspaces, so the updater can merge each under its own snapshot.
+    #: ``None`` for a whole-run/single fetch (merged flat, as before).
+    by_workspace: dict[str, Any] | None = None
 
 
 class FetchProvider(Protocol):
@@ -196,7 +200,10 @@ def augment(
         if response.status == 200:
             body = response.body
             if _is_jsonish(body) and _non_empty(body) and validator(body):
-                _merge(session, plan, body)
+                if response.by_workspace:
+                    _merge_by_workspace(session, plan, response.by_workspace)
+                else:
+                    _merge(session, plan, body)
                 _record_provenance(log, plan, strategy)
                 session.fetch_cache[plan.field] = True
                 return _succeed(check, log, plan, source=strategy, validated=True)
@@ -227,6 +234,21 @@ def _merge(session, plan: FetchPlan, body: Any) -> None:
     key = _top_key(plan.field)
     existing = session.shared_kb.get(key)
     session.shared_kb[key] = _deep_merge(existing, body) if existing is not None else body
+
+
+def _merge_by_workspace(session, plan: FetchPlan, by_workspace: dict) -> None:
+    """Merge each workspace's fetched body under its own snapshot in the shared KB.
+
+    Keeps the ``{workspace_id: snapshot}`` shape intact, so a field fetched for the
+    workspaces that lacked it lands in the right place for the generated check.
+    """
+    key = _top_key(plan.field)
+    for ws_id, body in by_workspace.items():
+        snapshot = session.shared_kb.get(ws_id)
+        if not isinstance(snapshot, dict):
+            continue
+        existing = snapshot.get(key)
+        snapshot[key] = _deep_merge(existing, body) if existing is not None else body
 
 
 def _record_provenance(log: KbUpdateLog, plan: FetchPlan, source: str) -> None:

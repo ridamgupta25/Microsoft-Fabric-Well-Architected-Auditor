@@ -115,6 +115,25 @@ class Settings(BaseSettings):
         default=2_000_000,
         description="Max serialized bytes a single fetch response may return (size cap).",
     )
+    # When on (and live fetch is enabled), the AI-generated, guardrail-validated
+    # fetch(client, workspace_id) code is the SOLE live-fetch path: a cache miss runs
+    # it in the sandbox, and if it can't fetch (AI off, unsafe/bad code, or a failed
+    # GET) the field stays unfetched and the check reports N/A. Off => the fixed
+    # endpoint provider does all live fetching and the AI fetch code is an archived
+    # artifact only.
+    custom_checks_execute_fetch_code: bool = Field(
+        default=False,
+        description="On a cache miss, execute the AI-generated read-only fetch code as the sole live path (no endpoint fallback).",
+    )
+    # Hard per-check memory ceiling for the Node 5 runner (defense in depth on top of
+    # the AST allow-list + timeout). 0 disables it (fast in-thread path, no tracemalloc
+    # overhead). When > 0, a generated check that grows traced allocations past the cap
+    # is aborted with a MemoryLimitError instead of risking process OOM. Since generated
+    # code may only import pure-Python stdlib modules, tracemalloc captures its growth.
+    custom_checks_max_memory_mb: int = Field(
+        default=0,
+        description="Per-check memory ceiling (MB) for the runner; 0 disables the cap.",
+    )
 
     # -- AI request timeout ---------------------------------------------------
     # Per-request timeout for a model call, so a slow/unresponsive gateway fails

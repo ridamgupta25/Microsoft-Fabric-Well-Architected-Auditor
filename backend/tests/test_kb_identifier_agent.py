@@ -123,6 +123,32 @@ def test_plan_low_confidence_marks_fetch_plan_optional(monkeypatch):
     assert check.fetch_plan.mandatory is False
 
 
+# -- plan: per-workspace presence ----------------------------------------------
+
+def test_plan_fetches_only_workspaces_missing_the_field():
+    session = CustomCheckSession()
+    session.shared_kb = {
+        "ws1": {"id": "ws1", "display_name": "A", "git_connected": True},   # has it
+        "ws2": {"id": "ws2", "display_name": "B"},                          # missing
+        "ws3": {"id": "ws3", "display_name": "C"},                          # missing
+    }
+    check = plan(_check("verify git source control"), session)
+    assert check.lifecycle_status is LifecycleStatus.PENDING
+    assert check.fetch_plan is not None
+    assert set(check.fetch_plan.workspace_ids) == {"ws2", "ws3"}  # ws1 excluded
+
+
+def test_plan_all_workspaces_present_is_processed_custom():
+    session = CustomCheckSession()
+    session.shared_kb = {
+        "ws1": {"id": "ws1", "display_name": "A", "git_connected": True},
+        "ws2": {"id": "ws2", "display_name": "B", "git_connected": False},
+    }
+    check = plan(_check("verify git source control"), session)
+    assert check.lifecycle_status is LifecycleStatus.PROCESSED_CUSTOM
+    assert check.fetch_plan is None
+
+
 # -- catalog resolver ----------------------------------------------------------
 
 def test_field_value_returns_missing_when_absent():

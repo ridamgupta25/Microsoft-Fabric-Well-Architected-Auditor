@@ -196,6 +196,15 @@ def field_value(kb: dict, path: str) -> Any:
     return MISSING
 
 
+def field_in_workspace(snapshot: dict, path: str) -> Any:
+    """The value at ``path`` within a *single* workspace snapshot, or MISSING.
+
+    Unlike :func:`field_value`, this never falls through to another workspace, so
+    the caller can decide per workspace whether the field is present.
+    """
+    return _resolve(snapshot, path)
+
+
 def _resolve(kb: dict, path: str) -> Any:
     cur: Any = kb
     for part in path.split("."):
@@ -206,4 +215,4 @@ def _resolve(kb: dict, path: str) -> Any:
     return cur
 
 
-__all__ = ["KbField", "KB_FIELD_CATALOG", "MISSING", "field_value"]
+__all__ = ["KbField", "KB_FIELD_CATALOG", "MISSING", "field_value", "field_in_workspace"]

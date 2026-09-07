@@ -36,9 +36,11 @@ db = ["sqlalchemy>=2.0", "alembic>=1.13", "asyncpg>=0.29"]
 ai = ["openai>=1.40", "tiktoken>=0.7"]
 # Node 1 Guardrails AI Guard (input validation). Pulls the base package only; the
 # Hub validators (DetectJailbreak/DetectPII/DetectPromptInjection/SecretsPresent/
-# ValidLength/RestrictToTopic) install separately via `guardrails hub install`
-# after `guardrails configure` with a Hub token. Absent => Node 1 stays on its
-# always-on deterministic regex floor. See docs/managing-checks.md.
+# ValidLength/RestrictToTopic) are now plain PyPI packages (no Hub token) — install
+# only the ones you want, e.g. `pip install guardrails-ai-detect-pii`. Each is
+# imported optionally, so a missing validator never disables the Guard; absent all
+# of them, Node 1 stays on its always-on deterministic regex floor. See
+# docs/managing-checks.md.
 guardrails = ["guardrails-ai>=0.5"]
 # Persistent, scalable vector store for Nodes 2/3a (Qdrant local mode — no server,
 # no token). Off by default; enable with AUDITFAST_VECTOR_STORE_BACKEND=qdrant.

@@ -99,6 +99,6 @@ bounded retry, HITL interrupt) are already implemented. A thin optional LangGrap
 | **Execute** generated REST-fetch code live | Needs a live, read-only Fabric client + auth session (offline mode has none) and a hardened network sandbox; executing generated network code is a large security surface | High — build behind a gated live provider + guardrail, off by default |
 | **Merge Custom Checks into the deterministic checks page** (one page, not a separate tab) | UI/IA change spanning `RunAuditPage`/report views | Medium |
 | **Fold custom report into `reporting/` + save to History** | Touches the reporting engine and history store | Medium |
-| **Install Guardrails-AI Hub validators** (PII/secrets/jailbreak/topic) | Heavy deps (torch/transformers) + Hub token | Low (seam ready) |
+| **Install Guardrails-AI Hub validators** (PII/secrets/jailbreak/topic) | Heavy ML deps (torch/transformers) for jailbreak/injection; light ones (PII/secrets/length) are token-free PyPI packages | Light installed + Guard active; heavy ML optional |
 | **Optional LangGraph `StateGraph` wrapper** (`interrupt_before` for HITL) | Additive wrapper over existing nodes | Low |
 | **Swap in-memory vector store → Qdrant** | Durability/concurrency at scale | Low (wrapper isolates it) |

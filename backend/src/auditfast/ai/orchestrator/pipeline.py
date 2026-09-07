@@ -61,7 +61,9 @@ def run_check(
     kb_identifier_agent.plan(check, session, ai=ai)  # Node 3a
 
     # When data is missing, capture the read-only REST-fetch code the AI would use
-    # to enrich the KB (a stored, safety-validated artifact — not executed here).
+    # to enrich the KB. It is a stored, safety-validated artifact; whether it is
+    # executed depends on the provider (a CodeFetchProvider runs it, the endpoint
+    # provider ignores it).
     if check.fetch_plan is not None:
         fetch_code_gen_agent.generate_fetch_code(check, ai=ai)
 
@@ -70,6 +72,8 @@ def run_check(
         and check.fetch_plan is not None
         and provider is not None
     ):
+        if hasattr(provider, "bind_check"):
+            provider.bind_check(check)  # hand this check's fetch_code to the provider
         kb_updater_agent.augment(check, provider, session)  # Node 3b
     # No provider -> the check stays PENDING (data needed, none available).
 

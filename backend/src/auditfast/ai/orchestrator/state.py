@@ -100,6 +100,10 @@ class FetchPlan:
     endpoint: str = ""
     confidence: float = 0.0
     mandatory: bool = True
+    #: The specific workspace ids that lack the field and must be fetched. Empty
+    #: means "all workspaces bound on the provider" (the single-workspace / whole-
+    #: run case); set to a subset when only some selected workspaces are missing it.
+    workspace_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -108,6 +112,7 @@ class FetchPlan:
             "endpoint": self.endpoint,
             "confidence": self.confidence,
             "mandatory": self.mandatory,
+            "workspace_ids": list(self.workspace_ids),
         }
 
 
