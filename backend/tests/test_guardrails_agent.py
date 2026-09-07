@@ -144,3 +144,20 @@ def test_guardrails_ai_cannot_loosen_a_deterministic_drop(monkeypatch):
 def test_guardrails_ai_seam_returns_none_when_ai_disabled():
     # Base install: AI off -> the optional seam is a no-op, deterministic verdict only.
     assert guardrails_agent._guardrails_ai_screen("anything") is None
+
+
+def test_guard_builds_from_installed_validators():
+    # Regression: guardrails 0.11 removed Guard.use_many, so _build_guard must compose
+    # via the current `Guard.use` API without raising. Only meaningful when the
+    # `guardrails` extra is installed; skipped otherwise. Builds only (no validate),
+    # so no ML model is loaded.
+    pytest.importorskip("guardrails")
+    from auditfast.ai.agents import _guardrails_ai
+
+    guard = _guardrails_ai._build_guard()
+    validators = guard.get_validators("output") or guard.get_validators("$")
+    names = {type(v).__name__ for v in validators}
+    # The custom FabricZeroWriteValidator is always present; its inclusion proves the
+    # composition ran through the real API rather than raising.
+    assert "FabricZeroWriteValidator" in names
+

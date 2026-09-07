@@ -49,10 +49,21 @@ def build_live_provider(token: str | None) -> object | None:
     settings = get_settings()
     if not settings.custom_checks_live_fetch_enabled or not token:
         return None
-    from ..ai.orchestrator.live_provider import LiveFetchProvider
+    from ..ai.orchestrator.live_provider import CodeFetchProvider, LiveFetchProvider
     from ..clients.live import LiveFabricProvider
 
     fabric = LiveFabricProvider(token)
+    if settings.custom_checks_execute_fetch_code:
+        # Opt-in: the AI-generated, guardrail-validated fetch code IS the live path.
+        # A cache miss runs it in the sandbox; if the code can't fetch (AI off, bad
+        # code, or a failed GET) the field stays unfetched and the check reports N/A.
+        return CodeFetchProvider(
+            fabric._get,
+            enabled=True,
+            max_calls=settings.custom_checks_live_fetch_max_calls,
+            max_bytes=settings.custom_checks_live_fetch_max_bytes,
+        )
+    # Default: the fixed, curated endpoint provider does the live fetching.
     return LiveFetchProvider(
         fabric._get,
         enabled=True,

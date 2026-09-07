@@ -19,9 +19,12 @@ Design source: plan Section 13 (Node 5 hardening - MANDATORY).
 from __future__ import annotations
 
 import ast
+import ctypes
 import threading
+import tracemalloc
 from typing import Any
 
+from ...config.settings import get_settings
 from .base_check import MAX_SCORE, MIN_SCORE, RESULT_KEYS, BaseAuditCheck
 
 #: The only modules a generated check may import. Read-only, pure, no I/O.
@@ -49,6 +52,10 @@ _SAFE_BUILTIN_NAMES = (
 
 class UnsafeCodeError(ValueError):
     """Raised when generated source fails the AST allow-list."""
+
+
+class MemoryLimitError(Exception):
+    """Raised in the worker thread when a check's allocations exceed the ceiling."""
 
 
 def _safe_builtins() -> dict[str, Any]:
@@ -150,7 +157,18 @@ def validate_result(result: Any) -> tuple[bool, str]:
     return True, ""
 
 
-def _run_with_timeout(fn, timeout: float) -> tuple[Any, Exception | None]:
+def _async_raise(tid: int, exctype: type[BaseException]) -> None:
+    """Inject ``exctype`` into the thread ``tid`` so a runaway check can be unwound."""
+    res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+        ctypes.c_ulong(tid), ctypes.py_object(exctype)
+    )
+    if res > 1:  # rolled into >1 thread by mistake -> undo
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(tid), None)
+
+
+def _run_with_timeout(
+    fn, timeout: float, *, max_memory_mb: int = 0
+) -> tuple[Any, Exception | None]:
     box: dict[str, Any] = {}
 
     def target() -> None:
@@ -160,8 +178,48 @@ def _run_with_timeout(fn, timeout: float) -> tuple[Any, Exception | None]:
             box["error"] = exc
 
     thread = threading.Thread(target=target, daemon=True)
+
+    if not max_memory_mb or max_memory_mb <= 0:
+        thread.start()
+        thread.join(timeout)
+        if thread.is_alive():
+            return None, TimeoutError(f"evaluate exceeded {timeout}s")
+        if "error" in box:
+            return None, box["error"]
+        return box.get("value"), None
+
+    # Memory-capped path: sample process-traced allocations while the check runs and
+    # inject MemoryLimitError into the worker once it grows past the cap. Generated
+    # code may only import pure-Python stdlib, so tracemalloc captures its growth.
+    cap_bytes = max_memory_mb * 1024 * 1024
+    started_tracing = not tracemalloc.is_tracing()
+    if started_tracing:
+        tracemalloc.start()
+    baseline = tracemalloc.get_traced_memory()[0]
+    stop = threading.Event()
+    breached = threading.Event()
+
+    def watch() -> None:
+        while not stop.wait(0.02):
+            peak = tracemalloc.get_traced_memory()[1]
+            if peak - baseline > cap_bytes:
+                breached.set()
+                tid = thread.ident
+                if tid is not None:
+                    _async_raise(tid, MemoryLimitError)
+                return
+
     thread.start()
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
     thread.join(timeout)
+    stop.set()
+    watcher.join(0.5)
+    if started_tracing:
+        tracemalloc.stop()
+
+    if breached.is_set():
+        return None, MemoryLimitError(f"evaluate exceeded {max_memory_mb} MB memory ceiling")
     if thread.is_alive():
         return None, TimeoutError(f"evaluate exceeded {timeout}s")
     if "error" in box:
@@ -179,18 +237,32 @@ def _error_result(reason: str, kind: str) -> dict:
     }
 
 
-def run_check(check_cls: type[BaseAuditCheck], kb: dict, *, timeout: float = 5.0) -> dict:
+def run_check(
+    check_cls: type[BaseAuditCheck],
+    kb: dict,
+    *,
+    timeout: float = 5.0,
+    max_memory_mb: int | None = None,
+) -> dict:
     """Instantiate and run ``check_cls`` against ``kb`` under a timeout.
 
     Always returns a valid result dict: a genuine evaluation, or a shape-valid
-    ``ERROR`` result describing the failure - it never raises.
+    ``ERROR`` result describing the failure - it never raises. ``max_memory_mb``
+    defaults to ``settings.custom_checks_max_memory_mb`` (0 disables the cap).
     """
+    if max_memory_mb is None:
+        try:
+            max_memory_mb = get_settings().custom_checks_max_memory_mb
+        except Exception:  # noqa: BLE001 - settings unavailable -> no cap
+            max_memory_mb = 0
     try:
         instance = check_cls()
     except Exception as exc:  # noqa: BLE001
         return _error_result(f"instantiation failed: {exc}", type(exc).__name__)
 
-    value, err = _run_with_timeout(lambda: instance.evaluate(kb), timeout)
+    value, err = _run_with_timeout(
+        lambda: instance.evaluate(kb), timeout, max_memory_mb=max_memory_mb or 0
+    )
     if err is not None:
         return _error_result(str(err), type(err).__name__)
     ok, reason = validate_result(value)
@@ -199,19 +271,22 @@ def run_check(check_cls: type[BaseAuditCheck], kb: dict, *, timeout: float = 5.0
     return value
 
 
-def load_and_run(source: str, kb: dict, *, timeout: float = 5.0) -> dict:
+def load_and_run(
+    source: str, kb: dict, *, timeout: float = 5.0, max_memory_mb: int | None = None
+) -> dict:
     """Convenience: validate + load + run, returning a valid result dict."""
     try:
         check_cls = load_check(source)
     except UnsafeCodeError as exc:
         return _error_result(f"rejected: {exc}", "UnsafeCodeError")
-    return run_check(check_cls, kb, timeout=timeout)
+    return run_check(check_cls, kb, timeout=timeout, max_memory_mb=max_memory_mb)
 
 
 __all__ = [
     "ALLOWED_IMPORTS",
     "BANNED_NAMES",
     "UnsafeCodeError",
+    "MemoryLimitError",
     "validate_source",
     "validate_result",
     "load_check",

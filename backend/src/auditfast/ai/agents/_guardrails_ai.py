@@ -10,6 +10,13 @@ the Guard specified in ``local/Planning/Guardrail AI - Node.md`` (authoritative)
     FabricZeroWriteValidator (custom) -> DetectPII -> SecretsPresent ->
     RestrictToTopic
 
+Each Hub validator is an **optional** PyPI package (e.g.
+``pip install guardrails-ai-detect-pii``); the Guard is composed from whichever are
+installed, preserving order. A missing ML validator (``DetectJailbreak`` /
+``DetectPromptInjection`` pull heavy torch/transformers) is simply skipped, so the
+installed subset still runs on top of the regex floor. ``FabricZeroWriteValidator``
+is custom and always present.
+
 The Guard only ever *tightens* the deterministic verdict (fail-closed): the agent
 consults it after the regex screen already passed, so a failure here escalates
 PASS -> DROP and a pass changes nothing.
@@ -23,14 +30,26 @@ from __future__ import annotations
 import threading
 
 from guardrails import Guard  # type: ignore[import-not-found]
-from guardrails.hub import (  # type: ignore[import-not-found]
-    DetectJailbreak,
-    DetectPII,
-    DetectPromptInjection,
-    RestrictToTopic,
-    SecretsPresent,
-    ValidLength,
-)
+
+
+# Hub validators are optional PyPI packages (e.g. `pip install guardrails-ai-detect-pii`).
+# Import each independently so a missing ML validator (DetectJailbreak /
+# DetectPromptInjection pull heavy torch/transformers) does not disable the whole
+# Guard — the installed subset still runs on top of the always-on regex floor.
+def _optional_validator(name: str):
+    try:
+        module = __import__("guardrails.hub", fromlist=[name])
+        return getattr(module, name)
+    except Exception:  # noqa: BLE001 - validator package not installed
+        return None
+
+
+ValidLength = _optional_validator("ValidLength")
+DetectJailbreak = _optional_validator("DetectJailbreak")
+DetectPromptInjection = _optional_validator("DetectPromptInjection")
+DetectPII = _optional_validator("DetectPII")
+SecretsPresent = _optional_validator("SecretsPresent")
+RestrictToTopic = _optional_validator("RestrictToTopic")
 
 try:  # validator base moved across guardrails releases
     from guardrails.validator_base import (  # type: ignore[import-not-found]
@@ -93,22 +112,43 @@ _GUARD_LOCK = threading.Lock()
 
 
 def _build_guard() -> Guard:
-    """Compose the ordered Guard. Built once and reused across requests."""
+    """Compose the ordered Guard from the installed validators. Built once and reused.
+
+    The custom ``FabricZeroWriteValidator`` is always present; each optional Hub
+    validator is added only when its PyPI package is installed, preserving order.
+    A validator whose construction fails (e.g. a heavy ML validator whose model
+    cannot be loaded offline) is skipped, so the installed subset still runs.
+    """
     max_chars = get_settings().guardrail_max_prompt_chars
+    validators = []
+
+    def _add(factory) -> None:
+        try:
+            validators.append(factory())
+        except Exception:  # noqa: BLE001 - a validator that won't construct is skipped
+            pass
+
+    if ValidLength is not None:
+        _add(lambda: ValidLength(min=1, max=max_chars, on_fail="exception"))
+    if DetectJailbreak is not None:
+        _add(lambda: DetectJailbreak(on_fail="exception"))
+    if DetectPromptInjection is not None:
+        _add(lambda: DetectPromptInjection(on_fail="exception"))
+    validators.append(FabricZeroWriteValidator(on_fail="exception"))
+    if DetectPII is not None:
+        _add(lambda: DetectPII(on_fail="exception"))
+    if SecretsPresent is not None:
+        _add(lambda: SecretsPresent(on_fail="exception"))
+    if RestrictToTopic is not None:
+        _add(
+            lambda: RestrictToTopic(
+                valid_topics=_VALID_TOPICS,
+                disable_llm=True,
+                on_fail="exception",
+            )
+        )
     guard = Guard()
-    guard.use_many(
-        ValidLength(min=1, max=max_chars, on_fail="exception"),
-        DetectJailbreak(on_fail="exception"),
-        DetectPromptInjection(on_fail="exception"),
-        FabricZeroWriteValidator(on_fail="exception"),
-        DetectPII(on_fail="exception"),
-        SecretsPresent(on_fail="exception"),
-        RestrictToTopic(
-            valid_topics=_VALID_TOPICS,
-            disable_llm=True,
-            on_fail="exception",
-        ),
-    )
+    guard.use(*validators)
     return guard
 
 

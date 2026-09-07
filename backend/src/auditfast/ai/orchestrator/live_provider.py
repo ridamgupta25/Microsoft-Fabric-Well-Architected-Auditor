@@ -17,7 +17,7 @@ import logging
 from typing import Any, Callable
 
 from ..agents.kb_updater_agent import FetchResponse
-from ..custom_runtime.live_fetch import _is_safe_path
+from ..custom_runtime.live_fetch import _is_safe_path, run_fetch_code
 
 log = logging.getLogger("auditfast.custom_checks")
 
@@ -54,15 +54,14 @@ class LiveFetchProvider:
         """Record the run's workspace id(s) so ``{id}`` endpoints can resolve."""
         self._workspace_ids = [str(w) for w in (workspace_ids or []) if w]
 
-    def _resolve_paths(self, endpoint: str | None) -> list[str]:
-        """Turn a catalog endpoint template into concrete, GET-only REST paths.
+    def _resolve_by_ws(self, endpoint: str | None, ws_ids: list[str]) -> list[tuple[str, str]]:
+        """Turn a catalog endpoint template into ``(workspace_id, path)`` pairs.
 
-        Strips the HTTP method prefix (only ``GET`` is ever resolved — the
-        read-only guarantee), drops a leading ``/v1`` (the getter's base URL
-        already carries it, so keeping it would 404 as ``/v1/v1``), and expands
-        the single workspace-level ``{id}`` into **one path per bound workspace**.
-        Per-item templates (more than one ``{id}``) cannot be resolved without an
-        item id, so they yield no paths and the updater's loop advances offline.
+        Strips the HTTP method prefix (only ``GET`` is resolved — the read-only
+        guarantee), drops a leading ``/v1`` (the getter's base URL already carries
+        it), and expands the single workspace-level ``{id}`` into **one pair per
+        given workspace** (the ``workspace_id`` is empty for a workspace-independent
+        endpoint). Per-item templates (more than one ``{id}``) yield nothing.
         """
         ep = (endpoint or "").strip()
         if not ep:
@@ -78,10 +77,14 @@ class LiveFetchProvider:
                 break
         placeholders = ep.count("{id}")
         if placeholders == 0:
-            return [ep] if ep else []
-        if placeholders == 1 and self._workspace_ids:
-            return [ep.replace("{id}", ws) for ws in self._workspace_ids]
-        return []  # per-item (two {id}) or no bound workspace -> decline
+            return [("", ep)] if ep else []
+        if placeholders == 1 and ws_ids:
+            return [(ws, ep.replace("{id}", ws)) for ws in ws_ids]
+        return []  # per-item (two {id}) or no workspace -> decline
+
+    def _resolve_paths(self, endpoint: str | None) -> list[str]:
+        """Concrete GET-only REST paths for the bound workspaces (path list only)."""
+        return [path for _ws, path in self._resolve_by_ws(endpoint, self._workspace_ids)]
 
     @staticmethod
     def _combine(bodies: list[Any]) -> Any:
@@ -107,12 +110,16 @@ class LiveFetchProvider:
         # (404) so the updater's loop advances exactly as it does offline.
         if not self._enabled or strategy != "item_rest":
             return FetchResponse(404)
-        paths = [p for p in self._resolve_paths(plan.endpoint) if _is_safe_path(p)]
-        if not paths:
+        # Fetch only the plan's target workspaces (the ones missing the field) when
+        # given, else every bound workspace.
+        ws_ids = list(getattr(plan, "workspace_ids", None) or []) or self._workspace_ids
+        pairs = [(ws, p) for ws, p in self._resolve_by_ws(plan.endpoint, ws_ids) if _is_safe_path(p)]
+        if not pairs:
             return FetchResponse(404)
         bodies: list[Any] = []
+        by_ws: dict[str, Any] = {}
         last_status = 404
-        for path in paths:
+        for ws, path in pairs:
             self._calls += 1
             if self._calls > self._max_calls:
                 log.warning("live fetch call budget exhausted", extra={"budget": self._max_calls})
@@ -126,9 +133,104 @@ class LiveFetchProvider:
                     continue  # skip this workspace's oversize body, keep the rest
                 log.info("live fetch path=%s bytes=%s call=%s", path, size, self._calls)
                 bodies.append(body)
+                if ws:
+                    by_ws[ws] = body
         if not bodies:
             return FetchResponse(last_status or 0)
-        return FetchResponse(200, body=self._combine(bodies))
+        return FetchResponse(200, body=self._combine(bodies), by_workspace=by_ws or None)
+
+
+class _BodyGetterClient:
+    """Adapts a ``(status, body)`` getter to the ``.get(path) -> body`` read-only
+    client the AI fetch code expects.
+
+    Strips a leading ``/v1`` (the getter's base URL already carries it, so keeping
+    it would 404 as ``/v1/v1``) and returns the parsed body on a ``200``, else
+    ``None`` so the fetch code simply sees "no data".
+    """
+
+    __slots__ = ("_getter",)
+
+    def __init__(self, getter: Getter) -> None:
+        self._getter = getter
+
+    def get(self, path: str) -> Any:  # noqa: D401 - read-only client protocol
+        p = str(path).strip()
+        for prefix in ("/v1/", "v1/"):
+            if p.startswith(prefix):
+                p = "/" + p[len(prefix):]
+                break
+        status, body = self._getter(p)
+        return body if status == 200 else None
+
+
+class CodeFetchProvider:
+    """A read-only FetchProvider that *executes* the AI-generated ``fetch`` code.
+
+    Runs the check's guardrail-validated ``fetch(client, workspace_id)`` in the same
+    hardened sandbox as generated checks (anti-SSRF path screen, call budget, size
+    cap, timeout), injecting a read-only Fabric client. Only the ``item_rest``
+    strategy is served, and only when enabled *and* a ``fetch_code`` is bound for the
+    current check; every other case declines with a ``404`` so the updater's loop
+    advances exactly as it does offline. Bind the current check's code with
+    :meth:`bind_check` before its Node 3b runs.
+    """
+
+    def __init__(
+        self,
+        getter: Getter,
+        *,
+        enabled: bool,
+        max_calls: int = 20,
+        max_bytes: int = 2_000_000,
+        timeout: float = 5.0,
+    ) -> None:
+        self._client = _BodyGetterClient(getter)
+        self._enabled = enabled
+        self._max_calls = max_calls
+        self._max_bytes = max_bytes
+        self._timeout = timeout
+        self._workspace_ids: list[str] = []
+        self._fetch_code: str | None = None
+
+    def bind_workspaces(self, workspace_ids) -> None:
+        """Record the run's workspace id(s) so per-workspace fetch code can run."""
+        self._workspace_ids = [str(w) for w in (workspace_ids or []) if w]
+
+    def bind_check(self, check) -> None:
+        """Bind the current check's AI fetch code before its Node 3b runs."""
+        self._fetch_code = getattr(check, "fetch_code", None)
+
+    def fetch(self, plan, strategy) -> FetchResponse:  # noqa: D401 - protocol method
+        # No code / gate off / wrong strategy behaves as "not available" (404) so
+        # the updater falls through to the next provider exactly as offline.
+        if not self._enabled or strategy != "item_rest" or not self._fetch_code:
+            return FetchResponse(404)
+        # Run the AI fetch code for the plan's target workspaces (the missing ones)
+        # when given, else every bound workspace.
+        ws_ids = list(getattr(plan, "workspace_ids", None) or []) or self._workspace_ids or [""]
+        bodies: list[Any] = []
+        by_ws: dict[str, Any] = {}
+        for ws in ws_ids:
+            data, err = run_fetch_code(
+                self._fetch_code, self._client, ws,
+                enabled=True, max_calls=self._max_calls,
+                max_bytes=self._max_bytes, timeout=self._timeout,
+            )
+            if err is not None:
+                log.info("fetch-code declined ws=%s: %s", ws, err)
+                continue
+            if data is not None:
+                size = len(json.dumps(data, default=str).encode("utf-8"))
+                log.info("fetch-code run ws=%s bytes=%s", ws, size)
+                bodies.append(data)
+                if ws:
+                    by_ws[ws] = data
+        if not bodies:
+            return FetchResponse(502)
+        return FetchResponse(
+            200, body=LiveFetchProvider._combine(bodies), by_workspace=by_ws or None
+        )
 
 
 class ChainedFetchProvider:
@@ -136,6 +238,18 @@ class ChainedFetchProvider:
 
     def __init__(self, *providers) -> None:
         self._providers = providers
+
+    def bind_workspaces(self, workspace_ids) -> None:
+        """Delegate workspace binding to any child provider that supports it."""
+        for provider in self._providers:
+            if hasattr(provider, "bind_workspaces"):
+                provider.bind_workspaces(workspace_ids)
+
+    def bind_check(self, check) -> None:
+        """Delegate per-check binding to any child provider that supports it."""
+        for provider in self._providers:
+            if hasattr(provider, "bind_check"):
+                provider.bind_check(check)
 
     def fetch(self, plan, strategy) -> FetchResponse:  # noqa: D401 - protocol method
         last = FetchResponse(404)
@@ -147,4 +261,4 @@ class ChainedFetchProvider:
         return last
 
 
-__all__ = ["LiveFetchProvider", "ChainedFetchProvider", "Getter"]
+__all__ = ["LiveFetchProvider", "CodeFetchProvider", "ChainedFetchProvider", "Getter"]

@@ -175,6 +175,55 @@ def test_run_check_times_out_a_slow_check():
     assert result["error"] == "TimeoutError"
 
 
+# -- memory ceiling ------------------------------------------------------------
+
+def test_run_check_enforces_memory_ceiling():
+    class Hog(BaseAuditCheck):
+        check_id = "chk_hog"
+
+        def evaluate(self, kb):
+            # Grow allocations slowly so the sampling watchdog trips well before the
+            # process is at risk; each chunk is ~800 KB, paced by a small sleep.
+            blob = []
+            for _ in range(10000):
+                blob.append([0] * 100_000)
+                time.sleep(0.002)
+            return {"status": "PASS", "score": 100.0, "findings": [], "recommendations": []}
+
+    result = run_check(Hog, {}, timeout=5.0, max_memory_mb=20)
+    assert result["status"] == "ERROR"
+    assert result["error"] == "MemoryLimitError"
+
+
+def test_run_check_memory_ceiling_allows_a_frugal_check():
+    class Frugal(BaseAuditCheck):
+        check_id = "chk_frugal"
+
+        def evaluate(self, kb):
+            return {"status": "PASS", "score": 100.0, "findings": [], "recommendations": []}
+
+    result = run_check(Frugal, {}, timeout=5.0, max_memory_mb=64)
+    assert result["status"] == "PASS"
+    assert result["score"] == 100.0
+
+
+def test_run_check_memory_ceiling_zero_disables_the_cap():
+    class Modest(BaseAuditCheck):
+        check_id = "chk_modest"
+
+        def evaluate(self, kb):
+            data = [0] * 500_000  # ~4 MB, would trip a tiny cap if one were set
+            return {
+                "status": "PASS",
+                "score": float(len(data) > 0) * 100.0,
+                "findings": [],
+                "recommendations": [],
+            }
+
+    result = run_check(Modest, {}, timeout=5.0, max_memory_mb=0)
+    assert result["status"] == "PASS"
+
+
 # -- result validation ---------------------------------------------------------
 
 def test_validate_result_accepts_bool_score_as_invalid():

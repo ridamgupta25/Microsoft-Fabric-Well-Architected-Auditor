@@ -94,6 +94,13 @@ _GEN_SYSTEM = (
     "the specific failing objects; include a positive evidence line even when the check "
     "fully passes. ALWAYS populate 'recommendations' with concrete next steps whenever "
     "the score is below 100. "
+    "\n\nMULTI-WORKSPACE EVIDENCE: when kb has more than one workspace, report findings "
+    "PER workspace, not as a single aggregate. Prefix each finding with the workspace's "
+    "'display_name' (e.g. \"Marketing: 2 of 3 notebooks have a description\"; \"Finance: "
+    "no role assignments captured\"), and add one line per workspace so a reader can tell "
+    "exactly which workspace each result came from. Iterate `for ws in kb.values():` and "
+    "use `ws.get('display_name')` as the label. A short overall summary line may follow, "
+    "but the per-workspace lines are required. "
     "\n\nThe code is READ-ONLY: it may only read the kb dict. Do NOT import os/sys/"
     "subprocess/socket/requests, do NOT open files, do NOT use eval/exec/getattr or "
     "dunder attributes. Return only the code."
@@ -209,6 +216,13 @@ def generate(
         except UnsafeCodeError as exc:
             feedback = f"Rejected as unsafe: {exc}."
             log.stage_failed, log.reason = "static", str(exc)
+            continue
+        except Exception as exc:  # noqa: BLE001 - exec-time load failure (e.g. blocked import)
+            feedback = (
+                f"Code failed to load ({type(exc).__name__}: {exc}). Write self-contained "
+                "read-only code with NO import statements and no __import__; the KB is passed in."
+            )
+            log.stage_failed, log.reason = "load", str(exc)
             continue
         result = run_check(check_cls, kb, timeout=timeout)
         if result.get("error"):

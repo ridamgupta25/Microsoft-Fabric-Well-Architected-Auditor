@@ -30,6 +30,7 @@ from ..rag.kb_field_catalog import (
     KB_FIELD_CATALOG,
     MISSING,
     KbField,
+    field_in_workspace,
     field_value,
 )
 from ..rag.kb_field_catalog import _tokens as _catalog_tokens
@@ -102,13 +103,42 @@ def plan(check: CustomCheck, session, *, ai: AiConfig | None = None) -> CustomCh
     if field is None:
         return check  # nothing recognised; left PENDING, surfaced for manual review
 
+    min_confidence = get_settings().kb_identifier_min_confidence
+
+    # Per-workspace presence: a field may be captured for some workspaces but not
+    # others (e.g. a partial crawl, or a workspace the API didn't expose it on).
+    # When the KB is a {workspace_id: snapshot} map, decide presence per workspace
+    # and fetch only the ones that lack it. If every workspace has it -> present.
+    workspaces = {
+        ws_id: snap
+        for ws_id, snap in session.shared_kb.items()
+        if isinstance(snap, dict) and ("display_name" in snap or "id" in snap)
+    }
+    if workspaces:
+        missing = [
+            ws_id for ws_id, snap in workspaces.items()
+            if not _present_in(snap, field)
+        ]
+        if not missing:
+            check.lifecycle_status = LifecycleStatus.PROCESSED_CUSTOM
+            return check
+        check.fetch_plan = FetchPlan(
+            field=field.path,
+            resource=field.resource,
+            endpoint=field.endpoint,
+            confidence=round(confidence, 3),
+            mandatory=field.mandatory and confidence >= min_confidence,
+            workspace_ids=missing,
+        )
+        return check  # left PENDING for Node 3b to augment the missing workspaces
+
+    # Fallback: a flat snapshot (no per-workspace map) — whole-KB presence check.
     value = field_value(session.shared_kb, field.path)
     present = value is not MISSING and field.validator(value)
     if present:
         check.lifecycle_status = LifecycleStatus.PROCESSED_CUSTOM
         return check
 
-    min_confidence = get_settings().kb_identifier_min_confidence
     check.fetch_plan = FetchPlan(
         field=field.path,
         resource=field.resource,
@@ -117,6 +147,12 @@ def plan(check: CustomCheck, session, *, ai: AiConfig | None = None) -> CustomCh
         mandatory=field.mandatory and confidence >= min_confidence,
     )
     return check  # left PENDING for Node 3b to augment
+
+
+def _present_in(snapshot: dict, field: KbField) -> bool:
+    """True when ``field`` is present *and* quality-valid in one workspace snapshot."""
+    value = field_in_workspace(snapshot, field.path)
+    return value is not MISSING and field.validator(value)
 
 
 __all__ = ["identify", "plan"]

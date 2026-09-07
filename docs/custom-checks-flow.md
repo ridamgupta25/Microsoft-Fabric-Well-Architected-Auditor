@@ -68,10 +68,12 @@ flowchart TD
   patterns, and a write-intent detector (with negation/"is enabled" neutralisers) that
   enforces zero-write.
 - **Seam (optional):** [`_guardrails_ai.py`](../backend/src/auditfast/ai/agents/_guardrails_ai.py)
-  builds the full Guardrails-AI Guard (ValidLength → DetectJailbreak → DetectPromptInjection →
-  custom FabricZeroWriteValidator → DetectPII → SecretsPresent → RestrictToTopic). It
-  **auto-activates only when the `guardrails` extra is installed** (torch/transformers +
-  Hub token). Not installed here → regex floor runs.
+  builds the Guardrails-AI Guard (ValidLength → DetectJailbreak → DetectPromptInjection →
+  custom FabricZeroWriteValidator → DetectPII → SecretsPresent → RestrictToTopic). Each
+  Hub validator is an **optional token-free PyPI package** (e.g.
+  `pip install guardrails-ai-detect-pii`); the Guard is composed from whichever are
+  installed. The light validators (PII/secrets/length) are installed; the heavy ML ones
+  (jailbreak/injection, torch/transformers) are skipped — the regex floor covers them.
 - Dropped checks are tagged `DROPPED_GUARDRAIL` with the failing validator + reason,
   surfaced to the user in the "Not evaluated" area.
 
@@ -208,13 +210,13 @@ archive is a durable copy, not the runtime source.
 
 ## 5. Design-vs-implementation gap table
 
-| # | Intended | Current | Impact | To close it |
+| # | Intended | Current | Impact | Status / to close it |
 |---|----------|---------|--------|-------------|
-| 1 | LangGraph state machine | Plain Python function sequence (`pipeline.py`) | Low — behaviour equivalent | Optional LangGraph wrapper with `interrupt_before` |
-| 2 | Chroma/Qdrant vector store | In-memory pure-Python cosine `VectorStore` | Low–med — fine at this scale, not durable/concurrent | Swap behind the existing `index()/nearest()` wrapper |
-| 3 | AI generates REST-fetch code, re-guardrailed, executed to enrich KB | Fixed strategies via `FetchProvider`; offline = re-read crawl snapshot | **High** — cannot fetch what the crawl didn't capture; no fetch-code artifact | Add a live `FetchProvider` (real REST reads) and/or an AI-authored, guardrailed, sandboxed fetch step |
-| 4 | Guardrail AI (PII, secrets, jailbreak, topic) | Deterministic regex floor; Guardrails-AI seam present but package not installed | Med — PII/secrets/topic not enforced live | `pip install guardrails-ai` + Hub validators |
-| 5 | Merge approved checks into final report + save to history | Standalone Markdown report; not in `reporting/`, `output/`, or History | Med — results not persisted with the audit | Fold into the reporting engine + history store |
+| 1 | LangGraph state machine | Plain Python function sequence (`pipeline.py`) | Low — behaviour equivalent | Open (optional) — LangGraph wrapper with `interrupt_before` |
+| 2 | Chroma/Qdrant vector store | Qdrant backend built + tested (`qdrant_store.py`); in-memory cosine is the default | Low — durable option available | ✅ Done — set `AUDITFAST_VECTOR_STORE_BACKEND=qdrant` to persist |
+| 3 | AI generates REST-fetch code, re-guardrailed, executed to enrich KB | Live `LiveFetchProvider` does real read-only REST reads (verified live, multi-workspace); AI fetch-code is generated + archived but not executed | Low — live reads work; endpoint provider covers the normal path | ✅ Live fetch done. Executing the AI-authored fetch code is an optional escape hatch (`run_fetch_code`, tested, not wired) |
+| 4 | Guardrail AI (PII, secrets, jailbreak, topic) | Regex floor + Guardrails-AI Guard active with the light validators (ValidLength/DetectPII/SecretsPresent) | Low — PII/secrets/length enforced; regex floor covers jailbreak/injection | ✅ Done (no Hub token needed). Heavy ML jailbreak/injection validators optional (`detect-jailbreak`/`detect-prompt-injection`, torch/transformers) |
+| 5 | Merge approved checks into final report + save to history | Folded into the audit report `custom_checks` section, the Excel "Custom Checks" sheet (`append_custom_checks_sheet`), and History | Low — persisted with the audit | ✅ Done (session 2 + Excel wiring via `audit_runner.py`) |
 | 6 | Generated code false-passing "no notebooks" | Fixed via KB-shape prompt (new generations only) | Was **High**, now low | Re-run old checks; optionally validate the runner's result against KB counts |
 | 7 | Store generated code per run in gitignore | Done — `custom-checks-runs/` (audit code + fetch record + updated KB) | Resolved | — |
 
