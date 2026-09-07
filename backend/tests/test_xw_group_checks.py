@@ -12,13 +12,13 @@ import pytest
 from auditfast.core.check.data_management_quality.data_operations.group import (
     layer_separation_consistent,
 )
-from auditfast.core.check.governance_compliance.data_operations.group import (
-    tech_metadata_consistent,
-)
 from auditfast.core.check.data_management_quality.data_storage.group import (
     _aggregate_derivations,
     aggregate_consistency,
     cross_layer_reconciliation,
+)
+from auditfast.core.check.governance_compliance.data_operations.group import (
+    tech_metadata_consistent,
 )
 from auditfast.core.check.registry import GROUP_REGISTRY, REGISTRY, CheckRegistry
 from auditfast.core.check.security.data_operations.group import (

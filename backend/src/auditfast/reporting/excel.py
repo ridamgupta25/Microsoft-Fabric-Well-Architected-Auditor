@@ -8,10 +8,6 @@ from datetime import date
 from ..core.engine import READ_INCOMPLETE_CHECK_ID
 from ..core.enums import Pillar, Severity, Status
 from ..core.scoring import percentage, rating
-from ..core.validation import (
-    PENDING_LABEL,
-    VALIDATED_LABEL,
-)
 from .structure import (
     RISK_PROFILE,
     assessment_weight,
@@ -21,7 +17,6 @@ from .structure import (
     pillar_controls,
     severity_counts,
     strengths,
-    validation_counts,
     workspace_control_score,
     workspace_ids,
 )
@@ -66,7 +61,7 @@ def build_excel(
     workspace_id_by_name = workspace_ids(results)
     consolidated_findings = findings(controls)
     consolidated_strengths = strengths(controls)
-    validated, total_controls = validation_counts(controls)
+    total_controls = len(controls)
     severity_total = severity_counts(controls)
     reported_severities = (
         Severity.CRITICAL,
@@ -84,7 +79,6 @@ def build_excel(
     light_green = "E2F0D9"
     light_orange = "FCE4D6"
     light_gray = "F2F2F2"
-    banded_fill = PatternFill("solid", fgColor="F7F9FC")
     pass_fill = PatternFill("solid", fgColor="C6EFCE")
     partial_fill = PatternFill("solid", fgColor="FFEB9C")
     fail_fill = PatternFill("solid", fgColor="FFC7CE")
@@ -152,6 +146,31 @@ def build_excel(
         )
         ws.add_table(table)
 
+    def add_block_table(ws, name: str, header_row: int, last_row: int, ncols: int) -> None:
+        """Turn one stacked block into its own Excel table.
+
+        Summary and Area Detail are not single grids — each holds several blocks
+        separated by blank rows, so neither can be one table. Each block becomes
+        its own instead, which is what gives them the filter dropdowns and banded
+        rows the flat sheets already had. A block with no data rows is skipped:
+        Excel rejects a header-only table, and an ``auto_filter`` fallback would
+        apply to the whole sheet rather than the block.
+        """
+        if last_row <= header_row:
+            return
+        last_letter = get_column_letter(ncols)
+        table = Table(
+            displayName=name, ref=f"A{header_row}:{last_letter}{last_row}"
+        )
+        table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        ws.add_table(table)
+
     def add_score_scale(
         ws,
         ref: str,
@@ -194,16 +213,12 @@ def build_excel(
                 ),
             )
 
-    def band_unfilled_rows(ws) -> None:
-        for row_number in range(2, ws.max_row + 1, 2):
-            row = list(ws.iter_rows(min_row=row_number, max_row=row_number))[0]
-            if not any(cell.value is not None for cell in row):
-                continue
-            for cell in row:
-                if cell.fill.fill_type is None:
-                    cell.fill = banded_fill
-
     # -- Summary ---------------------------------------------------------------
+    # Summary and Area Detail are stacks of separate blocks, not single grids, so
+    # each block's header row and last data row are recorded as it is written and
+    # turned into its own Excel table at the end.
+    summary_blocks: list[tuple[str, int, int, int]] = []
+    area_blocks: list[tuple[str, int, int, int]] = []
     ws = wb.active
     ws.title = "Summary"
     ws["A1"] = f"Fabric Audit - {project_name}"
@@ -248,40 +263,61 @@ def build_excel(
         ws.cell(row=row, column=5, value=label)
         row += 1
     scorecard_end_row = row - 1
+    summary_blocks.append(("SummaryAreaScorecard", 13, scorecard_end_row, 5))
 
+    row += 2
+    style_section(ws, row, "Coverage", 2)
     row += 1
-    style_section(ws, row, "Coverage and Validation", 5)
-    row += 1
-    coverage_headers = ["Measure", "Count", "Measure", "Count", "Rate"]
+    coverage_headers = ["Measure", "Count"]
     for column, value in enumerate(coverage_headers, start=1):
         ws.cell(row=row, column=column, value=value)
     style_header(ws, row, len(coverage_headers))
+    coverage_header_row = row
     control_counts = {status: sum(c.status is status for c in controls) for status in Status}
     coverage_rows = [
-        ("Consolidated controls", total_controls, VALIDATED_LABEL, validated),
-        ("Passing controls", control_counts[Status.PASS], PENDING_LABEL, total_controls - validated),
-        (
-            "Failing controls",
-            control_counts[Status.FAIL],
-            "Validation coverage",
-            validated,
-        ),
-        ("Partial controls", control_counts[Status.PARTIAL], "Asset-level results", len(results)),
-        ("Not assessed", control_counts[Status.NA], "Crawl warnings", len(errors or [])),
+        ("Consolidated controls", total_controls),
+        ("Passing controls", control_counts[Status.PASS]),
+        ("Failing controls", control_counts[Status.FAIL]),
+        ("Partial controls", control_counts[Status.PARTIAL]),
+        ("Not assessed", control_counts[Status.NA]),
+        ("Asset-level results", len(results)),
+        ("Crawl warnings", len(errors or [])),
     ]
-    for measure, count, validation, validation_count in coverage_rows:
+    for measure, count in coverage_rows:
         row += 1
         ws.cell(row=row, column=1, value=measure)
         ws.cell(row=row, column=2, value=count)
-        ws.cell(row=row, column=3, value=validation)
-        ws.cell(row=row, column=4, value=validation_count)
-        if validation == "Validation coverage":
-            ws.cell(
-                row=row,
-                column=5,
-                value=validated / total_controls if total_controls else 0,
-            )
-            ws.cell(row=row, column=5).number_format = "0.0%"
+    summary_blocks.append(("SummaryCoverage", coverage_header_row, row, 2))
+
+    # -- Workspace Scores ------------------------------------------------------
+    # The Area Scorecard answers "how does this estate score per pillar"; this
+    # answers "which workspace is pulling the score down", which the summary
+    # could not show before. Sorted worst-first and colour-scaled, so the
+    # workspace needing attention is the first row read. Cross-workspace (group)
+    # results carry their group's name rather than a workspace's, so they appear
+    # here too.
+    row += 2
+    style_section(ws, row, "Workspace Scores", 2)
+    row += 1
+    workspace_headers = ["Workspace", "Score"]
+    for column, value in enumerate(workspace_headers, start=1):
+        ws.cell(row=row, column=column, value=value)
+    style_header(ws, row, len(workspace_headers))
+    workspace_header_row = row
+    for name, workspace_agg in sorted(
+        agg["by_workspace"].items(),
+        key=lambda item: (item[1]["pct"] is None, item[1]["pct"] or 0, item[0]),
+    ):
+        row += 1
+        ws.cell(row=row, column=1, value=name)
+        ws.cell(row=row, column=2, value=_pct(workspace_agg["pct"]))
+        ws.cell(row=row, column=2).number_format = "0.0%"
+    workspace_score_range = (
+        f"B{workspace_header_row + 1}:B{row}" if row > workspace_header_row else ""
+    )
+    summary_blocks.append(
+        ("SummaryWorkspaceScores", workspace_header_row, row, 2)
+    )
 
     row += 2
     style_section(ws, row, "Key Strengths", 5)
@@ -290,6 +326,7 @@ def build_excel(
     for column, value in enumerate(strength_headers, start=1):
         ws.cell(row=row, column=column, value=value)
     style_header(ws, row, len(strength_headers), fill="548235")
+    strength_header_row = row
     for control in consolidated_strengths[:10]:
         row += 1
         ws.cell(row=row, column=1, value=control.ref)
@@ -297,6 +334,7 @@ def build_excel(
         ws.cell(row=row, column=3, value=control.title)
         ws.cell(row=row, column=4, value=control.impacted_evidence)
         ws.cell(row=row, column=5, value=control.assets_assessed)
+    summary_blocks.append(("SummaryKeyStrengths", strength_header_row, row, 5))
 
     row += 2
     style_section(ws, row, "Key Risks", 5)
@@ -305,6 +343,7 @@ def build_excel(
     for column, value in enumerate(risk_headers, start=1):
         ws.cell(row=row, column=column, value=value)
     style_header(ws, row, len(risk_headers), fill="C65911")
+    risk_header_row_summary = row
     for control in consolidated_findings[:10]:
         row += 1
         ws.cell(row=row, column=1, value=control.ref)
@@ -312,6 +351,7 @@ def build_excel(
         ws.cell(row=row, column=3, value=control.pillar.value)
         ws.cell(row=row, column=4, value=control.finding)
         ws.cell(row=row, column=5, value=control.recommendation)
+    summary_blocks.append(("SummaryKeyRisks", risk_header_row_summary, row, 5))
 
     row += 2
     style_section(ws, row, "Remediation Roadmap", 5)
@@ -320,6 +360,7 @@ def build_excel(
     for column, value in enumerate(roadmap_headers, start=1):
         ws.cell(row=row, column=column, value=value)
     style_header(ws, row, len(roadmap_headers))
+    roadmap_header_row = row
     for severity in reported_severities:
         row += 1
         *_, sla = RISK_PROFILE[severity]
@@ -328,8 +369,16 @@ def build_excel(
         ws.cell(row=row, column=3, value=sla)
         ws.cell(row=row, column=4, value="Mitigate")
         ws.cell(row=row, column=5, value="Open")
+    summary_blocks.append(("SummaryRoadmap", roadmap_header_row, row, 5))
 
-    for column, width in {"A": 24, "B": 36, "C": 24, "D": 70, "E": 70}.items():
+    for name, header_row, last_row, ncols in summary_blocks:
+        add_block_table(ws, name, header_row, last_row, ncols)
+    # One set of widths serves every block on this sheet, so they are a
+    # compromise: A holds refs and workspace names, C and D the long prose
+    # (Strength/Finding, Evidence/Recommendation), E either a recommendation or a
+    # small count. C was 24, which cramped the Strength column against a 70-wide
+    # count column on its right.
+    for column, width in {"A": 26, "B": 30, "C": 46, "D": 60, "E": 46}.items():
         ws.column_dimensions[column].width = width
     wrap_sheet(ws)
 
@@ -361,10 +410,11 @@ def build_excel(
         category_map = defaultdict(list)
         for control in rows:
             category_map[control.category].append(control)
-        category_header = ["Category", "Score", "Rating", "Validated", "Controls"]
+        category_header = ["Category", "Score", "Rating", "Controls"]
         for column, value in enumerate(category_header, start=1):
             area.cell(row=row, column=column, value=value)
         style_header(area, row, len(category_header))
+        category_header_row = row
         for category, category_controls in category_map.items():
             category_results = [
                 result for control in category_controls for result in control.results
@@ -376,17 +426,15 @@ def build_excel(
             area.cell(row=row, column=2, value=_pct(category_score))
             area.cell(row=row, column=2).number_format = "0%"
             area.cell(row=row, column=3, value=category_label)
-            area.cell(
-                row=row,
-                column=4,
-                value=sum(control.validation == VALIDATED_LABEL for control in category_controls),
-            )
-            area.cell(row=row, column=5, value=len(category_controls))
+            area.cell(row=row, column=4, value=len(category_controls))
+        area_blocks.append(
+            (f"AreaCategories{pillar_number[pillar]}", category_header_row, row, 4)
+        )
         row += 2
 
         pillar_strengths = strengths(rows)
         area.cell(row=row, column=1, value=f"Strengths ({len(pillar_strengths)})")
-        style_header(area, row, 8, fill="548235")
+        style_header(area, row, 7, fill="548235")
         row += 1
         strength_detail_headers = [
             "Ref",
@@ -394,13 +442,13 @@ def build_excel(
             "Severity",
             "Score",
             "Assets",
-            "Validation",
             "Evidence",
             "Status",
         ]
         for column, value in enumerate(strength_detail_headers, start=1):
             area.cell(row=row, column=column, value=value)
-        style_header(area, row, len(strength_detail_headers), fill="70AD47"        )
+        style_header(area, row, len(strength_detail_headers), fill="70AD47")
+        strength_block_row = row
         for control in pillar_strengths:
             row += 1
             values = [
@@ -409,12 +457,14 @@ def build_excel(
                 control.severity.value,
                 control.score_average,
                 control.assets_assessed,
-                control.validation,
                 control.impacted_evidence,
                 control.status.value,
             ]
             for column, value in enumerate(values, start=1):
                 area.cell(row=row, column=column, value=value)
+        area_blocks.append(
+            (f"AreaStrengths{pillar_number[pillar]}", strength_block_row, row, 7)
+        )
         row += 2
 
         pillar_findings = findings(rows)
@@ -434,6 +484,7 @@ def build_excel(
         for column, value in enumerate(finding_detail_headers, start=1):
             area.cell(row=row, column=column, value=value)
         style_header(area, row, len(finding_detail_headers))
+        finding_block_row = row
         for control in pillar_findings:
             row += 1
             values = [
@@ -448,9 +499,16 @@ def build_excel(
             ]
             for column, value in enumerate(values, start=1):
                 area.cell(row=row, column=column, value=value)
+        area_blocks.append(
+            (f"AreaFindings{pillar_number[pillar]}", finding_block_row, row, 8)
+        )
         row += 3
 
-    area_widths = [18, 70, 18, 18, 36, 36, 70, 80]
+    for name, header_row, last_row, ncols in area_blocks:
+        add_block_table(area, name, header_row, last_row, ncols)
+    # Widths shared by every block on this sheet: A refs/categories, B the long
+    # title, C-D short codes and scores, E-F asset lists, G-H the long prose.
+    area_widths = [20, 45, 16, 12, 30, 30, 45, 55]
     for index, width in enumerate(area_widths, start=1):
         area.column_dimensions[area.cell(row=1, column=index).column_letter].width = width
     wrap_sheet(area)
@@ -467,7 +525,6 @@ def build_excel(
         "Confidence",
         "Severity",
         "Rationale",
-        "Validation",
         "Score",
         *workspace_id_by_name.values(),
     ]
@@ -499,7 +556,6 @@ def build_excel(
                 "",
                 control.severity.value,
                 control.rationale,
-                control.validation,
                 overall_score,
                 *workspace_scores,
             ]
@@ -513,7 +569,10 @@ def build_excel(
                     value=value,
                 )
                 checklist.cell(row=checklist.max_row, column=column).number_format = "0"
-    checklist.freeze_panes = "L2"
+    # Freeze through the Score column (K) so the workspace score columns scroll
+    # against a fixed identity block. One column left of L since the Validation
+    # column was removed.
+    checklist.freeze_panes = "K2"
     last_checklist_column = checklist.cell(
         row=1,
         column=len(checklist_headers),
@@ -533,7 +592,6 @@ def build_excel(
         12,
         9,
         32,
-        11,
         8,
         *(11 for _ in workspace_id_by_name),
     ]
@@ -881,6 +939,8 @@ def build_excel(
 
     add_score_scale(ws, "B3")
     add_score_scale(ws, f"D14:D{scorecard_end_row}")
+    if workspace_score_range:
+        add_score_scale(ws, workspace_score_range)
     add_score_scale(area, f"B1:B{area.max_row}")
     add_score_scale(risk, "E2")
     if workspace_id_by_name:
@@ -898,14 +958,16 @@ def build_excel(
 
     for sheet in (ws, area, checklist, finding_sheet, risk, inventory, *workspace_sheets):
         add_result_formatting(sheet)
-    band_unfilled_rows(ws)
-    band_unfilled_rows(area)
+    # Summary and Area Detail are banded by their block tables now, so the manual
+    # row banding they used to need would double up on the table stripes.
 
-    # The Checklist keeps its explicit compact widths (not auto-fitted) so the
-    # first view reaches the Score/WS columns without shrinking the font.
+    # Checklist, Summary and Area Detail keep their explicit widths rather than
+    # being auto-fitted. Auto-fitting stretched every prose column to the 70-wide
+    # cap, which made rows tall enough to clip and pushed short numeric columns
+    # (an "Assets Assessed" count) out to the same width as an evidence
+    # paragraph. These three sheets stack blocks with different shapes, so a
+    # chosen compromise reads better than a per-column fit.
     for sheet, max_width in (
-        (ws, 70),
-        (area, 70),
         (finding_sheet, 70),
         (inventory, 45),
         *((sheet, 60) for sheet in workspace_sheets),
