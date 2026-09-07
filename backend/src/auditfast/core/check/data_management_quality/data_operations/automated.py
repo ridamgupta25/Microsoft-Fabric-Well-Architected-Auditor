@@ -247,7 +247,7 @@ def notebook_standardization(ctx: CheckContext) -> Verdict:
             "upper / lower / trim / ltrim / rtrim / regexp_replace / normalize_code",
     }
     missing_desc = "; ".join(f"{m} (looked for {hints[m]})" for m in missing)
-    found_desc = ", ".join(present) if present else "none"
+    found_desc = f". Present: {', '.join(present)}" if present else ""
     return binary(False, (
-        f"Standardization missing: {missing_desc}. Present: {found_desc}"
+        f"Standardization missing: {missing_desc}{found_desc}"
     ))
