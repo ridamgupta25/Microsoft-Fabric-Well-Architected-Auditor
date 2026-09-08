@@ -89,6 +89,20 @@ class AuditRequest(BaseModel):
                     "If provided, these checks are merged with automated results. "
                     "External checks override automated checks with the same id.",
     )
+    check_set: Literal["standard", "admin"] = Field(
+        default="standard",
+        description="'standard' runs the ordinary deterministic library. 'admin' "
+                    "runs ONLY the elevated-access checks in 'admin_categories' "
+                    "— an independent run with its own crawl and its own score, "
+                    "so it never mixes with a standard audit's numbers.",
+    )
+    admin_categories: list[str] = Field(
+        default_factory=list,
+        description="For check_set='admin': which elevated families to run "
+                    "('Tenant', 'Capacity', 'Workspace Admin'). Required when "
+                    "check_set='admin' — an empty list runs nothing rather than "
+                    "silently running every family.",
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -262,6 +276,18 @@ class AuditReport(BaseModel):
         default=False,
         description="True when the overall/pillar/layer roll-ups were weighted by "
                     "environment level. Per-workspace scores are unaffected.",
+    )
+    check_set: str = Field(
+        default="standard",
+        description="Which library produced these numbers: 'standard' (the "
+                    "deterministic audit) or 'admin' (an independent "
+                    "elevated-access run). The two never mix, so this tells a "
+                    "reader which scorecard they are looking at.",
+    )
+    admin_categories: list[str] = Field(
+        default_factory=list,
+        description="For an elevated run, the families it covered. Empty for a "
+                    "standard audit.",
     )
     errors: list[WorkspaceError] = Field(default_factory=list)
     files: dict[str, str] = Field(

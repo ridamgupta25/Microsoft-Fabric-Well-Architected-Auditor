@@ -10,7 +10,13 @@ from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, status
 
-from ...schemas.catalog import CatalogSummary, CheckSpecOut, LayerOut, PillarOut
+from ...schemas.catalog import (
+    AdminCategoryOut,
+    CatalogSummary,
+    CheckSpecOut,
+    LayerOut,
+    PillarOut,
+)
 from ...services import catalog_service
 
 router = APIRouter(prefix="/catalog", tags=["catalog"])
@@ -54,3 +60,38 @@ async def check_detail(check_id: str) -> CheckSpecOut:
 async def summary() -> CatalogSummary:
     """Counts by pillar and object kind — the coverage-at-a-glance view."""
     return CatalogSummary(**catalog_service.catalog_summary())
+
+
+@router.get(
+    "/admin-categories",
+    response_model=list[AdminCategoryOut],
+    summary="List elevated-access categories",
+)
+async def admin_categories() -> list[AdminCategoryOut]:
+    """The elevated-access families and how many checks each holds.
+
+    Drives the "which elevated checks do you want to run?" screen. Every family
+    is always returned — one with no checks yet comes back with
+    ``available: false`` so the screen can offer it as not-yet-available rather
+    than omit it.
+    """
+    return [AdminCategoryOut(**row) for row in catalog_service.list_admin_categories()]
+
+
+@router.get(
+    "/admin-checks",
+    response_model=list[CheckSpecOut],
+    summary="List elevated-access checks",
+)
+async def admin_checks(
+    category: Annotated[
+        str | None, Query(description="Filter by elevated family, e.g. 'Workspace Admin'.")
+    ] = None,
+) -> list[CheckSpecOut]:
+    """The elevated-access rule library, optionally narrowed to one family.
+
+    Kept separate from ``/catalog/checks`` because these never run in a standard
+    audit: they live in their own registry and only the elevated run mode selects
+    them.
+    """
+    return [CheckSpecOut(**row) for row in catalog_service.list_admin_checks(category)]

@@ -5,6 +5,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 
 import { AuditProvider } from "@/context/AuditContext";
 import { MainLayout } from "@/layouts/MainLayout";
+import { AdminChecksPage } from "@/pages/AdminChecksPage";
 import { AuthCallbackPage } from "@/pages/AuthCallbackPage";
 import { ChecklistPage } from "@/pages/ChecklistPage";
 import { ChecksPage } from "@/pages/ChecksPage";
@@ -23,6 +24,7 @@ export default function App() {
         <Route element={<MainLayout />}>
           <Route index element={<DashboardPage />} />
           <Route path="run" element={<RunAuditPage />} />
+          <Route path="run-admin" element={<AdminChecksPage />} />
           <Route path="report/:auditId" element={<ReportPage />} />
           <Route path="catalog" element={<ChecksPage />} />
           <Route path="checklist" element={<ChecklistPage />} />

@@ -34,6 +34,14 @@ _DEFAULT_FABRIC_SCOPES = [
     "https://api.fabric.microsoft.com/Workspace.Read.All",
     "https://api.fabric.microsoft.com/Item.ReadWrite.All",
     "https://api.fabric.microsoft.com/OneLake.Read.All",
+    # Elevated-access (admin) checks read cloud connections and on-premises
+    # gateways. Both are ordinary delegated reads — NOT tenant-admin — but they
+    # are separate scopes, and without them /connections and /gateways return
+    # 401/403 and every check that needs them reports N/A. Requesting them here
+    # is harmless for a user who has no such rights: consent is per-tenant and an
+    # unauthorised read still just fails closed.
+    "https://api.fabric.microsoft.com/Connection.Read.All",
+    "https://api.fabric.microsoft.com/Gateway.Read.All",
 ]
 # Microsoft's first-party Azure CLI public client - lets a user sign in with
 # just their email when no app registration is available.

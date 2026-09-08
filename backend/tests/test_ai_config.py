@@ -5,6 +5,8 @@ leaks, and flows into Node 4 code generation — without any real model.
 """
 from __future__ import annotations
 
+import pytest
+
 from auditfast.ai.agents import code_gen_agent
 from auditfast.ai.custom_runtime.base_check import clear_custom_registry
 from auditfast.ai.orchestrator import is_enabled
@@ -16,8 +18,6 @@ from auditfast.ai.orchestrator.state import (
     make_check_id,
 )
 from auditfast.services import custom_checks_service
-
-import pytest
 
 _OPENAI = AiConfig(provider="openai", api_key="sk-secret", model="gpt-x", base_url="http://x/v1")
 _AZURE = AiConfig(provider="azure", api_key="k", deployment="dep", endpoint="https://a.openai.azure.com")

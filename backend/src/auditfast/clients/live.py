@@ -1983,10 +1983,13 @@ class LiveFabricProvider:
 
         workspaces = body.get("value") or []
         result["count"] = len(workspaces)
+        member_of = 0
         for workspace in workspaces[:max_workspaces]:
             workspace_id = workspace.get("id")
             items_status, items_body = self._get(f"/workspaces/{workspace_id}/items")
             roles_status, _ = self._get(f"/workspaces/{workspace_id}/roleAssignments")
+            if roles_status == 200:
+                member_of += 1
             items = (items_body or {}).get("value", []) if items_status == 200 else []
             result["samples"].append({
                 "name": workspace.get("displayName", workspace_id),
@@ -1995,4 +1998,30 @@ class LiveFabricProvider:
                 "pipelines": sum(1 for i in items if i.get("type") == "DataPipeline"),
                 "roles_status": roles_status,
             })
+
+        result["admin"] = self._probe_admin(member_of, len(result["samples"]))
         return result
+
+    def _probe_admin(self, member_of: int, sampled: int) -> dict:
+        """Can this token read what the elevated-access checks need?
+
+        Three independent capabilities, probed with one cheap call each, because
+        they fail independently: a workspace Admin with no gateway role reads
+        role assignments but not gateways.
+
+        ``roleAssignments`` returning 200 is the practical test for "Member or
+        higher" — the role itself is not exposed anywhere the caller can read, so
+        the read *is* the permission check. It is sampled over the same few
+        workspaces the caller already probed, so this adds no extra requests.
+        """
+        connections_status, _ = self._get("/connections")
+        gateways_status, _ = self._get("/gateways")
+        return {
+            "connections_status": connections_status,
+            "gateways_status": gateways_status,
+            "member_workspaces": member_of,
+            "sampled_workspaces": sampled,
+            "role_assignments_readable": member_of > 0,
+            "connections_readable": connections_status == 200,
+            "gateways_readable": gateways_status == 200,
+        }

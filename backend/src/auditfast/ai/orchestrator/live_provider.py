@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from ..agents.kb_updater_agent import FetchResponse
 from ..custom_runtime.live_fetch import _is_safe_path, run_fetch_code
