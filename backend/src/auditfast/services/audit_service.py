@@ -697,6 +697,7 @@ def _resolve_admin_categories(names: Iterable[str] | None) -> list[AdminCategory
 def run_admin_audit(
     project_path: str | Path,
     categories: Iterable[str] | None = None,
+    admin_options: dict | None = None,
     workspaces: Sequence[dict] | Sequence[str] | None = None,
     out_dir: str | Path | None = None,
     token: str | None = None,
@@ -754,6 +755,7 @@ they are cached in the elevated run's **own** knowledge base
         )
 
     config = load_project(project_path)
+    config.settings.update(admin_options or {})
     if run_dir:
         out_dir = Path(run_dir)
         out_dir.mkdir(parents=True, exist_ok=True)

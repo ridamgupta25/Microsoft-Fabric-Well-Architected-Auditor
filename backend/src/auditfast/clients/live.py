@@ -190,6 +190,9 @@ class LiveFabricProvider:
         #: N/A rather than treating unreadable Files sections as empty.
         self._storage_token = storage_token
         self._onelake_client = None
+        #: Tenant-wide admin calls would otherwise repeat once per selected
+        #: workspace. Cache their normalized read outcome for this provider.
+        self._admin_cache: dict[str, tuple[Any, bool]] = {}
 
     # -- transport -------------------------------------------------------------
     def _get(self, path: str) -> tuple[int | None, Any]:
@@ -1347,6 +1350,51 @@ class LiveFabricProvider:
                 self._powerbi_client = PowerBIClient(self._powerbi_token, timeout=self._timeout)
         return self._powerbi_client
 
+    def _cached_admin(self, key: str, loader) -> tuple[Any, bool]:
+        with self._lock:
+            cached = self._admin_cache.get(key)
+        if cached is not None:
+            return cached
+        value = loader()
+        with self._lock:
+            self._admin_cache.setdefault(key, value)
+            return self._admin_cache[key]
+
+    def _tenant_domains(self) -> tuple[list[dict], bool]:
+        domains, known = self._values("/admin/domains")
+        if not known:
+            return [], False
+        normalized: list[dict] = []
+        for domain in domains:
+            domain_id = str(domain.get("id") or "")
+            rows, readable = self._values(f"/admin/domains/{domain_id}/workspaces")
+            if not readable:
+                return normalized, False
+            normalized.append({
+                "id": domain_id,
+                "name": domain.get("displayName") or domain.get("name") or domain_id,
+                "workspace_ids": [str(row.get("id") or row.get("workspaceId") or "")
+                                  for row in rows if row.get("id") or row.get("workspaceId")],
+            })
+        return normalized, True
+
+    @staticmethod
+    def _endorsement_scan(payload: dict, workspace_id: str) -> dict:
+        items: list[dict] = []
+        for workspace in payload.get("workspaces", []) or []:
+            if str(workspace.get("id") or "") != workspace_id:
+                continue
+            for kind in ("datasets", "reports"):
+                for item in workspace.get(kind, []) or []:
+                    detail = item.get("endorsementDetails") or {}
+                    items.append({
+                        "id": item.get("id"),
+                        "name": item.get("name") or item.get("displayName"),
+                        "type": "SemanticModel" if kind == "datasets" else "Report",
+                        "endorsement": detail.get("endorsement") or "None",
+                    })
+        return {"items": items}
+
     def _onelake(self):
         """Return a OneLake ADLS Gen2 client, or None without a Storage token."""
         if self._onelake_client is not None:
@@ -1607,6 +1655,56 @@ class LiveFabricProvider:
             capacity_id=workspace.get("capacityId"),
             deployment_pipeline=bool(workspace.get("assignedToDeploymentPipeline")),
         )
+
+        if Resource.TENANT_SETTINGS in wanted:
+            pbi = self._powerbi()
+            if pbi is None:
+                ctx.unavailable.add(Resource.TENANT_SETTINGS)
+            else:
+                ctx.tenant_settings, readable = self._cached_admin(
+                    "tenant_settings", pbi.tenant_settings
+                )
+                if not readable:
+                    ctx.unavailable.add(Resource.TENANT_SETTINGS)
+
+        if Resource.TENANT_DOMAINS in wanted:
+            ctx.tenant_domains, readable = self._cached_admin(
+                "tenant_domains", self._tenant_domains
+            )
+            if not readable:
+                ctx.unavailable.add(Resource.TENANT_DOMAINS)
+
+        if Resource.ADMIN_ACTIVITY in wanted:
+            pbi = self._powerbi()
+            if pbi is None:
+                ctx.unavailable.add(Resource.ADMIN_ACTIVITY)
+            else:
+                ctx.activity_events, readable = self._cached_admin(
+                    "activity_events", pbi.activity_events
+                )
+                if not readable:
+                    ctx.unavailable.add(Resource.ADMIN_ACTIVITY)
+
+        if Resource.ADMIN_SCANNER in wanted:
+            pbi = self._powerbi()
+            if pbi is None:
+                ctx.unavailable.add(Resource.ADMIN_SCANNER)
+            else:
+                payload, readable = pbi.admin_scan(workspace_id)
+                ctx.admin_scan = self._endorsement_scan(payload, workspace_id)
+                if not readable:
+                    ctx.unavailable.add(Resource.ADMIN_SCANNER)
+
+        if Resource.CAPACITY_METRICS in wanted:
+            pbi = self._powerbi()
+            if pbi is None:
+                ctx.unavailable.add(Resource.CAPACITY_METRICS)
+            else:
+                ctx.capacity_metrics, readable = self._cached_admin(
+                    "capacity_metrics", pbi.capacity_metrics
+                )
+                if not readable:
+                    ctx.unavailable.add(Resource.CAPACITY_METRICS)
 
         if Resource.CONNECTIONS in wanted:
             rows, known = self._values("/connections")

@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote, urlsplit
 
 from .errors import ProviderError
 
@@ -320,6 +322,140 @@ class PowerBIClient:
             return body
         raise PowerBIError(*_error_detail(status, body))
 
+    # -- elevated audit reads -------------------------------------------------
+    def tenant_settings(self) -> tuple[list[dict], bool]:
+        """Return tenant settings, preserving unreadable versus genuinely empty."""
+        status, body = self._get("/admin/tenantsettings")
+        if status != 200 or not isinstance(body, dict):
+            return [], False
+        rows = body.get("tenantSettings", body.get("value", [])) or []
+        return [row for row in rows if isinstance(row, dict)], True
+
+    def activity_events(self, days_back: int = 14) -> tuple[list[dict], bool]:
+        """Read a bounded activity-log window one UTC day at a time."""
+        rows: list[dict] = []
+        today = datetime.now(timezone.utc).date()
+        for offset in range(max(1, min(int(days_back), 28))):
+            day = today - timedelta(days=offset + 1)
+            start = f"{day.isoformat()}T00:00:00.000Z"
+            end = f"{day.isoformat()}T23:59:59.999Z"
+            path = ("/admin/activityevents?startDateTime=" + quote(f"'{start}'")
+                    + "&endDateTime=" + quote(f"'{end}'"))
+            seen: set[str] = set()
+            while path and path not in seen:
+                seen.add(path)
+                status, body = self._get(path)
+                if status != 200 or not isinstance(body, dict):
+                    return rows, False
+                rows.extend(row for row in body.get("activityEventEntities", [])
+                            if isinstance(row, dict))
+                continuation = body.get("continuationUri")
+                if not continuation:
+                    break
+                parsed = urlsplit(str(continuation))
+                base_path = urlsplit(self.BASE).path
+                relative_path = parsed.path.removeprefix(base_path)
+                path = relative_path + (f"?{parsed.query}" if parsed.query else "")
+        return rows, True
+
+    def admin_scan(self, workspace_id: str) -> tuple[dict, bool]:
+        """Run the existing read-only Scanner API client for one workspace."""
+        from ..discovery.scanner import ScannerApiClient
+
+        token = self._session.headers.get("Authorization", "").removeprefix("Bearer ")
+        payload = ScannerApiClient(token, timeout=self._timeout).scan([workspace_id])
+        return payload, bool(payload)
+
+    def capacity_metrics(self) -> tuple[dict, bool]:
+        """Find and query the Capacity Metrics model, adapting to its schema."""
+        match = None
+        group_id = None
+        for group in self.list_groups():
+            candidate_group = str(group.get("id") or "")
+            for dataset in self.list_datasets(candidate_group):
+                if "capacity metrics" in str(dataset.get("name") or "").lower():
+                    match, group_id = dataset, candidate_group
+                    break
+            if match:
+                break
+        if not match:
+            return {"model_found": False}, True
+
+        dataset_id = str(match.get("id") or "")
+        try:
+            schema_body = self.execute_queries(dataset_id, ["EVALUATE INFO.VIEW.COLUMNS()"], group_id)
+        except PowerBIError:
+            return {}, False
+        columns: dict[str, list[str]] = {}
+        for row in _query_rows(schema_body):
+            table = str(_row_value(row, "table") or "")
+            column = str(_row_value(row, "name", "column") or "")
+            if table and column:
+                columns.setdefault(table, []).append(column)
+
+        fact = _capacity_fact(columns)
+        overload = _overload_fact(columns)
+        result: dict[str, Any] = {
+            "model_found": True,
+            "model_id": dataset_id,
+            "model_workspace_id": group_id,
+            "peak_split": None,
+            "top_consumers": [],
+            "throttling_readable": overload is not None,
+            "throttling_events": 0,
+            "query_load": [],
+        }
+        if fact:
+            table, cu, when, operation, item, workspace = fact
+            if when:
+                dax = f"EVALUATE SUMMARIZECOLUMNS({_dax_col(table, when)}, \"TotalCU\", SUM({_dax_col(table, cu)}))"
+                try:
+                    timed = _query_rows(self.execute_queries(dataset_id, [dax], group_id))
+                except PowerBIError:
+                    timed = []
+                peak = off_peak = 0.0
+                for row in timed:
+                    hour = _hour(_row_value(row, when, "When"))
+                    value = float(_row_value(row, "TotalCU") or 0)
+                    if hour is not None and 8 <= hour < 18:
+                        peak += value
+                    else:
+                        off_peak += value
+                if timed:
+                    result["peak_split"] = {"peak": peak, "off_peak": off_peak}
+            keys = [name for name in (workspace, item, operation) if name]
+            if keys:
+                grouping = ", ".join(_dax_col(table, name) for name in dict.fromkeys(keys))
+                dax = f"EVALUATE TOPN(20, SUMMARIZECOLUMNS({grouping}, \"TotalCU\", SUM({_dax_col(table, cu)})), [TotalCU], DESC)"
+                try:
+                    result["top_consumers"] = _query_rows(
+                        self.execute_queries(dataset_id, [dax], group_id)
+                    )
+                except PowerBIError:
+                    pass
+            if operation:
+                dax = f"EVALUATE SUMMARIZECOLUMNS({_dax_col(table, operation)}, \"TotalCU\", SUM({_dax_col(table, cu)}))"
+                try:
+                    operation_rows = _query_rows(self.execute_queries(dataset_id, [dax], group_id))
+                except PowerBIError:
+                    operation_rows = []
+                words = ("sql", "warehouse", "dataset", "semantic", "model", "query", "refresh")
+                result["query_load"] = [
+                    row for row in operation_rows
+                    if any(word in str(_row_value(row, operation)).lower() for word in words)
+                ]
+        if overload:
+            table, column, when = overload
+            key = _dax_col(table, when or column)
+            dax = f"EVALUATE FILTER(SUMMARIZECOLUMNS({key}, \"Overload\", SUM({_dax_col(table, column)})), [Overload] > 0)"
+            try:
+                result["throttling_events"] = len(_query_rows(
+                    self.execute_queries(dataset_id, [dax], group_id)
+                ))
+            except PowerBIError:
+                result["throttling_readable"] = False
+        return result, True
+
     # -- resolution helpers ----------------------------------------------------
     def find_report_group(self, report_id: str) -> tuple[str | None, dict | None]:
         """Locate which workspace a report lives in by scanning accessible groups."""
@@ -366,6 +502,58 @@ def _refresh_schedule(body: dict) -> dict:
         "times": times,
         "local_time_zone_id": str(raw.get("localTimeZoneId") or ""),
     }
+
+
+def _query_rows(body: dict) -> list[dict]:
+    results = body.get("results") or []
+    tables = results[0].get("tables", []) if results else []
+    return [row for row in (tables[0].get("rows", []) if tables else []) if isinstance(row, dict)]
+
+
+def _row_value(row: dict, *hints: str):
+    for hint in hints:
+        target = hint.lower()
+        for key, value in row.items():
+            leaf = str(key).rsplit("[", 1)[-1].rstrip("]").lower()
+            if target == leaf or target in leaf:
+                return value
+    return None
+
+
+def _pick(columns: list[str], *words: str) -> str | None:
+    return next((column for word in words for column in columns
+                 if word in column.lower()), None)
+
+
+def _capacity_fact(schema: dict[str, list[str]]):
+    for table, columns in schema.items():
+        cu = _pick(columns, "cu (s)", "cu(s)", "cu ", "capacity unit")
+        if cu:
+            return (table, cu, _pick(columns, "hour", "date", "day", "time"),
+                    _pick(columns, "operation"), _pick(columns, "item"),
+                    _pick(columns, "workspace"))
+    return None
+
+
+def _overload_fact(schema: dict[str, list[str]]):
+    for table, columns in schema.items():
+        signal = _pick(columns, "throttl", "overload", "burndown", "rejection", "delay")
+        if signal:
+            return table, signal, _pick(columns, "hour", "date", "day", "time")
+    return None
+
+
+def _dax_col(table: str, column: str) -> str:
+    return "'" + table.replace("'", "''") + "'[" + column.replace("]", "]]" ) + "]"
+
+
+def _hour(value) -> int | None:
+    if isinstance(value, (int, float)) and 0 <= int(value) <= 23:
+        return int(value)
+    try:
+        return datetime.fromisoformat(str(value or "").replace("Z", "+00:00")).hour
+    except ValueError:
+        return None
 
 
 def _error_detail(status: int | None, body: Any) -> tuple[str, int | None, str | None]:

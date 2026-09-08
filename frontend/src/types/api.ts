@@ -384,6 +384,8 @@ export interface AuditRequest {
    * production, which group is the developers / operations / report readers.
    */
   admin_settings?: AdminSettings;
+  /** Manual confirmations and scope inputs used only by elevated checks. */
+  admin_options?: Record<string, unknown>;
 }
 
 /**

@@ -46,6 +46,21 @@ const REQUIREMENTS: Record<string, string> = {
 };
 
 /**
+ * A standing note for the families whose access cannot be probed up front.
+ *
+ * Workspace Admin is probed (see {@link gaps}); Tenant and Capacity are not,
+ * because their APIs are tenant-wide and one call would not tell the reviewer
+ * which of the nine/five checks it unlocks. So the requirement is stated plainly
+ * here, up front, rather than only becoming visible as N/A after the run.
+ */
+const ROLE_NOTES: Record<string, string> = {
+  Tenant:
+    "Without the Fabric tenant administrator role, these checks cannot read the admin APIs and will report N/A.",
+  Capacity:
+    "Without capacity administrator access to the Capacity Metrics app, these checks will report N/A.",
+};
+
+/**
  * What this account cannot read, if anything.
  *
  * Only gaps are reported. A working account sees nothing here — a permanent
@@ -76,6 +91,7 @@ function CategoryCard({
 }) {
   const disabled = !info.available;
   const missing = gaps(info.category, probe);
+  const roleNote = ROLE_NOTES[info.category];
 
   return (
     <button
@@ -106,6 +122,9 @@ function CategoryCard({
         <p className="mt-3 text-xs font-medium text-slate-500">
           No checks registered yet — nothing would run.
         </p>
+      )}
+      {!disabled && roleNote && (
+        <p className="mt-3 text-xs text-amber-700">{roleNote}</p>
       )}
       {missing.length > 0 && (
         <p className="mt-3 text-xs text-amber-700">
