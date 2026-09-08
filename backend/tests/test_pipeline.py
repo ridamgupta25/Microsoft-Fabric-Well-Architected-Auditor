@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import pytest
 
+from auditfast.ai.agents import kb_identifier_agent
 from auditfast.ai.agents.kb_updater_agent import FetchResponse
 from auditfast.ai.custom_runtime.base_check import clear_custom_registry
 from auditfast.ai.orchestrator import pipeline
@@ -126,6 +127,25 @@ def test_permission_error_keeps_its_diagnostic(monkeypatch):
         session=session, provider=provider, router=_NOOP_ROUTER, generator=_GEN, reviewer=None,
     )
     assert session.checks[0].lifecycle_status is LifecycleStatus.KB_FETCH_FAILED
+
+
+def test_unrecognised_open_ended_check_reaches_codegen_when_ai_on(monkeypatch):
+    # An open-ended check that maps to no catalog field must NOT dead-end at PENDING
+    # when AI is on: it gets a generic fetch plan, the offline snapshot misses (404 ->
+    # ITEM_TYPE_NOT_SUPPORTED), and it falls through to code-gen against the crawled KB.
+    monkeypatch.setattr(pipeline, "is_enabled", lambda ai=None: True)
+    monkeypatch.setattr(kb_identifier_agent, "identify", lambda _p, **_k: (None, 0.0, "none"))
+    monkeypatch.setattr(kb_identifier_agent, "is_enabled", lambda ai=None: True)
+    session = CustomCheckSession()
+    provider = FakeProvider(FetchResponse(404))
+    pipeline.run_batch(
+        ["workspace should have only 10 notebooks"],
+        session=session, provider=provider, router=_NOOP_ROUTER, generator=_GEN, reviewer=None,
+    )
+    check = session.checks[0]
+    assert check.fetch_plan is not None
+    assert check.lifecycle_status is LifecycleStatus.PROCESSED_CUSTOM
+    assert check.code_gen.status == "GENERATED"
 
 
 # -- HITL ----------------------------------------------------------------------
