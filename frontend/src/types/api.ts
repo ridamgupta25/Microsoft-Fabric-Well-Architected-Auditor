@@ -378,6 +378,30 @@ export interface AuditRequest {
   check_set?: CheckSet;
   /** For `check_set: "admin"`: which elevated families to run. */
   admin_categories?: string[];
+  /**
+   * Reviewer-supplied answers layered over the project YAML for an elevated
+   * run. These name things Fabric cannot report — which workspaces are
+   * production, which group is the developers / operations / report readers.
+   */
+  admin_settings?: AdminSettings;
+}
+
+/**
+ * The six inputs the elevated checks cannot get from Fabric.
+ *
+ * Three checks compare role assignments against a name only the reviewer knows,
+ * and two more need a human to confirm something the API does not expose at all
+ * (app audiences, gateway machine sizing). Left empty, those checks report N/A
+ * rather than guessing.
+ */
+export interface AdminSettings {
+  production_workspaces?: string[];
+  developer_groups?: string[];
+  operations_groups?: string[];
+  report_consumer_groups?: string[];
+  app_access_reviewed?: boolean;
+  gateway_sizing_confirmed?: boolean;
+  code_scan_clean?: boolean;
 }
 
 export type CheckSet = "standard" | "admin";

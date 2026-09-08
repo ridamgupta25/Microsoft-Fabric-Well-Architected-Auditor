@@ -316,6 +316,16 @@ class Resource(StrEnum):
     #: bodies. Needs the ``Item.ReadWrite`` scope getDefinition requires; without
     #: it the definition is unreadable and the trigger-depth check reports N/A.
     ACTIVATOR_DEFINITIONS = "activatorDefinitions"
+    #: On-premises / VNet data gateways and their members, from ``/gateways`` and
+    #: ``/gateways/{id}/members``. An **elevated** read: ``Gateway.Read.All`` plus
+    #: a role on each gateway, so the list returns only the gateways the caller
+    #: administers. Not tenant-admin. Without it the gateway checks report N/A.
+    GATEWAYS = "gateways"
+    #: Per-Lakehouse OneLake data access roles, from
+    #: ``…/items/{id}/dataAccessRoles``. Needs ``OneLake.Read.All`` plus a
+    #: workspace role. Only role names, member counts and the granted permissions
+    #: are kept — never the data itself.
+    DATA_ACCESS_ROLES = "dataAccessRoles"
 
 
 class Status(StrEnum):

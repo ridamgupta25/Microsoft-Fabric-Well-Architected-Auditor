@@ -61,6 +61,18 @@ class Settings(BaseSettings):
     )
     cache_background_refresh: bool = True
 
+    # -- elevated (admin) knowledge base --------------------------------------
+    # The elevated run is deliberately a separate world from the standard audit:
+    # its own crawl, its own checks, its own score — and its own knowledge base.
+    # Sharing one store would mean a narrow admin crawl could be served to a
+    # standard audit as if it were a complete snapshot, silently turning every
+    # notebook check N/A. Separate directories make that impossible.
+    admin_cache_dir: str = Field(
+        default="kb-cache-admin",
+        description="Knowledge base for elevated (admin) runs, separate from the "
+                    "standard cache_dir so the two can never serve each other.",
+    )
+
     # -- knowledge-base archive ----------------------------------------------
     # A permanent, timestamped history of every crawled workspace, separate from
     # the single-file cache above. Each audit writes a new dated folder, so the

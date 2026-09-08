@@ -251,6 +251,21 @@ zero and the run-selection screen offers it as not-yet-available.
 An elevated run is **independent**: its own crawl, its own report directory, its
 own score. It is never a stage of a standard audit.
 
+It also has **its own knowledge base** (`AUDITFAST_ADMIN_CACHE_DIR`, default
+`kb-cache-admin/`), separate from the standard one. Two reasons:
+
+- **Cost.** `CachingProvider` deliberately ignores the requested resources and
+  crawls the whole workspace so its KB is always complete. Sharing it would make
+  an elevated run pay for every notebook `getDefinition`, SQL column read and
+  OneLake listing just to read role assignments.
+- **Contamination.** A snapshot holding role assignments but no notebook
+  definitions looks *complete* to `WorkspaceContext.is_complete` — which records
+  read *failures*, not deliberate narrowness. Shared, it would be served to a
+  standard audit as whole and silently turn every notebook check N/A.
+
+Within the admin KB a snapshot is reused only when it covers **at least** the
+resources the run needs; each snapshot records what its crawl actually fetched.
+
 ```jsonc
 POST /api/v1/audit
 {

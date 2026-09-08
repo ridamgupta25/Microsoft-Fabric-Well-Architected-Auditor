@@ -84,7 +84,7 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
                    token_refresher=None, powerbi_token: str | None = None,
                    sql_token: str | None = None, storage_token: str | None = None,
                    sql_token_refresher=None, source: str = "live",
-                   snapshots: Sequence[dict] | None = None):
+                   snapshots: Sequence[dict] | None = None, narrow: bool = False):
     """Create the provider for a run.
 
     With ``source="live"`` (the default) every run reads the live tenant, but
@@ -111,6 +111,13 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
 
     ``storage_token`` is an optional Storage-audience token used only for OneLake
     ADLS Gen2 Files listings. Without it, file-layout checks report N/A.
+
+    ``narrow=True`` builds the provider for an elevated ("admin") run. It crawls
+    **only the resources the run asked for** instead of the whole workspace, and
+    keeps its own knowledge base (``AUDITFAST_ADMIN_CACHE_DIR``) entirely
+    separate from the standard one — the two can never serve each other a
+    snapshot. See
+    :class:`~auditfast.services.context_store.NarrowCrawlProvider`.
     """
     settings = get_settings()
     if source == "kb":
@@ -123,6 +130,19 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
                               sql_token=sql_token if settings.sql_endpoint_enabled else None,
                               storage_token=storage_token,
                               sql_token_refresher=sql_token_refresher)
+    if narrow:
+        from .context_store import ContextStore, NarrowCrawlProvider
+
+        store = (
+            ContextStore(settings.resolve(settings.admin_cache_dir))
+            if settings.cache_enabled else None
+        )
+        # Deliberately not wrapped in ArchivingProvider: the standard archive is
+        # a record of full workspace crawls, and a narrow admin snapshot filed
+        # beside them would misrepresent what was read that day.
+        return NarrowCrawlProvider(
+            live, store, ttl_seconds=settings.cache_ttl_seconds, force_refresh=refresh
+        )
     provider = live
     if settings.cache_enabled:
         from .context_store import CachingProvider, ContextStore
@@ -690,6 +710,7 @@ def run_admin_audit(
     source: str = "live",
     snapshots: Sequence[dict] | None = None,
     run_dir: str | Path | None = None,
+    settings_override: dict | None = None,
 ) -> AuditRun:
     """Run **only** the elevated-access checks in ``categories``.
 
@@ -699,9 +720,16 @@ def run_admin_audit(
     privileges — the same estate scores the same whether or not anyone had the
     Member role that day.
 
-    The crawl is automatically narrow: the engine fetches only
-    ``registry.required_resources(specs)``, so an elevated run reads role
-    assignments, connections or gateways and nothing else.
+The crawl is narrow **and separate**, which needs the provider's cooperation, not
+just the engine's. The engine already asks for only
+``registry.required_resources()``, but
+:class:`~auditfast.services.context_store.CachingProvider` ignores that and
+crawls the whole workspace so the KB it writes is always complete — which would
+make an elevated run pay for every notebook ``getDefinition``, SQL column read
+and OneLake listing just to read role assignments. So this run builds its
+provider with ``narrow=True``: only the requested resources are fetched, and
+they are cached in the elevated run's **own** knowledge base
+(``AUDITFAST_ADMIN_CACHE_DIR``), which the standard audit never reads.
 
     Raises:
         AuditError: when no category resolves, or the resolved categories hold no
@@ -743,10 +771,16 @@ def run_admin_audit(
                               powerbi_token=powerbi_token, sql_token=sql_token,
                               storage_token=storage_token,
                               sql_token_refresher=sql_token_refresher,
-                              source=source, snapshots=snapshots)
+                              source=source, snapshots=snapshots, narrow=True)
     provider = _RunScopedProvider(provider)
     targets = _resolve_targets(config, workspaces)
     remediation: RemediationBook = load_remediation(config)
+    # The reviewer's answers win over the project YAML. Three checks ask things
+    # Fabric cannot report - which workspace is production, which group is the
+    # developers - and the person running the audit knows them; a YAML edited
+    # once per engagement does not. Layered rather than replaced, so a project
+    # that *does* set them keeps working with nothing supplied.
+    settings = {**config.settings, **(settings_override or {})}
 
     def _progress(partial: list[CheckResult]) -> None:
         run = _build_run(config.name, partial)
@@ -759,7 +793,7 @@ def run_admin_audit(
     raw_results = run_engine(
         provider,
         targets,
-        config.settings,
+        settings,
         registry=registry,
         remediation=remediation,
         on_progress=_progress if on_progress else None,

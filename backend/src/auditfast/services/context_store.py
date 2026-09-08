@@ -29,7 +29,7 @@ from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 
-from ..clients.base import ALL_RESOURCES, Provider
+from ..clients.base import ALL_RESOURCES, STANDARD_RESOURCES, Provider
 from ..core.enums import Layer, Resource
 from ..core.errors import WorkspaceAccessError
 from ..core.models import WorkspaceContext
@@ -57,16 +57,44 @@ class ContextStore:
     def path_for(self, workspace_id: str) -> Path:
         return self.root / f"{_safe_name(workspace_id)}.json"
 
-    def save(self, ctx: WorkspaceContext) -> Path:
-        """Persist a snapshot and refresh the in-memory cache (atomic write)."""
+    def save(self, ctx: WorkspaceContext, resources: Iterable[Resource] | None = None) -> Path:
+        """Persist a snapshot and refresh the in-memory cache (atomic write).
+
+        ``resources`` records *what the crawl actually asked for*. The standard
+        cache always crawls everything and leaves this ``None``, meaning "the
+        whole workspace". A narrow crawl (the elevated run) must record its
+        subset, because serving a snapshot to a run that needs more than it
+        holds would answer questions from data that was never fetched — an N/A
+        rendered as a verdict.
+        """
         path = self.path_for(ctx.id)
         payload = {"saved_at": time.time(), "context": ctx.to_dict()}
+        if resources is not None:
+            payload["resources"] = sorted(r.value for r in resources)
         with self._lock:
             tmp = path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             tmp.replace(path)  # atomic on the same filesystem
             self._cache[ctx.id] = (payload["saved_at"], ctx)
         return path
+
+    def covered_resources(self, workspace_id: str) -> set[Resource] | None:
+        """What the stored crawl fetched, or ``None`` for "the whole workspace".
+
+        ``None`` covers both a full crawl and any snapshot written before this
+        was recorded, so an existing knowledge base keeps working unchanged.
+        """
+        path = self.path_for(workspace_id)
+        if not path.exists():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8")).get("resources")
+        except Exception:
+            return None
+        if raw is None:
+            return None
+        known = {r.value: r for r in Resource}
+        return {known[value] for value in raw if value in known}
 
     def load(self, workspace_id: str) -> WorkspaceContext | None:
         """Return the cached or on-disk snapshot, or ``None`` if never crawled."""
@@ -193,7 +221,12 @@ class CachingProvider:
         return self._refresh_now(workspace_id, layer)
 
     def _refresh_now(self, workspace_id: str, layer: Layer) -> WorkspaceContext:
-        ctx = self._live.fetch(workspace_id, layer, ALL_RESOURCES)
+        # STANDARD_RESOURCES, not ALL_RESOURCES: the elevated reads (gateways,
+        # OneLake data access roles) need scopes an ordinary sign-in lacks, so
+        # asking for them here would spend calls no standard check reads and
+        # record 403s that read as findings. The elevated run requests them
+        # explicitly against its own knowledge base.
+        ctx = self._live.fetch(workspace_id, layer, STANDARD_RESOURCES)
         self._store.save(ctx)
         return ctx
 
@@ -217,6 +250,93 @@ class CachingProvider:
                     self._refreshing.discard(workspace_id)
 
         threading.Thread(target=_work, name=f"kb-refresh-{workspace_id}", daemon=True).start()
+
+
+class NarrowCrawlProvider:
+    """The elevated ("admin") run's provider: its own crawl, its own knowledge base.
+
+    An elevated run is a separate world from the standard audit, and that
+    separation has to reach the provider. Two problems otherwise:
+
+    * **Cost.** :class:`CachingProvider` ignores the requested ``resources`` and
+      crawls *everything* on a miss, so the KB it writes is always complete.
+      Right for a standard audit — but it would make an elevated run pay for
+      every notebook ``getDefinition``, SQL column read and OneLake listing just
+      to read role assignments. On a 1,000-item workspace that is minutes of work
+      for one list call.
+    * **Contamination.** A snapshot holding role assignments but no notebook
+      definitions looks *complete* to :attr:`WorkspaceContext.is_complete`, which
+      only flags read *failures*, not deliberate narrowness. Shared with the
+      standard audit it would be served as whole, silently turning every notebook
+      check N/A.
+
+    So this provider keeps a **separate store** (``AUDITFAST_ADMIN_CACHE_DIR``)
+    and crawls only what the run asked for. Within that store a snapshot is
+    reused only when it covers *at least* the requested resources — otherwise a
+    run that added the gateway checks would be answered from a snapshot that
+    never fetched a gateway, which is the same "verdict from data we never read"
+    bug in a smaller disguise.
+    """
+
+    def __init__(
+        self,
+        live: Provider,
+        store: ContextStore | None = None,
+        *,
+        ttl_seconds: float = 86_400.0,
+        force_refresh: bool = False,
+    ):
+        self._live = live
+        self._store = store
+        self._ttl = ttl_seconds
+        self._force = force_refresh
+        #: True when any workspace was answered from an existing snapshot, so a
+        #: caller can report provenance exactly as the caching provider does.
+        self.served_from_cache = False
+
+    def _usable(self, workspace_id: str, wanted: set[Resource]) -> WorkspaceContext | None:
+        """A stored snapshot fresh enough, complete enough, and wide enough."""
+        if self._store is None or self._force:
+            return None
+        cached = self._store.load(workspace_id)
+        age = self._store.age_seconds(workspace_id)
+        if cached is None or age is None or age > self._ttl or not cached.is_complete:
+            return None
+        covered = self._store.covered_resources(workspace_id)
+        # ``None`` means a full crawl, which covers everything.
+        if covered is not None and not wanted <= covered:
+            return None
+        return cached
+
+    def fetch(
+        self,
+        workspace_id: str,
+        layer: Layer = Layer.MIXED,
+        resources: Iterable[Resource] = ALL_RESOURCES,
+    ) -> WorkspaceContext:
+        wanted = set(resources)
+        cached = self._usable(workspace_id, wanted)
+        if cached is not None:
+            self.served_from_cache = True
+            return cached
+
+        log.info(
+            "admin crawl of %s: %d resource(s) instead of the full workspace",
+            workspace_id, len(wanted),
+        )
+        ctx = self._live.fetch(workspace_id, layer, wanted)
+        if self._store is not None and ctx.is_complete:
+            # Recorded with its resource set, so a later run needing more than
+            # this holds re-crawls instead of being answered from a gap.
+            self._store.save(ctx, resources=wanted)
+        return ctx
+
+    def list_workspaces(self) -> list[dict]:
+        return self._live.list_workspaces()
+
+    def probe(self, *args, **kwargs):
+        probe = getattr(self._live, "probe", None)
+        return probe(*args, **kwargs) if probe else {}
 
 
 class KBArchive:

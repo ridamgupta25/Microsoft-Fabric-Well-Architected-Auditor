@@ -67,6 +67,7 @@ class AuditRunner:
         snapshots: list[dict] | None = None,
         check_set: str = "standard",
         admin_categories: list[str] | None = None,
+        admin_settings: dict | None = None,
     ) -> AuditJob:
         """Accept an audit and start it in the background."""
         is_admin = check_set == "admin"
@@ -108,6 +109,7 @@ class AuditRunner:
                 snapshots=snapshots,
                 check_set=check_set,
                 admin_categories=admin_categories,
+                admin_settings=admin_settings,
                 parent_correlation_id=correlation_id.get(),
             )
         )
@@ -221,6 +223,7 @@ class AuditRunner:
         snapshots: list[dict] | None = None,
         check_set: str = "standard",
         admin_categories: list[str] | None = None,
+        admin_settings: dict | None = None,
         parent_correlation_id: str = "-",
     ) -> None:
         """Run one audit to completion, recording success or failure."""
@@ -278,6 +281,7 @@ class AuditRunner:
                         sql_token_refresher=sql_token_refresher,
                         source=source,
                         snapshots=snapshots,
+                        settings_override=admin_settings,
                     )
                     admin_report: dict[str, Any] = audit_service.to_json(admin_run)
                     admin_report["audit_id"] = job.id
