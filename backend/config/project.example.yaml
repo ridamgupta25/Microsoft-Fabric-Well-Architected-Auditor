@@ -41,3 +41,9 @@ auth:
     - "https://api.fabric.microsoft.com/Workspace.Read.All"
     - "https://api.fabric.microsoft.com/Item.ReadWrite.All"   # required for getDefinition (item code)
     - "https://api.fabric.microsoft.com/OneLake.Read.All"      # required for lakehouse shortcuts
+    # The two below are only needed for the elevated-access ("admin") checks:
+    # cloud connection credentials and on-premises gateways. Ordinary delegated
+    # reads, NOT tenant-admin - but without them /connections and /gateways
+    # return 403 and those checks report N/A instead of a verdict.
+    - "https://api.fabric.microsoft.com/Connection.Read.All"
+    - "https://api.fabric.microsoft.com/Gateway.Read.All"

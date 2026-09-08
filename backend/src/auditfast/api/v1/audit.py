@@ -27,6 +27,40 @@ from ..deps import OrganizationDep, RunnerDep, SettingsDep, resolve_token
 router = APIRouter(prefix="/audit", tags=["audit"])
 
 
+def _validate_admin_request(request: AuditRequest) -> None:
+    """Reject an elevated run that would check nothing.
+
+    Both failures are the caller's mistake and both look identical afterwards —
+    an audit that finishes instantly with a clean sheet. Failing loudly here is
+    the difference between "you picked nothing" and "your estate is fine".
+    """
+    from ...core.check.registry import admin_registry_for
+    from ...core.enums import AdminCategory
+
+    resolved = [AdminCategory.parse(name) for name in request.admin_categories]
+    known = [category for category in resolved if category is not None]
+    if not known:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "check_set='admin' needs at least one valid entry in "
+                "admin_categories. Valid values: "
+                + ", ".join(c.value for c in AdminCategory)
+            ),
+        )
+
+    registry = admin_registry_for(known)
+    if not len(registry):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "No checks are registered yet for: "
+                + ", ".join(c.value for c in known)
+                + ". Nothing would run, so the audit was not started."
+            ),
+        )
+
+
 @router.post(
     "",
     response_model=AuditAccepted,
@@ -46,9 +80,17 @@ async def submit_audit(
     here so an unauthenticated request fails immediately rather than as a dead
     background job. A ``source="kb"`` run replays saved snapshots and needs no
     token, so sign-in is skipped entirely.
+
+    ``check_set="admin"`` runs **only** the elevated-access categories named in
+    ``admin_categories`` — an independent run with its own crawl and its own
+    score. The selection is validated here rather than in the worker so an empty
+    or unknown category is a 400, not an audit that silently checks nothing.
     """
     token = None if request.source == "kb" else resolve_token(request.auth_session)
     project = str(settings.resolve(request.project) if request.project else settings.project_path)
+
+    if request.check_set == "admin":
+        _validate_admin_request(request)
 
     job = await runner.submit(
         project_path=project,
@@ -62,6 +104,8 @@ async def submit_audit(
         external_checks_csv=request.external_checks_csv,
         source=request.source,
         snapshots=request.snapshots,
+        check_set=request.check_set,
+        admin_categories=request.admin_categories,
     )
     return AuditAccepted(
         audit_id=job.id, status=job.status, submitted_at=job.submitted_at

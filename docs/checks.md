@@ -217,6 +217,91 @@ as the automated crawl finishes.
 
 ---
 
+## Elevated ("admin") checks
+
+Some checklist points need data an ordinary reviewer cannot read: workspace role
+assignments (**Member or higher**), cloud connections (`Connection.Read.All` plus
+a role on each connection), gateways (`Gateway.Read.All`), tenant settings, or
+capacity metrics.
+
+These live in a **separate registry** — `ADMIN_REGISTRY`, alongside the existing
+`GROUP_REGISTRY` — and are registered with `@admin_check(..., category=...)`
+rather than `@check`. A standard audit selects only from `REGISTRY`, so it can
+never pick one up.
+
+**Why separate, and not a flag.** If an elevated check could join the standard
+scorecard, the same estate would score differently depending on whether the
+person who signed in happened to hold the Member role. Keeping the two registries
+apart makes that structurally impossible, and keeps `len(REGISTRY)` — a pinned
+test value — stable.
+
+There are three families, all declared up front in `AdminCategory`:
+
+| Category | Needs |
+|---|---|
+| `Workspace Admin` | Member or higher on the workspace; a role on each connection / gateway |
+| `Tenant` | Fabric tenant administrator (tenant settings, scanner, audit logs) |
+| `Capacity` | Capacity administrator (metrics, SKU) |
+
+A family with no registered checks is **not** an error — it reports a count of
+zero and the run-selection screen offers it as not-yet-available.
+
+### Running them
+
+An elevated run is **independent**: its own crawl, its own report directory, its
+own score. It is never a stage of a standard audit.
+
+```jsonc
+POST /api/v1/audit
+{
+  "auth_session": "...",
+  "check_set": "admin",
+  "admin_categories": ["Workspace Admin"]
+}
+```
+
+An empty or unknown `admin_categories` is rejected with **400** rather than
+running nothing — an audit that checked nothing and an audit that found nothing
+wrong produce the same-looking report, and only one of them is a real result.
+
+The crawl narrows itself: the engine fetches only
+`registry.required_resources(specs)`, so an elevated run reads role assignments,
+connections or gateways and nothing else.
+
+### Adding one
+
+Write it in `core/check/elevated/<family>/admin.py` (the leaf module **must** be
+named `admin.py` to be auto-imported) and register with the matching category:
+
+```python
+@admin_check(
+    id="ADM-PROD-WRITE", ref="11.3.2",
+    title="Production workspaces have restricted access (no developer write)",
+    pillar=Pillar.DEVOPS, category=AdminCategory.WORKSPACE,
+    scope=Scope.WORKSPACE, severity=Severity.CRITICAL,
+    requires=[Resource.ROLE_ASSIGNMENTS],
+)
+def production_write_access(ctx: CheckContext) -> Verdict:
+    if not ctx.workspace.has(Resource.ROLE_ASSIGNMENTS):
+        return not_applicable(
+            "Workspace role assignments could not be read — this needs Member or higher"
+        )
+    ...
+```
+
+Nothing else needs editing: the catalog endpoint, the selection screen and the
+run mode all read from the registry, so the family lights up with a live count as
+soon as a check lands.
+
+Every rule from the standard library still applies, and one matters more here
+than anywhere: **a role the user lacks is N/A, never FAIL.** A Contributor
+running the tool must not make a correct estate look broken.
+
+Discovery endpoints: `GET /api/v1/catalog/admin-categories` and
+`GET /api/v1/catalog/admin-checks?category=...`.
+
+---
+
 ## Adding a check
 
 > **Assisted path.** Before writing one by hand, assess a plain-language

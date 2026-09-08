@@ -189,6 +189,48 @@ class Automation(StrEnum):
     MANUAL = "manual"
 
 
+class AdminCategory(StrEnum):
+    """Which elevated-access family a check belongs to.
+
+    An ordinary check reads what any workspace member can see. These three
+    families need privileges a normal reviewer does not have, so they are kept
+    out of the standard registry entirely and run only from the explicit
+    "elevated checks" run mode:
+
+    - ``TENANT``: needs the Fabric tenant-admin APIs (tenant settings, scanner,
+      audit logs).
+    - ``CAPACITY``: needs capacity administration / metrics.
+    - ``WORKSPACE``: needs **Member or higher** on the workspace, or a role on
+      the connection or gateway being read. Not tenant-admin — the signed-in
+      user's own token works, provided they hold the role.
+
+    All three are declared from the start so a family can be populated without
+    touching the run mode, the catalog, or the UI; a family with no registered
+    checks simply reports a count of zero.
+    """
+
+    TENANT = "Tenant"
+    CAPACITY = "Capacity"
+    WORKSPACE = "Workspace Admin"
+
+    @classmethod
+    def parse(cls, value: str | AdminCategory | None) -> AdminCategory | None:
+        """Coerce an API string into a category, or ``None`` when unknown.
+
+        Returning ``None`` rather than raising keeps a typo in a request from
+        500-ing; the caller treats an unknown category as "nothing selected".
+        """
+        if isinstance(value, cls):
+            return value
+        if not value:
+            return None
+        text = str(value).strip().lower()
+        for member in cls:
+            if member.value.lower() == text or member.name.lower() == text:
+                return member
+        return None
+
+
 class Scope(StrEnum):
     """What kind of object a check inspects.
 

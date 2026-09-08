@@ -15,7 +15,8 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Callable, Protocol, runtime_checkable
+from collections.abc import Callable
+from typing import Any, Protocol, runtime_checkable
 
 from ..agents.fetch_code_gen_agent import validate_fetch_source
 from .local_runner import UnsafeCodeError, _run_with_timeout, _safe_builtins

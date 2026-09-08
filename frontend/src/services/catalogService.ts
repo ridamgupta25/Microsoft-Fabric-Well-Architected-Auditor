@@ -6,6 +6,7 @@
  */
 import { apiClient } from "./apiClient";
 import type {
+  AdminCategoryInfo,
   CatalogSummary,
   CheckSpec,
   Health,
@@ -44,5 +45,24 @@ export async function describeCheck(checkId: string): Promise<CheckSpec> {
 
 export async function getCatalogSummary(): Promise<CatalogSummary> {
   const { data } = await apiClient.get<CatalogSummary>("/catalog/summary");
+  return data;
+}
+
+/**
+ * The elevated-access families and how many checks each holds.
+ *
+ * Always returns every family, including those with no checks yet — the screen
+ * shows an empty one as not-yet-available rather than hiding it, so a family
+ * added later appears with no frontend change.
+ */
+export async function listAdminCategories(): Promise<AdminCategoryInfo[]> {
+  const { data } = await apiClient.get<AdminCategoryInfo[]>("/catalog/admin-categories");
+  return data;
+}
+
+export async function listAdminChecks(category?: string): Promise<CheckSpec[]> {
+  const { data } = await apiClient.get<CheckSpec[]>("/catalog/admin-checks", {
+    params: category ? { category } : {},
+  });
   return data;
 }

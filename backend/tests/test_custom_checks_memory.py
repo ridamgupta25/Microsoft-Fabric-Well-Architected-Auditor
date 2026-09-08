@@ -7,8 +7,8 @@ from auditfast.ai.orchestrator.state import (
     CustomCheckSession,
     LifecycleStatus,
 )
-from auditfast.services.custom_checks_memory import CustomChecksMemory
 from auditfast.services import custom_checks_service
+from auditfast.services.custom_checks_memory import CustomChecksMemory
 
 _VALID = (
     "class Reused(BaseAuditCheck):\n"

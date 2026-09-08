@@ -18,7 +18,17 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from .advisory import is_advisory
-from .enums import ITEM_TYPE_SCOPE, Automation, Layer, Pillar, Resource, Scope, Severity, Status
+from .enums import (
+    ITEM_TYPE_SCOPE,
+    AdminCategory,
+    Automation,
+    Layer,
+    Pillar,
+    Resource,
+    Scope,
+    Severity,
+    Status,
+)
 from .validation import is_validated
 
 #: Highest score any single check can award.
@@ -476,6 +486,10 @@ class CheckSpec:
     #: The fixed answers a reviewer chooses between for an ``INTERACTIVE`` check.
     #: Empty for every automated/roadmap/manual check.
     options: tuple[CheckOption, ...] = ()
+    #: The elevated-access family this check belongs to, or ``None`` for an
+    #: ordinary check. Set only by ``admin_check``, which registers into the
+    #: separate ADMIN_REGISTRY — so a standard audit can never select one.
+    admin_category: AdminCategory | None = None
 
     @property
     def interactive(self) -> bool:
@@ -512,6 +526,7 @@ class CheckSpec:
             "interactive": self.interactive,
             "question": self.question or self.title,
             "options": [option.to_dict() for option in self.options],
+            "admin_category": self.admin_category.value if self.admin_category else None,
             "description": self.description or (self.fn.__doc__ or "").strip(),
             # Whether this check's checklist point has completed Phase 1
             # validation. Keyed by ref; source of truth:
