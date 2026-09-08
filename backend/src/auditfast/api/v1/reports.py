@@ -17,14 +17,18 @@ router = APIRouter(prefix="/reports", tags=["reports"])
 #: whitelist, so a path fragment in the URL can never be used to read an
 #: arbitrary file off the server.
 _XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+_HTML = "text/html; charset=utf-8"
 DOWNLOADS: dict[str, tuple[str, str]] = {
     "markdown": ("audit-report.md", "text/markdown"),
     "excel": ("audit-report.xlsx", _XLSX),
+    "html": ("audit-report.html", _HTML),
     "advisory-markdown": ("advisory-report.md", "text/markdown"),
     "advisory-excel": ("advisory-report.xlsx", _XLSX),
+    "advisory-html": ("advisory-report.html", _HTML),
     # Written by advisory judging, which runs after the audit on request.
     "advisory-judged-markdown": ("advisory-judged/advisory-report.md", "text/markdown"),
     "advisory-judged-excel": ("advisory-judged/advisory-report.xlsx", _XLSX),
+    "advisory-judged-html": ("advisory-judged/advisory-report.html", _HTML),
 }
 
 
@@ -77,12 +81,12 @@ async def get_report(
 )
 async def download_report(
     audit_id: str,
-    kind: Annotated[str, PathParam(description="markdown | excel")],
+    kind: Annotated[str, PathParam(description="markdown | excel | html")],
     runner: RunnerDep,
     organization_id: OrganizationDep,
     settings: SettingsDep,
 ) -> FileResponse:
-    """Download the Markdown or Excel rendering of a report.
+    """Download the Markdown, Excel or HTML rendering of a report.
 
     Resolved against **this audit's** own output directory. Each run writes its
     own timestamped folder, so a fixed path would hand back whichever audit

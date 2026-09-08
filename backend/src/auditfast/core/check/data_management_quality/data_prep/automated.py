@@ -2296,7 +2296,12 @@ def nb_bronze_metadata(ctx: CheckContext) -> Verdict:
     present = [name for name, found in controls.items() if found]
     missing = [name for name, found in controls.items() if not found]
     score = {0: 0, 1: 1, 2: 2, 3: 3}[len(present)]
-    evidence = f"Bronze write ({how}); present: {', '.join(present) if present else 'none'}"
+    # Only state what was actually found. Saying "present: none" and then listing
+    # everything as missing reports the same fact twice, which reads as though two
+    # separate gaps were detected.
+    evidence = f"Bronze write ({how})"
+    if present:
+        evidence += f"; present: {', '.join(present)}"
     if missing:
         evidence += f"; missing: {', '.join(missing)}"
     return graded(score, evidence)
@@ -2353,7 +2358,8 @@ def nb_silver_quality(ctx: CheckContext) -> Verdict:
     return covered(
         len(present), len(_SILVER_ASPECTS),
         f"Silver write ({how}) applies {len(present)} of {len(_SILVER_ASPECTS)} "
-        f"scored quality aspect(s): {', '.join(present) if present else 'none'}"
+        f"scored quality aspect(s)"
+        + (f": {', '.join(present)}" if present else "")
         + (f". Not found: {', '.join(missing)}" if missing else "")
         + f". {dedup_note}",
     )
@@ -2708,7 +2714,8 @@ def nb_dq_rules(ctx: CheckContext) -> Verdict:
     return covered(
         len(present), len(_DQ_ASPECTS),
         f"{len(present)} of {len(_DQ_ASPECTS)} data-quality discipline(s) are codified "
-        f"in executable notebook code: {', '.join(present) if present else 'none'}"
+        f"in executable notebook code"
+        + (f": {', '.join(present)}" if present else "")
         + (f". Not found: {', '.join(missing)}" if missing else ""),
     )
 

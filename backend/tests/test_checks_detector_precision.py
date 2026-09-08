@@ -701,6 +701,20 @@ def test_dq_rules_do_not_pass_on_deduplication_alone():
     assert verdict.score is not None and verdict.score < _PASS
 
 
+def test_evidence_does_not_report_the_same_gap_twice():
+    """A "none" list followed by "Not found: <everything>" states one fact twice.
+
+    The report read "... are codified in executable notebook code: none. Not
+    found: a, b, c, d", which scans as two separate findings. When nothing is
+    present the list of what is missing already says so.
+    """
+    code = "df = spark.read.json('Files/in.json')\ndf.write.saveAsTable('t')"
+    evidence = nb_dq_rules(_ctx(_nb(code))).evidence
+    assert ": none" not in evidence
+    assert "none. Not found" not in evidence
+    assert "Not found:" in evidence
+
+
 def test_dq_rules_pass_when_every_discipline_is_codified():
     code = (
         "from pyspark.sql.types import StructType, StructField\n"

@@ -238,6 +238,14 @@ export function AdvisoryPanel({
             <>
               <a
                 className="btn-secondary"
+                href={reportDownloadUrl(auditId, "advisory-judged-html")}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Judged report (HTML)
+              </a>
+              <a
+                className="btn-secondary"
                 href={reportDownloadUrl(auditId, "advisory-judged-excel")}
               >
                 Judged report (Excel)

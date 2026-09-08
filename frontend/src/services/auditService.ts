@@ -135,10 +135,13 @@ export function reportDownloadUrl(
   kind:
     | "markdown"
     | "excel"
+    | "html"
     | "advisory-markdown"
     | "advisory-excel"
+    | "advisory-html"
     | "advisory-judged-markdown"
-    | "advisory-judged-excel",
+    | "advisory-judged-excel"
+    | "advisory-judged-html",
 ): string {
   return downloadUrl(`/reports/${auditId}/download/${kind}`);
 }
