@@ -104,6 +104,56 @@ def test_consolidates_repeated_asset_failures_by_control():
     assert "Notebook D" in access.not_assessed
 
 
+def test_evidence_lists_judged_verdicts_before_not_assessed():
+    """A reader needs the verdict first; "could not be assessed" is context.
+
+    Evidence was grouped in workspace/object order, so an N/A on an
+    alphabetically earlier asset led the cell and the real verdict sat below it.
+    Judged statuses now come first, N/A last.
+    """
+    shared = {
+        "check_id": "NB-ORDER",
+        "ref": "9.9.9",
+        "title": "Ordering",
+        "pillar": Pillar.RELIABILITY,
+    }
+    results = [
+        _result(
+            **shared, status=Status.NA, score=None, obj="A_Notebook",
+            evidence="Definition could not be read",
+        ),
+        _result(
+            **shared, status=Status.PASS, score=3, obj="B_Notebook",
+            evidence="Retry policy configured",
+        ),
+    ]
+    evidence = consolidate(results)[0].impacted_evidence
+    assert evidence.index("Retry policy configured") < evidence.index(
+        "Definition could not be read"
+    )
+
+
+def test_a_failure_still_leads_the_evidence():
+    shared = {
+        "check_id": "NB-ORDER2",
+        "ref": "9.9.8",
+        "title": "Ordering",
+        "pillar": Pillar.RELIABILITY,
+    }
+    results = [
+        _result(
+            **shared, status=Status.NA, score=None, obj="A_Notebook",
+            evidence="Definition could not be read",
+        ),
+        _result(
+            **shared, status=Status.FAIL, score=0, obj="B_Notebook",
+            evidence="No retry policy",
+        ),
+    ]
+    control = consolidate(results)[0]
+    assert control.impacted_evidence.startswith("No retry policy")
+
+
 def test_excel_matches_sql_report_flow_and_risk_register(tmp_path):
     results = _sample_results()
     output = tmp_path / "fabric-report.xlsx"
@@ -130,7 +180,9 @@ def test_excel_matches_sql_report_flow_and_risk_register(tmp_path):
     assert "Notebook C" in workbook["Findings"]["G2"].value
     assert workbook["Summary"].freeze_panes == "A3"
     assert workbook["Area Detail"].freeze_panes == "A2"
-    assert workbook["Checklist"].freeze_panes == "L2"
+    # Freeze through the Score column. One column left of the old L2 since the
+    # Validation column was removed from the Checklist.
+    assert workbook["Checklist"].freeze_panes == "K2"
     assert workbook["Findings"].freeze_panes == "F2"
     assert workbook["Risk Register"].freeze_panes == "H12"
     assert workbook["Risk Register"].sheet_view.pane.xSplit == 7
@@ -150,7 +202,16 @@ def test_excel_matches_sql_report_flow_and_risk_register(tmp_path):
     assert len(workbook["Summary"].conditional_formatting) > 0
     assert workbook["Checklist"]["A1"].font.bold
     assert workbook["Checklist"]["A1"].fill.fgColor.rgb.endswith("305496")
-    assert workbook["Checklist"]["L2"].number_format == "0"
+    # Located by header rather than by letter: the workspace score columns shift
+    # whenever a fixed column is added or removed, and a hardcoded letter here
+    # silently pins the old layout instead of the behaviour.
+    checklist = workbook["Checklist"]
+    workspace_column = next(
+        column
+        for column in range(1, checklist.max_column + 1)
+        if checklist.cell(row=1, column=column).value == "WS1"
+    )
+    assert checklist.cell(row=2, column=workspace_column).number_format == "0"
     assert 10 <= workbook["Checklist"].column_dimensions["A"].width <= 60
 
 
