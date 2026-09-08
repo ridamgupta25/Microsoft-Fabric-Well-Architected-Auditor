@@ -120,6 +120,29 @@ _DEFINITION_GATE = threading.BoundedSemaphore(
     _bounded_int_env("AUDITFAST_MAX_INFLIGHT_ITEM_FETCHES", 32, 1, 32)
 )
 
+#: Resources whose reads walk the workspace's item list, so asking for any of
+#: them must also fetch ``/workspaces/{id}/items``.
+#:
+#: Getting this wrong is silent: a resource missing from here still *runs*, finds
+#: no items to iterate, and reports N/A on every workspace — which reads as "not
+#: applicable here" rather than "the crawl never looked". ``DATA_ACCESS_ROLES``
+#: is read per Lakehouse and was exactly that bug on an elevated-only run.
+_ITEM_DERIVED_RESOURCES: frozenset[Resource] = frozenset({
+    Resource.ITEMS,
+    Resource.PIPELINE_DEFINITIONS,
+    Resource.NOTEBOOK_DEFINITIONS,
+    Resource.ENVIRONMENT_DEFINITIONS,
+    Resource.TABLE_SCHEMAS,
+    Resource.SHORTCUTS,
+    Resource.SEMANTIC_MODEL_DEFINITIONS,
+    Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE,
+    Resource.ITEM_RUN_HISTORY,
+    Resource.WAREHOUSE_AUDIT,
+    Resource.LAKEHOUSE_FILES,
+    Resource.ACTIVATOR_DEFINITIONS,
+    Resource.DATA_ACCESS_ROLES,
+})
+
 
 class LiveFabricProvider:
     """Reads a live Fabric tenant with a delegated, read-only OAuth2 token."""
@@ -720,6 +743,77 @@ class LiveFabricProvider:
             "minimum_tls_version": None,
             "status": "unknown",
         }
+
+    def _gateways(self) -> tuple[list[dict], bool]:
+        """List the gateways this caller administers, with their members.
+
+        An elevated read: ``Gateway.Read.All`` plus a role on each gateway, so
+        the list holds only the gateways the caller can see. ``known`` is False
+        when the list call itself failed, because "we could not ask" and "there
+        are none" must never look the same in a report.
+        """
+        rows, known = self._values("/gateways")
+        if not known:
+            return [], False
+        gateways = []
+        for row in rows:
+            gateway_id = row.get("id")
+            if not gateway_id:
+                continue
+            members, _ = self._values(f"/gateways/{gateway_id}/members")
+            gateways.append({
+                "id": gateway_id,
+                "display_name": row.get("displayName", ""),
+                "type": row.get("type", ""),
+                "version": row.get("version", ""),
+                "number_of_member_gateways": row.get("numberOfMemberGateways"),
+                "load_balancing_setting": row.get("loadBalancingSetting", ""),
+                # Only shape is kept: how many machines back this gateway and
+                # whether each is enabled. Never a credential or a host name.
+                "members": [
+                    {
+                        "display_name": m.get("displayName", ""),
+                        "enabled": m.get("enabled"),
+                        "version": m.get("version", ""),
+                    }
+                    for m in members if isinstance(m, dict)
+                ],
+            })
+        return gateways, True
+
+    def _data_access_roles(self, workspace_id: str, item_id: str) -> tuple[list[dict], bool]:
+        """List a Lakehouse's OneLake data access roles (name, members, permissions).
+
+        Returns ``(roles, known)``. The status split matters more here than
+        elsewhere: Fabric answers **404** when the Lakehouse has no data access
+        roles configured at all, and that is precisely the finding 6.2.6 looks
+        for — "workspace access alone decides who reads the data". Treating it as
+        a read failure would mark the resource unavailable and report N/A on the
+        one estate the check exists to catch.
+
+        Only a permission denial or a transient fault is genuinely "could not
+        ask".
+        """
+        status, body = self._get(
+            f"/workspaces/{workspace_id}/items/{item_id}/dataAccessRoles"
+        )
+        if status in (400, 404):
+            # No data access roles defined on this Lakehouse. A real answer.
+            return [], True
+        if status != 200 or not isinstance(body, dict):
+            log.warning("lakehouse %s dataAccessRoles -> HTTP %s", item_id, status)
+            return [], False
+        roles = []
+        for row in body.get("value") or []:
+            members = row.get("members") or {}
+            entra = members.get("microsoftEntraMembers") or []
+            item_access = members.get("fabricItemMembers") or []
+            roles.append({
+                "name": row.get("name", ""),
+                "members": len(entra) + len(item_access),
+                "permissions": len(row.get("decisionRules") or []),
+            })
+        return roles, True
 
     def _item_shortcuts(self, workspace_id: str, item_id: str) -> tuple[list[dict], bool]:
         """List an item's OneLake shortcuts (name/path/target type), all pages.
@@ -1525,6 +1619,12 @@ class LiveFabricProvider:
                 ctx.unavailable.add(Resource.CONNECTIONS)
             log.info("fetch %s: %d connection records read", workspace_id, len(ctx.connections))
 
+        if Resource.GATEWAYS in wanted:
+            ctx.gateways, known = self._gateways()
+            if not known:
+                ctx.unavailable.add(Resource.GATEWAYS)
+            log.info("fetch %s: %d gateway(s) read", workspace_id, len(ctx.gateways))
+
         # Report → semantic-model bindings (Power BI Get Reports In Group). One
         # list call, no per-report fetch: only id/name/datasetId are retained.
         # A Fabric-native fallback runs after the item list below, for a sign-in
@@ -1538,20 +1638,7 @@ class LiveFabricProvider:
 
         # Pipeline, notebook, and table reads all walk the item list, so fetch it
         # whenever any item-derived resource was asked for.
-        if wanted & {
-            Resource.ITEMS,
-            Resource.PIPELINE_DEFINITIONS,
-            Resource.NOTEBOOK_DEFINITIONS,
-            Resource.ENVIRONMENT_DEFINITIONS,
-            Resource.TABLE_SCHEMAS,
-            Resource.SHORTCUTS,
-            Resource.SEMANTIC_MODEL_DEFINITIONS,
-            Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE,
-            Resource.ITEM_RUN_HISTORY,
-            Resource.WAREHOUSE_AUDIT,
-            Resource.LAKEHOUSE_FILES,
-            Resource.ACTIVATOR_DEFINITIONS,
-        }:
+        if wanted & _ITEM_DERIVED_RESOURCES:
             rows, known = self._values(f"/workspaces/{workspace_id}/items")
             ctx.items = [Item.from_api(row) for row in rows]
             if not known:
@@ -1881,6 +1968,26 @@ class LiveFabricProvider:
                 ctx.unavailable.add(Resource.SHORTCUTS)
             log.info("fetch %s: %d shortcuts read (%d of %d listings failed)",
                      workspace_id, total, failed, attempted)
+
+        if Resource.DATA_ACCESS_ROLES in wanted:
+            role_lakehouses = [i for i in ctx.items if i.type == "Lakehouse"]
+            fetched = self._fetch_items_parallel(
+                role_lakehouses,
+                lambda it: self._data_access_roles(workspace_id, it.id))
+            attempted = failed = 0
+            for item, (roles, known) in zip(role_lakehouses, fetched, strict=True):
+                attempted += 1
+                if not known:
+                    failed += 1
+                    continue
+                # Recorded even when empty: a Lakehouse with *no* data access
+                # role is the finding 6.2.6 is looking for, and dropping it would
+                # make that indistinguishable from an unreadable one.
+                ctx.data_access_roles[item.display_name or item.id] = roles
+            if attempted and failed == attempted:
+                ctx.unavailable.add(Resource.DATA_ACCESS_ROLES)
+            log.info("fetch %s: data access roles read for %d of %d lakehouse(s)",
+                     workspace_id, attempted - failed, attempted)
 
         # Semantic-model measures + relationships, parsed from the TMSL definition.
         if Resource.SEMANTIC_MODEL_DEFINITIONS in wanted:

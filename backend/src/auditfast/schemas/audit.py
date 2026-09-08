@@ -103,6 +103,15 @@ class AuditRequest(BaseModel):
                     "check_set='admin' — an empty list runs nothing rather than "
                     "silently running every family.",
     )
+    admin_settings: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Reviewer-supplied answers for the elevated run, layered "
+                    "over the project YAML's project: block. These name things "
+                    "Fabric cannot report — which workspaces are production, "
+                    "which security group is the developers / operations / "
+                    "report readers — so the checks that need them can score "
+                    "instead of reporting N/A. Only read when check_set='admin'.",
+    )
 
     model_config = {
         "json_schema_extra": {

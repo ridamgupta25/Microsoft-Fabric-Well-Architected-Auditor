@@ -14,6 +14,32 @@ project:
   heavy_shuffle_bytes: 1073741824
   long_running_notebook_ms: 300000
 
+  # -- elevated ("admin") checks -------------------------------------------
+  # These name things Fabric cannot tell us: which workspaces are production,
+  # and which security groups are the developers / operations / report readers.
+  # Each list is empty by default, and a check with nothing to compare against
+  # reports N/A rather than guessing - the same way the source notebooks do
+  # ("none named, so 11.3.2 will not score").
+  #
+  # Names are matched case-insensitively against the role assignment's display
+  # name, exactly as shown in Fabric's Manage access pane.
+  production_workspaces: []      # e.g. ["MLC_DATASTORE_PROD", "Sales-Prod-Reporting"]
+  developer_groups: []           # e.g. ["SG-Fabric-Developers"]
+  operations_groups: []          # e.g. ["SG-Fabric-Operations"]
+  report_consumer_groups: []     # e.g. ["SG-Sales-Report-Readers"]
+  # Reviewer attestation for 14.4.4: app audiences are not readable from the
+  # Fabric API, so full marks need a human to confirm they were checked by hand.
+  app_access_reviewed: false
+  # Reviewer attestation for 1.3.8: the gateways API reports membership and
+  # version, never machine capacity, so sizing has to be confirmed by whoever
+  # runs the box.
+  gateway_sizing_confirmed: false
+  # Reviewer attestation for 1.3.7: connections are only half that point. A
+  # secret pasted into notebook or pipeline code never becomes a connection, so
+  # it is invisible to the connection scan - set this once the code scan
+  # (NB-SECRETS 3.1.3 / PL-SECRETS 6.4.2) has come back clean.
+  code_scan_clean: false
+
 remediation: "config/remediation.yaml"
 
 # The workspaces that make up this project, each tagged with a layer role.

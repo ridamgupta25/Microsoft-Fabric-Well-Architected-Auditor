@@ -216,6 +216,16 @@ class WorkspaceContext:
     #: of "who has access", for the workspace whose role assignments could not be
     #: read from Fabric REST.
     sql_principals: list[dict] = field(default_factory=list)
+    #: On-premises / VNet data gateways the caller administers:
+    #: ``{"id", "display_name", "type", "version", "number_of_member_gateways",
+    #: "members"}``. An elevated read (``Gateway.Read.All`` + a role on each
+    #: gateway), so an empty list can mean "none" *or* "none you administer" —
+    #: which is why the checks consult :attr:`unavailable` first.
+    gateways: list[dict] = field(default_factory=list)
+    #: OneLake data access roles per Lakehouse, keyed by item display name:
+    #: ``[{"name", "members", "permissions"}]``. Only role shape is kept, never
+    #: the data the role grants access to.
+    data_access_roles: dict[str, list] = field(default_factory=dict)
     #: Resources the provider tried and failed to read. A check whose data lands
     #: here must report N/A rather than failing: "we could not determine this" is
     #: not the same finding as "this is not configured".
@@ -315,6 +325,8 @@ class WorkspaceContext:
             "sql_views": self.sql_views,
             "sql_routines": self.sql_routines,
             "sql_principals": self.sql_principals,
+            "gateways": self.gateways,
+            "data_access_roles": self.data_access_roles,
             "unavailable": sorted(r.value for r in self.unavailable),
             "read_failures": self.read_failures,
         }
@@ -352,6 +364,8 @@ class WorkspaceContext:
             sql_views=list(data.get("sql_views", [])),
             sql_routines=list(data.get("sql_routines", [])),
             sql_principals=list(data.get("sql_principals", [])),
+            gateways=list(data.get("gateways", [])),
+            data_access_roles=dict(data.get("data_access_roles", {})),
             unavailable={Resource(v) for v in data.get("unavailable", [])},
             read_failures=dict(data.get("read_failures", {})),
         )
