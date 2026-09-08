@@ -226,6 +226,14 @@ class WorkspaceContext:
     #: ``[{"name", "members", "permissions"}]``. Only role shape is kept, never
     #: the data the role grants access to.
     data_access_roles: dict[str, list] = field(default_factory=dict)
+    #: Tenant-admin evidence is repeated on each selected workspace context so
+    #: existing workspace-scoped engine dispatch and snapshot replay need no
+    #: special global-context path. Providers may cache the tenant-wide calls.
+    tenant_settings: list[dict] = field(default_factory=list)
+    tenant_domains: list[dict] = field(default_factory=list)
+    admin_scan: dict = field(default_factory=dict)
+    activity_events: list[dict] = field(default_factory=list)
+    capacity_metrics: dict = field(default_factory=dict)
     #: Resources the provider tried and failed to read. A check whose data lands
     #: here must report N/A rather than failing: "we could not determine this" is
     #: not the same finding as "this is not configured".
@@ -327,6 +335,11 @@ class WorkspaceContext:
             "sql_principals": self.sql_principals,
             "gateways": self.gateways,
             "data_access_roles": self.data_access_roles,
+            "tenant_settings": self.tenant_settings,
+            "tenant_domains": self.tenant_domains,
+            "admin_scan": self.admin_scan,
+            "activity_events": self.activity_events,
+            "capacity_metrics": self.capacity_metrics,
             "unavailable": sorted(r.value for r in self.unavailable),
             "read_failures": self.read_failures,
         }
@@ -366,6 +379,11 @@ class WorkspaceContext:
             sql_principals=list(data.get("sql_principals", [])),
             gateways=list(data.get("gateways", [])),
             data_access_roles=dict(data.get("data_access_roles", {})),
+            tenant_settings=list(data.get("tenant_settings", [])),
+            tenant_domains=list(data.get("tenant_domains", [])),
+            admin_scan=dict(data.get("admin_scan", {})),
+            activity_events=list(data.get("activity_events", [])),
+            capacity_metrics=dict(data.get("capacity_metrics", {})),
             unavailable={Resource(v) for v in data.get("unavailable", [])},
             read_failures=dict(data.get("read_failures", {})),
         )

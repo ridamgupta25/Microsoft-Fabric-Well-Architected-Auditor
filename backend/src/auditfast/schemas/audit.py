@@ -112,6 +112,10 @@ class AuditRequest(BaseModel):
                     "report readers — so the checks that need them can score "
                     "instead of reporting N/A. Only read when check_set='admin'.",
     )
+    admin_options: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Manual confirmations and scope inputs used only by elevated checks.",
+    )
 
     model_config = {
         "json_schema_extra": {

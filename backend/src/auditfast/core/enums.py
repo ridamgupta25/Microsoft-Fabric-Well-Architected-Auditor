@@ -326,6 +326,20 @@ class Resource(StrEnum):
     #: workspace role. Only role names, member counts and the granted permissions
     #: are kept — never the data itself.
     DATA_ACCESS_ROLES = "dataAccessRoles"
+    #: Tenant-wide settings returned by the Power BI admin API. Available only
+    #: to a Fabric tenant administrator.
+    TENANT_SETTINGS = "tenantSettings"
+    #: Fabric domain membership plus workspace assignments, used to verify
+    #: business-area ownership boundaries.
+    TENANT_DOMAINS = "tenantDomains"
+    #: Tenant-admin metadata scan results, including endorsement details that
+    #: ordinary workspace item APIs omit.
+    ADMIN_SCANNER = "adminScanner"
+    #: Tenant activity events used by access, audit coverage and deployment
+    #: checks. The provider stores a bounded recent window only.
+    ADMIN_ACTIVITY = "adminActivity"
+    #: Normalized observations queried from the Fabric Capacity Metrics model.
+    CAPACITY_METRICS = "capacityMetrics"
 
 
 class Status(StrEnum):

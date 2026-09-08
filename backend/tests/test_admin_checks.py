@@ -17,6 +17,7 @@ from auditfast.core.check.registry import (
 )
 from auditfast.core.enums import AdminCategory, Layer, Pillar, Resource, Scope
 from auditfast.core.models import CheckContext, RoleAssignment, WorkspaceContext
+from auditfast.schemas.auth import DiagnosticsResponse
 from auditfast.services.context_store import ContextStore, NarrowCrawlProvider
 
 from .conftest import AUTHENTICATED_SESSION
@@ -78,6 +79,38 @@ def test_spec_serialization_exposes_the_category():
         return binary(True, "ok")
 
     assert throwaway.get("TEST-ADM-2").to_dict()["admin_category"] == "Tenant"
+
+
+def test_elevated_evidence_survives_snapshot_round_trip():
+    context = WorkspaceContext(
+        id="ws-1",
+        tenant_settings=[{"title": "Export data", "enabled": False}],
+        tenant_domains=[{"id": "domain-1", "workspace_ids": ["ws-1"]}],
+        admin_scan={"workspaces": [{"id": "ws-1", "datasets": []}]},
+        activity_events=[{"Activity": "AddGroupUser", "WorkSpaceId": "ws-1"}],
+        capacity_metrics={"model_found": True, "throttling_events": 0},
+    )
+
+    restored = WorkspaceContext.from_dict(context.to_dict())
+
+    assert restored.tenant_settings == context.tenant_settings
+    assert restored.tenant_domains == context.tenant_domains
+    assert restored.admin_scan == context.admin_scan
+    assert restored.activity_events == context.activity_events
+    assert restored.capacity_metrics == context.capacity_metrics
+
+
+def test_diagnostics_response_preserves_admin_readiness():
+    response = DiagnosticsResponse(admin={
+        "member_workspaces": 2,
+        "sampled_workspaces": 3,
+        "role_assignments_readable": True,
+        "connections_readable": False,
+        "gateways_readable": False,
+    })
+
+    assert response.model_dump()["admin"]["member_workspaces"] == 2
+    assert response.model_dump()["admin"]["role_assignments_readable"] is True
 
 
 # -- category filtering --------------------------------------------------------
@@ -177,6 +210,13 @@ def test_every_elevated_check_ref_has_remediation_text():
     book = load_remediation(load_project(PROJECT_FILE))
     missing = sorted({spec.ref for spec in ADMIN_REGISTRY if not book.get(spec.ref)})
     assert missing == [], f"elevated checks with no remediation text: {missing}"
+
+
+def test_tenant_and_capacity_publish_all_notebook_checks(client):
+    body = client.get("/api/v1/catalog/admin-categories").json()
+    counts = {row["category"]: row["checks"] for row in body}
+    assert counts["Tenant"] == 9
+    assert counts["Capacity"] == 5
 
 
 def test_admin_checks_endpoint_rejects_an_unknown_category(client):
@@ -722,3 +762,23 @@ def test_a_forbidden_data_access_role_read_stays_unknown(monkeypatch):
     roles, known = provider._data_access_roles("w1", "lh1")
     assert known is False
     assert roles == []
+
+
+def test_capacity_manual_confirmation_promotes_the_metrics_app_score():
+    spec = ADMIN_REGISTRY.get("CP-12-2-1")
+    assert spec is not None
+    workspace = WorkspaceContext(
+        id="ws-1",
+        capacity_metrics={"model_found": True},
+    )
+
+    unconfirmed = spec.fn(CheckContext(workspace, {}, "ws-1", workspace))
+    confirmed = spec.fn(CheckContext(
+        workspace,
+        {"metrics_app_monitored": True},
+        "ws-1",
+        workspace,
+    ))
+
+    assert unconfirmed.score == 2
+    assert confirmed.score == 3

@@ -768,6 +768,27 @@ def test_powerbi_dataset_created_dates_falls_back_to_personal_workspace():
     assert client.dataset_created_dates(group_id="ws") == {"d1": "2024-04-20T18:11:44Z"}
 
 
+def test_powerbi_activity_events_follows_continuation_uri():
+    from auditfast.clients.powerbi import PowerBIClient
+
+    client = PowerBIClient("pbi")
+    continuation = f"{client.BASE}/admin/activityevents?continuationToken=next"
+    session = _SequenceGetSession([
+        _FakeResponse(200, {
+            "activityEventEntities": [{"Id": "first"}],
+            "continuationUri": continuation,
+        }),
+        _FakeResponse(200, {"activityEventEntities": [{"Id": "second"}]}),
+    ])
+    client._session = session
+
+    rows, readable = client.activity_events(days_back=1)
+
+    assert readable is True
+    assert [row["Id"] for row in rows] == ["first", "second"]
+    assert session.calls[1] == continuation
+
+
 # -- token refresh tests -------------------------------------------------------
 
 class _CountingFakeSession:

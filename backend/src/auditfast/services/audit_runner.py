@@ -68,6 +68,7 @@ class AuditRunner:
         check_set: str = "standard",
         admin_categories: list[str] | None = None,
         admin_settings: dict | None = None,
+        admin_options: dict[str, Any] | None = None,
     ) -> AuditJob:
         """Accept an audit and start it in the background."""
         is_admin = check_set == "admin"
@@ -84,6 +85,7 @@ class AuditRunner:
                 "source": source,
                 "check_set": check_set,
                 "admin_categories": admin_categories or [],
+                "admin_options": admin_options or {},
             },
             # An elevated run has no interactive checks — they live in the
             # standard registry — so it is never given a questionnaire to answer.
@@ -110,6 +112,7 @@ class AuditRunner:
                 check_set=check_set,
                 admin_categories=admin_categories,
                 admin_settings=admin_settings,
+                admin_options=admin_options,
                 parent_correlation_id=correlation_id.get(),
             )
         )
@@ -224,6 +227,7 @@ class AuditRunner:
         check_set: str = "standard",
         admin_categories: list[str] | None = None,
         admin_settings: dict | None = None,
+        admin_options: dict[str, Any] | None = None,
         parent_correlation_id: str = "-",
     ) -> None:
         """Run one audit to completion, recording success or failure."""
@@ -270,6 +274,7 @@ class AuditRunner:
                         audit_service.run_admin_audit,
                         project_path,
                         admin_categories,
+                        admin_options,
                         workspaces,
                         out_dir,
                         token,

@@ -107,6 +107,7 @@ async def submit_audit(
         check_set=request.check_set,
         admin_categories=request.admin_categories,
         admin_settings=request.admin_settings,
+        admin_options=request.admin_options,
     )
     return AuditAccepted(
         audit_id=job.id, status=job.status, submitted_at=job.submitted_at
