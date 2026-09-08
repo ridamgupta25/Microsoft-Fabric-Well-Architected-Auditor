@@ -123,6 +123,29 @@ def test_plan_low_confidence_marks_fetch_plan_optional(monkeypatch):
     assert check.fetch_plan.mandatory is False
 
 
+def test_plan_unrecognised_with_ai_on_builds_generic_fetch_plan(monkeypatch):
+    # Open-ended custom check that matches no catalog field: with AI on it must NOT
+    # dead-end at PENDING with no plan — it gets a generic fetch plan so the pipeline
+    # can generate fetch code / code-gen against the crawled KB.
+    monkeypatch.setattr(kb_identifier_agent, "identify", lambda _p, **_k: (None, 0.0, "none"))
+    monkeypatch.setattr(kb_identifier_agent, "is_enabled", lambda ai=None: True)
+    session = CustomCheckSession()
+    check = plan(_check("workspace should have only 10 notebooks"), session)
+    assert check.fetch_plan is not None
+    assert check.fetch_plan.field.startswith("custom_")
+    assert check.fetch_plan.mandatory is False
+
+
+def test_plan_unrecognised_with_ai_off_stays_pending(monkeypatch):
+    # AI off: nothing recognised and no LLM to generate code -> left PENDING, no plan.
+    monkeypatch.setattr(kb_identifier_agent, "identify", lambda _p, **_k: (None, 0.0, "none"))
+    monkeypatch.setattr(kb_identifier_agent, "is_enabled", lambda ai=None: False)
+    session = CustomCheckSession()
+    check = plan(_check("workspace should have only 10 notebooks"), session)
+    assert check.lifecycle_status is LifecycleStatus.PENDING
+    assert check.fetch_plan is None
+
+
 # -- plan: per-workspace presence ----------------------------------------------
 
 def test_plan_fetches_only_workspaces_missing_the_field():
