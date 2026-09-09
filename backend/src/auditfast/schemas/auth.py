@@ -104,6 +104,18 @@ class DiagnosticSample(BaseModel):
     roles_status: int | None = None
 
 
+class AdminReadiness(BaseModel):
+    """What the signed-in token can read for elevated workspace checks."""
+
+    connections_status: int | None = None
+    gateways_status: int | None = None
+    member_workspaces: int = 0
+    sampled_workspaces: int = 0
+    role_assignments_readable: bool = False
+    connections_readable: bool = False
+    gateways_readable: bool = False
+
+
 class DiagnosticsResponse(BaseModel):
     """Per-resource HTTP status codes, so partial permissions are visible."""
 
@@ -111,5 +123,6 @@ class DiagnosticsResponse(BaseModel):
     count: int = 0
     samples: list[DiagnosticSample] = Field(default_factory=list)
     error: str | None = None
+    admin: AdminReadiness | None = None
     granted_scopes: str = ""
     token_audience: str = ""

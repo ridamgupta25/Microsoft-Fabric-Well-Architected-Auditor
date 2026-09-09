@@ -370,6 +370,65 @@ export interface AuditRequest {
   source?: AuditSource;
   /** Uploaded snapshots to audit, when `source` is `kb`. */
   snapshots?: Record<string, unknown>[];
+  /**
+   * `standard` runs the ordinary deterministic library. `admin` runs ONLY the
+   * elevated-access families named in `admin_categories` — an independent run
+   * with its own crawl and its own score, never mixed with a standard audit.
+   */
+  check_set?: CheckSet;
+  /** For `check_set: "admin"`: which elevated families to run. */
+  admin_categories?: string[];
+  /**
+   * Reviewer-supplied answers layered over the project YAML for an elevated
+   * run. These name things Fabric cannot report — which workspaces are
+   * production, which group is the developers / operations / report readers.
+   */
+  admin_settings?: AdminSettings;
+  /** Manual confirmations and scope inputs used only by elevated checks. */
+  admin_options?: Record<string, unknown>;
+}
+
+/**
+ * The six inputs the elevated checks cannot get from Fabric.
+ *
+ * Three checks compare role assignments against a name only the reviewer knows,
+ * and two more need a human to confirm something the API does not expose at all
+ * (app audiences, gateway machine sizing). Left empty, those checks report N/A
+ * rather than guessing.
+ */
+export interface AdminSettings {
+  production_workspaces?: string[];
+  developer_groups?: string[];
+  operations_groups?: string[];
+  report_consumer_groups?: string[];
+  app_access_reviewed?: boolean;
+  gateway_sizing_confirmed?: boolean;
+  code_scan_clean?: boolean;
+  /** Which workspace holds the Fabric Capacity Metrics app — a search hint. */
+  capacity_metrics_workspace?: string;
+  /**
+   * How the app's semantic model is recognised, as a case-insensitive substring
+   * of its name. A filter, not a hint: a value matching nothing makes 12.2.1
+   * report the app as missing.
+   */
+  capacity_metrics_model?: string;
+  /** The client's working day in UTC, used to split busy from quiet hours. */
+  capacity_peak_start_hour?: number;
+  capacity_peak_end_hour?: number;
+  metrics_app_monitored?: boolean;
+  analysis_documented?: boolean;
+  throttling_tracked?: boolean;
+}
+
+export type CheckSet = "standard" | "admin";
+
+/** One elevated-access family offered on the run-selection screen. */
+export interface AdminCategoryInfo {
+  category: string;
+  checks: number;
+  /** False when no checks are registered for it yet. */
+  available: boolean;
+  pillars: string[];
 }
 
 export interface AuditAccepted {
@@ -454,6 +513,13 @@ export interface AuditReport {
   layers: string[];
   counts: Record<string, number>;
   total_scored: number;
+  /**
+   * Which library produced these numbers: `standard` (the deterministic audit)
+   * or `admin` (an independent elevated-access run). The two never mix.
+   */
+  check_set?: CheckSet;
+  /** For an elevated run, the families it covered. Empty for a standard audit. */
+  admin_categories?: string[];
   results: CheckResult[];
   /** Project workspace groups (cross-workspace). Empty for isolated-only runs. */
   groups?: WorkspaceGroup[];
@@ -640,4 +706,26 @@ export interface Diagnostics {
   count: number;
   samples: DiagnosticSample[];
   error?: string | null;
+  /** What the signed-in token can read for the elevated-access checks. */
+  admin?: AdminReadiness;
+  granted_scopes?: string;
+  token_audience?: string;
+}
+
+/**
+ * Whether this token clears the bar for each elevated-access family.
+ *
+ * These fail independently: a workspace Admin with no gateway role reads role
+ * assignments but not gateways, so the screen enables each family on its own
+ * evidence rather than on one blanket "are you an admin?" answer.
+ */
+export interface AdminReadiness {
+  connections_status: number | null;
+  gateways_status: number | null;
+  /** Sampled workspaces whose role assignments were readable (Member or higher). */
+  member_workspaces: number;
+  sampled_workspaces: number;
+  role_assignments_readable: boolean;
+  connections_readable: boolean;
+  gateways_readable: boolean;
 }

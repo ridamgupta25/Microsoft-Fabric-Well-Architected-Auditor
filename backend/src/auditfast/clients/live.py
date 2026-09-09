@@ -23,7 +23,7 @@ import re
 import threading
 import time
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from typing import Any
@@ -120,6 +120,32 @@ _DEFINITION_GATE = threading.BoundedSemaphore(
     _bounded_int_env("AUDITFAST_MAX_INFLIGHT_ITEM_FETCHES", 32, 1, 32)
 )
 
+#: Resources whose reads walk the workspace's item list, so asking for any of
+#: them must also fetch ``/workspaces/{id}/items``.
+#:
+#: Getting this wrong is silent: a resource missing from here still *runs*, finds
+#: no items to iterate, and reports N/A on every workspace — which reads as "not
+#: applicable here" rather than "the crawl never looked". ``DATA_ACCESS_ROLES``
+#: is read per Lakehouse and was exactly that bug on an elevated-only run.
+_ITEM_DERIVED_RESOURCES: frozenset[Resource] = frozenset({
+    Resource.ITEMS,
+    Resource.PIPELINE_DEFINITIONS,
+    Resource.NOTEBOOK_DEFINITIONS,
+    Resource.ENVIRONMENT_DEFINITIONS,
+    Resource.TABLE_SCHEMAS,
+    Resource.SHORTCUTS,
+    Resource.SEMANTIC_MODEL_DEFINITIONS,
+    Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE,
+    Resource.ITEM_RUN_HISTORY,
+    Resource.WAREHOUSE_AUDIT,
+    Resource.LAKEHOUSE_FILES,
+    Resource.ACTIVATOR_DEFINITIONS,
+    Resource.DATA_ACCESS_ROLES,
+    # 14.3.6 excludes the semantic models Fabric creates for a Lakehouse or
+    # Warehouse, which it recognises by their sharing that item's name.
+    Resource.ADMIN_SCANNER,
+})
+
 
 class LiveFabricProvider:
     """Reads a live Fabric tenant with a delegated, read-only OAuth2 token."""
@@ -167,6 +193,23 @@ class LiveFabricProvider:
         #: N/A rather than treating unreadable Files sections as empty.
         self._storage_token = storage_token
         self._onelake_client = None
+        #: Tenant-wide admin calls would otherwise repeat once per selected
+        #: workspace. Cache their normalized read outcome for this provider.
+        self._admin_cache: dict[str, tuple[Any, bool]] = {}
+        #: Which workspace holds the Fabric Capacity Metrics app, as supplied by
+        #: the reviewer. The app can be installed anywhere and no API reports
+        #: where, so this is a hint, not a filter: it is searched first and the
+        #: rest of the tenant still follows, so a wrong name costs only ordering.
+        self.capacity_metrics_workspace: str = ""
+        #: How the Capacity Metrics semantic model is recognised, by name. Unlike
+        #: the workspace hint this is a filter: the stock app, FUAM and a renamed
+        #: install carry different names, and a value matching nothing reports
+        #: "not deployed" for an estate that monitors its capacity properly.
+        self.capacity_metrics_model: str = "Capacity Metrics"
+        #: The client's working day, on a 24-hour clock. Metrics-model times are
+        #: UTC, so a client elsewhere needs these shifted or 12.1.2's busy/quiet
+        #: split measures the wrong half of the day.
+        self.capacity_peak_hours: tuple[int, int] = (8, 18)
 
     # -- transport -------------------------------------------------------------
     def _get(self, path: str) -> tuple[int | None, Any]:
@@ -721,6 +764,89 @@ class LiveFabricProvider:
             "status": "unknown",
         }
 
+    def _gateways(self) -> tuple[list[dict], bool]:
+        """List the gateways this caller administers, with their members.
+
+        An elevated read: ``Gateway.Read.All`` plus a role on each gateway, so
+        the list holds only the gateways the caller can see. ``known`` is False
+        when the list call itself failed, because "we could not ask" and "there
+        are none" must never look the same in a report.
+        """
+        rows, known = self._values("/gateways")
+        if not known:
+            return [], False
+        gateways = []
+        for row in rows:
+            gateway_id = row.get("id")
+            if not gateway_id:
+                continue
+            members, _ = self._values(f"/gateways/{gateway_id}/members")
+            gateways.append({
+                "id": gateway_id,
+                "display_name": row.get("displayName", ""),
+                "type": row.get("type", ""),
+                "version": row.get("version", ""),
+                "number_of_member_gateways": row.get("numberOfMemberGateways"),
+                "load_balancing_setting": row.get("loadBalancingSetting", ""),
+                # Only shape is kept: how many machines back this gateway and
+                # whether each is enabled. Never a credential or a host name.
+                "members": [
+                    {
+                        "display_name": m.get("displayName", ""),
+                        "enabled": m.get("enabled"),
+                        "version": m.get("version", ""),
+                    }
+                    for m in members if isinstance(m, dict)
+                ],
+            })
+        return gateways, True
+
+    def _data_access_roles(self, workspace_id: str, item_id: str) -> tuple[list[dict], bool]:
+        """List a Lakehouse's OneLake data access roles (name, members, permissions).
+
+        Returns ``(roles, known)``. The status split matters more here than
+        elsewhere: Fabric answers **404** when the Lakehouse has no data access
+        roles configured at all, and that is precisely the finding 6.2.6 looks
+        for — "workspace access alone decides who reads the data". Treating it as
+        a read failure would mark the resource unavailable and report N/A on the
+        one estate the check exists to catch.
+
+        Only a permission denial or a transient fault is genuinely "could not
+        ask".
+        """
+        status, body = self._get(
+            f"/workspaces/{workspace_id}/items/{item_id}/dataAccessRoles"
+        )
+        if status in (400, 404):
+            # No data access roles defined on this Lakehouse. A real answer.
+            return [], True
+        if status != 200 or not isinstance(body, dict):
+            log.warning("lakehouse %s dataAccessRoles -> HTTP %s", item_id, status)
+            return [], False
+        roles = []
+        for row in body.get("value") or []:
+            members = row.get("members") or {}
+            entra = members.get("microsoftEntraMembers") or []
+            item_access = members.get("fabricItemMembers") or []
+            name = str(row.get("name") or "")
+            roles.append({
+                "name": name,
+                # A "Default*" role is the one Fabric creates itself — it is not
+                # evidence anyone scoped access, so the check counts only the
+                # roles a human defined.
+                "built_in": name.startswith("Default"),
+                "members": len(entra) + len(item_access),
+                # Individuals named directly in a role are the same stale-access
+                # problem as individuals holding a workspace role: nobody removes
+                # them when the person moves on.
+                "individuals": sum(
+                    1 for member in entra
+                    if isinstance(member, dict) and member.get("objectType") == "User"
+                ),
+                "permissions": len(row.get("decisionRules") or []),
+            })
+        return roles, True
+
     def _item_shortcuts(self, workspace_id: str, item_id: str) -> tuple[list[dict], bool]:
         """List an item's OneLake shortcuts (name/path/target type), all pages.
 
@@ -1253,6 +1379,91 @@ class LiveFabricProvider:
                 self._powerbi_client = PowerBIClient(self._powerbi_token, timeout=self._timeout)
         return self._powerbi_client
 
+    def _cached_admin(self, key: str, loader) -> tuple[Any, bool]:
+        with self._lock:
+            cached = self._admin_cache.get(key)
+        if cached is not None:
+            return cached
+        value = loader()
+        with self._lock:
+            self._admin_cache.setdefault(key, value)
+            return self._admin_cache[key]
+
+    def _tenant_domains(self) -> tuple[list[dict], bool]:
+        domains, known = self._values("/admin/domains")
+        if not known:
+            return [], False
+        normalized: list[dict] = []
+        for domain in domains:
+            domain_id = str(domain.get("id") or "")
+            rows, readable = self._values(f"/admin/domains/{domain_id}/workspaces")
+            if not readable:
+                return normalized, False
+            normalized.append({
+                "id": domain_id,
+                "name": domain.get("displayName") or domain.get("name") or domain_id,
+                "workspace_ids": [str(row.get("id") or row.get("workspaceId") or "")
+                                  for row in rows if row.get("id") or row.get("workspaceId")],
+            })
+        return normalized, True
+
+    #: Names that mean "Fabric or an app made this", not "someone built this to
+    #: be trusted". The notebook leaves them out of 14.3.6's population.
+    _ENDORSEMENT_EXCLUDE_KEYWORDS = ("usage metrics", "report usage", "template app")
+
+    @staticmethod
+    def _endorsement_scan(payload: dict, workspace_id: str,
+                          items: Sequence[Item] = ()) -> dict:
+        """Collect the semantic models and reports 14.3.6 judges for endorsement.
+
+        Two exclusions, both from the notebook, and both there to stop the score
+        being dragged down by content nobody is expected to endorse:
+
+        * **Default semantic models.** Every Lakehouse and Warehouse gets one
+          created automatically, carrying the same name as the item. Nobody
+          endorses those, so a workspace with six Lakehouses would otherwise
+          score 0 however well its real models are badged.
+        * **Usage-metrics and template-app content**, matched by name.
+
+        What is excluded is reported alongside the population, so a reviewer can
+        see the judged set rather than trusting the filter.
+        """
+        auto = {
+            (item.display_name or "").strip().lower()
+            for item in items
+            if item.type in ("Lakehouse", "Warehouse") and item.display_name
+        }
+        judged: list[dict] = []
+        excluded: list[dict] = []
+        for workspace in payload.get("workspaces", []) or []:
+            if str(workspace.get("id") or "") != workspace_id:
+                continue
+            for kind in ("datasets", "reports"):
+                for item in workspace.get(kind, []) or []:
+                    detail = item.get("endorsementDetails") or {}
+                    name = item.get("name") or item.get("displayName") or ""
+                    kind_label = "SemanticModel" if kind == "datasets" else "Report"
+                    row = {
+                        "id": item.get("id"),
+                        "name": name,
+                        "type": kind_label,
+                        "endorsement": detail.get("endorsement") or "None",
+                    }
+                    low = name.strip().lower()
+                    why = []
+                    if kind_label == "SemanticModel" and low in auto:
+                        why.append("created automatically for a Lakehouse or Warehouse")
+                    word = next(
+                        (k for k in LiveFabricProvider._ENDORSEMENT_EXCLUDE_KEYWORDS
+                         if k in low), None)
+                    if word:
+                        why.append(f"name contains '{word}'")
+                    if why:
+                        excluded.append({**row, "excluded_because": "; ".join(why)})
+                    else:
+                        judged.append(row)
+        return {"items": judged, "excluded": excluded}
+
     def _onelake(self):
         """Return a OneLake ADLS Gen2 client, or None without a Storage token."""
         if self._onelake_client is not None:
@@ -1514,6 +1725,71 @@ class LiveFabricProvider:
             deployment_pipeline=bool(workspace.get("assignedToDeploymentPipeline")),
         )
 
+        if Resource.TENANT_SETTINGS in wanted:
+            pbi = self._powerbi()
+            if pbi is None:
+                ctx.unavailable.add(Resource.TENANT_SETTINGS)
+            else:
+                ctx.tenant_settings, readable = self._cached_admin(
+                    "tenant_settings", pbi.tenant_settings
+                )
+                if not readable:
+                    ctx.unavailable.add(Resource.TENANT_SETTINGS)
+
+        if Resource.TENANT_DOMAINS in wanted:
+            ctx.tenant_domains, readable = self._cached_admin(
+                "tenant_domains", self._tenant_domains
+            )
+            if not readable:
+                ctx.unavailable.add(Resource.TENANT_DOMAINS)
+
+        if Resource.ADMIN_ACTIVITY in wanted:
+            pbi = self._powerbi()
+            if pbi is None:
+                ctx.unavailable.add(Resource.ADMIN_ACTIVITY)
+            else:
+                ctx.activity_events, readable = self._cached_admin(
+                    "activity_events", pbi.activity_events
+                )
+                if not readable:
+                    ctx.unavailable.add(Resource.ADMIN_ACTIVITY)
+
+        # The endorsement scan is *filtered* by the workspace's item list (default
+        # semantic models share their Lakehouse's name), so the payload is held
+        # here and turned into ctx.admin_scan once the item list has been read.
+        scanner_payload: dict | None = None
+        if Resource.ADMIN_SCANNER in wanted:
+            pbi = self._powerbi()
+            if pbi is None:
+                ctx.unavailable.add(Resource.ADMIN_SCANNER)
+            else:
+                payload, readable = pbi.admin_scan(workspace_id)
+                scanner_payload = payload
+                if not readable:
+                    ctx.unavailable.add(Resource.ADMIN_SCANNER)
+
+        if Resource.CAPACITY_METRICS in wanted:
+            pbi = self._powerbi()
+            if pbi is None:
+                ctx.unavailable.add(Resource.CAPACITY_METRICS)
+            else:
+                # The reviewer's answers: where the app lives (an ordering hint),
+                # how its model is named (a filter), and the working day the
+                # busy/quiet split is measured against.
+                hint = self.capacity_metrics_workspace
+                model = self.capacity_metrics_model
+                peak_start, peak_end = self.capacity_peak_hours
+                # Every input is part of the identity of the answer, so a run
+                # that changes one is not served the previous run's result.
+                key = (f"capacity_metrics:{hint.strip().lower()}:"
+                       f"{model.strip().lower()}:{peak_start}:{peak_end}")
+                ctx.capacity_metrics, readable = self._cached_admin(
+                    key,
+                    lambda: pbi.capacity_metrics(hint, model, peak_start, peak_end),
+                )
+                if not readable:
+                    ctx.unavailable.add(Resource.CAPACITY_METRICS)
+
         if Resource.CONNECTIONS in wanted:
             rows, known = self._values("/connections")
             ctx.connections = [
@@ -1524,6 +1800,12 @@ class LiveFabricProvider:
             if not known:
                 ctx.unavailable.add(Resource.CONNECTIONS)
             log.info("fetch %s: %d connection records read", workspace_id, len(ctx.connections))
+
+        if Resource.GATEWAYS in wanted:
+            ctx.gateways, known = self._gateways()
+            if not known:
+                ctx.unavailable.add(Resource.GATEWAYS)
+            log.info("fetch %s: %d gateway(s) read", workspace_id, len(ctx.gateways))
 
         # Report → semantic-model bindings (Power BI Get Reports In Group). One
         # list call, no per-report fetch: only id/name/datasetId are retained.
@@ -1538,20 +1820,7 @@ class LiveFabricProvider:
 
         # Pipeline, notebook, and table reads all walk the item list, so fetch it
         # whenever any item-derived resource was asked for.
-        if wanted & {
-            Resource.ITEMS,
-            Resource.PIPELINE_DEFINITIONS,
-            Resource.NOTEBOOK_DEFINITIONS,
-            Resource.ENVIRONMENT_DEFINITIONS,
-            Resource.TABLE_SCHEMAS,
-            Resource.SHORTCUTS,
-            Resource.SEMANTIC_MODEL_DEFINITIONS,
-            Resource.SEMANTIC_MODEL_REFRESH_SCHEDULE,
-            Resource.ITEM_RUN_HISTORY,
-            Resource.WAREHOUSE_AUDIT,
-            Resource.LAKEHOUSE_FILES,
-            Resource.ACTIVATOR_DEFINITIONS,
-        }:
+        if wanted & _ITEM_DERIVED_RESOURCES:
             rows, known = self._values(f"/workspaces/{workspace_id}/items")
             ctx.items = [Item.from_api(row) for row in rows]
             if not known:
@@ -1571,6 +1840,13 @@ class LiveFabricProvider:
                     log.info("fetch %s: %d report binding(s) recovered from Fabric "
                              "item definitions (no Power BI token needed)",
                              workspace_id, len(bindings))
+
+        # Needs the item list above: the models Fabric auto-creates for a
+        # Lakehouse or Warehouse are recognised by name, and counting them would
+        # drag 14.3.6 down for content nobody is expected to endorse.
+        if scanner_payload is not None:
+            ctx.admin_scan = self._endorsement_scan(
+                scanner_payload, workspace_id, ctx.items)
 
         # Per-item run/refresh recency (last_run_utc) plus the per-workspace
         # semantic-model created date. Fetched whenever a recency-needing resource
@@ -1882,6 +2158,26 @@ class LiveFabricProvider:
             log.info("fetch %s: %d shortcuts read (%d of %d listings failed)",
                      workspace_id, total, failed, attempted)
 
+        if Resource.DATA_ACCESS_ROLES in wanted:
+            role_lakehouses = [i for i in ctx.items if i.type == "Lakehouse"]
+            fetched = self._fetch_items_parallel(
+                role_lakehouses,
+                lambda it: self._data_access_roles(workspace_id, it.id))
+            attempted = failed = 0
+            for item, (roles, known) in zip(role_lakehouses, fetched, strict=True):
+                attempted += 1
+                if not known:
+                    failed += 1
+                    continue
+                # Recorded even when empty: a Lakehouse with *no* data access
+                # role is the finding 6.2.6 is looking for, and dropping it would
+                # make that indistinguishable from an unreadable one.
+                ctx.data_access_roles[item.display_name or item.id] = roles
+            if attempted and failed == attempted:
+                ctx.unavailable.add(Resource.DATA_ACCESS_ROLES)
+            log.info("fetch %s: data access roles read for %d of %d lakehouse(s)",
+                     workspace_id, attempted - failed, attempted)
+
         # Semantic-model measures + relationships, parsed from the TMSL definition.
         if Resource.SEMANTIC_MODEL_DEFINITIONS in wanted:
             models = [i for i in ctx.items if i.type == "SemanticModel"]
@@ -1983,10 +2279,13 @@ class LiveFabricProvider:
 
         workspaces = body.get("value") or []
         result["count"] = len(workspaces)
+        member_of = 0
         for workspace in workspaces[:max_workspaces]:
             workspace_id = workspace.get("id")
             items_status, items_body = self._get(f"/workspaces/{workspace_id}/items")
             roles_status, _ = self._get(f"/workspaces/{workspace_id}/roleAssignments")
+            if roles_status == 200:
+                member_of += 1
             items = (items_body or {}).get("value", []) if items_status == 200 else []
             result["samples"].append({
                 "name": workspace.get("displayName", workspace_id),
@@ -1995,4 +2294,30 @@ class LiveFabricProvider:
                 "pipelines": sum(1 for i in items if i.get("type") == "DataPipeline"),
                 "roles_status": roles_status,
             })
+
+        result["admin"] = self._probe_admin(member_of, len(result["samples"]))
         return result
+
+    def _probe_admin(self, member_of: int, sampled: int) -> dict:
+        """Can this token read what the elevated-access checks need?
+
+        Three independent capabilities, probed with one cheap call each, because
+        they fail independently: a workspace Admin with no gateway role reads
+        role assignments but not gateways.
+
+        ``roleAssignments`` returning 200 is the practical test for "Member or
+        higher" — the role itself is not exposed anywhere the caller can read, so
+        the read *is* the permission check. It is sampled over the same few
+        workspaces the caller already probed, so this adds no extra requests.
+        """
+        connections_status, _ = self._get("/connections")
+        gateways_status, _ = self._get("/gateways")
+        return {
+            "connections_status": connections_status,
+            "gateways_status": gateways_status,
+            "member_workspaces": member_of,
+            "sampled_workspaces": sampled,
+            "role_assignments_readable": member_of > 0,
+            "connections_readable": connections_status == 200,
+            "gateways_readable": gateways_status == 200,
+        }

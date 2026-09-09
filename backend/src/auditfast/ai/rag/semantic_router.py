@@ -150,7 +150,7 @@ class SemanticRouter:
         self.store.index(_DEFAULT_CHECKS, items, version=version)
         return bool(items)
 
-    def _direction_check(self, prompt: str, matches) -> "IntentDecision | None":
+    def _direction_check(self, prompt: str, matches) -> IntentDecision | None:
         """Ask the Intent Critic whether a keyword hit is the SAME direction.
 
         A Stage-1 hit shares wording but may be the opposite intent ("enabled" vs

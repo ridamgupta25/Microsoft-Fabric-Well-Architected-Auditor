@@ -120,6 +120,23 @@ export function ReportPage() {
   const isolatedRows = Object.entries(report.by_workspace).filter(
     ([name]) => !groupedKeys.has(name),
   );
+  const workspaceCheckCounts = new Map<string, { total: number; na: number }>();
+  for (const result of report.results) {
+    const counts = workspaceCheckCounts.get(result.workspace) ?? { total: 0, na: 0 };
+    counts.total += 1;
+    if (result.status === "N/A") counts.na += 1;
+    workspaceCheckCounts.set(result.workspace, counts);
+  }
+  const elevatedLimitations = report.check_set === "admin"
+    ? Object.entries(
+        report.results
+          .filter((result) => result.status === "N/A")
+          .reduce<Record<string, number>>((reasons, result) => {
+            reasons[result.evidence] = (reasons[result.evidence] ?? 0) + 1;
+            return reasons;
+          }, {}),
+      )
+    : [];
 
   return (
     <div className="space-y-6">
@@ -191,6 +208,23 @@ export function ReportPage() {
               </tbody>
             </table>
           </div>
+        </section>
+      )}
+
+      {elevatedLimitations.length > 0 && (
+        <section className="rounded-md border border-amber-200 bg-amber-50 p-4 dark:border-amber-900 dark:bg-amber-950">
+          <h2 className="text-base font-semibold text-amber-900 dark:text-amber-300">
+            Elevated checks not assessed ({report.counts["N/A"] ?? 0})
+          </h2>
+          <p className="mt-1 text-sm text-amber-800 dark:text-amber-400">
+            These checks ran but could not read the required administrator data, so they are N/A
+            and excluded from the score.
+          </p>
+          <ul className="mt-3 space-y-1 text-sm text-amber-900 dark:text-amber-300">
+            {elevatedLimitations.map(([reason, count]) => (
+              <li key={reason}>{count} check{count === 1 ? "" : "s"}: {reason}</li>
+            ))}
+          </ul>
         </section>
       )}
 
@@ -310,7 +344,12 @@ export function ReportPage() {
                   <tr key={name}>
                     <td className="font-medium">{name}</td>
                     <td><span className="badge bg-slate-100 dark:bg-slate-800">{score.layer}</span></td>
-                    <td>{score.count}</td>
+                    <td>
+                      {workspaceCheckCounts.get(name)?.total ?? score.count} run · {score.count} scored
+                      {(workspaceCheckCounts.get(name)?.na ?? 0) > 0
+                        ? ` · ${workspaceCheckCounts.get(name)!.na} N/A`
+                        : ""}
+                    </td>
                     <td><ScoreBar pct={score.pct} /></td>
                   </tr>
                 ))}
@@ -361,7 +400,15 @@ export function ReportPage() {
                                 "—"
                               )}
                             </td>
-                            <td>{score ? score.count : "—"}</td>
+                            <td>
+                              {score && key
+                                ? `${workspaceCheckCounts.get(key)?.total ?? score.count} run · ${score.count} scored${
+                                    (workspaceCheckCounts.get(key)?.na ?? 0) > 0
+                                      ? ` · ${workspaceCheckCounts.get(key)!.na} N/A`
+                                      : ""
+                                  }`
+                                : "—"}
+                            </td>
                             <td>
                               {score ? (
                                 <ScoreBar pct={score.pct} />
@@ -399,7 +446,12 @@ export function ReportPage() {
                         <tr key={name}>
                           <td className="font-medium">{name}</td>
                           <td><span className="badge bg-slate-100 dark:bg-slate-800">{score.layer}</span></td>
-                          <td>{score.count}</td>
+                          <td>
+                            {workspaceCheckCounts.get(name)?.total ?? score.count} run · {score.count} scored
+                            {(workspaceCheckCounts.get(name)?.na ?? 0) > 0
+                              ? ` · ${workspaceCheckCounts.get(name)!.na} N/A`
+                              : ""}
+                          </td>
                           <td><ScoreBar pct={score.pct} /></td>
                         </tr>
                       ))}

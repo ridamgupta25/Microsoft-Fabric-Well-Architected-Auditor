@@ -15,6 +15,7 @@ import { getHealth } from "@/services/catalogService";
 const NAV = [
   { to: "/", label: "Dashboard", end: true },
   { to: "/run", label: "Run audit" },
+  { to: "/run-admin", label: "Admin checks" },
   { to: "/catalog", label: "Checks" },
   { to: "/checklist", label: "Checklist" },
   { to: "/history", label: "History" },

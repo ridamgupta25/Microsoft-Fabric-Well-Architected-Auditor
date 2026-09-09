@@ -14,7 +14,6 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, status
 
 from ...ai.orchestrator.ai_config import AiConfig
-from ...services import auth_service
 from ...schemas.custom_checks import (
     AiConfigIn,
     CustomChecksRequest,
@@ -22,7 +21,7 @@ from ...schemas.custom_checks import (
     VerifyAiRequest,
     VerifyAiResult,
 )
-from ...services import custom_checks_service
+from ...services import auth_service, custom_checks_service
 
 router = APIRouter(prefix="/custom-checks", tags=["custom-checks"])
 

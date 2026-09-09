@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 
-from ..enums import Automation, Layer, Pillar, Resource, Scope, Severity
+from ..enums import AdminCategory, Automation, Layer, Pillar, Resource, Scope, Severity
 from ..models import CheckContext, CheckOption, CheckSpec, GroupCheckSpec, GroupContext
 
 
@@ -358,4 +358,101 @@ def group_check(
         return fn
 
     return decorate
+
+
+# -- elevated-access (admin) checks -------------------------------------------
+
+#: The process-wide registry of elevated-access checks, kept **separate from**
+#: :data:`REGISTRY` for the same reason :data:`GROUP_REGISTRY` is: a registry the
+#: standard audit never reads cannot leak into a standard audit.
+#:
+#: A flag on the shared registry would have to be honoured by every existing
+#: ``registry.select()`` call site; one missed call site and an elevated check
+#: silently joins the deterministic scorecard and moves the score. Holding them
+#: apart makes that impossible, and keeps ``len(REGISTRY)`` — a pinned test
+#: value — unchanged.
+#:
+#: The engine needs no change to run these: :func:`auditfast.core.engine.run_audit`
+#: already takes ``registry=``, and this is an ordinary :class:`CheckRegistry`.
+ADMIN_REGISTRY = CheckRegistry()
+
+
+def admin_check(
+    *,
+    id: str,
+    ref: str,
+    title: str,
+    pillar: Pillar,
+    category: AdminCategory,
+    scope: Scope = Scope.WORKSPACE,
+    severity: Severity = Severity.MEDIUM,
+    layers: Sequence[Layer] = (Layer.ANY,),
+    requires: Sequence[Resource] = (),
+    weight: float = 1.0,
+    description: str = "",
+    required: bool = True,
+    registry: CheckRegistry | None = None,
+) -> Callable:
+    """Register an elevated-access check and return it unchanged.
+
+    Identical to :func:`check` in every respect a check body cares about — same
+    ``CheckContext``, same verdict helpers, same **N/A-not-FAIL** rule — but it
+    lands in :data:`ADMIN_REGISTRY` instead of :data:`REGISTRY`, so it runs only
+    from the explicit elevated run mode and never from a standard audit.
+
+    Args:
+        category: which elevated family this belongs to. This is the whole
+            extension point: register a check with
+            :attr:`~auditfast.core.enums.AdminCategory.TENANT` or ``CAPACITY``
+            and it appears in the catalog, the selection screen and the run mode
+            with no further wiring.
+
+    A check whose data needs a role the signed-in user lacks must still report
+    N/A, never FAIL — "we could not read this" is not "this is misconfigured",
+    and that holds just as strongly here as in the standard library.
+    """
+
+    def decorate(fn: Callable[[CheckContext], object]):
+        target = registry if registry is not None else ADMIN_REGISTRY
+        target.register(
+            CheckSpec(
+                id=id,
+                ref=ref,
+                title=title,
+                pillar=Pillar.for_checklist_ref(ref, pillar),
+                scope=scope,
+                fn=fn,
+                severity=severity,
+                layers=frozenset(layers),
+                requires=frozenset(requires),
+                weight=weight,
+                description=description,
+                required=required,
+                admin_category=category,
+            )
+        )
+        return fn
+
+    return decorate
+
+
+def admin_registry_for(
+    categories: Iterable[AdminCategory] | None = None,
+    *,
+    source: CheckRegistry | None = None,
+) -> CheckRegistry:
+    """A registry holding only the elevated checks in ``categories``.
+
+    ``None`` (or an empty selection) yields **an empty registry, not everything**:
+    running every elevated family because the caller forgot to choose one is
+    exactly the surprise this run mode exists to avoid.
+    """
+    wanted = set(categories or ())
+    narrow = CheckRegistry()
+    if not wanted:
+        return narrow
+    for spec in (source if source is not None else ADMIN_REGISTRY).all():
+        if spec.admin_category in wanted:
+            narrow.register(spec)
+    return narrow
 

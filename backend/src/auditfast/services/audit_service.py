@@ -24,7 +24,7 @@ from ..core.check.helpers import RemediationBook
 from ..core.check.registry import REGISTRY
 from ..core.engine import READ_INCOMPLETE_CHECK_ID
 from ..core.engine import run_audit as run_engine
-from ..core.enums import Layer, Pillar
+from ..core.enums import AdminCategory, Layer, Pillar
 from ..core.models import CheckResult, WorkspaceContext
 from ..core.scoring import aggregate
 from .project import ProjectConfig, load_project, load_remediation
@@ -70,6 +70,12 @@ class AuditRun:
     #: — advisory judging especially — can find this run's files instead of
     #: guessing at the newest thing in the output folder.
     out_dir: str | None = None
+    #: Which library this run used: "standard" (the deterministic audit) or
+    #: "admin" (an independent elevated-access run). Display only — it tells a
+    #: reader which numbers they are looking at, since the two never mix.
+    check_set: str = "standard"
+    #: For an elevated run, the categories it covered. Empty for a standard one.
+    admin_categories: list[str] = field(default_factory=list)
 
 
 # -- provider construction ----------------------------------------------------
@@ -78,7 +84,10 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
                    token_refresher=None, powerbi_token: str | None = None,
                    sql_token: str | None = None, storage_token: str | None = None,
                    sql_token_refresher=None, source: str = "live",
-                   snapshots: Sequence[dict] | None = None):
+                   snapshots: Sequence[dict] | None = None, narrow: bool = False,
+                   capacity_metrics_workspace: str = "",
+                   capacity_metrics_model: str = "",
+                   capacity_peak_hours: tuple[int, int] | None = None):
     """Create the provider for a run.
 
     With ``source="live"`` (the default) every run reads the live tenant, but
@@ -105,6 +114,13 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
 
     ``storage_token`` is an optional Storage-audience token used only for OneLake
     ADLS Gen2 Files listings. Without it, file-layout checks report N/A.
+
+    ``narrow=True`` builds the provider for an elevated ("admin") run. It crawls
+    **only the resources the run asked for** instead of the whole workspace, and
+    keeps its own knowledge base (``AUDITFAST_ADMIN_CACHE_DIR``) entirely
+    separate from the standard one — the two can never serve each other a
+    snapshot. See
+    :class:`~auditfast.services.context_store.NarrowCrawlProvider`.
     """
     settings = get_settings()
     if source == "kb":
@@ -117,6 +133,24 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
                               sql_token=sql_token if settings.sql_endpoint_enabled else None,
                               storage_token=storage_token,
                               sql_token_refresher=sql_token_refresher)
+    live.capacity_metrics_workspace = capacity_metrics_workspace or ""
+    if capacity_metrics_model.strip():
+        live.capacity_metrics_model = capacity_metrics_model.strip()
+    if capacity_peak_hours:
+        live.capacity_peak_hours = capacity_peak_hours
+    if narrow:
+        from .context_store import ContextStore, NarrowCrawlProvider
+
+        store = (
+            ContextStore(settings.resolve(settings.admin_cache_dir))
+            if settings.cache_enabled else None
+        )
+        # Deliberately not wrapped in ArchivingProvider: the standard archive is
+        # a record of full workspace crawls, and a narrow admin snapshot filed
+        # beside them would misrepresent what was read that day.
+        return NarrowCrawlProvider(
+            live, store, ttl_seconds=settings.cache_ttl_seconds, force_refresh=refresh
+        )
     provider = live
     if settings.cache_enabled:
         from .context_store import CachingProvider, ContextStore
@@ -653,6 +687,170 @@ def run_audit(
     return run
 
 
+def _resolve_admin_categories(names: Iterable[str] | None) -> list[AdminCategory]:
+    """Turn requested category names into enum members.
+
+    Unknown names are dropped rather than raising, so a typo narrows the run
+    instead of failing it; an empty result is caught by the caller, which refuses
+    to run rather than falling back to "everything".
+    """
+    resolved: list[AdminCategory] = []
+    for name in names or ():
+        member = AdminCategory.parse(name)
+        if member is not None and member not in resolved:
+            resolved.append(member)
+    return resolved
+
+
+def _peak_hours(settings: dict) -> tuple[int, int] | None:
+    """Read the reviewer's working day, or ``None`` to keep the 08:00-18:00 default.
+
+    A value that is not a whole hour is **ignored rather than clamped**: a typo
+    that silently became 00:00 would still produce a peak/off-peak split, and a
+    confidently wrong number is worse than the documented default.
+    """
+    raw_start = settings.get("capacity_peak_start_hour")
+    raw_end = settings.get("capacity_peak_end_hour")
+    if raw_start is None and raw_end is None:
+        return None
+    try:
+        start = int(raw_start if raw_start is not None else 8)
+        end = int(raw_end if raw_end is not None else 18)
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= start <= 23 and 0 <= end <= 23) or start == end:
+        return None
+    return start, end
+
+
+def run_admin_audit(
+    project_path: str | Path,
+    categories: Iterable[str] | None = None,
+    admin_options: dict | None = None,
+    workspaces: Sequence[dict] | Sequence[str] | None = None,
+    out_dir: str | Path | None = None,
+    token: str | None = None,
+    on_progress: Callable[[dict], None] | None = None,
+    refresh: bool = False,
+    token_refresher=None,
+    powerbi_token: str | None = None,
+    sql_token: str | None = None,
+    storage_token: str | None = None,
+    sql_token_refresher=None,
+    source: str = "live",
+    snapshots: Sequence[dict] | None = None,
+    run_dir: str | Path | None = None,
+    settings_override: dict | None = None,
+) -> AuditRun:
+    """Run **only** the elevated-access checks in ``categories``.
+
+    An independent run, deliberately not a stage of :func:`run_audit`: it has its
+    own crawl, its own report directory and its own score. Keeping it separate is
+    what stops a standard audit's number moving with the signed-in user's
+    privileges — the same estate scores the same whether or not anyone had the
+    Member role that day.
+
+The crawl is narrow **and separate**, which needs the provider's cooperation, not
+just the engine's. The engine already asks for only
+``registry.required_resources()``, but
+:class:`~auditfast.services.context_store.CachingProvider` ignores that and
+crawls the whole workspace so the KB it writes is always complete — which would
+make an elevated run pay for every notebook ``getDefinition``, SQL column read
+and OneLake listing just to read role assignments. So this run builds its
+provider with ``narrow=True``: only the requested resources are fetched, and
+they are cached in the elevated run's **own** knowledge base
+(``AUDITFAST_ADMIN_CACHE_DIR``), which the standard audit never reads.
+
+    Raises:
+        AuditError: when no category resolves, or the resolved categories hold no
+            registered checks. Running nothing silently would look like a clean
+            result, which is the one outcome an audit must never fake.
+    """
+    from ..core.check.registry import admin_registry_for
+
+    resolved = _resolve_admin_categories(categories)
+    if not resolved:
+        raise AuditError(
+            "No elevated-access category selected. Choose at least one of: "
+            + ", ".join(c.value for c in AdminCategory)
+        )
+
+    registry = admin_registry_for(resolved)
+    if not len(registry):
+        raise AuditError(
+            "No checks are registered yet for: "
+            + ", ".join(c.value for c in resolved)
+            + ". Nothing would run, so the audit was not started."
+        )
+
+    config = load_project(project_path)
+    config.settings.update(admin_options or {})
+    if run_dir:
+        out_dir = Path(run_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+    elif out_dir:
+        from .run_output import new_run_dir, prune_empty_runs, run_label
+
+        prune_empty_runs(out_dir)
+        # Label the directory by category so an elevated run is never mistaken
+        # for the standard audit sitting beside it in output/.
+        label = run_label(config.name, workspaces)
+        suffix = "-".join(c.name.lower() for c in resolved)
+        out_dir = new_run_dir(out_dir, f"{label}-admin-{suffix}")
+
+    # The reviewer's answers win over the project YAML. Several checks ask things
+    # Fabric cannot report - which workspace is production, which group is the
+    # developers, where the Capacity Metrics app lives - and the person running
+    # the audit knows them; a YAML edited once per engagement does not. Layered
+    # rather than replaced, so a project that *does* set them keeps working with
+    # nothing supplied.
+    settings = {**config.settings, **(settings_override or {})}
+
+    provider = build_provider(
+        config, token, refresh=refresh, token_refresher=token_refresher,
+        powerbi_token=powerbi_token, sql_token=sql_token,
+        storage_token=storage_token, sql_token_refresher=sql_token_refresher,
+        source=source, snapshots=snapshots, narrow=True,
+        capacity_metrics_workspace=str(settings.get("capacity_metrics_workspace") or ""),
+        capacity_metrics_model=str(settings.get("capacity_metrics_model") or ""),
+        capacity_peak_hours=_peak_hours(settings),
+    )
+    provider = _RunScopedProvider(provider)
+    targets = _resolve_targets(config, workspaces)
+    remediation: RemediationBook = load_remediation(config)
+
+    def _progress(partial: list[CheckResult]) -> None:
+        run = _build_run(config.name, partial)
+        run.check_set = "admin"
+        run.admin_categories = [c.value for c in resolved]
+        report = to_json(run)
+        report["partial"] = True
+        on_progress(report)  # type: ignore[misc]
+
+    raw_results = run_engine(
+        provider,
+        targets,
+        settings,
+        registry=registry,
+        remediation=remediation,
+        on_progress=_progress if on_progress else None,
+    )
+
+    run = _build_run(config.name, raw_results)
+    run.check_set = "admin"
+    run.admin_categories = [c.value for c in resolved]
+    served = bool(getattr(provider, "served_from_cache", False))
+    run.kb = {
+        "source": source,
+        "served_from_cache": served,
+        "refreshing": served and not refresh and source == "live",
+    }
+    if out_dir:
+        run.out_dir = str(out_dir)
+        run.files.update(write_reports(run, out_dir))
+    return run
+
+
 def _write_advisory_bundle(results, contexts, out_dir) -> dict:
     """Write the offline judging artefacts; never fatal to an audit.
 
@@ -934,6 +1132,8 @@ def to_json(run: AuditRun) -> dict:
         "results": [r.to_dict() for r in run.results],
         "groups": run.groups,
         "weighted_by_environment": run.weighted_by_environment,
+        "check_set": run.check_set,
+        "admin_categories": run.admin_categories,
         "kb": run.kb,
         "advisory": {
             "overall": run.advisory_aggregate.get("overall"),

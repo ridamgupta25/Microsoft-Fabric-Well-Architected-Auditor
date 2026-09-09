@@ -21,6 +21,20 @@ from ..core.models import WorkspaceContext
 #: narrow the request.
 ALL_RESOURCES: frozenset[Resource] = frozenset(Resource)
 
+#: Resources only the elevated ("admin") checks read. They need scopes and roles
+#: an ordinary reviewer does not hold (``Gateway.Read.All`` plus a role on each
+#: gateway; ``OneLake.Read.All`` plus a workspace role), so a standard audit must
+#: not request them: it would spend calls on data no standard check reads and
+#: collect 403s that look like findings in the crawl-completeness section.
+ELEVATED_RESOURCES: frozenset[Resource] = frozenset({
+    Resource.GATEWAYS,
+    Resource.DATA_ACCESS_ROLES,
+})
+
+#: What a full *standard* crawl fetches — everything except the elevated reads.
+#: The elevated run asks for its resources explicitly, so nothing is lost.
+STANDARD_RESOURCES: frozenset[Resource] = ALL_RESOURCES - ELEVATED_RESOURCES
+
 
 @runtime_checkable
 class Provider(Protocol):
