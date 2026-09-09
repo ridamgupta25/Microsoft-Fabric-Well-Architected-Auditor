@@ -132,3 +132,79 @@ def test_ignores_non_eligible_check():
     out = generate(check, CustomCheckSession(), generator=_seq_generator(_GOOD), reviewer=None)
     assert out.code_gen is None
     assert out.lifecycle_status is LifecycleStatus.PENDING
+
+
+# -- _coerce_to_check: rescue weak-model "forgot to subclass" mistakes ---------
+
+from auditfast.ai.agents.code_gen_agent import _coerce_to_check
+
+
+def test_coerce_injects_base_when_class_has_no_base():
+    src = "class GitCheck:\n    def evaluate(self, kb):\n        return {}\n"
+    out = _coerce_to_check(src)
+    assert "class GitCheck(BaseAuditCheck):" in out
+
+
+def test_coerce_appends_base_to_other_base():
+    src = "class GitCheck(object):\n    def evaluate(self, kb):\n        return {}\n"
+    out = _coerce_to_check(src)
+    assert "BaseAuditCheck" in out and "object" in out
+
+
+def test_coerce_leaves_proper_subclass_untouched():
+    assert _coerce_to_check(_GOOD) == _GOOD
+
+
+def test_coerce_noop_without_evaluate():
+    src = "x = 1\n"
+    assert _coerce_to_check(src) == src
+
+
+def test_coerce_wraps_bare_evaluate_function():
+    src = (
+        "def evaluate(kb):\n"
+        "    return {'status': 'PASS', 'score': 100.0, 'findings': [], 'recommendations': []}\n"
+    )
+    out = _coerce_to_check(src)
+    assert "class GeneratedCheck(BaseAuditCheck):" in out
+    assert "def evaluate(self, kb):" in out
+
+
+def test_coerce_strips_model_defined_stub_base():
+    # Weak model redefines BaseAuditCheck (shadowing the real one). Strip the stub so
+    # the generated subclass binds to the real injected base and loads.
+    src = (
+        "class BaseAuditCheck:\n"
+        "    def evaluate(self, kb):\n"
+        "        return {}\n"
+        "class GitCheck(BaseAuditCheck):\n"
+        "    check_id = 'chk_git'\n"
+        "    def evaluate(self, kb):\n"
+        "        return {'status': 'PASS', 'score': 100.0, 'findings': [], 'recommendations': []}\n"
+    )
+    out = _coerce_to_check(src)
+    assert "class BaseAuditCheck:" not in out  # stub removed
+    assert "class GitCheck(BaseAuditCheck):" in out  # real subclass kept
+    # And it now actually loads + runs against the real base.
+    check = generate(
+        _eligible_check(), CustomCheckSession(),
+        generator=_seq_generator(out), reviewer=None,
+    )
+    assert check.code_gen.status == "GENERATED"
+
+
+def test_generate_rescues_missing_base_class_in_the_loop():
+    # A generator that "forgets" (BaseAuditCheck) should still succeed thanks to the rescue.
+    no_base = (
+        "class GitChk:\n"
+        "    check_id = 'chk_git'\n"
+        "    def evaluate(self, kb):\n"
+        "        return {'status': 'PASS', 'score': 100.0, 'findings': [], 'recommendations': []}\n"
+    )
+    rescued = _coerce_to_check(no_base)  # what default_generator would now return
+    check = generate(
+        _eligible_check(), CustomCheckSession(),
+        generator=_seq_generator(rescued), reviewer=None,
+    )
+    assert check.code_gen.status == "GENERATED"
+    assert check.code_gen.attempts == 1
