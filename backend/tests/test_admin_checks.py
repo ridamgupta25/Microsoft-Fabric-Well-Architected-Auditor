@@ -702,13 +702,34 @@ def test_personal_gateway_cannot_be_made_redundant():
     assert _run("ADM-GATEWAY-HA", clustered).score == 3
 
 
-def test_onelake_check_reports_a_lakehouse_with_no_data_access_role():
-    """An empty role list is a finding; an unreadable one is not."""
-    governed = _ctx(data_access_roles={"lh": [{"name": "readers", "members": 2}]})
-    assert _run("ADM-ONELAKE-ACCESS", governed).score == 3
+def test_gateway_ladder_matches_the_notebook():
+    """Unclustered scores 0 outright, not a proportional band."""
+    single = {"display_name": "gw1", "type": "OnPremises", "number_of_member_gateways": 1}
+    pair = {"display_name": "gw2", "type": "OnPremises", "number_of_member_gateways": 2}
 
-    ungoverned = _ctx(data_access_roles={"lh": [], "lh2": [{"name": "r"}]})
-    assert _run("ADM-ONELAKE-ACCESS", ungoverned).score == 1
+    assert _run("ADM-GATEWAY-HA", _ctx(gateways=[single])).score == 0
+    assert _run("ADM-GATEWAY-HA", _ctx(gateways=[single, pair])).score == 1
+    # All clustered but sizing unconfirmed caps at 2.
+    assert _run("ADM-GATEWAY-HA", _ctx(gateways=[pair])).score == 2
+
+
+def test_onelake_check_reports_a_lakehouse_with_no_data_access_role():
+    """The notebook's four rungs, including individuals named in a role."""
+    group_role = {"name": "readers", "built_in": False, "members": 2, "individuals": 0}
+    person_role = {"name": "readers", "built_in": False, "members": 1, "individuals": 1}
+
+    assert _run("ADM-ONELAKE-ACCESS", _ctx(data_access_roles={"lh": [group_role]})).score == 3
+    assert _run("ADM-ONELAKE-ACCESS", _ctx(data_access_roles={"lh": [person_role]})).score == 2
+    partial = _ctx(data_access_roles={"lh": [group_role], "lh2": []})
+    assert _run("ADM-ONELAKE-ACCESS", partial).score == 1
+    assert _run("ADM-ONELAKE-ACCESS", _ctx(data_access_roles={"lh": []})).score == 0
+
+
+def test_a_default_role_does_not_count_as_scoped_access():
+    """Fabric creates Default* roles itself; they are not evidence of scoping."""
+    built_in = {"name": "DefaultReader", "built_in": True, "members": 5, "individuals": 0}
+    ctx = _ctx(data_access_roles={"lh": [built_in]})
+    assert _run("ADM-ONELAKE-ACCESS", ctx).score == 0
 
 
 def test_data_access_roles_pulls_the_item_list_with_it():
@@ -721,6 +742,9 @@ def test_data_access_roles_pulls_the_item_list_with_it():
     from auditfast.clients.live import _ITEM_DERIVED_RESOURCES
 
     assert Resource.DATA_ACCESS_ROLES in _ITEM_DERIVED_RESOURCES
+    # 14.3.6 recognises Fabric's auto-created semantic models by their sharing a
+    # Lakehouse or Warehouse name, so it needs the item list for the same reason.
+    assert Resource.ADMIN_SCANNER in _ITEM_DERIVED_RESOURCES
 
 
 def test_a_standard_crawl_does_not_request_elevated_resources():
@@ -782,3 +806,257 @@ def test_capacity_manual_confirmation_promotes_the_metrics_app_score():
 
     assert unconfirmed.score == 2
     assert confirmed.score == 3
+
+
+# -- tenant / capacity ladders -------------------------------------------------
+
+def _tenant(check_id: str, settings=None, **workspace):
+    ws = WorkspaceContext(id="w1", display_name="WS One", layer=Layer.MIXED, **workspace)
+    return ADMIN_REGISTRY.get(check_id).fn(CheckContext(ws, settings or {}, "w1", ws))
+
+
+def test_no_manual_deployments_reads_the_shared_production_setting():
+    """The setting name must match the one the UI and every other check use.
+
+    11.2.3 originally read 'prod_workspaces' while the run screen, the project
+    YAML and the workspace tier all write 'production_workspaces' — so the check
+    was permanently N/A. A silent always-N/A, which is the failure mode this tier
+    has hit three times.
+    """
+    events = [{"Activity": "UpdateDataset", "WorkSpaceName": "WS One"}]
+    assert _tenant("TN-11-2-3", activity_events=events).score is None
+    scored = _tenant(
+        "TN-11-2-3",
+        settings={"production_workspaces": ["WS One"]},
+        activity_events=events,
+    )
+    assert scored.score is not None
+
+
+def test_tenant_checks_do_not_invent_a_third_rung():
+    """7.2.4 caps at 2 and 7.4.1 at 2 — the notebooks have no 3.
+
+    A log recording a change is not a log anyone reviews, and neither is
+    readable from any API. Awarding 3 for an unsettable flag would have been a
+    score nobody could ever earn.
+    """
+    events = [{"Activity": "AddGroupMembers", "UserId": "u@x", "WorkSpaceName": "WS One"}]
+    assert _tenant("TN-7-2-4", activity_events=events).score == 2
+    assert _tenant("TN-7-4-1", activity_events=events).score == 2
+
+
+def test_an_empty_activity_log_is_a_zero_for_export_not_a_one():
+    """The notebook: no events at all means nothing proves the log is capturing."""
+    assert _tenant("TN-7-4-1", activity_events=[]).score == 0
+
+
+def test_audit_coverage_scores_the_number_of_change_kinds_seen():
+    """The notebook's score *is* kinds_seen — 3 kinds, 3 points."""
+    all_three = [
+        {"Activity": "CreateWorkspace"},
+        {"Activity": "AddGroupMembers"},
+        {"Activity": "DeleteDataset"},
+    ]
+    assert _tenant("TN-7-4-2", activity_events=all_three).score == 3
+    assert _tenant("TN-7-4-2", activity_events=[{"Activity": "DeleteDataset"}]).score == 1
+    # An empty log is unknown, not zero coverage.
+    assert _tenant("TN-7-4-2", activity_events=[]).score is None
+
+
+def test_every_tenant_and_capacity_check_is_na_when_its_data_is_unreadable():
+    """Tenant admin refusal is N/A, never FAIL — the tier's central rule."""
+    blind = WorkspaceContext(
+        id="w1", display_name="WS One",
+        unavailable={
+            Resource.TENANT_SETTINGS, Resource.TENANT_DOMAINS,
+            Resource.ADMIN_ACTIVITY, Resource.ADMIN_SCANNER,
+            Resource.CAPACITY_METRICS,
+        },
+    )
+    ctx = CheckContext(blind, {}, "w1", blind)
+    for spec in ADMIN_REGISTRY:
+        if spec.admin_category in (AdminCategory.TENANT, AdminCategory.CAPACITY):
+            verdict = spec.fn(ctx)
+            assert verdict.score is None, f"{spec.id} scored on unreadable data"
+
+
+def test_capacity_metrics_workspace_hint_is_searched_first():
+    """The app can live anywhere; the reviewer's answer orders the search.
+
+    A hint is not a filter — the rest of the tenant still follows, so a wrong
+    name costs ordering rather than a false "app not installed".
+    """
+    from auditfast.clients.powerbi import PowerBIClient
+
+    client = PowerBIClient.__new__(PowerBIClient)
+    seen: list[str] = []
+    client.list_groups = lambda: [  # type: ignore[method-assign]
+        {"id": "a", "name": "Other"},
+        {"id": "b", "name": "Capacity Metrics"},
+    ]
+
+    def _datasets(group_id):
+        seen.append(group_id)
+        return []
+
+    client.list_datasets = _datasets  # type: ignore[method-assign]
+    client.capacity_metrics("Capacity Metrics")
+    assert seen[0] == "b", "the named workspace must be searched first"
+
+
+def _metrics_client(datasets):
+    """A PowerBIClient whose one workspace holds ``datasets``.
+
+    ``execute_queries`` returns an empty body, so the model is *found* but its
+    schema yields no fact table — enough to exercise the name matching without
+    a live tenant.
+    """
+    from auditfast.clients.powerbi import PowerBIClient
+
+    client = PowerBIClient.__new__(PowerBIClient)
+    client.list_groups = lambda: [{"id": "a", "name": "Admin"}]  # type: ignore[method-assign]
+    client.list_datasets = lambda group_id: datasets  # type: ignore[method-assign]
+    client.execute_queries = lambda *a, **k: {}  # type: ignore[method-assign]
+    return client
+
+
+def test_a_renamed_metrics_app_is_found_by_the_reviewers_model_name():
+    """The stock app, FUAM and a renamed install carry different names.
+
+    The name is a *filter*, so getting it wrong reports "not deployed" for an
+    estate that monitors its capacity perfectly well — the one input where a
+    wrong value costs a false finding rather than a slower search.
+    """
+    datasets = [{"id": "m1", "name": "FUAM Capacity Monitoring"}]
+
+    missed, known = _metrics_client(datasets).capacity_metrics("")
+    assert known and missed["model_found"] is False
+    assert missed["model_name_searched"] == "capacity metrics"
+
+    # 12.2.1 must name what it looked for, so the 0 is actionable.
+    verdict = _run("CP-12-2-1", _ctx(capacity_metrics=missed))
+    assert verdict.score == 0
+    assert "capacity metrics" in verdict.evidence
+    assert "model name" in verdict.evidence
+
+    found, _ = _metrics_client(datasets).capacity_metrics("", "FUAM")
+    assert found["model_found"] is True
+
+
+def test_a_blank_model_name_falls_back_to_the_notebook_default():
+    """An empty box must not match every dataset in the tenant."""
+    client = _metrics_client([{"id": "m1", "name": "Sales"}])
+    result, _ = client.capacity_metrics("", "   ")
+    assert result["model_found"] is False
+    assert result["model_name_searched"] == "capacity metrics"
+
+
+def test_the_working_day_may_wrap_past_midnight():
+    """A local working day shifted into UTC routinely wraps.
+
+    09:00-18:00 in UTC+10 is 23:00-08:00 UTC. A naive start <= h < end would
+    call the client's whole working day off-peak and invert 12.1.2.
+    """
+    from auditfast.clients.powerbi import _in_working_day
+
+    assert _in_working_day(9, 8, 18)
+    assert not _in_working_day(20, 8, 18)
+
+    assert _in_working_day(23, 22, 6)
+    assert _in_working_day(2, 22, 6)
+    assert not _in_working_day(12, 22, 6)
+
+    assert not _in_working_day(9, 8, 8), "an empty window is not the whole day"
+
+
+def test_an_unusable_peak_hour_keeps_the_documented_default():
+    """A typo must not silently become midnight and still produce a split."""
+    from auditfast.services.audit_service import _peak_hours
+
+    assert _peak_hours({}) is None
+    assert _peak_hours({"capacity_peak_start_hour": 9,
+                        "capacity_peak_end_hour": 17}) == (9, 17)
+    assert _peak_hours({"capacity_peak_start_hour": 22,
+                        "capacity_peak_end_hour": 6}) == (22, 6)
+    assert _peak_hours({"capacity_peak_start_hour": 25,
+                        "capacity_peak_end_hour": 6}) is None
+    assert _peak_hours({"capacity_peak_start_hour": "morning",
+                        "capacity_peak_end_hour": 6}) is None
+    assert _peak_hours({"capacity_peak_start_hour": 8,
+                        "capacity_peak_end_hour": 8}) is None
+
+
+def test_the_peak_verdict_names_the_window_it_measured():
+    """The times are UTC, so a reader elsewhere needs to see the window."""
+    metrics = {
+        "model_found": True,
+        "peak_split": {"peak": 100.0, "off_peak": 20.0, "window": "22:00-06:00 UTC"},
+    }
+    verdict = _run("CP-12-1-2", _ctx(capacity_metrics=metrics))
+    assert "22:00-06:00 UTC" in verdict.evidence
+
+
+def test_domain_ownership_scores_membership_and_caps_at_two():
+    """6.1.9's rungs 3 and 0 need every workspace at once, so 2 is the ceiling.
+
+    The notebook's own degraded ladder for "crossings could not be assessed" is
+    ``2 if not orphans else 1``, which is exactly this check's situation.
+    """
+    domains = [{"id": "d1", "name": "Finance", "workspace_ids": ["w1", "w9"]}]
+    assert _run("TN-6-1-9", _ctx(tenant_domains=domains)).score == 2
+
+    elsewhere = [{"id": "d1", "name": "Finance", "workspace_ids": ["w9"]}]
+    assert _run("TN-6-1-9", _ctx(tenant_domains=elsewhere)).score == 1
+
+
+def test_domain_ownership_is_na_when_the_tenant_defines_no_domain():
+    """No domains at all is nothing to align against, not a failure."""
+    assert _run("TN-6-1-9", _ctx(tenant_domains=[])).score is None
+
+
+def test_endorsement_leaves_out_default_models_and_usage_metrics():
+    """Counting content nobody endorses would drag a good estate to 0.
+
+    Every Lakehouse gets a same-named semantic model automatically; the
+    notebook excludes them (``INCLUDE_DEFAULT_MODELS = False``) along with
+    usage-metrics and template-app content.
+    """
+    from auditfast.clients.live import LiveFabricProvider
+    from auditfast.core.models import Item
+
+    payload = {"workspaces": [{
+        "id": "w1",
+        "datasets": [
+            {"id": "1", "name": "Sales",
+             "endorsementDetails": {"endorsement": "Certified"}},
+            {"id": "2", "name": "BronzeLake"},
+            {"id": "3", "name": "Usage Metrics Report"},
+        ],
+        "reports": [{"id": "4", "name": "Sales Overview",
+                     "endorsementDetails": {"endorsement": "Promoted"}}],
+    }]}
+    items = [Item(id="lh", type="Lakehouse", display_name="BronzeLake")]
+
+    scan = LiveFabricProvider._endorsement_scan(payload, "w1", items)
+    judged = {row["name"] for row in scan["items"]}
+    assert judged == {"Sales", "Sales Overview"}
+    assert len(scan["excluded"]) == 2
+
+    ctx = _ctx(admin_scan=scan)
+    verdict = _run("TN-14-3-6", ctx)
+    assert verdict.score == 3, "both judged items are endorsed, one Certified"
+    assert "2 auto-created or usage-metrics item(s) excluded" in verdict.evidence
+
+
+def test_endorsement_counts_a_real_model_named_like_no_lakehouse():
+    """The exclusion is by name match, so an ordinary model still counts."""
+    from auditfast.clients.live import LiveFabricProvider
+
+    payload = {"workspaces": [{
+        "id": "w1",
+        "datasets": [{"id": "1", "name": "BronzeLake"}],
+        "reports": [],
+    }]}
+    scan = LiveFabricProvider._endorsement_scan(payload, "w1", [])
+    assert len(scan["items"]) == 1, "no Lakehouse of that name, so it is judged"
+    assert _run("TN-14-3-6", _ctx(admin_scan=scan)).score == 0

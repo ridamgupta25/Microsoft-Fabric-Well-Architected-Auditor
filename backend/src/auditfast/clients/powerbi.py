@@ -366,20 +366,51 @@ class PowerBIClient:
         payload = ScannerApiClient(token, timeout=self._timeout).scan([workspace_id])
         return payload, bool(payload)
 
-    def capacity_metrics(self) -> tuple[dict, bool]:
-        """Find and query the Capacity Metrics model, adapting to its schema."""
+    def capacity_metrics(self, preferred_workspace: str = "",
+                         model_name_contains: str = "Capacity Metrics",
+                         peak_start_hour: int = 8,
+                         peak_end_hour: int = 18) -> tuple[dict, bool]:
+        """Find and query the Capacity Metrics model, adapting to its schema.
+
+        ``preferred_workspace`` is the reviewer's answer to "which workspace holds
+        the app?" — a name or an id. It is searched first, because the app can be
+        installed anywhere and a tenant with many workspaces would otherwise be
+        walked in list order until it happens to turn up.
+
+        ``model_name_contains`` is how the app is *recognised*, matched as a
+        case-insensitive substring of the semantic model's name. Unlike the
+        workspace hint this is a **filter, not an ordering**: the stock app,
+        FUAM, and a renamed install all carry different names, and a value that
+        matches nothing reports "app not deployed" for an estate that monitors
+        its capacity perfectly well. It is the notebook's ``MODEL_NAME_CONTAINS``.
+
+        ``peak_start_hour``/``peak_end_hour`` bound the client's working day on a
+        24-hour clock. The times in the metrics model are **UTC**, so a client
+        that is not on UTC needs these shifted or the busy/quiet split for 12.1.2
+        measures the wrong half of the day.
+        """
         match = None
         group_id = None
-        for group in self.list_groups():
+        wanted = preferred_workspace.strip().lower()
+        needle = model_name_contains.strip().lower() or "capacity metrics"
+        groups = list(self.list_groups())
+        if wanted:
+            # Named workspace first; the rest still follow, so a wrong name costs
+            # nothing beyond ordering.
+            groups.sort(
+                key=lambda g: str(g.get("name") or "").strip().lower() != wanted
+                and str(g.get("id") or "").strip().lower() != wanted
+            )
+        for group in groups:
             candidate_group = str(group.get("id") or "")
             for dataset in self.list_datasets(candidate_group):
-                if "capacity metrics" in str(dataset.get("name") or "").lower():
+                if needle in str(dataset.get("name") or "").lower():
                     match, group_id = dataset, candidate_group
                     break
             if match:
                 break
         if not match:
-            return {"model_found": False}, True
+            return {"model_found": False, "model_name_searched": needle}, True
 
         dataset_id = str(match.get("id") or "")
         try:
@@ -417,12 +448,15 @@ class PowerBIClient:
                 for row in timed:
                     hour = _hour(_row_value(row, when, "When"))
                     value = float(_row_value(row, "TotalCU") or 0)
-                    if hour is not None and 8 <= hour < 18:
+                    if hour is not None and _in_working_day(hour, peak_start_hour, peak_end_hour):
                         peak += value
                     else:
                         off_peak += value
                 if timed:
-                    result["peak_split"] = {"peak": peak, "off_peak": off_peak}
+                    result["peak_split"] = {
+                        "peak": peak, "off_peak": off_peak,
+                        "window": f"{peak_start_hour:02d}:00-{peak_end_hour:02d}:00 UTC",
+                    }
             keys = [name for name in (workspace, item, operation) if name]
             if keys:
                 grouping = ", ".join(_dax_col(table, name) for name in dict.fromkeys(keys))
@@ -432,7 +466,9 @@ class PowerBIClient:
                         self.execute_queries(dataset_id, [dax], group_id)
                     )
                 except PowerBIError:
-                    pass
+                    # Top consumers are a nice-to-have: 12.2.2 reports N/A on an
+                    # empty list rather than failing the whole metrics read.
+                    log.debug("capacity metrics: top-consumer query refused")
             if operation:
                 dax = f"EVALUATE SUMMARIZECOLUMNS({_dax_col(table, operation)}, \"TotalCU\", SUM({_dax_col(table, cu)}))"
                 try:
@@ -554,6 +590,21 @@ def _hour(value) -> int | None:
         return datetime.fromisoformat(str(value or "").replace("Z", "+00:00")).hour
     except ValueError:
         return None
+
+
+def _in_working_day(hour: int, start: int, end: int) -> bool:
+    """Is ``hour`` inside the ``[start, end)`` working day, in UTC?
+
+    The window may wrap past midnight. Shifting a local working day into UTC is
+    exactly how that happens — a 09:00-18:00 day in UTC+10 is 23:00-08:00 UTC —
+    so a naive ``start <= hour < end`` would call the client's whole working day
+    "off-peak" and invert the 12.1.2 verdict.
+    """
+    if start == end:
+        return False
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
 
 
 def _error_detail(status: int | None, body: Any) -> tuple[str, int | None, str | None]:

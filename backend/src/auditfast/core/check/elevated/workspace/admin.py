@@ -40,7 +40,7 @@ from collections.abc import Iterable, Sequence
 
 from ....enums import AdminCategory, Pillar, Resource, Scope, Severity
 from ....models import CheckContext, RoleAssignment
-from ...helpers import Verdict, binary, covered, graded, not_applicable
+from ...helpers import Verdict, binary, graded, not_applicable
 from ...registry import admin_check
 
 #: Roles that can change what is in a workspace. Viewer is read-only.
@@ -206,9 +206,15 @@ def operations_team_has_access(ctx: CheckContext) -> Verdict:
     for the people who built it. This asks the readable half of that question:
     does the operations group have access to the workspace at all?
 
-    **Needs configuration.** ``operations_groups`` in the project YAML names the
-    group; Fabric cannot infer it. Unset ⇒ N/A, exactly as the notebook refuses
-    to score without ``OPS_GROUPS``.
+    Ladder (from the notebook): the notebook scores the *share* of workspaces the
+    operations group can reach — all of them 3, half or more 2, fewer 1, none 0.
+    Per workspace that share is all-or-nothing, so this scores 3 or 0 and the
+    engine's roll-up reproduces the notebook's proportion across the run, while
+    naming which workspaces are missing access.
+
+    **Needs configuration.** ``operations_groups`` names the group; Fabric cannot
+    infer it. Unset ⇒ N/A, exactly as the notebook refuses to score without
+    ``OPS_GROUPS``.
 
     **What it cannot determine.** Whether the dashboard is *useful* — only that
     the team can reach the workspace holding it.
@@ -227,9 +233,9 @@ def operations_team_has_access(ctx: CheckContext) -> Verdict:
     hits = [a for a in _matching(assignments, wanted) if a.role in _READ_ROLES]
     if hits:
         named = ", ".join(f"{a.display_name} ({a.role})" for a in hits)
-        return binary(True, f"Operations access present: {named}")
-    return binary(
-        False,
+        return graded(3, f"Operations access present: {named}")
+    return graded(
+        0,
         "None of the named operations group(s) holds a role on this workspace: "
         + ", ".join(sorted(wanted))
         + ". Check the names match Manage access before treating this as a gap",
@@ -761,11 +767,11 @@ def gateways_are_highly_available(ctx: CheckContext) -> Verdict:
     it: patch that box and the estate's ingestion stops. Clustering is a member
     added in the gateway settings, not a rebuild.
 
-    Ladder (from the notebook): a personal gateway carrying estate traffic scores
-    0 — it cannot be clustered at all. Otherwise the score is the share of
-    standard gateways that are clustered. **Full marks need the machine sizing
-    confirmed by a human** (``gateway_sizing_confirmed``), because the API reports
-    membership and version, never capacity.
+    Ladder (from the notebook): personal gateways only → 0, they cannot be
+    clustered at all. Personal gateways alongside clustered standard ones → 1.
+    Otherwise: none clustered → 0; some → 1; all clustered → 3 when the machine
+    sizing is confirmed, 2 when it is not — the API reports membership and
+    version, never capacity.
 
     **What it cannot determine.** Whether the machines are big enough, patched,
     or in different failure domains.
@@ -784,13 +790,13 @@ def gateways_are_highly_available(ctx: CheckContext) -> Verdict:
         )
 
     personal = [g for g in gateways if "Personal" in str(g.get("type") or "")]
-    if personal and len(personal) == len(gateways):
+    standard = [g for g in gateways if g not in personal]
+    if not standard:
         return graded(
             0,
             f"{len(personal)} personal gateway(s) carry estate traffic and cannot "
             f"be made redundant: {_describe(personal)}",
         )
-    standard = [g for g in gateways if g not in personal]
     clustered = [
         g for g in standard
         if (g.get("number_of_member_gateways") or len(g.get("members") or []) or 0) > 1
@@ -802,18 +808,29 @@ def gateways_are_highly_available(ctx: CheckContext) -> Verdict:
             f"clustered, but {len(personal)} personal gateway(s) also carry "
             f"estate traffic and cannot be made redundant",
         )
-    if len(clustered) == len(standard) and not ctx.setting("gateway_sizing_confirmed", False):
+    if not clustered:
+        return graded(
+            0,
+            f"None of the {len(standard)} gateway(s) has a second member machine, "
+            f"so each is a single point of failure for every source behind it",
+        )
+    if len(clustered) < len(standard):
+        return graded(
+            1,
+            f"{len(clustered)} of {len(standard)} gateway(s) are clustered; the "
+            f"rest run on one machine",
+        )
+    if not ctx.setting("gateway_sizing_confirmed", False):
         return graded(
             2,
             f"All {len(standard)} gateway(s) are clustered, but the machine "
             f"sizing was not confirmed — the API reports membership and version, "
-            f"never capacity. Record it with 'gateway_sizing_confirmed'",
+            f"never capacity",
         )
-    return covered(
-        len(clustered), len(standard),
-        f"{len(clustered)} of {len(standard)} gateway(s) have a second member "
-        f"machine"
-        + ("; sizing confirmed by the reviewer" if len(clustered) == len(standard) else ""),
+    return graded(
+        3,
+        f"All {len(standard)} gateway(s) are clustered and the machine sizing was "
+        f"confirmed by the reviewer",
     )
 
 
@@ -827,15 +844,22 @@ def gateways_are_highly_available(ctx: CheckContext) -> Verdict:
     requires=[Resource.DATA_ACCESS_ROLES],
 )
 def onelake_access_is_governed(ctx: CheckContext) -> Verdict:
-    """Each Lakehouse defines a data access role, not just workspace-wide access.
+    """Each Lakehouse has a scoped data access role, held by groups not people.
 
     Without a data access role, everyone with a workspace role sees every folder
-    and every table in the Lakehouse. A data access role narrows that to the
-    folders an audience actually needs.
+    and every table in the Lakehouse. A role narrows that to the folders an
+    audience actually needs.
+
+    Ladder (from the notebook): no Lakehouse scoped scores 0; some scoped scores
+    1; all scoped but with individuals named directly in a role scores 2; all
+    scoped with group-based membership scores 3.
+
+    Fabric's own ``Default*`` roles do not count — they are created automatically
+    and are not evidence that anyone scoped access.
 
     **What it cannot determine.** Whether the roles are *correct* — only that
-    someone has defined access at the data layer rather than leaving it to the
-    workspace role alone. A role granting everything to everyone counts here.
+    someone defined access at the data layer rather than leaving it to the
+    workspace role alone. A role granting everything to everyone counts as scoped.
     """
     if not ctx.workspace.has(Resource.DATA_ACCESS_ROLES):
         return not_applicable(
@@ -846,14 +870,38 @@ def onelake_access_is_governed(ctx: CheckContext) -> Verdict:
     if not by_lakehouse:
         return not_applicable("No Lakehouse in this workspace, so there is no OneLake access to govern")
 
-    governed = [name for name, roles in by_lakehouse.items() if roles]
-    ungoverned = sorted(name for name, roles in by_lakehouse.items() if not roles)
-    return covered(
-        len(governed), len(by_lakehouse),
-        f"{len(ungoverned)} of {len(by_lakehouse)} lakehouse(s) define no OneLake "
-        f"data access role, so workspace access alone decides who reads the data: "
-        + ", ".join(ungoverned[:5])
-        if ungoverned else
-        f"All {len(by_lakehouse)} lakehouse(s) define at least one OneLake data "
-        f"access role",
+    # Only roles somebody defined count; Fabric's Default* roles are automatic.
+    defined = {
+        name: [role for role in roles if not role.get("built_in")]
+        for name, roles in by_lakehouse.items()
+    }
+    scoped = [name for name, roles in defined.items() if roles]
+    ungoverned = sorted(name for name, roles in defined.items() if not roles)
+    total = len(defined)
+
+    if not scoped:
+        return graded(
+            0,
+            f"None of the {total} lakehouse(s) has a data access role, so workspace "
+            f"access alone decides who reads the data: " + ", ".join(ungoverned[:5]),
+        )
+    if len(scoped) < total:
+        return graded(
+            1,
+            f"{len(scoped)} of {total} lakehouse(s) have a scoped role; the rest "
+            f"rely on workspace access alone: " + ", ".join(ungoverned[:5]),
+        )
+    individuals = sum(
+        int(role.get("individuals") or 0)
+        for roles in defined.values() for role in roles
+    )
+    if individuals:
+        return graded(
+            2,
+            f"Every lakehouse has a scoped role, but {individuals} individual(s) are "
+            f"named directly in a role rather than through a security group",
+        )
+    return graded(
+        3,
+        f"All {total} lakehouse(s) have scoped roles with group-based membership",
     )

@@ -84,7 +84,10 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
                    token_refresher=None, powerbi_token: str | None = None,
                    sql_token: str | None = None, storage_token: str | None = None,
                    sql_token_refresher=None, source: str = "live",
-                   snapshots: Sequence[dict] | None = None, narrow: bool = False):
+                   snapshots: Sequence[dict] | None = None, narrow: bool = False,
+                   capacity_metrics_workspace: str = "",
+                   capacity_metrics_model: str = "",
+                   capacity_peak_hours: tuple[int, int] | None = None):
     """Create the provider for a run.
 
     With ``source="live"`` (the default) every run reads the live tenant, but
@@ -130,6 +133,11 @@ def build_provider(config: ProjectConfig, token: str | None = None, *, refresh: 
                               sql_token=sql_token if settings.sql_endpoint_enabled else None,
                               storage_token=storage_token,
                               sql_token_refresher=sql_token_refresher)
+    live.capacity_metrics_workspace = capacity_metrics_workspace or ""
+    if capacity_metrics_model.strip():
+        live.capacity_metrics_model = capacity_metrics_model.strip()
+    if capacity_peak_hours:
+        live.capacity_peak_hours = capacity_peak_hours
     if narrow:
         from .context_store import ContextStore, NarrowCrawlProvider
 
@@ -694,6 +702,27 @@ def _resolve_admin_categories(names: Iterable[str] | None) -> list[AdminCategory
     return resolved
 
 
+def _peak_hours(settings: dict) -> tuple[int, int] | None:
+    """Read the reviewer's working day, or ``None`` to keep the 08:00-18:00 default.
+
+    A value that is not a whole hour is **ignored rather than clamped**: a typo
+    that silently became 00:00 would still produce a peak/off-peak split, and a
+    confidently wrong number is worse than the documented default.
+    """
+    raw_start = settings.get("capacity_peak_start_hour")
+    raw_end = settings.get("capacity_peak_end_hour")
+    if raw_start is None and raw_end is None:
+        return None
+    try:
+        start = int(raw_start if raw_start is not None else 8)
+        end = int(raw_end if raw_end is not None else 18)
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= start <= 23 and 0 <= end <= 23) or start == end:
+        return None
+    return start, end
+
+
 def run_admin_audit(
     project_path: str | Path,
     categories: Iterable[str] | None = None,
@@ -769,20 +798,26 @@ they are cached in the elevated run's **own** knowledge base
         suffix = "-".join(c.name.lower() for c in resolved)
         out_dir = new_run_dir(out_dir, f"{label}-admin-{suffix}")
 
-    provider = build_provider(config, token, refresh=refresh, token_refresher=token_refresher,
-                              powerbi_token=powerbi_token, sql_token=sql_token,
-                              storage_token=storage_token,
-                              sql_token_refresher=sql_token_refresher,
-                              source=source, snapshots=snapshots, narrow=True)
+    # The reviewer's answers win over the project YAML. Several checks ask things
+    # Fabric cannot report - which workspace is production, which group is the
+    # developers, where the Capacity Metrics app lives - and the person running
+    # the audit knows them; a YAML edited once per engagement does not. Layered
+    # rather than replaced, so a project that *does* set them keeps working with
+    # nothing supplied.
+    settings = {**config.settings, **(settings_override or {})}
+
+    provider = build_provider(
+        config, token, refresh=refresh, token_refresher=token_refresher,
+        powerbi_token=powerbi_token, sql_token=sql_token,
+        storage_token=storage_token, sql_token_refresher=sql_token_refresher,
+        source=source, snapshots=snapshots, narrow=True,
+        capacity_metrics_workspace=str(settings.get("capacity_metrics_workspace") or ""),
+        capacity_metrics_model=str(settings.get("capacity_metrics_model") or ""),
+        capacity_peak_hours=_peak_hours(settings),
+    )
     provider = _RunScopedProvider(provider)
     targets = _resolve_targets(config, workspaces)
     remediation: RemediationBook = load_remediation(config)
-    # The reviewer's answers win over the project YAML. Three checks ask things
-    # Fabric cannot report - which workspace is production, which group is the
-    # developers - and the person running the audit knows them; a YAML edited
-    # once per engagement does not. Layered rather than replaced, so a project
-    # that *does* set them keeps working with nothing supplied.
-    settings = {**config.settings, **(settings_override or {})}
 
     def _progress(partial: list[CheckResult]) -> None:
         run = _build_run(config.name, partial)
