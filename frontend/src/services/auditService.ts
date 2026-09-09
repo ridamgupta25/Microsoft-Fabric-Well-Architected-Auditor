@@ -134,6 +134,8 @@ export function reportDownloadUrl(
   auditId: string,
   kind:
     | "markdown"
+    | "checklist-markdown"
+    | "risk-register-markdown"
     | "excel"
     | "html"
     | "advisory-markdown"

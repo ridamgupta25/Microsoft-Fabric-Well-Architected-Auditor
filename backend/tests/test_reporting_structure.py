@@ -5,6 +5,10 @@ from auditfast.core.models import CheckResult
 from auditfast.core.scoring import aggregate
 from auditfast.reporting.excel import build_excel
 from auditfast.reporting.markdown import build_markdown
+from auditfast.reporting.markdown import (
+    build_checklist_markdown,
+    build_risk_register_markdown,
+)
 from auditfast.reporting.structure import consolidate, findings
 
 
@@ -252,19 +256,16 @@ def test_markdown_matches_sql_section_hierarchy():
     report = build_markdown("Fabric Project", aggregate(results), results)
 
     headings = [
-        "## Executive Summary",
-        "## Area Detail",
-        "## Checklist",
-        "## Findings (1)",
-        "## Risk Register",
-        "## Invent",
+        "## 1. Executive Summary",
+        "## 2. Workspace / Solution Overview",
+        "## 3. Detailed Findings and Recommendations by Area",
+        "## 4. Risk Overview",
+        "## 5. Glossary",
     ]
     positions = [report.index(f"\n{heading}\n") for heading in headings]
     assert positions == sorted(positions)
-    assert "### Remediation Roadmap" in report
-    assert "Notebook A" in report
-    assert "Notebook B" in report
-    assert "Notebook C" in report
+    assert "### 1.2 Area Scorecard" in report
+    assert "### 1.3 Radar Chart" in report
     assert "R-001" in report
 
 
@@ -315,14 +316,45 @@ def test_workspace_ids_and_scores_match_between_inventory_and_checklist(tmp_path
     assert checklist_rows["NB-CACHE"] == {"WS1": 3, "WS2": 0}
 
     markdown = build_markdown("Fabric Project", aggregate(results), results)
-    checklist_header = next(
-        line
-        for line in markdown.splitlines()
-        if line.startswith("| Check ID | Ref | Area |")
+    assert "## 2. Workspace / Solution Overview" in markdown
+    assert "### 2.1 Workspace Scores" in markdown
+    # Both workspaces appear under their report-local IDs.
+    assert "| WS1 |" in markdown
+    assert "| WS2 |" in markdown
+
+
+def test_standalone_checklist_markdown_holds_only_the_checklist():
+    results = _sample_results()
+
+    checklist = build_checklist_markdown("Fabric Project", results)
+
+    # Category-wise checklist layout, but nothing from the other report sections.
+    assert "## Checklist Statistics" in checklist
+    assert "## Risk Register" not in checklist
+    assert "### Critical Risks" not in checklist
+    assert "## Invent" not in checklist
+    # Area/category grouping with the dummy-format per-category table header.
+    assert "## Area 6: Security & Access Control" in checklist
+    assert "| # | Checklist Item | Score | Notes / Evidence |" in checklist
+    # Every consolidated control's ref appears in the checklist.
+    for control in consolidate(results):
+        assert control.ref in checklist
+
+
+def test_standalone_risk_register_markdown_holds_only_the_risk_register():
+    results = _sample_results()
+
+    register = build_risk_register_markdown("Fabric Project", results)
+
+    assert "# Risk Register" in register
+    assert "## Severity Summary" in register
+    assert "## Checklist Statistics" not in register
+    assert "## Invent" not in register
+    # The severity-grouped schema and the R-001 row are present.
+    assert (
+        "| Risk ID | Ref ID | Check ID | Finding | Area | Impact | Recommendation |"
+        in register
     )
-    assert checklist_header.endswith("| WS1 | WS2 |")
-    checklist_cache_row = next(
-        line for line in markdown.splitlines() if line.startswith("| NB-CACHE |")
-    )
-    assert checklist_cache_row.endswith("| 3.00 | 0.00 |")
-    assert "3.00%" not in checklist_cache_row
+    assert "### High Risks" in register
+    assert "R-001" in register
+    assert "R-001" in register
