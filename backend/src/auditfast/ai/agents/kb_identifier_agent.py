@@ -19,6 +19,7 @@ from __future__ import annotations
 from functools import partial
 
 from ...config.settings import get_settings
+from ..orchestrator import is_enabled
 from ..orchestrator.ai_config import AiConfig
 from ..orchestrator.state import (
     CustomCheck,
@@ -101,7 +102,18 @@ def plan(check: CustomCheck, session, *, ai: AiConfig | None = None) -> CustomCh
 
     field, confidence, stage = identify(check.raw_prompt, ai=ai)
     if field is None:
-        return check  # nothing recognised; left PENDING, surfaced for manual review
+        # Open-ended custom check: it matched no curated catalog field. Custom checks
+        # are arbitrary, so rather than dead-ending at PENDING, when AI is on hand it a
+        # generic FetchPlan. The pipeline then generates read-only fetch code for it
+        # and either executes it live (CodeFetchProvider) or, offline, falls through to
+        # code-gen against the crawled KB — letting the AI read whatever the check needs.
+        if is_enabled(ai):
+            check.fetch_plan = FetchPlan(
+                field=f"custom_{check.check_id}",
+                confidence=0.0,
+                mandatory=False,
+            )
+        return check  # AI off -> nothing recognised, left PENDING for manual review
 
     min_confidence = get_settings().kb_identifier_min_confidence
 
