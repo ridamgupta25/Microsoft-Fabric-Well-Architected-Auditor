@@ -66,7 +66,28 @@ class CheckSpecOut(BaseModel):
         description="True once the check has completed Phase 1 validation; False "
         "while it is still pending validation for the next phase.",
     )
+    admin_category: str | None = Field(
+        default=None,
+        description="Elevated-access family ('Tenant', 'Capacity', 'Workspace "
+        "Admin') for a check that needs privileges beyond ordinary workspace "
+        "access. Null for an ordinary check.",
+    )
     description: str = ""
+
+
+class AdminCategoryOut(BaseModel):
+    """One elevated-access family offered on the run-selection screen."""
+
+    category: str = Field(description="Family name, e.g. 'Workspace Admin'.")
+    checks: int = Field(description="How many elevated checks it currently holds.")
+    available: bool = Field(
+        description="False when no checks are registered for it yet, so the "
+        "screen can offer it as not-yet-available rather than hiding it."
+    )
+    pillars: list[str] = Field(
+        default_factory=list,
+        description="The pillars its checks roll up into.",
+    )
 
 
 class PillarOut(BaseModel):

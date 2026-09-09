@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from ..core.check.registry import REGISTRY, CheckRegistry
-from ..core.enums import Layer, Pillar, Scope
+from ..core.check.registry import ADMIN_REGISTRY, REGISTRY, CheckRegistry
+from ..core.enums import AdminCategory, Layer, Pillar, Scope
 
 
 def list_pillars() -> list[dict]:
@@ -94,3 +94,47 @@ def catalog_summary(registry: CheckRegistry = REGISTRY) -> dict:
             for scope in registry.scopes()
         },
     }
+
+
+# -- elevated-access (admin) checks -------------------------------------------
+
+def list_admin_categories(registry: CheckRegistry = ADMIN_REGISTRY) -> list[dict]:
+    """Every elevated-access family, with how many checks each currently has.
+
+    Always returns all three families, including those with no checks yet, so the
+    selection screen is driven by this response rather than a hardcoded list: a
+    category populated later appears automatically, and one that is still empty
+    is shown as unavailable instead of silently missing.
+    """
+    by_category: dict[AdminCategory, list] = {category: [] for category in AdminCategory}
+    for spec in registry.all():
+        if spec.admin_category in by_category:
+            by_category[spec.admin_category].append(spec)
+
+    return [
+        {
+            "category": category.value,
+            "checks": len(specs),
+            "available": bool(specs),
+            "pillars": sorted({spec.pillar.value for spec in specs}),
+        }
+        for category, specs in by_category.items()
+    ]
+
+
+def list_admin_checks(
+    category: str | None = None,
+    registry: CheckRegistry = ADMIN_REGISTRY,
+) -> list[dict]:
+    """The elevated-access catalog, optionally narrowed to one family.
+
+    An unrecognized ``category`` yields an empty list rather than an error, so a
+    typo in a query string cannot break the screen.
+    """
+    specs = registry.all()
+    if category:
+        member = AdminCategory.parse(category)
+        if member is None:
+            return []
+        specs = [spec for spec in specs if spec.admin_category is member]
+    return [spec.to_dict() for spec in sorted(specs, key=lambda s: s.id)]

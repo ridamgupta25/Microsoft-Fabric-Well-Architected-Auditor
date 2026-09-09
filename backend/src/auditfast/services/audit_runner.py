@@ -65,8 +65,13 @@ class AuditRunner:
         external_checks_csv: str | None = None,
         source: str = "live",
         snapshots: list[dict] | None = None,
+        check_set: str = "standard",
+        admin_categories: list[str] | None = None,
+        admin_settings: dict | None = None,
+        admin_options: dict[str, Any] | None = None,
     ) -> AuditJob:
         """Accept an audit and start it in the background."""
+        is_admin = check_set == "admin"
         job = AuditJob(
             id=uuid.uuid4().hex[:16],
             status=JobStatus.QUEUED,
@@ -78,8 +83,16 @@ class AuditRunner:
                 "weight_by_environment": weight_by_environment,
                 "external_checks_csv": external_checks_csv,
                 "source": source,
+                "check_set": check_set,
+                "admin_categories": admin_categories or [],
+                "admin_options": admin_options or {},
             },
-            questionnaire=questionnaire_service.build_questionnaire(pillars, workspaces),
+            # An elevated run has no interactive checks — they live in the
+            # standard registry — so it is never given a questionnaire to answer.
+            questionnaire=(
+                [] if is_admin
+                else questionnaire_service.build_questionnaire(pillars, workspaces)
+            ),
         )
         await self._repository.add(job)
 
@@ -96,6 +109,10 @@ class AuditRunner:
                 external_checks_csv=external_checks_csv,
                 source=source,
                 snapshots=snapshots,
+                check_set=check_set,
+                admin_categories=admin_categories,
+                admin_settings=admin_settings,
+                admin_options=admin_options,
                 parent_correlation_id=correlation_id.get(),
             )
         )
@@ -207,6 +224,10 @@ class AuditRunner:
         external_checks_csv: str | None = None,
         source: str = "live",
         snapshots: list[dict] | None = None,
+        check_set: str = "standard",
+        admin_categories: list[str] | None = None,
+        admin_settings: dict | None = None,
+        admin_options: dict[str, Any] | None = None,
         parent_correlation_id: str = "-",
     ) -> None:
         """Run one audit to completion, recording success or failure."""
@@ -244,6 +265,46 @@ class AuditRunner:
                 job.report = partial_report
 
             try:
+                if check_set == "admin":
+                    # An elevated run is independent: only the selected admin
+                    # categories, its own crawl, its own report directory. It has
+                    # no advisory stage and no questionnaire, so none of the
+                    # standard run's follow-up applies to it.
+                    admin_run = await asyncio.to_thread(
+                        audit_service.run_admin_audit,
+                        project_path,
+                        admin_categories,
+                        admin_options,
+                        workspaces,
+                        out_dir,
+                        token,
+                        on_progress=_on_progress,
+                        token_refresher=token_refresher,
+                        powerbi_token=powerbi_token,
+                        sql_token=sql_token,
+                        storage_token=storage_token,
+                        sql_token_refresher=sql_token_refresher,
+                        source=source,
+                        snapshots=snapshots,
+                        settings_override=admin_settings,
+                    )
+                    admin_report: dict[str, Any] = audit_service.to_json(admin_run)
+                    admin_report["audit_id"] = job.id
+                    job.out_dir = admin_run.out_dir
+                    job.mark_succeeded(admin_report)
+                    logger.info(
+                        "elevated audit finished",
+                        extra={
+                            "audit_id": job.id,
+                            "categories": ",".join(admin_run.admin_categories),
+                            "overall": admin_report.get("overall"),
+                        },
+                    )
+                    # No repository update here: the `finally` below persists the
+                    # job, and returning skips the standard run's KB-refresh step,
+                    # which does not apply to an elevated run.
+                    return
+
                 run = await asyncio.to_thread(
                     audit_service.run_audit,
                     project_path,

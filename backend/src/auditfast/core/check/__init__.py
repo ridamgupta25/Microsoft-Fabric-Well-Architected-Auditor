@@ -29,9 +29,12 @@ from .helpers import (
     note,
 )
 from .registry import (
+    ADMIN_REGISTRY,
     REGISTRY,
     CheckRegistry,
     DuplicateCheckError,
+    admin_check,
+    admin_registry_for,
     check,
     manual_check,
     questionnaire_check,
@@ -48,7 +51,9 @@ Option = CheckOption
 #: Re-add "roadmap" here to restore them — the generated roadmap.py files remain.
 #: "group" carries cross-workspace (@group_check) modules, which register into
 #: the separate GROUP_REGISTRY.
-_CHECK_MODULES = {"automated", "manual", "questionnaire", "group"}
+#: "admin" carries elevated-access (@admin_check) modules, which register into
+#: the separate ADMIN_REGISTRY and therefore never run in a standard audit.
+_CHECK_MODULES = {"automated", "manual", "questionnaire", "group", "admin"}
 
 
 def _discover() -> tuple[str, ...]:
@@ -73,6 +78,7 @@ def registered_modules() -> tuple[str, ...]:
 
 
 __all__ = [
+    "ADMIN_REGISTRY",
     "REGISTRY",
     "CheckRegistry",
     "DuplicateCheckError",
@@ -80,6 +86,8 @@ __all__ = [
     "CheckOption",
     "RemediationBook",
     "Verdict",
+    "admin_check",
+    "admin_registry_for",
     "binary",
     "check",
     "covered",

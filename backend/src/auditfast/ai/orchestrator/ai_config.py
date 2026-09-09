@@ -44,7 +44,7 @@ class AiConfig:
             "api_key": "***" if self.api_key else "",
         }
 
-    def without_key(self) -> "AiConfig":
+    def without_key(self) -> AiConfig:
         return replace(self, api_key="")
 
 

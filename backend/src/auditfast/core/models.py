@@ -18,7 +18,17 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from .advisory import is_advisory
-from .enums import ITEM_TYPE_SCOPE, Automation, Layer, Pillar, Resource, Scope, Severity, Status
+from .enums import (
+    ITEM_TYPE_SCOPE,
+    AdminCategory,
+    Automation,
+    Layer,
+    Pillar,
+    Resource,
+    Scope,
+    Severity,
+    Status,
+)
 from .validation import is_validated
 
 #: Highest score any single check can award.
@@ -206,6 +216,24 @@ class WorkspaceContext:
     #: of "who has access", for the workspace whose role assignments could not be
     #: read from Fabric REST.
     sql_principals: list[dict] = field(default_factory=list)
+    #: On-premises / VNet data gateways the caller administers:
+    #: ``{"id", "display_name", "type", "version", "number_of_member_gateways",
+    #: "members"}``. An elevated read (``Gateway.Read.All`` + a role on each
+    #: gateway), so an empty list can mean "none" *or* "none you administer" —
+    #: which is why the checks consult :attr:`unavailable` first.
+    gateways: list[dict] = field(default_factory=list)
+    #: OneLake data access roles per Lakehouse, keyed by item display name:
+    #: ``[{"name", "members", "permissions"}]``. Only role shape is kept, never
+    #: the data the role grants access to.
+    data_access_roles: dict[str, list] = field(default_factory=dict)
+    #: Tenant-admin evidence is repeated on each selected workspace context so
+    #: existing workspace-scoped engine dispatch and snapshot replay need no
+    #: special global-context path. Providers may cache the tenant-wide calls.
+    tenant_settings: list[dict] = field(default_factory=list)
+    tenant_domains: list[dict] = field(default_factory=list)
+    admin_scan: dict = field(default_factory=dict)
+    activity_events: list[dict] = field(default_factory=list)
+    capacity_metrics: dict = field(default_factory=dict)
     #: Resources the provider tried and failed to read. A check whose data lands
     #: here must report N/A rather than failing: "we could not determine this" is
     #: not the same finding as "this is not configured".
@@ -305,6 +333,13 @@ class WorkspaceContext:
             "sql_views": self.sql_views,
             "sql_routines": self.sql_routines,
             "sql_principals": self.sql_principals,
+            "gateways": self.gateways,
+            "data_access_roles": self.data_access_roles,
+            "tenant_settings": self.tenant_settings,
+            "tenant_domains": self.tenant_domains,
+            "admin_scan": self.admin_scan,
+            "activity_events": self.activity_events,
+            "capacity_metrics": self.capacity_metrics,
             "unavailable": sorted(r.value for r in self.unavailable),
             "read_failures": self.read_failures,
         }
@@ -342,6 +377,13 @@ class WorkspaceContext:
             sql_views=list(data.get("sql_views", [])),
             sql_routines=list(data.get("sql_routines", [])),
             sql_principals=list(data.get("sql_principals", [])),
+            gateways=list(data.get("gateways", [])),
+            data_access_roles=dict(data.get("data_access_roles", {})),
+            tenant_settings=list(data.get("tenant_settings", [])),
+            tenant_domains=list(data.get("tenant_domains", [])),
+            admin_scan=dict(data.get("admin_scan", {})),
+            activity_events=list(data.get("activity_events", [])),
+            capacity_metrics=dict(data.get("capacity_metrics", {})),
             unavailable={Resource(v) for v in data.get("unavailable", [])},
             read_failures=dict(data.get("read_failures", {})),
         )
@@ -476,6 +518,10 @@ class CheckSpec:
     #: The fixed answers a reviewer chooses between for an ``INTERACTIVE`` check.
     #: Empty for every automated/roadmap/manual check.
     options: tuple[CheckOption, ...] = ()
+    #: The elevated-access family this check belongs to, or ``None`` for an
+    #: ordinary check. Set only by ``admin_check``, which registers into the
+    #: separate ADMIN_REGISTRY — so a standard audit can never select one.
+    admin_category: AdminCategory | None = None
 
     @property
     def interactive(self) -> bool:
@@ -512,6 +558,7 @@ class CheckSpec:
             "interactive": self.interactive,
             "question": self.question or self.title,
             "options": [option.to_dict() for option in self.options],
+            "admin_category": self.admin_category.value if self.admin_category else None,
             "description": self.description or (self.fn.__doc__ or "").strip(),
             # Whether this check's checklist point has completed Phase 1
             # validation. Keyed by ref; source of truth:

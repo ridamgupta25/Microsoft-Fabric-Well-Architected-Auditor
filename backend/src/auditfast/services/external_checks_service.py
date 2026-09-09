@@ -35,19 +35,53 @@ def _parse_pillar(pillar_str: str) -> Pillar:
         if pillar.value.lower() in text.lower():
             return pillar
 
-    # Fallback: check common mappings
-    mappings = {
-        "security": Pillar.SECURITY,
-        "governance": Pillar.GOVERNANCE,
-        "operations": Pillar.OPERATIONS,
-        "performance": Pillar.PERFORMANCE,
-        "cost": Pillar.COST,
-        "data quality": Pillar.GOVERNANCE,  # Sometimes grouped
-        "data management": Pillar.GOVERNANCE,
+    # Fallback: match on a distinctive word. Keyed by the *checklist section
+    # number* the CSV carries first, then by keyword, because the admin
+    # notebooks emit headings like "14 Semantic Model & Reporting (8%)" that name
+    # no Pillar member at all.
+    lowered = text.lower()
+    leading = lowered.split()[0].lstrip("0") if lowered.split() else ""
+    by_section = {
+        "1": Pillar.ARCHITECTURE,
+        "2": Pillar.DATA_INTEGRATION,
+        "3": Pillar.DATA_PROCESSING,
+        "4": Pillar.DATA_MODELING,
+        "5": Pillar.DATA_QUALITY,
+        "6": Pillar.SECURITY_ACCESS,
+        "7": Pillar.COMPLIANCE,
+        "8": Pillar.DATA_GOVERNANCE,
+        "9": Pillar.RELIABILITY,
+        "10": Pillar.MONITORING,
+        "11": Pillar.DEVOPS,
+        "12": Pillar.COST_MANAGEMENT,
+        "13": Pillar.DOCUMENTATION,
+        "14": Pillar.SECURITY_ACCESS,
     }
+    if leading in by_section:
+        return by_section[leading]
 
-    for key, pillar in mappings.items():
-        if key in text.lower():
+    keywords = {
+        "security": Pillar.SECURITY_ACCESS,
+        "compliance": Pillar.COMPLIANCE,
+        "governance": Pillar.DATA_GOVERNANCE,
+        "monitoring": Pillar.MONITORING,
+        "observability": Pillar.MONITORING,
+        "devops": Pillar.DEVOPS,
+        "deployment": Pillar.DEVOPS,
+        "reliability": Pillar.RELIABILITY,
+        "cost": Pillar.COST_MANAGEMENT,
+        "capacity": Pillar.COST_MANAGEMENT,
+        "architecture": Pillar.ARCHITECTURE,
+        "ingestion": Pillar.DATA_INTEGRATION,
+        "integration": Pillar.DATA_INTEGRATION,
+        "transformation": Pillar.DATA_PROCESSING,
+        "quality": Pillar.DATA_QUALITY,
+        "modeling": Pillar.DATA_MODELING,
+        "storage": Pillar.DATA_MODELING,
+        "documentation": Pillar.DOCUMENTATION,
+    }
+    for key, pillar in keywords.items():
+        if key in lowered:
             return pillar
 
     raise ExternalCheckError(f"Unknown pillar: '{pillar_str}'")

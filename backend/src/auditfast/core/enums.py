@@ -189,6 +189,48 @@ class Automation(StrEnum):
     MANUAL = "manual"
 
 
+class AdminCategory(StrEnum):
+    """Which elevated-access family a check belongs to.
+
+    An ordinary check reads what any workspace member can see. These three
+    families need privileges a normal reviewer does not have, so they are kept
+    out of the standard registry entirely and run only from the explicit
+    "elevated checks" run mode:
+
+    - ``TENANT``: needs the Fabric tenant-admin APIs (tenant settings, scanner,
+      audit logs).
+    - ``CAPACITY``: needs capacity administration / metrics.
+    - ``WORKSPACE``: needs **Member or higher** on the workspace, or a role on
+      the connection or gateway being read. Not tenant-admin — the signed-in
+      user's own token works, provided they hold the role.
+
+    All three are declared from the start so a family can be populated without
+    touching the run mode, the catalog, or the UI; a family with no registered
+    checks simply reports a count of zero.
+    """
+
+    TENANT = "Tenant"
+    CAPACITY = "Capacity"
+    WORKSPACE = "Workspace Admin"
+
+    @classmethod
+    def parse(cls, value: str | AdminCategory | None) -> AdminCategory | None:
+        """Coerce an API string into a category, or ``None`` when unknown.
+
+        Returning ``None`` rather than raising keeps a typo in a request from
+        500-ing; the caller treats an unknown category as "nothing selected".
+        """
+        if isinstance(value, cls):
+            return value
+        if not value:
+            return None
+        text = str(value).strip().lower()
+        for member in cls:
+            if member.value.lower() == text or member.name.lower() == text:
+                return member
+        return None
+
+
 class Scope(StrEnum):
     """What kind of object a check inspects.
 
@@ -274,6 +316,30 @@ class Resource(StrEnum):
     #: bodies. Needs the ``Item.ReadWrite`` scope getDefinition requires; without
     #: it the definition is unreadable and the trigger-depth check reports N/A.
     ACTIVATOR_DEFINITIONS = "activatorDefinitions"
+    #: On-premises / VNet data gateways and their members, from ``/gateways`` and
+    #: ``/gateways/{id}/members``. An **elevated** read: ``Gateway.Read.All`` plus
+    #: a role on each gateway, so the list returns only the gateways the caller
+    #: administers. Not tenant-admin. Without it the gateway checks report N/A.
+    GATEWAYS = "gateways"
+    #: Per-Lakehouse OneLake data access roles, from
+    #: ``…/items/{id}/dataAccessRoles``. Needs ``OneLake.Read.All`` plus a
+    #: workspace role. Only role names, member counts and the granted permissions
+    #: are kept — never the data itself.
+    DATA_ACCESS_ROLES = "dataAccessRoles"
+    #: Tenant-wide settings returned by the Power BI admin API. Available only
+    #: to a Fabric tenant administrator.
+    TENANT_SETTINGS = "tenantSettings"
+    #: Fabric domain membership plus workspace assignments, used to verify
+    #: business-area ownership boundaries.
+    TENANT_DOMAINS = "tenantDomains"
+    #: Tenant-admin metadata scan results, including endorsement details that
+    #: ordinary workspace item APIs omit.
+    ADMIN_SCANNER = "adminScanner"
+    #: Tenant activity events used by access, audit coverage and deployment
+    #: checks. The provider stores a bounded recent window only.
+    ADMIN_ACTIVITY = "adminActivity"
+    #: Normalized observations queried from the Fabric Capacity Metrics model.
+    CAPACITY_METRICS = "capacityMetrics"
 
 
 class Status(StrEnum):

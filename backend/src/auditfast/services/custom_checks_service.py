@@ -14,8 +14,7 @@ import logging
 from collections.abc import Sequence
 
 from ..ai.custom_runtime.local_runner import load_and_run
-from ..ai.orchestrator import diagnose, is_enabled
-from ..ai.orchestrator import pipeline
+from ..ai.orchestrator import diagnose, is_enabled, pipeline
 from ..ai.orchestrator.ai_config import AiConfig
 from ..config.settings import get_settings
 from .context_store import ContextStore

@@ -27,9 +27,14 @@ POST is never treated as a write.
 """
 from __future__ import annotations
 
+import contextlib
 import threading
 
 from guardrails import Guard  # type: ignore[import-not-found]
+
+from ...config.settings import get_settings
+from ..orchestrator.state import GuardrailVerdict
+from .guardrails_agent import _has_write_intent
 
 
 # Hub validators are optional PyPI packages (e.g. `pip install guardrails-ai-detect-pii`).
@@ -65,10 +70,6 @@ except Exception:  # pragma: no cover - older layout
         Validator,
         register_validator,
     )
-
-from ...config.settings import get_settings
-from ..orchestrator.state import GuardrailVerdict
-from .guardrails_agent import _has_write_intent
 
 #: Topics a custom Fabric audit check is allowed to be about.
 _VALID_TOPICS = ["data governance", "microsoft fabric", "azure", "auditing"]
@@ -123,10 +124,11 @@ def _build_guard() -> Guard:
     validators = []
 
     def _add(factory) -> None:
-        try:
+        # A validator that will not construct (e.g. a heavy ML validator whose
+        # model cannot be loaded offline) is skipped, so the installed subset
+        # still runs.
+        with contextlib.suppress(Exception):
             validators.append(factory())
-        except Exception:  # noqa: BLE001 - a validator that won't construct is skipped
-            pass
 
     if ValidLength is not None:
         _add(lambda: ValidLength(min=1, max=max_chars, on_fail="exception"))

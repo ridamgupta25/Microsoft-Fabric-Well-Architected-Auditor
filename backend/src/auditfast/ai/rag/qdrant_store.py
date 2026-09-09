@@ -20,8 +20,10 @@ from .vector_store import Neighbor
 
 def _qdrant():
     """Import qdrant lazily so the base install never needs it."""
-    from qdrant_client import QdrantClient  # type: ignore[import-not-found]
-    from qdrant_client import models  # type: ignore[import-not-found]
+    from qdrant_client import (
+        QdrantClient,  # type: ignore[import-not-found]
+        models,  # type: ignore[import-not-found]
+    )
 
     return QdrantClient, models
 
