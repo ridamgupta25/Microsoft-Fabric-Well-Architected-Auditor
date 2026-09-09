@@ -188,6 +188,18 @@ export function AdminChecksPage() {
   const [appReviewed, setAppReviewed] = useState(false);
   const [sizingConfirmed, setSizingConfirmed] = useState(false);
   const [codeScanClean, setCodeScanClean] = useState(false);
+  // Capacity: which workspace holds the metrics app, plus the three things the
+  // app cannot tell us — whether anyone actually reads it.
+  const [metricsWorkspace, setMetricsWorkspace] = useState("");
+  // How the app's semantic model is recognised, by name. Unlike the workspace
+  // this is a filter, so a wrong value reports "not deployed" rather than just
+  // searching more slowly — hence the explicit default rather than a blank.
+  const [metricsModel, setMetricsModel] = useState("Capacity Metrics");
+  const [peakStart, setPeakStart] = useState("8");
+  const [peakEnd, setPeakEnd] = useState("18");
+  const [metricsMonitored, setMetricsMonitored] = useState(false);
+  const [analysisDocumented, setAnalysisDocumented] = useState(false);
+  const [throttlingTracked, setThrottlingTracked] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
 
   const categories = useAsync(() => listAdminCategories(), []);
@@ -234,10 +246,33 @@ export function AdminChecksPage() {
     if (appReviewed) settings.app_access_reviewed = true;
     if (sizingConfirmed) settings.gateway_sizing_confirmed = true;
     if (codeScanClean) settings.code_scan_clean = true;
+    if (metricsWorkspace.trim()) {
+      settings.capacity_metrics_workspace = metricsWorkspace.trim();
+    }
+    if (metricsModel.trim()) {
+      settings.capacity_metrics_model = metricsModel.trim();
+    }
+    // Only send a whole hour in range; anything else keeps the documented
+    // 08:00-18:00 default rather than silently becoming 0.
+    const hour = (value: string): number | null => {
+      const parsed = Number(value.trim());
+      return Number.isInteger(parsed) && parsed >= 0 && parsed <= 23 ? parsed : null;
+    };
+    const start = hour(peakStart);
+    const end = hour(peakEnd);
+    if (start !== null && end !== null && start !== end) {
+      settings.capacity_peak_start_hour = start;
+      settings.capacity_peak_end_hour = end;
+    }
+    if (metricsMonitored) settings.metrics_app_monitored = true;
+    if (analysisDocumented) settings.analysis_documented = true;
+    if (throttlingTracked) settings.throttling_tracked = true;
     return settings;
   }, [
     selectedWorkspaces, prodWorkspaces, devGroups, opsGroups, consumerGroups,
     appReviewed, sizingConfirmed, codeScanClean,
+    metricsWorkspace, metricsModel, peakStart, peakEnd,
+    metricsMonitored, analysisDocumented, throttlingTracked,
   ]);
 
   const run = useCallback(async () => {
@@ -311,6 +346,7 @@ export function AdminChecksPage() {
 
   const probe = diagnostics.data?.admin;
   const wantsWorkspaceAdmin = selected.includes("Workspace Admin");
+  const wantsCapacity = selected.includes("Capacity");
 
   if (phase === "running") {
     const running = job?.status === "queued" || job?.status === "running" || !job;
@@ -559,10 +595,134 @@ export function AdminChecksPage() {
         </Section>
       )}
 
+      {wantsCapacity && (
+        <Section
+          title="About your capacity"
+          description="The Capacity Metrics app shows what your capacity is doing, but not whether anyone is watching. Tell us where it lives and what your team does with it."
+        >
+          <div className="space-y-5 rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950">
+            <label className="block space-y-1">
+              <span className="text-sm font-medium text-slate-800">
+                Which workspace holds the Capacity Metrics app?
+              </span>
+              <span className="block text-xs text-slate-500">
+                The app can be installed anywhere and Fabric offers no way to find it.
+                Leave blank and we will search the workspaces you selected — which may
+                not include it.
+              </span>
+              <input
+                type="text"
+                value={metricsWorkspace}
+                onChange={(event) => setMetricsWorkspace(event.target.value)}
+                placeholder="e.g. Capacity Metrics"
+                className="input"
+              />
+            </label>
+
+            <label className="block space-y-1">
+              <span className="text-sm font-medium text-slate-800">
+                What is the app's report named?
+              </span>
+              <span className="block text-xs text-slate-500">
+                We find the app by matching this against the name of the report's
+                semantic model, so partial names are fine. Change it if the app was
+                installed under a different name — otherwise we will report it as
+                missing even though it is there.
+              </span>
+              <input
+                type="text"
+                value={metricsModel}
+                onChange={(event) => setMetricsModel(event.target.value)}
+                placeholder="Capacity Metrics"
+                className="input"
+              />
+            </label>
+
+            <div className="space-y-1">
+              <span className="block text-sm font-medium text-slate-800">
+                When is your team's working day?
+              </span>
+              <span className="block text-xs text-slate-500">
+                Used to separate busy hours from quiet ones. Fabric records these
+                times in <strong>UTC</strong>, so shift them if your team is not on
+                UTC. The window may run past midnight.
+              </span>
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  min={0}
+                  max={23}
+                  value={peakStart}
+                  onChange={(event) => setPeakStart(event.target.value)}
+                  className="input w-20"
+                  aria-label="Working day start hour, UTC"
+                />
+                <span className="text-sm text-slate-500">to</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={23}
+                  value={peakEnd}
+                  onChange={(event) => setPeakEnd(event.target.value)}
+                  className="input w-20"
+                  aria-label="Working day end hour, UTC"
+                />
+                <span className="text-sm text-slate-500">UTC</span>
+              </div>
+            </div>
+
+            <label className="flex items-start gap-2 border-t border-slate-100 pt-4 text-sm dark:border-slate-800">
+              <input
+                type="checkbox"
+                checked={metricsMonitored}
+                onChange={(event) => setMetricsMonitored(event.target.checked)}
+                className="mt-1"
+              />
+              <span>
+                Somebody <strong>reviews the Capacity Metrics app</strong> regularly.
+                <span className="block text-xs text-slate-500">
+                  An app nobody opens monitors nothing, and Fabric cannot tell us who
+                  looks at it.
+                </span>
+              </span>
+            </label>
+            <label className="flex items-start gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={analysisDocumented}
+                onChange={(event) => setAnalysisDocumented(event.target.checked)}
+                className="mt-1"
+              />
+              <span>
+                Our <strong>capacity analysis is written down</strong>.
+                <span className="block text-xs text-slate-500">
+                  Peak versus quiet hours, the heaviest workloads, and how much of the
+                  capacity is query load — recorded somewhere, not just visible in the app.
+                </span>
+              </span>
+            </label>
+            <label className="flex items-start gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={throttlingTracked}
+                onChange={(event) => setThrottlingTracked(event.target.checked)}
+                className="mt-1"
+              />
+              <span>
+                <strong>Throttling incidents are logged</strong> and acted on.
+                <span className="block text-xs text-slate-500">
+                  Only matters if throttling actually happened — a capacity with no
+                  incidents scores full marks either way.
+                </span>
+              </span>
+            </label>
+          </div>
+        </Section>
+      )}
+
       {error && <ErrorBanner message={error} />}
 
-      <div className="flex items-center gap-3">
-        <button
+      <div className="flex items-center gap-3">        <button
           type="button"
           onClick={run}
           disabled={submitting || !isSignedIn}

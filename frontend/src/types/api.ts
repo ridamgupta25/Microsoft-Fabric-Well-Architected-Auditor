@@ -404,6 +404,20 @@ export interface AdminSettings {
   app_access_reviewed?: boolean;
   gateway_sizing_confirmed?: boolean;
   code_scan_clean?: boolean;
+  /** Which workspace holds the Fabric Capacity Metrics app — a search hint. */
+  capacity_metrics_workspace?: string;
+  /**
+   * How the app's semantic model is recognised, as a case-insensitive substring
+   * of its name. A filter, not a hint: a value matching nothing makes 12.2.1
+   * report the app as missing.
+   */
+  capacity_metrics_model?: string;
+  /** The client's working day in UTC, used to split busy from quiet hours. */
+  capacity_peak_start_hour?: number;
+  capacity_peak_end_hour?: number;
+  metrics_app_monitored?: boolean;
+  analysis_documented?: boolean;
+  throttling_tracked?: boolean;
 }
 
 export type CheckSet = "standard" | "admin";

@@ -23,7 +23,7 @@ import re
 import threading
 import time
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from typing import Any
@@ -141,6 +141,9 @@ _ITEM_DERIVED_RESOURCES: frozenset[Resource] = frozenset({
     Resource.LAKEHOUSE_FILES,
     Resource.ACTIVATOR_DEFINITIONS,
     Resource.DATA_ACCESS_ROLES,
+    # 14.3.6 excludes the semantic models Fabric creates for a Lakehouse or
+    # Warehouse, which it recognises by their sharing that item's name.
+    Resource.ADMIN_SCANNER,
 })
 
 
@@ -193,6 +196,20 @@ class LiveFabricProvider:
         #: Tenant-wide admin calls would otherwise repeat once per selected
         #: workspace. Cache their normalized read outcome for this provider.
         self._admin_cache: dict[str, tuple[Any, bool]] = {}
+        #: Which workspace holds the Fabric Capacity Metrics app, as supplied by
+        #: the reviewer. The app can be installed anywhere and no API reports
+        #: where, so this is a hint, not a filter: it is searched first and the
+        #: rest of the tenant still follows, so a wrong name costs only ordering.
+        self.capacity_metrics_workspace: str = ""
+        #: How the Capacity Metrics semantic model is recognised, by name. Unlike
+        #: the workspace hint this is a filter: the stock app, FUAM and a renamed
+        #: install carry different names, and a value matching nothing reports
+        #: "not deployed" for an estate that monitors its capacity properly.
+        self.capacity_metrics_model: str = "Capacity Metrics"
+        #: The client's working day, on a 24-hour clock. Metrics-model times are
+        #: UTC, so a client elsewhere needs these shifted or 12.1.2's busy/quiet
+        #: split measures the wrong half of the day.
+        self.capacity_peak_hours: tuple[int, int] = (8, 18)
 
     # -- transport -------------------------------------------------------------
     def _get(self, path: str) -> tuple[int | None, Any]:
@@ -811,9 +828,21 @@ class LiveFabricProvider:
             members = row.get("members") or {}
             entra = members.get("microsoftEntraMembers") or []
             item_access = members.get("fabricItemMembers") or []
+            name = str(row.get("name") or "")
             roles.append({
-                "name": row.get("name", ""),
+                "name": name,
+                # A "Default*" role is the one Fabric creates itself — it is not
+                # evidence anyone scoped access, so the check counts only the
+                # roles a human defined.
+                "built_in": name.startswith("Default"),
                 "members": len(entra) + len(item_access),
+                # Individuals named directly in a role are the same stale-access
+                # problem as individuals holding a workspace role: nobody removes
+                # them when the person moves on.
+                "individuals": sum(
+                    1 for member in entra
+                    if isinstance(member, dict) and member.get("objectType") == "User"
+                ),
                 "permissions": len(row.get("decisionRules") or []),
             })
         return roles, True
@@ -1378,22 +1407,62 @@ class LiveFabricProvider:
             })
         return normalized, True
 
+    #: Names that mean "Fabric or an app made this", not "someone built this to
+    #: be trusted". The notebook leaves them out of 14.3.6's population.
+    _ENDORSEMENT_EXCLUDE_KEYWORDS = ("usage metrics", "report usage", "template app")
+
     @staticmethod
-    def _endorsement_scan(payload: dict, workspace_id: str) -> dict:
-        items: list[dict] = []
+    def _endorsement_scan(payload: dict, workspace_id: str,
+                          items: Sequence[Item] = ()) -> dict:
+        """Collect the semantic models and reports 14.3.6 judges for endorsement.
+
+        Two exclusions, both from the notebook, and both there to stop the score
+        being dragged down by content nobody is expected to endorse:
+
+        * **Default semantic models.** Every Lakehouse and Warehouse gets one
+          created automatically, carrying the same name as the item. Nobody
+          endorses those, so a workspace with six Lakehouses would otherwise
+          score 0 however well its real models are badged.
+        * **Usage-metrics and template-app content**, matched by name.
+
+        What is excluded is reported alongside the population, so a reviewer can
+        see the judged set rather than trusting the filter.
+        """
+        auto = {
+            (item.display_name or "").strip().lower()
+            for item in items
+            if item.type in ("Lakehouse", "Warehouse") and item.display_name
+        }
+        judged: list[dict] = []
+        excluded: list[dict] = []
         for workspace in payload.get("workspaces", []) or []:
             if str(workspace.get("id") or "") != workspace_id:
                 continue
             for kind in ("datasets", "reports"):
                 for item in workspace.get(kind, []) or []:
                     detail = item.get("endorsementDetails") or {}
-                    items.append({
+                    name = item.get("name") or item.get("displayName") or ""
+                    kind_label = "SemanticModel" if kind == "datasets" else "Report"
+                    row = {
                         "id": item.get("id"),
-                        "name": item.get("name") or item.get("displayName"),
-                        "type": "SemanticModel" if kind == "datasets" else "Report",
+                        "name": name,
+                        "type": kind_label,
                         "endorsement": detail.get("endorsement") or "None",
-                    })
-        return {"items": items}
+                    }
+                    low = name.strip().lower()
+                    why = []
+                    if kind_label == "SemanticModel" and low in auto:
+                        why.append("created automatically for a Lakehouse or Warehouse")
+                    word = next(
+                        (k for k in LiveFabricProvider._ENDORSEMENT_EXCLUDE_KEYWORDS
+                         if k in low), None)
+                    if word:
+                        why.append(f"name contains '{word}'")
+                    if why:
+                        excluded.append({**row, "excluded_because": "; ".join(why)})
+                    else:
+                        judged.append(row)
+        return {"items": judged, "excluded": excluded}
 
     def _onelake(self):
         """Return a OneLake ADLS Gen2 client, or None without a Storage token."""
@@ -1685,13 +1754,17 @@ class LiveFabricProvider:
                 if not readable:
                     ctx.unavailable.add(Resource.ADMIN_ACTIVITY)
 
+        # The endorsement scan is *filtered* by the workspace's item list (default
+        # semantic models share their Lakehouse's name), so the payload is held
+        # here and turned into ctx.admin_scan once the item list has been read.
+        scanner_payload: dict | None = None
         if Resource.ADMIN_SCANNER in wanted:
             pbi = self._powerbi()
             if pbi is None:
                 ctx.unavailable.add(Resource.ADMIN_SCANNER)
             else:
                 payload, readable = pbi.admin_scan(workspace_id)
-                ctx.admin_scan = self._endorsement_scan(payload, workspace_id)
+                scanner_payload = payload
                 if not readable:
                     ctx.unavailable.add(Resource.ADMIN_SCANNER)
 
@@ -1700,8 +1773,19 @@ class LiveFabricProvider:
             if pbi is None:
                 ctx.unavailable.add(Resource.CAPACITY_METRICS)
             else:
+                # The reviewer's answers: where the app lives (an ordering hint),
+                # how its model is named (a filter), and the working day the
+                # busy/quiet split is measured against.
+                hint = self.capacity_metrics_workspace
+                model = self.capacity_metrics_model
+                peak_start, peak_end = self.capacity_peak_hours
+                # Every input is part of the identity of the answer, so a run
+                # that changes one is not served the previous run's result.
+                key = (f"capacity_metrics:{hint.strip().lower()}:"
+                       f"{model.strip().lower()}:{peak_start}:{peak_end}")
                 ctx.capacity_metrics, readable = self._cached_admin(
-                    "capacity_metrics", pbi.capacity_metrics
+                    key,
+                    lambda: pbi.capacity_metrics(hint, model, peak_start, peak_end),
                 )
                 if not readable:
                     ctx.unavailable.add(Resource.CAPACITY_METRICS)
@@ -1756,6 +1840,13 @@ class LiveFabricProvider:
                     log.info("fetch %s: %d report binding(s) recovered from Fabric "
                              "item definitions (no Power BI token needed)",
                              workspace_id, len(bindings))
+
+        # Needs the item list above: the models Fabric auto-creates for a
+        # Lakehouse or Warehouse are recognised by name, and counting them would
+        # drag 14.3.6 down for content nobody is expected to endorse.
+        if scanner_payload is not None:
+            ctx.admin_scan = self._endorsement_scan(
+                scanner_payload, workspace_id, ctx.items)
 
         # Per-item run/refresh recency (last_run_utc) plus the per-workspace
         # semantic-model created date. Fetched whenever a recency-needing resource
