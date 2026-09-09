@@ -817,17 +817,31 @@ def write_reports(run: AuditRun, out_dir: str | Path) -> dict[str, str]:
     """Write the Markdown, Excel and HTML reports; return their paths."""
     from ..reporting.excel import build_excel
     from ..reporting.html import build_html
-    from ..reporting.markdown import build_markdown
+    from ..reporting.markdown import (
+        build_checklist_markdown,
+        build_markdown,
+        build_risk_register_markdown,
+    )
 
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
 
     markdown_path = directory / "audit-report.md"
+    checklist_path = directory / "audit-checklist.md"
+    risk_register_path = directory / "risk-register.md"
     excel_path = directory / "audit-report.xlsx"
     html_path = directory / "audit-report.html"
 
     markdown_path.write_text(
         build_markdown(run.project_name, run.aggregate, run.results, run.errors),
+        encoding="utf-8",
+    )
+    checklist_path.write_text(
+        build_checklist_markdown(run.project_name, run.results),
+        encoding="utf-8",
+    )
+    risk_register_path.write_text(
+        build_risk_register_markdown(run.project_name, run.results),
         encoding="utf-8",
     )
     build_excel(
@@ -843,6 +857,8 @@ def write_reports(run: AuditRun, out_dir: str | Path) -> dict[str, str]:
     )
     return {
         "markdown": str(markdown_path),
+        "checklist_markdown": str(checklist_path),
+        "risk_register_markdown": str(risk_register_path),
         "excel": str(excel_path),
         "html": str(html_path),
     }

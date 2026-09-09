@@ -110,3 +110,23 @@ def test_separate_advisory_report_files_are_generated_and_downloadable(client):
     page = client.get(f"/api/v1/reports/{audit_id}/download/advisory-html")
     assert page.status_code == 200
     assert page.headers["content-type"].startswith("text/html")
+
+
+def test_separate_checklist_and_risk_register_markdown_are_downloadable(client):
+    audit_id, report = _report(client)
+
+    assert report["files"].get("checklist_markdown") == "audit-checklist.md"
+    assert report["files"].get("risk_register_markdown") == "risk-register.md"
+
+    checklist = client.get(f"/api/v1/reports/{audit_id}/download/checklist-markdown")
+    assert checklist.status_code == 200
+    assert checklist.headers["content-type"].startswith("text/markdown")
+    assert "## Checklist Statistics" in checklist.text
+    assert "## Severity Summary" not in checklist.text
+
+    register = client.get(f"/api/v1/reports/{audit_id}/download/risk-register-markdown")
+    assert register.status_code == 200
+    assert register.headers["content-type"].startswith("text/markdown")
+    assert "# Risk Register" in register.text
+    assert "## Severity Summary" in register.text
+    assert "## Checklist Statistics" not in register.text

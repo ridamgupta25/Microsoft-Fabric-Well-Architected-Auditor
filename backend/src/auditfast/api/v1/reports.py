@@ -20,6 +20,8 @@ _XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 _HTML = "text/html; charset=utf-8"
 DOWNLOADS: dict[str, tuple[str, str]] = {
     "markdown": ("audit-report.md", "text/markdown"),
+    "checklist-markdown": ("audit-checklist.md", "text/markdown"),
+    "risk-register-markdown": ("risk-register.md", "text/markdown"),
     "excel": ("audit-report.xlsx", _XLSX),
     "html": ("audit-report.html", _HTML),
     "advisory-markdown": ("advisory-report.md", "text/markdown"),

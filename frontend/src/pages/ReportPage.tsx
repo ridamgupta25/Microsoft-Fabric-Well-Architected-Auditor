@@ -228,7 +228,25 @@ export function ReportPage() {
               target="_blank"
               rel="noreferrer"
             >
-              Markdown
+              Audit Report
+            </a>
+            <a
+              className="btn-secondary"
+              href={reportDownloadUrl(auditId, "checklist-markdown")}
+              target="_blank"
+              rel="noreferrer"
+              title="Just the checklist — one row per control, across workspaces"
+            >
+              Audit Checklist
+            </a>
+            <a
+              className="btn-secondary"
+              href={reportDownloadUrl(auditId, "risk-register-markdown")}
+              target="_blank"
+              rel="noreferrer"
+              title="Just the severity-sorted risk register"
+            >
+              Risk Register
             </a>
             <a className="btn-secondary" href={reportDownloadUrl(auditId, "excel")}>
               Excel
