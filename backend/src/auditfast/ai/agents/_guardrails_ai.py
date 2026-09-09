@@ -136,7 +136,18 @@ def _build_guard() -> Guard:
         _add(lambda: DetectPromptInjection(on_fail="exception"))
     validators.append(FabricZeroWriteValidator(on_fail="exception"))
     if DetectPII is not None:
-        _add(lambda: DetectPII(on_fail="exception"))
+        # Restrict to genuinely-sensitive identifiers. The default preset includes
+        # PERSON/LOCATION, which false-positives on ordinary audit words ("Delta
+        # format", "Mark as read", "Bill of materials"); an audit check should only
+        # be blocked for real leaked identifiers, not domain vocabulary.
+        _pii_entities = [
+            "EMAIL_ADDRESS", "PHONE_NUMBER", "CREDIT_CARD", "US_SSN",
+            "IBAN_CODE", "US_BANK_NUMBER", "CRYPTO", "IP_ADDRESS",
+        ]
+        try:
+            validators.append(DetectPII(pii_entities=_pii_entities, on_fail="exception"))
+        except Exception:  # noqa: BLE001 - arg name differs across versions -> plain form
+            _add(lambda: DetectPII(on_fail="exception"))
     if SecretsPresent is not None:
         _add(lambda: SecretsPresent(on_fail="exception"))
     if RestrictToTopic is not None:

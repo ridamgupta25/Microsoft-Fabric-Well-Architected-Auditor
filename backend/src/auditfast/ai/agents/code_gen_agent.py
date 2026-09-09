@@ -19,6 +19,7 @@ Design source: ``local/Planning/Generate Code - Node``.
 """
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -41,6 +42,8 @@ from ..orchestrator.state import (
 
 #: Lifecycle states from which a check is ready for code generation.
 _ELIGIBLE = (LifecycleStatus.PROCESSED_CUSTOM, LifecycleStatus.KB_AUGMENTED)
+
+_LOG = logging.getLogger("auditfast.custom_checks")
 
 _CODE_FENCE = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL)
 
@@ -118,6 +121,49 @@ def _extract_code(raw: str) -> str:
     return (match.group(1) if match else raw).strip()
 
 
+#: A `class X(...)` header, capturing the name and the (possibly empty) base list.
+_CLASS_HEADER = re.compile(r"class\s+(\w+)\s*(?:\(([^)]*)\))?\s*:")
+
+#: A model-invented stub ``class BaseAuditCheck: ...`` block (header + indented body
+#: up to the next top-level line). Weak models often redefine the base "to be safe",
+#: which shadows the real one injected into the sandbox and makes the generated
+#: subclass unrecognisable. Stripping it lets the real base take effect.
+_STUB_BASE = re.compile(r"^class\s+BaseAuditCheck\b.*?(?=^\S|\Z)", re.MULTILINE | re.DOTALL)
+
+
+def _coerce_to_check(source: str) -> str:
+    """Rescue common weak-model mistakes so a valid check still loads.
+
+    Handles: (1) a model-defined stub ``class BaseAuditCheck`` that shadows the real
+    base; (2) a check class that forgot to subclass ``BaseAuditCheck``; (3) a bare
+    top-level ``def evaluate(...)`` with no class. The result is still AST-validated
+    and smoke-run, so the safety contract is unchanged.
+    """
+    source = _STUB_BASE.sub("", source).lstrip("\n")
+    if "def evaluate" not in source:
+        return source  # no check method to rescue
+    if re.search(r"class\s+\w+\s*\([^)]*\bBaseAuditCheck\b", source):
+        return source  # already a proper subclass of the real base
+    m = _CLASS_HEADER.search(source)
+    if m:  # a class exists but forgot the base -> inject it
+        bases = (m.group(2) or "").strip()
+        new_bases = "BaseAuditCheck" if not bases else f"{bases}, BaseAuditCheck"
+        return f"{source[:m.start()]}class {m.group(1)}({new_bases}):{source[m.end():]}"
+    # No class at all, but a top-level `def evaluate(...)` -> wrap it in a subclass.
+    dm = re.search(r"^def\s+evaluate\s*\(\s*([^)]*)\)", source, re.MULTILINE)
+    if dm:
+        params = dm.group(1).strip()
+        if not params.split(",")[0].strip() == "self":  # bare evaluate(kb) -> add self
+            source = re.sub(
+                r"^def\s+evaluate\s*\(\s*",
+                "def evaluate(self, " if params else "def evaluate(self",
+                source, count=1, flags=re.MULTILINE,
+            )
+        body = "\n".join(("    " + ln) if ln.strip() else ln for ln in source.splitlines())
+        return 'class GeneratedCheck(BaseAuditCheck):\n    check_id = "chk_generated"\n' + body
+    return source
+
+
 def default_generator(prompt: str, feedback: str, *, ai: AiConfig | None = None) -> str | None:
     """LLM-backed generator. ``None`` when AI is off."""
     if not is_enabled(ai):
@@ -126,7 +172,7 @@ def default_generator(prompt: str, feedback: str, *, ai: AiConfig | None = None)
     if feedback:
         user += f"\n\nYour previous attempt was rejected. Fix this and try again:\n{feedback}"
     raw = complete(_GEN_SYSTEM, user, max_tokens=900, ai=ai)
-    return _extract_code(raw) if raw else None
+    return _coerce_to_check(_extract_code(raw)) if raw else None
 
 
 def default_reviewer(prompt: str, source: str, *, ai: AiConfig | None = None) -> ReviewVerdict | None:
@@ -206,6 +252,10 @@ def generate(
         # Stage 1 - static/safety.
         ok, reason = validate_source(source)
         if not ok:
+            _LOG.warning(
+                "code-gen rejected (static, attempt %s): %s\n--- generated source ---\n%s\n--- end ---",
+                attempt, reason, source[:2000],
+            )
             feedback = f"Static safety check failed: {reason}. Return only safe, read-only code."
             log.stage_failed, log.reason = "static", reason
             continue
@@ -214,6 +264,10 @@ def generate(
         try:
             check_cls = load_check(source)
         except UnsafeCodeError as exc:
+            _LOG.warning(
+                "code-gen load rejected (attempt %s): %s\n--- generated source ---\n%s\n--- end ---",
+                attempt, exc, source[:2000],
+            )
             feedback = f"Rejected as unsafe: {exc}."
             log.stage_failed, log.reason = "static", str(exc)
             continue
