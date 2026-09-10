@@ -33,6 +33,11 @@ kb-cache/
 # narrow admin crawl can never be served to a standard audit as if it were whole
 kb-cache-admin/
 Fabric workspace kb/
+# Standalone KB crawler exports contain customer evidence.
+fabric-kb/
+fabric-admin-kb/
+fabric-capacity-kb/
+fabric-tenant-kb/
 HLDS/
 
 # Custom-checks run archive — AI-generated audit code + updated KB + fetch record
