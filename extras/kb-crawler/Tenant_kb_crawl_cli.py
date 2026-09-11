@@ -55,7 +55,7 @@ _collector_metadata_runtime = None
 _collector_modules = {}
 _collector_lock = _collector_RLock()
 
-COLLECTOR_VERSION = '1.1.0-tenant-admin'
+COLLECTOR_VERSION = '1.2.1-tenant-admin'
 COLLECTOR_BUILD_SHA256 = '4ef1e6633b9ee9cb00daae875ee7bc4929c6af62d8ed855006e0c69867f4301b'
 # Historical source hashes from the original bundle, including retired build inputs.
 # These record provenance, not runtime dependencies or a hash of later manual edits.
@@ -5257,6 +5257,7 @@ _ELEVATED_CATEGORY = "Tenant"
 _ELEVATED_PROFILES = {
     "Workspace Admin": {
         "name": "workspace-admin",
+        "folder": "admin",
         "output": "fabric-admin-kb",
         "resources": ("workspace", "items", "roleAssignments", "connections", "gateways", "dataAccessRoles"),
         "access": (
@@ -5266,6 +5267,7 @@ _ELEVATED_PROFILES = {
     },
     "Capacity": {
         "name": "capacity-admin",
+        "folder": "capacity",
         "output": "fabric-capacity-kb",
         "resources": ("workspace", "capacityMetrics"),
         "access": (
@@ -5275,6 +5277,7 @@ _ELEVATED_PROFILES = {
     },
     "Tenant": {
         "name": "tenant-admin",
+        "folder": "tenant",
         "output": "fabric-tenant-kb",
         "resources": ("workspace", "items", "tenantSettings", "tenantDomains", "adminScanner", "adminActivity"),
         "access": (
@@ -5363,8 +5366,9 @@ def build_parser():
     )
     parser.add_argument("--layer", choices=_LAYERS, default="Mixed", help="Workspace layer (default: Mixed).")
     parser.add_argument(
-        "--output-dir", type=Path, default=Path(profile["output"]),
-        help=f"Parent for a new timestamped output directory (default: {profile['output']}).",
+        "--output-dir", type=Path,
+        default=Path(__file__).resolve().parent / "output" / profile["folder"],
+        help=f"Override the parent for timestamped runs (default: output\\{profile['folder']} beside this script).",
     )
     parser.add_argument(
         "--timeout", type=_positive_timeout, default=180,
@@ -5704,6 +5708,62 @@ def _new_run_directory(parent, prefix="fabric-kb"):
     return directory
 
 
+def _print_completion(run_dir, status):
+    message, color = {
+        "collected": ("Crawl completed.", 32),
+        "partial": ("Crawl partially completed.", 33),
+        "failed": ("Crawl failed.", 31),
+    }[status]
+    if sys.stdout.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb":
+        message = f"\033[{color}m{message}\033[0m"
+    print(message)
+    print(f"Output folder: {run_dir.resolve()}")
+    if status != "failed":
+        print("Create a ZIP of this folder and share it.")
+
+
+def _self_test_output_behavior(folder, prefix):
+    from contextlib import redirect_stdout
+    from io import StringIO
+    from unittest.mock import patch
+
+    expected = Path(__file__).resolve().parent / "output" / folder
+    with tempfile.TemporaryDirectory(prefix="kb-output-self-test-") as directory:
+        with patch("os.getcwd", return_value=directory):
+            assert build_parser().parse_args([]).output_dir == expected
+        assert expected.is_absolute()
+        assert build_parser().parse_args(["--output-dir", directory]).output_dir == Path(directory)
+        parent = Path(directory) / "output" / folder
+        first = _new_run_directory(parent, prefix)
+        second = _new_run_directory(parent, prefix)
+        assert first.parent == second.parent == parent
+        assert first != second and first.is_dir() and second.is_dir()
+        assert first.name.startswith(prefix + "_")
+        for status, label, color in (
+            ("collected", "Crawl completed.", 32),
+            ("partial", "Crawl partially completed.", 33),
+            ("failed", "Crawl failed.", 31),
+        ):
+            for terminal, no_color, term, colored in (
+                (True, "", "xterm-256color", True),
+                (False, "", "xterm-256color", False),
+                (True, "1", "xterm-256color", False),
+                (True, "", "dumb", False),
+            ):
+                captured = StringIO()
+                with (
+                    redirect_stdout(captured),
+                    patch.object(captured, "isatty", return_value=terminal),
+                    patch.dict(os.environ, {"NO_COLOR": no_color, "TERM": term}),
+                ):
+                    _print_completion(first, status)
+                rendered = f"\033[{color}m{label}\033[0m" if colored else label
+                expected_lines = [rendered, f"Output folder: {first.resolve()}"]
+                if status != "failed":
+                    expected_lines.append("Create a ZIP of this folder and share it.")
+                assert captured.getvalue().splitlines() == expected_lines
+
+
 def collect_workspaces(
     runtime, provider_factory, workspace_ids, layer, output_dir, *, tokens=None,
     resources=None, category=None, crawl_settings=None,
@@ -5840,14 +5900,7 @@ def collect_workspaces(
         summary_path, summary,
         forbidden_values=tokens.known_secrets() if tokens else (),
     )
-    print(f"KB output: {run_dir.resolve()}")
-    print(f"Collection status: {summary['status']}. No audit checks or AI calls were executed.")
-    if category:
-        print(f"Replay these JSON files with source='kb', check_set='admin', admin_categories=['{category}'].")
-        print("Use the offline API steps in the README; the current Admin Checks page is live-only.")
-    else:
-        print("Upload the workspace UUID JSON file(s) to the tool's saved-KB audit; do not upload the summary as a workspace.")
-    print("Partial output is retained: review its missing evidence before assessing coverage.")
+    _print_completion(run_dir, summary["status"])
     return (1 if summary["status"] == "failed" else 2 if summary["status"] == "partial" else 0), summary
 
 
@@ -6249,6 +6302,8 @@ def run_elevated_self_test(runtime):
     """Exercise real bundled providers with synthetic HTTP and no network."""
     from unittest.mock import patch
 
+    profile = _ELEVATED_PROFILES[_ELEVATED_CATEGORY]
+    _self_test_output_behavior(profile["folder"], profile["output"])
     workspace_id = "00000000-0000-0000-0000-000000000001"
     second_id = "00000000-0000-0000-0000-000000000002"
     missing_id = "00000000-0000-0000-0000-000000000003"
@@ -6518,7 +6573,8 @@ def run_elevated_self_test(runtime):
     if _ELEVATED_CATEGORY == "Workspace Admin":
         assert all(method == "GET" for method, _ in calls)
     print(f"SELF-TEST PASSED: {_ELEVATED_CATEGORY} resource scope, production parsing, input validation,")
-    print("snapshot round-trip, separate exports, checksums, caching and unavailable-evidence handling.")
+    print("snapshot round-trip, output layout, completion messages, separate exports, checksums,")
+    print("caching and unavailable-evidence handling.")
     print("No sign-in, network requests, tenant writes or audit/check execution occurred.")
     return 0
 

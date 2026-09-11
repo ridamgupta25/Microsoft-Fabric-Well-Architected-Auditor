@@ -55,7 +55,7 @@ _collector_metadata_runtime = None
 _collector_modules = {}
 _collector_lock = _collector_RLock()
 
-COLLECTOR_VERSION = '1.0+4ef1e6633b9e'
+COLLECTOR_VERSION = '1.2.1-standard'
 COLLECTOR_BUILD_SHA256 = '4ef1e6633b9ee9cb00daae875ee7bc4929c6af62d8ed855006e0c69867f4301b'
 # Historical source hashes from the original bundle, including retired build inputs.
 # These record provenance, not runtime dependencies or a hash of later manual edits.
@@ -5294,7 +5294,7 @@ def build_parser():
             "  python kb_crawl_cli.py --tenant-id TENANT_UUID "
             "--workspace-id WORKSPACE_UUID --auth browser\n"
             "  python kb_crawl_cli.py --tenant-id TENANT_UUID "
-            "--workspace-id WORKSPACE_UUID --auth azure-cli --output-dir fabric-kb\n\n"
+            "--workspace-id WORKSPACE_UUID --auth azure-cli\n\n"
             "Send the workspace JSON file(s), not credentials. Captured definitions can "
             "contain proprietary code, embedded secrets and notebook outputs; inspect "
             "and approve the export before sharing it."
@@ -5334,8 +5334,8 @@ def build_parser():
     )
     parser.add_argument("--layer", choices=_LAYERS, default="Mixed", help="Workspace layer (default: Mixed).")
     parser.add_argument(
-        "--output-dir", type=Path, default=Path("fabric-kb"),
-        help="Parent for a new timestamped output directory (default: fabric-kb).",
+        "--output-dir", type=Path, default=Path(__file__).resolve().parent / "output" / "normal",
+        help="Override the parent for timestamped runs (default: output\\normal beside this script).",
     )
     parser.add_argument(
         "--timeout", type=_positive_timeout, default=180,
@@ -5650,12 +5650,68 @@ def _has_read_failures(context, requested):
     return False
 
 
-def _new_run_directory(parent):
+def _new_run_directory(parent, prefix="fabric-kb"):
     parent.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    directory = parent / f"fabric-kb_{stamp}_{uuid4().hex[:8]}"
+    directory = parent / f"{prefix}_{stamp}_{uuid4().hex[:8]}"
     directory.mkdir(mode=0o700)
     return directory
+
+
+def _print_completion(run_dir, status):
+    message, color = {
+        "collected": ("Crawl completed.", 32),
+        "partial": ("Crawl partially completed.", 33),
+        "failed": ("Crawl failed.", 31),
+    }[status]
+    if sys.stdout.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb":
+        message = f"\033[{color}m{message}\033[0m"
+    print(message)
+    print(f"Output folder: {run_dir.resolve()}")
+    if status != "failed":
+        print("Create a ZIP of this folder and share it.")
+
+
+def _self_test_output_behavior(folder, prefix):
+    from contextlib import redirect_stdout
+    from io import StringIO
+    from unittest.mock import patch
+
+    expected = Path(__file__).resolve().parent / "output" / folder
+    with tempfile.TemporaryDirectory(prefix="kb-output-self-test-") as directory:
+        with patch("os.getcwd", return_value=directory):
+            assert build_parser().parse_args([]).output_dir == expected
+        assert expected.is_absolute()
+        assert build_parser().parse_args(["--output-dir", directory]).output_dir == Path(directory)
+        parent = Path(directory) / "output" / folder
+        first = _new_run_directory(parent, prefix)
+        second = _new_run_directory(parent, prefix)
+        assert first.parent == second.parent == parent
+        assert first != second and first.is_dir() and second.is_dir()
+        assert first.name.startswith(prefix + "_")
+        for status, label, color in (
+            ("collected", "Crawl completed.", 32),
+            ("partial", "Crawl partially completed.", 33),
+            ("failed", "Crawl failed.", 31),
+        ):
+            for terminal, no_color, term, colored in (
+                (True, "", "xterm-256color", True),
+                (False, "", "xterm-256color", False),
+                (True, "1", "xterm-256color", False),
+                (True, "", "dumb", False),
+            ):
+                captured = StringIO()
+                with (
+                    redirect_stdout(captured),
+                    patch.object(captured, "isatty", return_value=terminal),
+                    patch.dict(os.environ, {"NO_COLOR": no_color, "TERM": term}),
+                ):
+                    _print_completion(first, status)
+                rendered = f"\033[{color}m{label}\033[0m" if colored else label
+                expected_lines = [rendered, f"Output folder: {first.resolve()}"]
+                if status != "failed":
+                    expected_lines.append("Create a ZIP of this folder and share it.")
+                assert captured.getvalue().splitlines() == expected_lines
 
 
 def collect_workspaces(runtime, provider_factory, workspace_ids, layer, output_dir, *, tokens=None):
@@ -5761,10 +5817,7 @@ def collect_workspaces(runtime, provider_factory, workspace_ids, layer, output_d
         summary_path, summary,
         forbidden_values=tokens.known_secrets() if tokens else (),
     )
-    print(f"KB output: {run_dir.resolve()}")
-    print(f"Collection status: {summary['status']}. No audit checks or AI calls were executed.")
-    print("Upload the workspace UUID JSON file(s) to the tool's saved-KB audit; do not upload the summary as a workspace.")
-    print("Partial output is retained: review its missing evidence before assessing coverage.")
+    _print_completion(run_dir, summary["status"])
     return (1 if summary["status"] == "failed" else 2 if summary["status"] == "partial" else 0), summary
 
 
@@ -5884,6 +5937,7 @@ def run_self_test(runtime):
     import base64
     from unittest.mock import patch
 
+    _self_test_output_behavior("normal", "fabric-kb")
     workspace_id = "00000000-0000-0000-0000-000000000001"
     missing_id = "00000000-0000-0000-0000-000000000002"
     notebook_id = "00000000-0000-0000-0000-000000000010"
@@ -6038,7 +6092,8 @@ def run_self_test(runtime):
     assert calls and all(method == "GET" or "/getDefinition" in url for method, url in calls)
     assert not unknown_calls, f"Unexpected collector calls: {unknown_calls}"
     print("SELF-TEST PASSED: workspace discovery/selection, production parsing, exact JSON round-trip, partial reads,")
-    print("non-admin resource profile, crawl truncation flags, atomic export, checksums and credential exclusion.")
+    print("non-admin resource profile, output layout, completion messages, crawl truncation flags,")
+    print("atomic export, checksums and credential exclusion.")
     print("No sign-in, network requests, tenant writes or audit/check execution occurred.")
     return 0
 
@@ -6062,10 +6117,6 @@ def main(argv=None):
             return run_self_test(runtime)
         tokens = ClientTokens(args.tenant_id, args.auth, args.client_id)
         handler = _configure_logging(tokens)
-        print("Fabric KB crawl CLI. No AuditFAST installation is required.")
-        print("Only selected workspaces are collected; tenant-admin/capacity evidence is excluded.")
-        print("WARNING: exported source definitions can contain secrets, proprietary code and notebook outputs.")
-        print("Review and approve the resulting files before transferring them.")
         tokens.sign_in()
         print(f"Signed-in tenant: {tokens.tenant_id}")
         if args.tenant_id is None:
