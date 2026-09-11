@@ -585,8 +585,8 @@ def test_every_new_ref_is_registered_once_and_has_remediation_text():
 
     book = load_remediation(load_project(PROJECT_FILE))
     new = {
-        "14.1.2": "R-REL-AMBIGUOUS",
-        "14.1.8": "R-MODEL-HIDDEN-KEYS",
+        "1.4.2": "R-REL-AMBIGUOUS",
+        "1.4.5": "R-MODEL-HIDDEN-KEYS",
         "12.3.3": "WS-SPARK-IDLE",
         "1.1.5": "WS-MEDALLION",
         "4.4.1": "TB-WH-SCHEMAS",
