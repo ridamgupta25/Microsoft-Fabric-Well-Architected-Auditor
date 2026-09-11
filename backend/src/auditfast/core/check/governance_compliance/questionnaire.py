@@ -18,7 +18,7 @@ def _options(partial_guidance: str, no_guidance: str) -> list[CheckOption]:
 
 questionnaire_check(
     id="Q-CAT3-REPORT-KPI",
-    ref="14.3.3",
+    ref="1.4.6",
     title="Report KPI integrity and validation",
     pillar=Pillar.ARCHITECTURE,
     severity=Severity.HIGH,

@@ -94,15 +94,12 @@ _SECTION_PILLARS: dict[str, Pillar] = {
     "4": Pillar.DATA_MODELING, "5": Pillar.DATA_QUALITY, "6": Pillar.SECURITY_ACCESS,
     "7": Pillar.COMPLIANCE, "8": Pillar.DATA_GOVERNANCE, "9": Pillar.RELIABILITY,
     "10": Pillar.MONITORING, "11": Pillar.DEVOPS, "12": Pillar.COST_MANAGEMENT,
-    "14.1": Pillar.ARCHITECTURE, "14.2": Pillar.DATA_PROCESSING, "14.3": Pillar.ARCHITECTURE,
-    "14.4": Pillar.SECURITY_ACCESS, "14.5": Pillar.DATA_INTEGRATION,
 }
 _REF_PILLARS: dict[str, Pillar] = {
     "13.2.1": Pillar.SECURITY_ACCESS, "13.2.2": Pillar.SECURITY_ACCESS,
     "13.2.3": Pillar.SECURITY_ACCESS, "13.2.4": Pillar.SECURITY_ACCESS,
     "13.3.1": Pillar.COST_MANAGEMENT, "13.1.2": Pillar.ARCHITECTURE,
     "13.4.1": Pillar.DATA_INTEGRATION, "13.1.3": Pillar.ARCHITECTURE,
-    "14.5.3": Pillar.MONITORING, "14.5.4": Pillar.DEVOPS,
 }
 
 
@@ -111,5 +108,5 @@ def pillar_for_ref(ref: str, fallback: Pillar = Pillar.ARCHITECTURE) -> Pillar:
     if ref in _REF_PILLARS:
         return _REF_PILLARS[ref]
     parts = ref.split(".")
-    section = ".".join(parts[:2]) if parts and parts[0] == "14" else parts[0]
+    section = parts[0]
     return _SECTION_PILLARS.get(section, fallback)

@@ -26,7 +26,7 @@ BI_CONTENT_TYPES: frozenset[str] = frozenset({"SemanticModel", "Report", "Pagina
 
 
 @check(
-    id="WS-BI-DEPLOY", ref="14.5.4",
+    id="WS-BI-DEPLOY", ref="11.5.4",
     title="Semantic models and reports are source-controlled and deployed via pipeline (Dev → QA → Prod)",
     pillar=Pillar.DEVOPS, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=(Layer.REPORTING,),
@@ -116,7 +116,7 @@ _WIDE_MODEL_COLUMNS = 100
 
 
 @check(
-    id="SM-REFRESH-ORCHESTRATED", ref="14.5.1",
+    id="SM-REFRESH-ORCHESTRATED", ref="2.7.1",
     title="Refresh strategy aligned with upstream load completion",
     pillar=Pillar.DATA_INTEGRATION, scope=Scope.WORKSPACE, severity=Severity.MEDIUM,
     layers=REFRESH_LAYERS,
@@ -178,7 +178,7 @@ _ALERT_ITEM_TYPES: frozenset[str] = frozenset({"Reflex"})
 
 
 @check(
-    id="SM-REFRESH-ALERT", ref="14.5.3",
+    id="SM-REFRESH-ALERT", ref="10.4.5",
     title="Refresh failures alert the owning team",
     pillar=Pillar.MONITORING, scope=Scope.WORKSPACE, severity=Severity.HIGH,
     layers=(Layer.REPORTING,),
@@ -324,7 +324,7 @@ def _pipelines_with_guarded_refresh(ctx: CheckContext) -> list[str]:
 
 
 @check(
-    id="SM-INCREMENTAL-REFRESH", ref="14.5.2",
+    id="SM-INCREMENTAL-REFRESH", ref="2.7.2",
     title="Incremental refresh configured for large Import models",
     pillar=Pillar.DATA_INTEGRATION, scope=Scope.SEMANTIC_MODEL, severity=Severity.MEDIUM,
     layers=MODEL_LAYERS,

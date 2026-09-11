@@ -1194,7 +1194,7 @@ GUIDES: dict[str, JudgingGuide] = {
 
     # ---- semantic models and items -----------------------------------------
     "R-DAX-VAR": JudgingGuide(
-        ref="14.1.4",
+        ref="1.4.4",
         shape="graded",
         labels=("well_written", "hard_to_maintain_or_slow", "broken"),
         bands=(3, 1, 0),
@@ -1245,7 +1245,7 @@ GUIDES: dict[str, JudgingGuide] = {
         ),
     ),
     "SM-COLUMN-SHAPE": JudgingGuide(
-        ref="14.2.3",
+        ref="3.7.3",
         shape="ratio",
         labels=("compresses_well", "carries_expensive_columns"),
         compliant="compresses_well",

@@ -181,7 +181,7 @@ def test_subsections_are_named_from_the_checklist_not_invented():
     """
     page = _page([
         _result(ref="1.1.1", check_id="A", obj="A"),
-        _result(ref="14.4.1", check_id="B", obj="B"),
+        _result(ref="6.5.1", check_id="B", obj="B"),
         _result(ref="99.9.9", check_id="C", obj="C"),
     ])
     assert "1.1 \u00b7 Solution Architecture" in page

@@ -79,7 +79,7 @@ class Pillar(StrEnum):
             return _CHECKLIST_REF_PILLARS[ref]
 
         parts = ref.split(".")
-        section = ".".join(parts[:2]) if parts and parts[0] == "14" else parts[0]
+        section = parts[0]
         return _CHECKLIST_SECTION_PILLARS.get(section, fallback)
 
 
@@ -96,11 +96,6 @@ _CHECKLIST_SECTION_PILLARS: dict[str, Pillar] = {
     "10": Pillar.MONITORING,
     "11": Pillar.DEVOPS,
     "12": Pillar.COST_MANAGEMENT,
-    "14.1": Pillar.ARCHITECTURE,
-    "14.2": Pillar.DATA_PROCESSING,
-    "14.3": Pillar.ARCHITECTURE,
-    "14.4": Pillar.SECURITY_ACCESS,
-    "14.5": Pillar.DATA_INTEGRATION,
 }
 
 _CHECKLIST_REF_PILLARS: dict[str, Pillar] = {
@@ -112,8 +107,6 @@ _CHECKLIST_REF_PILLARS: dict[str, Pillar] = {
     "IMPL-20": Pillar.ARCHITECTURE,
     "IMPL-23": Pillar.DATA_INTEGRATION,
     "IMPL-24": Pillar.ARCHITECTURE,
-    "14.5.3": Pillar.MONITORING,
-    "14.5.4": Pillar.DEVOPS,
 }
 
 # All registered refs are now mapped to the updated checklist taxonomy. Add a

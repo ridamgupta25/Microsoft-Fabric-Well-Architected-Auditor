@@ -96,8 +96,8 @@ ADVISORY_CHECKLIST: dict[str, tuple[str, str]] = {
     "5.4.4":  ("data-quality", "Unknown-member monitoring is gated on dim_/fact_ naming in the code."),
     "5.1.10": ("data-quality", "The quarantine sink is identified from DataFrame variable names."),
     "3.1.4":  ("code-quality", "Whether markdown explains the business logic is a semantic judgment."),
-    "14.1.4": ("code-quality", "DAX quality is a heuristic judgment over expressions."),
-    "14.2.3": ("code-quality", "Cardinality falls back to name words including 'at' and 'on'."),
+    "1.4.4":  ("code-quality", "DAX quality is a heuristic judgment over expressions."),
+    "3.7.3":  ("code-quality", "Cardinality falls back to name words including 'at' and 'on'."),
 
     # Audit trail and monitoring: names decide the population.
     "4.6.5":  ("audit-lineage", "An audit table is recognised by name, so a destructive rewrite is invisible."),

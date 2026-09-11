@@ -42,8 +42,8 @@ from auditfast.core.models import CheckContext, Item, WorkspaceContext
 #: ref -> the check id(s) that answer it. 9.3.2 is answered by two checks (a
 #: notebook one and a pipeline one) because the evidence genuinely differs.
 ADDED: dict[str, list[str]] = {
-    "14.2.3": ["SM-COLUMN-SHAPE"],
-    "14.5.3": ["SM-REFRESH-ALERT"],
+    "3.7.3": ["SM-COLUMN-SHAPE"],
+    "10.4.5": ["SM-REFRESH-ALERT"],
     "2.6.4": ["WS-SCHEDULE-STAGGER"],
     "9.3.2": ["NB-MERGE-KEYED", "PL-MERGE-KEYED"],
 }
