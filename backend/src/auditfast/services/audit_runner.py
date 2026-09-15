@@ -328,6 +328,7 @@ class AuditRunner:
                 report = self._merge_answers(job, report)
                 job.out_dir = run.out_dir
                 report = self._attach_custom_checks(job, report)
+                report = self._attach_manual_checks(job, report)
                 job.mark_succeeded(report)
                 logger.info(
                     "audit finished",
@@ -425,6 +426,7 @@ class AuditRunner:
                 report = self._merge_answers(job, report)
                 job.out_dir = run.out_dir or job.out_dir
                 report = self._attach_custom_checks(job, report)
+                report = self._attach_manual_checks(job, report)
                 job.report = report
                 await self._repository.update(job)
                 logger.info(
@@ -474,6 +476,29 @@ class AuditRunner:
             report, job.answers, question_ids
         )
 
+    def _attach_manual_checks(self, job: AuditJob, report: dict[str, Any]) -> dict[str, Any]:
+        """Additively fold reviewer-approved manual (document-evidenced) checks in.
+
+        Read-only and never touches the deterministic score: it reads only the
+        remembered results (no AI, no Fabric). A failure here must never fail the
+        audit, so it is caught and logged.
+        """
+        try:
+            from . import evidence_checks_service
+
+            ws_ids = [
+                w.get("id")
+                for w in (job.request.get("workspaces") or [])
+                if isinstance(w, dict) and w.get("id")
+            ]
+            section = evidence_checks_service.approved_evidence_report(ws_ids or None)
+            if section and section.get("checks"):
+                report["manual_checks"] = section
+                self._append_manual_checks_excel(job, section)
+        except Exception:  # noqa: BLE001 - additive extra, never fatal to the audit
+            logger.exception("failed to attach manual checks", extra={"audit_id": job.id})
+        return report
+
     def _attach_custom_checks(self, job: AuditJob, report: dict[str, Any]) -> dict[str, Any]:
         """Additively fold reviewer-approved custom checks into a report.
 
@@ -518,6 +543,29 @@ class AuditRunner:
         except Exception:  # noqa: BLE001 - additive extra, never fatal to the audit
             logger.exception(
                 "failed to append custom checks to excel", extra={"audit_id": job.id}
+            )
+
+    def _append_manual_checks_excel(self, job: AuditJob, section: dict) -> None:
+        """Fold manual checks into the already-written Excel as an extra sheet.
+
+        The deterministic workbook is written before manual checks are approved,
+        so the sheet is appended here. A failure must never fail the audit.
+        """
+        out_dir = job.out_dir
+        if not out_dir:
+            return
+        from pathlib import Path
+
+        from ..reporting.excel import append_manual_checks_sheet
+
+        xlsx_path = Path(out_dir) / "audit-report.xlsx"
+        if not xlsx_path.exists():
+            return
+        try:
+            append_manual_checks_sheet(str(xlsx_path), section)
+        except Exception:  # noqa: BLE001 - additive extra, never fatal to the audit
+            logger.exception(
+                "failed to append manual checks to excel", extra={"audit_id": job.id}
             )
 
     # -- reading --------------------------------------------------------------

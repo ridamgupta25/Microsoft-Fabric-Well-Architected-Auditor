@@ -1072,3 +1072,116 @@ def append_custom_checks_sheet(xlsx_path: str, section: dict) -> bool:
 
     wb.save(xlsx_path)
     return True
+
+
+def _manual_status(score) -> str:
+    """Map a 0-3 manual-check score to a stakeholder status word."""
+    if not isinstance(score, (int, float)):
+        return ""
+    if score >= 3:
+        return "Pass"
+    if score == 2:
+        return "Partial"
+    return "Fail"
+
+
+def append_manual_checks_sheet(xlsx_path: str, section: dict) -> bool:
+    """Add a styled "Manual Checks" sheet to an already-written workbook.
+
+    Manual (document-evidenced) checks are approved after the deterministic Excel
+    is written, so they are folded in here by re-opening the file. Returns True
+    when a sheet was written, False when there is nothing to add. Mirrors
+    :func:`append_custom_checks_sheet`. Never raises for empty input.
+    """
+    from openpyxl import load_workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
+    checks = (section or {}).get("checks") or []
+    if not checks:
+        return False
+
+    dark_blue = "1F4E78"
+    medium_blue = "305496"
+    white = "FFFFFF"
+    pass_fill = PatternFill("solid", fgColor="C6EFCE")
+    partial_fill = PatternFill("solid", fgColor="FFEB9C")
+    fail_fill = PatternFill("solid", fgColor="FFC7CE")
+    banded_fill = PatternFill("solid", fgColor="F7F9FC")
+    thin_gray = Side(style="thin", color="D9E1F2")
+
+    status_fills = {
+        "pass": pass_fill,
+        "partial": partial_fill,
+        "fail": fail_fill,
+    }
+
+    wb = load_workbook(xlsx_path)
+    used = {name.casefold() for name in wb.sheetnames}
+    ws = wb.create_sheet(_safe_sheet_name("Manual Checks", used))
+    ws.sheet_view.showGridLines = False
+
+    ws["A1"] = "Manual Checks (0-3, document-evidenced, separate from the automated scorecard)"
+    ws.merge_cells("A1:F1")
+    ws["A1"].font = Font(bold=True, size=16, color=white)
+    ws["A1"].fill = PatternFill("solid", fgColor=dark_blue)
+    ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
+
+    workspaces = (section or {}).get("workspaces", 0)
+    ws["A2"] = f"Evaluated across {workspaces} workspace(s)"
+    ws.merge_cells("A2:F2")
+    ws["A2"].font = Font(italic=True)
+
+    headers = ["Check", "Ref", "Status", "Score", "Evidence", "Recommendation"]
+    header_row = 3
+    for column, value in enumerate(headers, start=1):
+        cell = ws.cell(row=header_row, column=column, value=value)
+        cell.font = Font(bold=True, color=white)
+        cell.fill = PatternFill("solid", fgColor=medium_blue)
+        cell.alignment = Alignment(vertical="center", wrap_text=True)
+        cell.border = Border(bottom=thin_gray)
+
+    row = header_row
+    for check in checks:
+        row += 1
+        title = check.get("title") or check.get("ref") or "(unnamed check)"
+        ref = check.get("ref") or ""
+        score = check.get("score")
+        status = _manual_status(score)
+        if str(check.get("source", "ai")).strip().casefold() == "manual":
+            evidence = "Manually attested"
+        else:
+            evidence = "; ".join(
+                str(c.get("quote", c)) if isinstance(c, dict) else str(c)
+                for c in (check.get("citations") or [])
+            )
+        recommendation = "; ".join(
+            str(item) for item in (check.get("recommendations") or [])
+        )
+        ws.cell(row=row, column=1, value=title)
+        ws.cell(row=row, column=2, value=ref)
+        status_cell = ws.cell(row=row, column=3, value=status)
+        score_cell = ws.cell(row=row, column=4, value=f"{score}/3" if isinstance(score, (int, float)) else "")
+        score_cell.alignment = Alignment(horizontal="center")
+        ws.cell(row=row, column=5, value=evidence)
+        ws.cell(row=row, column=6, value=recommendation)
+
+        fill = status_fills.get(status.strip().casefold())
+        if fill is not None:
+            status_cell.fill = fill
+        elif row % 2 == 0:
+            for column in range(1, len(headers) + 1):
+                ws.cell(row=row, column=column).fill = banded_fill
+
+    ws.freeze_panes = f"A{header_row + 1}"
+    for column, width in {"A": 50, "B": 10, "C": 14, "D": 10, "E": 70, "F": 70}.items():
+        ws.column_dimensions[column].width = width
+    for sheet_row in ws.iter_rows(min_row=header_row):
+        for cell in sheet_row:
+            cell.alignment = Alignment(
+                vertical="top",
+                wrap_text=True,
+                horizontal=cell.alignment.horizontal,
+            )
+
+    wb.save(xlsx_path)
+    return True

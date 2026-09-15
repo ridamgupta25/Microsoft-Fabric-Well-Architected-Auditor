@@ -543,6 +543,81 @@ export function ReportPage() {
           </div>
         </Section>
       )}
+
+      {(report.manual_checks?.checks.length ?? 0) > 0 && (
+        <Section
+          title="Manual checks"
+          description="Reviewer-approved document-evidenced checks, scored 0-3 and kept separate from the deterministic scorecard."
+        >
+          <p className="mb-3 text-sm text-slate-500 dark:text-slate-400">
+            {report.manual_checks!.checks.length} approved manual check
+            {report.manual_checks!.checks.length === 1 ? "" : "s"}.
+          </p>
+          <div className="card scroll-x">
+            <table className="table-base">
+              <thead>
+                <tr>
+                  <th className="min-w-[16rem]">Check</th>
+                  <th>Ref</th>
+                  <th>Status</th>
+                  <th>Score</th>
+                  <th className="min-w-[18rem]">Evidence</th>
+                  <th className="min-w-[14rem]">Recommendation</th>
+                </tr>
+              </thead>
+              <tbody>
+                {report.manual_checks!.checks.map((row) => {
+                  const status =
+                    row.score == null ? "N/A" : row.score >= 3 ? "PASS" : row.score >= 2 ? "PARTIAL" : "FAIL";
+                  const style = customStatusStyle(status);
+                  return (
+                    <tr key={row.ref}>
+                      <td className="font-medium text-slate-800 dark:text-slate-100">{row.title ?? row.ref}</td>
+                      <td className="whitespace-nowrap text-slate-600 dark:text-slate-300">{row.ref}</td>
+                      <td>
+                        <span className={`badge ${style.badge}`}>{status}</span>
+                      </td>
+                      <td className={`whitespace-nowrap font-semibold ${style.text}`}>
+                        {typeof row.score === "number" ? `${row.score} / 3` : "—"}
+                        {row.source === "manual" && (
+                          <span className="ml-1 text-xs font-normal text-slate-400">(manual)</span>
+                        )}
+                      </td>
+                      <td className="text-slate-600 dark:text-slate-300">
+                        {row.source === "manual" ? (
+                          <span className="italic text-slate-400">manually attested</span>
+                        ) : row.citations.length > 0 ? (
+                          <ul className="space-y-1">
+                            {row.citations.map((c, i) => (
+                              <li key={i} className="border-l-2 border-slate-200 pl-2 italic">
+                                “{c.quote}”
+                                <span className="not-italic text-xs text-slate-400"> — {c.source} p.{c.page}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <span className="text-slate-400">—</span>
+                        )}
+                      </td>
+                      <td className="text-slate-500">
+                        {row.recommendations.length > 0 ? (
+                          <ul className="list-disc space-y-0.5 pl-4">
+                            {row.recommendations.map((r, i) => (
+                              <li key={i}>{r}</li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <span className="text-slate-400">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Section>
+      )}
     </div>
   );
 }

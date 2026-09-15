@@ -110,6 +110,15 @@ class Settings(BaseSettings):
         description="Gitignored JSON file backing the custom-checks memory.",
     )
 
+    evidence_checks_memory_enabled: bool = Field(
+        default=True,
+        description="Remember approved manual (document-evidenced) checks across runs.",
+    )
+    evidence_checks_memory_file: str = Field(
+        default="custom-checks-runs/evidence-memory.json",
+        description="Gitignored JSON file backing the manual-checks memory.",
+    )
+
     # -- custom-checks live fetch (gated, OFF by default) ---------------------
     # When a check needs a KB field the snapshot lacks, the AI writes read-only
     # fetch code. Executing it means live Fabric calls, so it is gated OFF: the
