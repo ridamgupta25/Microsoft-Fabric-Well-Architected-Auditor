@@ -1,0 +1,587 @@
+[
+  {
+    "ref": "1.1.6",
+    "title": "Appropriate Fabric component selection per workload with documented rationale",
+    "tier": "A",
+    "ask_for": "Component-selection / design-rationale doc (Lakehouse for Bronze/Silver, Warehouse for Gold, DB for Metadata)",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document, or no component choices described",
+      "1": "Components listed but no rationale",
+      "2": "Components mapped to workloads",
+      "3": "Components mapped to workloads with a written rationale per choice"
+    }
+  },
+  {
+    "ref": "1.2.2",
+    "title": "Each medallion layer has a clearly defined purpose and transformation responsibility",
+    "tier": "A",
+    "ask_for": "Medallion (Bronze/Silver/Gold) design doc",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Layers named only",
+      "2": "Purpose described per layer",
+      "3": "Purpose plus transformation responsibility per layer"
+    }
+  },
+  {
+    "ref": "1.2.4",
+    "title": "Bronze immutability strategy defined and matches layer responsibility",
+    "tier": "A",
+    "ask_for": "Bronze / ingestion strategy doc (append/raw-capture vs overwrite)",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Mentions Bronze without a strategy",
+      "2": "States append-vs-overwrite choice",
+      "3": "States the strategy and why it matches Bronze responsibility"
+    }
+  },
+  {
+    "ref": "1.2.7",
+    "title": "Metadata DB role clearly defined and separated from business data",
+    "tier": "A",
+    "ask_for": "Metadata-DB design doc (run tracking, source changes, control/config/watermarks, lineage)",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Metadata DB mentioned only",
+      "2": "Role described",
+      "3": "Full role plus explicit separation from business data"
+    }
+  },
+  {
+    "ref": "2.3.1",
+    "title": "Source change capability documented per source",
+    "tier": "A",
+    "ask_for": "Source-capability / CDC design doc (which sources expose I/U/D, which require derivation)",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Sources listed only",
+      "2": "Insert/Update/Delete noted for some sources",
+      "3": "I/U/D plus derivation approach per source"
+    }
+  },
+  {
+    "ref": "2.3.5",
+    "title": "Update, delete and merge-conflict strategies documented",
+    "tier": "A",
+    "ask_for": "Load / merge strategy doc (full-replace vs changed-columns; soft/hard/tombstone delete; merge-conflict rule)",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "One of the three covered",
+      "2": "Two of the three covered",
+      "3": "Update, delete and merge-conflict all documented per table"
+    }
+  },
+  {
+    "ref": "2.5.4",
+    "title": "Metadata schema is documented and version-controlled",
+    "tier": "A",
+    "ask_for": "Metadata schema doc (and a note/link to source control)",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Schema documented only",
+      "2": "Documented and partially version-controlled",
+      "3": "Documented and fully version-controlled"
+    }
+  },
+  {
+    "ref": "4.4.10",
+    "title": "Warehouse capacity/scale considerations documented",
+    "tier": "A",
+    "ask_for": "Warehouse sizing / scale doc (concurrency, query patterns)",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Mentions sizing only",
+      "2": "Concurrency or query patterns considered",
+      "3": "Concurrency and query patterns with a capacity rationale"
+    }
+  },
+  {
+    "ref": "4.6.1",
+    "title": "Metadata DB schema is documented",
+    "tier": "A",
+    "ask_for": "Metadata-DB schema doc (run tracking, source changes, control/config/watermark/mapping, lineage)",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "A few tables documented",
+      "2": "Most areas documented",
+      "3": "All listed areas documented"
+    }
+  },
+  {
+    "ref": "4.6.7",
+    "title": "Retention policy defined for audit and metadata history",
+    "tier": "A",
+    "ask_for": "Retention policy doc for audit + metadata history",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Mentions retention only",
+      "2": "Defined for one of audit/metadata",
+      "3": "Defined for both with durations"
+    }
+  },
+  {
+    "ref": "5.1.1",
+    "title": "Data quality framework formally defined with DQ KPIs",
+    "tier": "A",
+    "ask_for": "DQ framework doc (rules, ownership, scoring; KPIs: completeness, accuracy, timeliness, consistency, uniqueness, validity)",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Rules only",
+      "2": "Rules plus ownership and scoring method",
+      "3": "Rules, ownership, scoring and the six DQ KPIs defined"
+    }
+  },
+  {
+    "ref": "5.1.5",
+    "title": "DQ remediation workflow exists (alert to investigate to fix to verify)",
+    "tier": "A",
+    "ask_for": "DQ remediation / runbook doc",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Alerting only",
+      "2": "Partial workflow",
+      "3": "All four stages (alert, investigate, fix, verify) defined"
+    }
+  },
+  {
+    "ref": "5.1.6",
+    "title": "DQ data contracts defined between producer and consumer teams per domain",
+    "tier": "A",
+    "ask_for": "Data-contract docs per domain",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Concept mentioned only",
+      "2": "Contracts for some domains",
+      "3": "Contracts across domains with obligations"
+    }
+  },
+  {
+    "ref": "5.1.8",
+    "title": "DQ SLAs defined per data product / Gold table",
+    "tier": "A",
+    "ask_for": "DQ SLA doc",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Generic SLA only",
+      "2": "SLAs for some tables",
+      "3": "SLAs per Gold table with targets"
+    }
+  },
+  {
+    "ref": "7.2.7",
+    "title": "Retention of historical data and audit-log retention per policy",
+    "tier": "A",
+    "ask_for": "Retention / compliance policy doc (historical financial data + audit-log retention)",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "One of the two covered",
+      "2": "Both mentioned",
+      "3": "Both with durations tied to policy/compliance"
+    }
+  },
+  {
+    "ref": "8.2.2",
+    "title": "Data stewards assigned per domain",
+    "tier": "A",
+    "ask_for": "Data-steward assignment doc",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "One domain has a steward",
+      "2": "Several domains have stewards",
+      "3": "Every domain (Finance, Sales, etc.) has a steward"
+    }
+  },
+  {
+    "ref": "8.2.3",
+    "title": "Ownership documented (roles, not just the team that built it)",
+    "tier": "A",
+    "ask_for": "Ownership / RACI doc",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Builder named only",
+      "2": "Owner role named",
+      "3": "Owner, steward and accountable roles named"
+    }
+  },
+  {
+    "ref": "8.2.4",
+    "title": "Escalation path for data quality issues defined",
+    "tier": "A",
+    "ask_for": "DQ escalation-path doc",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "A contact only",
+      "2": "A path defined",
+      "3": "Tiered path with owners and response expectation"
+    }
+  },
+  {
+    "ref": "8.3.1",
+    "title": "Data dictionary / glossary exists for Gold Warehouse tables",
+    "tier": "A",
+    "ask_for": "Data dictionary / glossary for Gold Warehouse tables",
+    "accepted_types": ["pdf", "docx", "md", "xlsx"],
+    "rubric": {
+      "0": "No document",
+      "1": "Partial coverage",
+      "2": "Most Gold tables covered",
+      "3": "Full dictionary with definitions"
+    }
+  },
+  {
+    "ref": "8.3.4",
+    "title": "Metadata accessible to data consumers (self-service discovery)",
+    "tier": "A",
+    "ask_for": "Metadata-access / catalog doc",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Internal only",
+      "2": "Shared location described",
+      "3": "Self-service discovery documented"
+    }
+  },
+  {
+    "ref": "8.3.5",
+    "title": "The solution's own Metadata DB is documented and discoverable",
+    "tier": "A",
+    "ask_for": "Metadata-DB documentation",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "Black box, no document",
+      "1": "Partial documentation",
+      "2": "Documented",
+      "3": "Documented and discoverable"
+    }
+  },
+  {
+    "ref": "8.3.6",
+    "title": "Common/shared terminology consistent across domains (single business glossary)",
+    "tier": "A",
+    "ask_for": "Business glossary",
+    "accepted_types": ["pdf", "docx", "md", "xlsx"],
+    "rubric": {
+      "0": "No document",
+      "1": "Partial glossary",
+      "2": "Single glossary exists",
+      "3": "Single glossary used consistently across domains"
+    }
+  },
+  {
+    "ref": "8.4.1",
+    "title": "Cross-domain data sharing rules defined",
+    "tier": "A",
+    "ask_for": "Cross-domain sharing-rules doc",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Informal only",
+      "2": "Rules defined",
+      "3": "Rules plus who-can-consume-what per domain"
+    }
+  },
+  {
+    "ref": "8.4.2",
+    "title": "Conformed dimensions governed centrally (single owner)",
+    "tier": "A",
+    "ask_for": "Conformed-dimension governance doc",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Dimensions listed only",
+      "2": "Single owner named",
+      "3": "Central owner plus change control"
+    }
+  },
+  {
+    "ref": "8.4.3",
+    "title": "Cross-domain reports have a documented ownership and certification model",
+    "tier": "A",
+    "ask_for": "Cross-domain certification-model doc",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Owner only",
+      "2": "Ownership plus source of truth",
+      "3": "Ownership plus a certification process"
+    }
+  },
+  {
+    "ref": "8.4.4",
+    "title": "Domain boundaries and interfaces (contracts) are documented",
+    "tier": "A",
+    "ask_for": "Domain-interface / contract doc",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Boundaries only",
+      "2": "Boundaries plus interfaces",
+      "3": "Boundaries plus documented contracts"
+    }
+  },
+  {
+    "ref": "9.1.4",
+    "title": "Manual intervention procedures documented for non-recoverable failures",
+    "tier": "A",
+    "ask_for": "Manual-intervention runbook",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Generic guidance only",
+      "2": "Procedures for key failures",
+      "3": "Step-by-step per non-recoverable scenario"
+    }
+  },
+  {
+    "ref": "10.5.3",
+    "title": "Escalation matrix defined (Level 1 to Level 2 to management)",
+    "tier": "A",
+    "ask_for": "Escalation matrix",
+    "accepted_types": ["pdf", "docx", "md", "xlsx"],
+    "rubric": {
+      "0": "No document",
+      "1": "Contacts only",
+      "2": "L1 to L2 defined",
+      "3": "L1 to L2 to management with triggers"
+    }
+  },
+  {
+    "ref": "12.1.1",
+    "title": "Fabric SKU selected based on workload analysis (not guesswork)",
+    "tier": "A",
+    "ask_for": "SKU / workload-analysis doc",
+    "accepted_types": ["pdf", "docx", "md", "xlsx"],
+    "rubric": {
+      "0": "Guesswork, no document",
+      "1": "SKU stated only",
+      "2": "Analysis basis shown",
+      "3": "Analysis plus justification for the SKU"
+    }
+  },
+  {
+    "ref": "12.1.4",
+    "title": "Growth projections modeled for next 6-12 months",
+    "tier": "A",
+    "ask_for": "Growth-projection doc (data volume, workspaces, domains)",
+    "accepted_types": ["pdf", "docx", "md", "xlsx"],
+    "rubric": {
+      "0": "No document",
+      "1": "Vague projection",
+      "2": "Volume growth modeled",
+      "3": "Volume, workspaces and domains over 6-12 months"
+    }
+  },
+  {
+    "ref": "12.2.3",
+    "title": "CU smoothing behavior understood (background vs interactive)",
+    "tier": "A",
+    "ask_for": "Capacity-analysis note covering CU smoothing",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Mentioned only",
+      "2": "Background vs interactive noted",
+      "3": "Smoothing explained and applied to planning"
+    }
+  },
+  {
+    "ref": "12.3.2",
+    "title": "Lifecycle / purge policies for aged raw files and audit history",
+    "tier": "A",
+    "ask_for": "Lifecycle / purge policy doc",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "One of raw files/audit covered",
+      "2": "Both mentioned",
+      "3": "Both with a purge cadence"
+    }
+  },
+  {
+    "ref": "12.3.5",
+    "title": "Reserved capacity vs. pay-as-you-go evaluated",
+    "tier": "A",
+    "ask_for": "Cost-evaluation doc",
+    "accepted_types": ["pdf", "docx", "md", "xlsx"],
+    "rubric": {
+      "0": "No document",
+      "1": "One option only",
+      "2": "Both options compared",
+      "3": "Compared with a decision rationale"
+    }
+  },
+  {
+    "ref": "13.1.1",
+    "title": "Architecture overview document exists",
+    "tier": "A",
+    "ask_for": "Architecture overview document",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Partial overview",
+      "2": "Covers the main layers",
+      "3": "Complete overview"
+    }
+  },
+  {
+    "ref": "13.1.2",
+    "title": "Data flow documentation covers all source-to-target mappings",
+    "tier": "A",
+    "ask_for": "Data-flow documentation",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Partial coverage",
+      "2": "Major flows covered",
+      "3": "All source-to-target mappings covered"
+    }
+  },
+  {
+    "ref": "13.1.3",
+    "title": "Business rules for transformations documented outside of code",
+    "tier": "A",
+    "ask_for": "Business-rules doc (outside code)",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "In code only",
+      "1": "A few rules documented",
+      "2": "Most rules documented",
+      "3": "All transformation rules documented externally"
+    }
+  },
+  {
+    "ref": "13.1.4",
+    "title": "Known issues and tech debt registered",
+    "tier": "A",
+    "ask_for": "Known-issues / tech-debt register",
+    "accepted_types": ["pdf", "docx", "md", "xlsx"],
+    "rubric": {
+      "0": "No document",
+      "1": "Informal notes",
+      "2": "A register exists",
+      "3": "Register maintained with owners and status"
+    }
+  },
+  {
+    "ref": "13.2.1",
+    "title": "Runbook exists for daily/weekly/monthly operations",
+    "tier": "A",
+    "ask_for": "Operations runbook covering daily, weekly and monthly tasks",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No runbook, or no recurring operations described",
+      "1": "Covers ad-hoc tasks or one cadence only",
+      "2": "Daily and weekly routines documented with owners",
+      "3": "Daily, weekly and monthly routines, each with owner and steps"
+    }
+  },
+  {
+    "ref": "13.2.2",
+    "title": "Failure recovery procedures documented step-by-step",
+    "tier": "A",
+    "ask_for": "Failure-recovery runbook",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Generic guidance",
+      "2": "Key scenarios covered",
+      "3": "Step-by-step per scenario"
+    }
+  },
+  {
+    "ref": "13.2.3",
+    "title": "On-call / escalation procedures documented",
+    "tier": "A",
+    "ask_for": "On-call / escalation doc",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Contacts only",
+      "2": "Rotation or escalation defined",
+      "3": "Rotation and escalation both defined"
+    }
+  },
+  {
+    "ref": "13.2.4",
+    "title": "Capacity scaling procedures documented",
+    "tier": "A",
+    "ask_for": "Capacity-scaling procedures doc",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Mentioned only",
+      "2": "Steps described",
+      "3": "Step-by-step scale up/down"
+    }
+  },
+  {
+    "ref": "13.3.3",
+    "title": "Source-to-target mapping documented per table",
+    "tier": "A",
+    "ask_for": "Source-to-target mapping doc",
+    "accepted_types": ["pdf", "docx", "md", "xlsx"],
+    "rubric": {
+      "0": "No document",
+      "1": "Partial coverage",
+      "2": "Most tables mapped",
+      "3": "Per-table mapping complete"
+    }
+  },
+  {
+    "ref": "13.3.4",
+    "title": "Acronyms and business terminology glossary available",
+    "tier": "A",
+    "ask_for": "Acronyms / terminology glossary",
+    "accepted_types": ["pdf", "docx", "md", "xlsx"],
+    "rubric": {
+      "0": "No document",
+      "1": "A few terms",
+      "2": "Most terms covered",
+      "3": "Complete acronym/term glossary"
+    }
+  },
+  {
+    "ref": "13.4.3",
+    "title": "Onboarding materials exist for new team members",
+    "tier": "A",
+    "ask_for": "Onboarding documentation",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Partial materials",
+      "2": "Covers setup",
+      "3": "Complete onboarding guide"
+    }
+  },
+  {
+    "ref": "4.7.1",
+    "title": "Cross-domain reports have a clear ownership and certification model",
+    "tier": "A",
+    "ask_for": "Report certification-model doc",
+    "accepted_types": ["pdf", "docx", "md"],
+    "rubric": {
+      "0": "No document",
+      "1": "Owner only",
+      "2": "Ownership plus source of truth",
+      "3": "Ownership plus a certification model"
+    }
+  }
+]

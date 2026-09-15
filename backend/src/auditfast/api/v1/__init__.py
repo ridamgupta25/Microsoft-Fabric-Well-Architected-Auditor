@@ -12,6 +12,7 @@ from . import (
     catalog,
     checklist,
     custom_checks,
+    evidence_checks,
     health,
     history,
     recommendations,
@@ -31,6 +32,7 @@ router.include_router(reports.router)
 router.include_router(recommendations.router)
 router.include_router(checklist.router)
 router.include_router(custom_checks.router)
+router.include_router(evidence_checks.router)
 router.include_router(history.router)
 
 __all__ = ["router"]

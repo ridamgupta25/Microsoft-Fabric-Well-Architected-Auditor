@@ -5,6 +5,7 @@
  * AI-authored custom checks live together instead of in separate nav items:
  *   - "Default checks" — the read-only rule catalog ({@link CatalogPage}).
  *   - "Custom checks"  — type checks in plain English and run them ({@link CustomChecksPage}).
+ *   - "Manual checks"  — the manual checklist points, scored from documentation ({@link EvidenceChecksPage}).
  *
  * Both tabs reuse their existing page components as-is; this file only owns the
  * tab switch, so neither flow changes behaviour.
@@ -13,8 +14,9 @@ import { useState } from "react";
 
 import { CatalogPage } from "@/pages/CatalogPage";
 import { CustomChecksPage } from "@/pages/CustomChecksPage";
+import { EvidenceChecksPage } from "@/pages/EvidenceChecksPage";
 
-type Tab = "default" | "custom";
+type Tab = "default" | "custom" | "evidence";
 
 export function ChecksPage({ initialTab = "default" }: { initialTab?: Tab }) {
   const [tab, setTab] = useState<Tab>(initialTab);
@@ -32,9 +34,18 @@ export function ChecksPage({ initialTab = "default" }: { initialTab?: Tab }) {
         <TabButton active={tab === "custom"} onClick={() => setTab("custom")}>
           Custom checks
         </TabButton>
+        <TabButton active={tab === "evidence"} onClick={() => setTab("evidence")}>
+          Manual checks
+        </TabButton>
       </div>
 
-      {tab === "default" ? <CatalogPage /> : <CustomChecksPage />}
+      {tab === "default" ? (
+        <CatalogPage />
+      ) : tab === "custom" ? (
+        <CustomChecksPage />
+      ) : (
+        <EvidenceChecksPage />
+      )}
     </div>
   );
 }

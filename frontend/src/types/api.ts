@@ -130,6 +130,56 @@ export interface VerifyAiResult {
   message: string;
 }
 
+// -- evidence checks ----------------------------------------------------------
+
+/** One catalog entry: what document to upload for a manual check + its rubric. */
+export interface EvidenceRequirementOut {
+  ref: string;
+  title: string;
+  tier: string;
+  pillar: string;
+  ask_for: string;
+  accepted_types: string[];
+  rubric: Record<string, string>;
+}
+
+export interface EvidenceCitation {
+  quote: string;
+  source: string;
+  page: number;
+}
+
+/** One drafted evidence-check result awaiting human review. */
+export interface EvidenceCheckRow {
+  ref: string;
+  title: string;
+  status: "DRAFTED" | "NEEDS_EVIDENCE" | "AI_REQUIRED" | "ADVISORY_ONLY";
+  score: number | null;
+  rung_matched: string | null;
+  citations: EvidenceCitation[];
+  gaps: string[];
+  recommendations: string[];
+  confidence: number;
+  source: string;
+  requires_human: boolean;
+  approved: boolean | null;
+  /** True when this check was approved for these workspaces in an earlier run. */
+  previously_approved?: boolean;
+}
+
+export interface EvidenceChecksResult {
+  checks: number;
+  files: number;
+  git_files: number;
+  git_error: string | null;
+  workspaces: string[];
+  skipped_files: string[];
+  summary: Record<string, number>;
+  ledger: EvidenceCheckRow[];
+  pending_review_ids: string[];
+  report_markdown: string;
+}
+
 // -- health -------------------------------------------------------------------
 
 export interface Health {
@@ -533,6 +583,8 @@ export interface AuditReport {
   advisory?: AdvisorySection;
   /** Reviewer-approved custom checks, scored 0-100, kept out of the scorecard. */
   custom_checks?: CustomChecksSection;
+  /** Reviewer-approved manual (document-evidenced) checks, 0-3, human-confirmed. */
+  manual_checks?: ManualChecksSection;
 }
 
 /** Approved custom checks folded into a report — separate 0-100 scores. */
@@ -548,6 +600,22 @@ export interface CustomCheckReportRow {
   score: number | null;
   findings: string[];
   recommendations: string[];
+}
+
+/** Approved manual (document-evidenced) checks folded into a report — 0-3. */
+export interface ManualChecksSection {
+  workspaces: number;
+  checks: ManualCheckReportRow[];
+}
+
+export interface ManualCheckReportRow {
+  ref: string;
+  title: string | null;
+  score: number | null;
+  rung_matched: string | null;
+  citations: EvidenceCitation[];
+  recommendations: string[];
+  source: string;
 }
 
 /** The non-deterministic checks, kept out of the deterministic scorecard. */

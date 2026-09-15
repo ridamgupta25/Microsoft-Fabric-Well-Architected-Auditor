@@ -258,6 +258,25 @@ class CustomChecksSection(BaseModel):
     checks: list[CustomCheckReportRow] = Field(default_factory=list)
 
 
+class ManualCheckRow(BaseModel):
+    """One approved manual (document-evidenced) check in a report."""
+
+    ref: str
+    title: str | None = None
+    score: int | None = None
+    rung_matched: str | None = None
+    citations: list[dict] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
+    source: str = "ai"
+
+
+class ManualChecksSection(BaseModel):
+    """Approved manual checks folded into a report — 0-3, human-confirmed."""
+
+    workspaces: int = 0
+    checks: list[ManualCheckRow] = Field(default_factory=list)
+
+
 class AuditReport(BaseModel):
     """The full result of a completed audit."""
     audit_id: str | None = None
@@ -319,6 +338,11 @@ class AuditReport(BaseModel):
         default=None,
         description="Reviewer-approved custom checks folded into the report "
         "(scored 0-100, kept separate from the deterministic scorecard).",
+    )
+    manual_checks: ManualChecksSection | None = Field(
+        default=None,
+        description="Reviewer-approved manual (document-evidenced) checks folded "
+        "into the report (0-3, human-confirmed, kept separate).",
     )
 
 
