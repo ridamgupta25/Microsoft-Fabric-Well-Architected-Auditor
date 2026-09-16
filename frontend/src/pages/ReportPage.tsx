@@ -482,7 +482,7 @@ export function ReportPage() {
             {report.custom_checks!.workspaces} workspace
             {report.custom_checks!.workspaces === 1 ? "" : "s"}.
           </p>
-          <div className="scroll-x">
+          <div className="card scroll-x">
             <table className="table-base">
               <thead>
                 <tr>
@@ -499,7 +499,7 @@ export function ReportPage() {
                 {report.custom_checks!.checks.map((row) => {
                   const style = customStatusStyle(row.status);
                   return (
-                    <tr key={row.check_id} className={style.row}>
+                    <tr key={row.check_id}>
                       <td className="font-medium text-slate-800 dark:text-slate-100">
                         {row.prompt ?? row.check_id}
                       </td>
