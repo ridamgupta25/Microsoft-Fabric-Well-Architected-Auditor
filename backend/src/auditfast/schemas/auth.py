@@ -37,6 +37,20 @@ class DeviceFlowRequest(BaseModel):
     scopes: list[str] = Field(default_factory=list)
 
 
+class ServicePrincipalRequest(BaseModel):
+    """Sign in as an app (service principal) via the client-credentials grant.
+
+    App-only: no user is involved, so it suits unattended/CI runs. The resulting
+    token's rights come from the app registration's *application* permissions
+    (admin-consented), not a user's delegated access.
+    """
+
+    tenant_id: str = Field(description="Directory (tenant) id.")
+    client_id: str = Field(description="Application (client) id of the app registration.")
+    client_secret: str = Field(description="A client secret for the app registration.")
+    scopes: list[str] = Field(default_factory=list)
+
+
 class LoginConfig(BaseModel):
     """Which sign-in methods the server offers, so the UI shows the right one."""
 

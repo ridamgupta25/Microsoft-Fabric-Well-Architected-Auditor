@@ -64,6 +64,28 @@ export async function loginWithAzureCli(): Promise<SessionResponse> {
 }
 
 /**
+ * Sign in as a service principal (app-only) — no user interaction.
+ *
+ * The app authenticates with its own tenant id, client id and secret via the
+ * client-credentials grant. Suited to unattended/CI runs. Completes on the
+ * server synchronously, so the returned session is already `done`. The token
+ * stays server-side; the browser only holds the session id.
+ */
+export async function loginWithServicePrincipal(params: {
+  tenantId: string;
+  clientId: string;
+  clientSecret: string;
+}): Promise<SessionResponse> {
+  const { data } = await apiClient.post<SessionResponse>("/login/service-principal", {
+    tenant_id: params.tenantId,
+    client_id: params.clientId,
+    client_secret: params.clientSecret,
+    scopes: [],
+  });
+  return data;
+}
+
+/**
  * Start a device-code sign-in — the browser-based flow for a hosted/remote app.
  *
  * Returns a short `user_code` and a `verification_uri`; the user opens that URI

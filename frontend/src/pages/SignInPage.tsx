@@ -23,6 +23,7 @@ import {
   getLoginConfig,
   getMe,
   loginWithAzureCli,
+  loginWithServicePrincipal,
   logout,
   startAuthCodeLogin,
   startDeviceCodeLogin,
@@ -38,8 +39,12 @@ export function SignInPage() {
   const [email, setEmail] = useState("");
   const [tenantId, setTenantId] = useState("");
   const [clientId, setClientId] = useState("");
+  const [spnTenantId, setSpnTenantId] = useState("");
+  const [spnClientId, setSpnClientId] = useState("");
+  const [spnSecret, setSpnSecret] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [showLocal, setShowLocal] = useState(false);
+  const [showSpn, setShowSpn] = useState(false);
   const [step, setStep] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -176,6 +181,25 @@ export function SignInPage() {
       setBusy(false);
     }
   }, [finish]);
+
+  const signInServicePrincipal = useCallback(async () => {
+    setError(null);
+    setBusy(true);
+    setStep("Signing in as a service principal…");
+    try {
+      const result = await loginWithServicePrincipal({
+        tenantId: spnTenantId.trim(),
+        clientId: spnClientId.trim(),
+        clientSecret: spnSecret,
+      });
+      finish(result.session);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setStep(null);
+    } finally {
+      setBusy(false);
+    }
+  }, [spnTenantId, spnClientId, spnSecret, finish]);
 
   const signOut = useCallback(async () => {
     if (!session) return;
@@ -405,6 +429,55 @@ export function SignInPage() {
             disabled={busy}
           >
             Reuse my Azure CLI session
+          </button>
+        </div>
+      </details>
+
+      <details
+        className="card"
+        open={showSpn}
+        onToggle={(event) => setShowSpn(event.currentTarget.open)}
+      >
+        <summary className="cursor-pointer text-sm font-medium text-slate-600 dark:text-slate-400">
+          Sign in with a service principal (app-only)
+        </summary>
+        <div className="mt-3 space-y-2">
+          <p className="text-xs text-slate-500">
+            Signs in as an app instead of a person — for unattended/automation (CI/CD)
+            runs. Needs an Entra app registration with admin-consented application
+            permissions. The secret is sent to the API and never stored in the browser.
+          </p>
+          <input
+            type="text"
+            className="input"
+            placeholder="Tenant ID"
+            value={spnTenantId}
+            onChange={(event) => setSpnTenantId(event.target.value)}
+            aria-label="Service principal tenant ID"
+          />
+          <input
+            type="text"
+            className="input"
+            placeholder="Client ID"
+            value={spnClientId}
+            onChange={(event) => setSpnClientId(event.target.value)}
+            aria-label="Service principal client ID"
+          />
+          <input
+            type="password"
+            className="input"
+            placeholder="Client secret"
+            value={spnSecret}
+            onChange={(event) => setSpnSecret(event.target.value)}
+            aria-label="Service principal client secret"
+          />
+          <button
+            type="button"
+            className="btn-secondary w-full"
+            onClick={signInServicePrincipal}
+            disabled={busy || !spnTenantId.trim() || !spnClientId.trim() || !spnSecret}
+          >
+            Sign in as service principal
           </button>
         </div>
       </details>
