@@ -15,6 +15,7 @@ from ...schemas.auth import (
     DeviceFlowRequest,
     LoginConfig,
     LoginRequest,
+    ServicePrincipalRequest,
     SessionResponse,
     SessionStatus,
     SignInStatus,
@@ -84,6 +85,27 @@ async def login_device_code(request: DeviceFlowRequest) -> SessionResponse:
         request.tenant_id, request.client_id, request.scopes or None
     )
     return SessionResponse(**result)
+
+
+@router.post(
+    "/login/service-principal",
+    response_model=SessionResponse,
+    summary="Sign in as a service principal (app-only)",
+)
+async def login_service_principal(request: ServicePrincipalRequest) -> SessionResponse:
+    """App-only sign-in for unattended/CI runs — no user interaction.
+
+    Completes synchronously: the returned session is already ``done``.
+    """
+    result = auth_service.login_service_principal(
+        request.tenant_id,
+        request.client_id,
+        request.client_secret,
+        request.scopes or None,
+    )
+    return SessionResponse(
+        session=result["session"], message=result["message"], status=SignInStatus.DONE
+    )
 
 
 @router.get(

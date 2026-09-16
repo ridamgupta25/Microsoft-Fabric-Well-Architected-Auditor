@@ -103,6 +103,14 @@ def _profile_from_claims(claims: dict | None) -> dict:
     return {"name": claims.get("name") or username, "username": username}
 
 
+def _profile_from_app_token(token: str | None) -> dict:
+    """A display profile for an app-only token, which carries no user claims."""
+    claims = _decode_jwt_claims(token)
+    appid = claims.get("appid") or claims.get("azp")
+    return {"name": claims.get("app_displayname") or appid or "Service principal",
+            "username": appid}
+
+
 def token_for(session_id: str | None) -> str | None:
     """Return the access token for a completed session, or ``None``."""
     sess = _SESSIONS.get(session_id or "")
@@ -475,6 +483,54 @@ def start_device_flow(tenant_id, client_id, scopes) -> dict:
         "message": flow.get("message"),
         "expires_in": flow.get("expires_in"),
     }
+
+
+def login_service_principal(tenant_id, client_id, client_secret, scopes=None) -> dict:
+    """Sign in as an app (service principal) — no user, for unattended/CI runs.
+
+    Uses the OAuth2 client-credentials grant: the app authenticates with its own
+    tenant id, client id and secret and receives an *app-only* token. Unlike every
+    other flow here there is no interactive step, so it completes synchronously and
+    the returned session is immediately ``done``. The token's permissions come from
+    the Entra app's *application* permissions (admin-consented), not a user's
+    delegated rights.
+    """
+    try:
+        import msal
+    except ImportError as exc:
+        raise AuthError("msal is not installed", 500) from exc
+
+    tenant = _clean(tenant_id)
+    client = _clean(client_id)
+    secret = _clean(client_secret)
+    if not (tenant and client and secret):
+        raise AuthError(
+            "Service principal sign-in needs a tenant id, client id and client secret.",
+            400)
+
+    authority = f"https://login.microsoftonline.com/{tenant}"
+    try:
+        app = msal.ConfidentialClientApplication(
+            client, authority=authority, client_credential=secret)
+    except Exception as exc:
+        raise AuthError(f"could not initialize sign-in: {exc}", 400) from exc
+
+    # Client credentials can only request a resource's .default — per-scope consent
+    # does not apply to app-only tokens.
+    try:
+        result = app.acquire_token_for_client(scopes=scopes or _FABRIC_DEFAULT_SCOPE)
+    except Exception as exc:
+        raise AuthError(f"service principal sign-in failed: {exc}", 400) from exc
+    if "access_token" not in result:
+        raise AuthError(
+            result.get("error_description", "service principal sign-in failed"), 400)
+
+    token = result["access_token"]
+    sid = uuid.uuid4().hex
+    _SESSIONS[sid] = {"result": token, "error": None, "done": True,
+                      "user": _profile_from_app_token(token), "_spn": True}
+    return {"session": sid, "status": "done",
+            "message": "Signed in as a service principal."}
 
 
 # -- redirect Authorization Code flow (hosted web sign-in) --------------------
